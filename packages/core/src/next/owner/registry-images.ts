@@ -1,6 +1,6 @@
 /** Root-owned immutable OLD/NEW images. Directory records and fragmented scalar payloads
  * outlive queue packets; only one projected, charged image lease may be live at a time. */
-import type { CatalogView, TableDef } from "../access/catalog.js";
+import type { ColumnDef } from "../access/catalog.js";
 import type { MaybePromise } from "../access/key-index.js";
 import {
   ROW_IMAGE_UNREAD,
@@ -27,18 +27,38 @@ import {
 export const REGISTRY_IMAGE_BYTES = 2048;
 const IMAGE = 1,
   SCALAR = 2;
+const IMAGE_SIDES = ["old", "new"] as const;
+export interface ImageCaptureContext {
+  readonly charge: ByteCharge;
+  prepare(bytes: number, signal: AbortSignal): MaybePromise<void>;
+}
 export interface ImageSource {
   readonly batch: Batch;
   readonly row: number;
+}
+export interface RegistryImageLink {
+  readonly image: RowImageRef;
+  readonly side: "old" | "new";
+  readonly columnId: number;
+}
+export interface RegistryImagePatch {
+  readonly columnId: number;
+  readonly value: Vector | RegistryImageLink | null;
 }
 export interface NativeImageShape {
   readonly tableId: number;
   readonly hasOld: boolean;
   readonly hasNew: boolean;
 }
+/** Scratch input schemas use the same typed scalar format without entering the catalog. */
+export interface RegistryImageTable {
+  readonly id: number;
+  readonly schemaVersion: number;
+  readonly columns: ReadonlyArray<Pick<ColumnDef, "id" | "type">>;
+}
 export interface RegistryImageScope {
   readonly rootId: number;
-  readonly catalog: CatalogView;
+  readonly catalog: { table(id: number): RegistryImageTable | undefined };
   readonly directory: RegistryDirectory;
   readonly fragments: RegistryFragments;
   readonly charge: ByteCharge;
@@ -123,6 +143,7 @@ export class RegistryImages {
     tableId: number,
     old: ImageSource | null,
     next: ImageSource | null,
+    capture?: ImageCaptureContext,
   ): Promise<RowImageRef> {
     return this.#work(async () => {
       const table = this.scope.catalog.table(tableId),
@@ -151,7 +172,7 @@ export class RegistryImages {
           }
         }
       if (captureBytes > 0) {
-        await this.scope.prepare(captureBytes, this.#signal ?? state());
+        await (capture ?? this.scope).prepare(captureBytes, this.#signal ?? state());
         this.#check();
       }
       const heads = [0, 0];
@@ -186,7 +207,7 @@ export class RegistryImages {
             vector,
             source.row,
             this.scope.fragments,
-            this.scope.charge,
+            capture?.charge ?? this.scope.charge,
           );
           this.#check();
           await this.scope.directory.put(SCALAR, id, scalar);
@@ -209,12 +230,197 @@ export class RegistryImages {
       return { spoolId: this.scope.rootId, row: id };
     });
   }
-  #validateProjection(table: TableDef, projection: RowBindingProjection): void {
+  /** Derive immutable UPDATE images by copying scalar descriptors, never OLD payloads.
+   * Changes are root-owned values (not an image lease), or explicit SQL NULL. The
+   * unchanged fragmented payloads remain shared until root close. A second derivation
+   * can replace generated placeholders after BEFORE without changing canonical OLD. */
+  derive(
+    ref: RowImageRef,
+    source: "old" | "new",
+    changes: readonly RegistryImagePatch[],
+    signal: AbortSignal,
+  ): Promise<RowImageRef> {
+    this.#check(signal);
+    this.#origin(ref);
+    return this.#work(async () => {
+      const { table, oldHead, nextHead } = await this.#info(ref, signal),
+        header = this.#header ?? state(),
+        scalar = this.#scalar ?? state();
+      if (!IMAGE_SIDES.includes(source)) state();
+      let cursor = source === "old" ? oldHead : nextHead,
+        capture = 0;
+      if (!cursor) state();
+      for (const [i, change] of changes.entries()) {
+        const column = table.columns.find((candidate) => candidate.id === change.columnId);
+        if (!column || changes.some((other, k) => k < i && other.columnId === column.id)) state();
+        if (change.value && "form" in change.value) {
+          if (change.value.length !== 1 || !samePhysicalType(column.type, change.value.type))
+            state();
+          capture = Math.max(capture, registryScalarStoreBytes(change.value, 0));
+        } else if (change.value) {
+          this.#origin(change.value.image);
+          if (!IMAGE_SIDES.includes(change.value.side)) state();
+          const link = change.value,
+            linked = await this.#info(link.image, signal),
+            sourceColumn = linked.table.columns.find((candidate) => candidate.id === link.columnId);
+          if (!sourceColumn || !samePhysicalType(sourceColumn.type, column.type)) state();
+        }
+      }
+      if (capture > 0) {
+        await this.scope.prepare(capture, signal);
+        this.#check(signal);
+      }
+      let first = 0,
+        previous = 0;
+      for (const column of table.columns) {
+        await this.scope.checkpoint();
+        this.#check(signal);
+        await this.#get(SCALAR, cursor, scalar);
+        this.#check(signal);
+        const view = viewOf(scalar),
+          next = view.getFloat64(0, true),
+          change = changes.find((entry) => entry.columnId === column.id);
+        if (view.getFloat64(8, true) !== column.id) corrupt();
+        if (change) {
+          if (change.value && !("form" in change.value)) {
+            await this.#copyLink(change.value, signal);
+          } else if (change.value) {
+            await storeRegistryScalar(
+              scalar,
+              change.value,
+              0,
+              this.scope.fragments,
+              this.scope.charge,
+            );
+            this.#check(signal);
+          } else {
+            const layout = view.getUint8(23);
+            scalar.fill(0, 16);
+            view.setUint8(23, layout);
+          }
+        }
+        const id = (this.#nextScalar = nextId(this.#nextScalar));
+        view.setFloat64(0, 0, true);
+        view.setFloat64(8, column.id, true);
+        await this.scope.directory.put(SCALAR, id, scalar);
+        this.#check(signal);
+        if (previous) {
+          await this.#get(SCALAR, previous, scalar);
+          viewOf(scalar).setFloat64(0, id, true);
+          await this.scope.directory.put(SCALAR, previous, scalar);
+          this.#check(signal);
+        } else first = id;
+        previous = id;
+        cursor = next;
+      }
+      if (cursor !== 0) corrupt();
+      const id = (this.#nextImage = nextId(this.#nextImage)),
+        view = viewOf(header);
+      header.fill(0);
+      view.setFloat64(0, oldHead, true);
+      view.setFloat64(8, first, true);
+      view.setFloat64(16, table.id, true);
+      view.setFloat64(24, table.schemaVersion, true);
+      view.setUint8(32, oldHead > 0 ? 1 : 0);
+      view.setUint8(33, 1);
+      view.setUint32(36, table.columns.length, true);
+      await this.scope.directory.put(IMAGE, id, header);
+      this.#check(signal);
+      return { spoolId: this.scope.rootId, row: id };
+    });
+  }
+  /** Project complete immutable OLD/NEW rows from typed registry input columns.
+   * Only scalar descriptors are copied; large payload fragments remain root-owned.
+   * Synthetic input schemas can never become accepted images without this real-table projection. */
+  compose(
+    tableId: number,
+    old: readonly RegistryImageLink[] | null,
+    next: readonly RegistryImageLink[] | null,
+    signal: AbortSignal,
+  ): Promise<RowImageRef> {
+    this.#check(signal);
+    return this.#work(async () => {
+      const table = this.scope.catalog.table(tableId);
+      if (!table || (!old && !next)) state();
+      const heads = [0, 0],
+        scalar = this.#scalar ?? state();
+      for (const [side, links] of [old, next].entries()) {
+        if (!links) continue;
+        if (links.length !== table.columns.length) state();
+        let previous = 0;
+        for (const [position, column] of table.columns.entries()) {
+          this.#check(signal);
+          const link = links[position];
+          if (!link) state();
+          this.#origin(link.image);
+          if (!IMAGE_SIDES.includes(link.side)) state();
+          const source = await this.#info(link.image, signal),
+            sourceColumn = source.table.columns.find((c) => c.id === link.columnId);
+          if (!sourceColumn || !samePhysicalType(sourceColumn.type, column.type)) state();
+          await this.#copyLink(link, signal);
+          this.#check(signal);
+          const id = (this.#nextScalar = nextId(this.#nextScalar)),
+            view = viewOf(scalar);
+          view.setFloat64(0, 0, true);
+          view.setFloat64(8, column.id, true);
+          await this.scope.directory.put(SCALAR, id, scalar);
+          this.#check(signal);
+          if (previous) {
+            await this.#get(SCALAR, previous, scalar);
+            viewOf(scalar).setFloat64(0, id, true);
+            await this.scope.directory.put(SCALAR, previous, scalar);
+            this.#check(signal);
+          } else heads[side] = id;
+          previous = id;
+          await this.scope.checkpoint();
+          this.#check(signal);
+        }
+      }
+      const id = (this.#nextImage = nextId(this.#nextImage)),
+        header = this.#header ?? state(),
+        view = viewOf(header);
+      header.fill(0);
+      view.setFloat64(0, heads[0] ?? 0, true);
+      view.setFloat64(8, heads[1] ?? 0, true);
+      view.setFloat64(16, table.id, true);
+      view.setFloat64(24, table.schemaVersion, true);
+      view.setUint8(32, old ? 1 : 0);
+      view.setUint8(33, next ? 1 : 0);
+      view.setUint32(36, table.columns.length, true);
+      await this.scope.directory.put(IMAGE, id, header);
+      this.#check(signal);
+      return { spoolId: this.scope.rootId, row: id };
+    });
+  }
+  /** Copy a selected source descriptor through the prepaid buffers, validating the
+   * complete source chain. No scalar payload is decoded/copied or leased. */
+  async #copyLink(link: RegistryImageLink, signal: AbortSignal): Promise<void> {
+    const { table, oldHead, nextHead } = await this.#info(link.image, signal),
+      scalar = this.#scalar ?? state(),
+      header = this.#header ?? state();
+    let cursor = link.side === "old" ? oldHead : nextHead,
+      found = false;
+    if (!cursor) state();
+    for (const column of table.columns) {
+      await this.#get(SCALAR, cursor, scalar);
+      this.#check(signal);
+      const view = viewOf(scalar);
+      if (view.getFloat64(8, true) !== column.id) corrupt();
+      cursor = view.getFloat64(0, true);
+      if (column.id === link.columnId) {
+        header.set(scalar);
+        found = true;
+      }
+    }
+    if (!found || cursor !== 0) corrupt();
+    scalar.set(header);
+  }
+  #validateProjection(table: RegistryImageTable, projection: RowBindingProjection): void {
     for (const side of [projection.old, projection.new])
       for (const id of side) if (!table.columns.some((column) => column.id === id)) state();
   }
   async #walk(
-    table: TableDef,
+    table: RegistryImageTable,
     head: number,
     selected: readonly number[] | null,
     visit: (position: number, scalar: Uint8Array) => Promise<void>,

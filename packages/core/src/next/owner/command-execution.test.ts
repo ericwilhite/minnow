@@ -9,6 +9,7 @@ import {
   NATIVE_BOUNDARY_LISTENER_REACH,
   NATIVE_BOUNDARY_NESTING_REACH,
   NATIVE_BOUNDARY_IMAGE_CANCEL_REACH,
+  NATIVE_BOUNDARY_FOLLOW_REACH,
 } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
 import type {
@@ -87,6 +88,7 @@ async function fixture(frames = 3) {
     active: RowImageLease | null = null,
     reading: (() => Promise<void>) | null = null,
     checking: (() => Promise<void>) | null = null,
+    following: ((command: CommandToken, signal: AbortSignal) => Promise<void>) | null = null,
     action: NativeCommandExecutionScope["runReferential"] = async () => undefined;
   const image = async () => {
     await reading?.();
@@ -128,12 +130,19 @@ async function fixture(frames = 3) {
       },
     },
     checks: {
+      referenceMustCheck: async () => true,
       verifyUnique: async () => {
         unique++;
         await checking?.();
       },
       verifyReference: async () => {
         throw new Error("No child FK in boundary fixture");
+      },
+      close: async () => undefined,
+    },
+    following: {
+      prepare: async (command, signal) => {
+        await following?.(command, signal);
       },
       close: async () => undefined,
     },
@@ -156,6 +165,9 @@ async function fixture(frames = 3) {
     },
     setCheck(work: () => Promise<void>) {
       checking = work;
+    },
+    setFollow(work: (command: CommandToken, signal: AbortSignal) => Promise<void>) {
+      following = work;
     },
     setAction(work: NativeCommandExecutionScope["runReferential"]) {
       action = work;
@@ -281,12 +293,12 @@ it.each(seedsFor("next-native-boundary", [0xb603]))(
   60000,
 );
 it.each(seedsFor("next-native-boundary-fence", [0xb604]))(
-  "cancels root waits and fences late image/check/action completion seed %i",
+  "cancels root waits and fences late image/check/action/follow completion seed %i",
   async (seed) => {
     const reach = createReach("native boundary fence", NATIVE_BOUNDARY_FENCE_REACH);
     await fc.assert(
       fc.asyncProperty(
-        fc.constantFrom("image", "check", "action"),
+        fc.constantFrom("image", "check", "action", "follow"),
         fc.boolean(),
         async (kind, callerCancel) => {
           reach.beginHistory();
@@ -307,6 +319,7 @@ it.each(seedsFor("next-native-boundary-fence", [0xb604]))(
           };
           if (kind === "image") f.setRead(pause);
           else if (kind === "check") f.setCheck(pause);
+          else if (kind === "follow") f.setFollow(pause);
           else f.setAction(pause);
           let closing: Promise<void> | null = null;
           let recursive: Promise<void> | null = null;
@@ -318,7 +331,7 @@ it.each(seedsFor("next-native-boundary-fence", [0xb604]))(
             const work =
               kind === "image"
                 ? f.native.readRowImages(entry.images, caller.signal)
-                : kind === "check"
+                : kind === "check" || kind === "follow"
                   ? f.native.verifyCommandUnique(command, caller.signal)
                   : f.native.executeReferentialId(entry.id, hooks, caller.signal);
             const rejected = expect(work).rejects.toThrow();
@@ -364,6 +377,8 @@ it.each(seedsFor("next-native-boundary-fence", [0xb604]))(
           ["check", true],
           ["action", true],
           ["image", false],
+          ["follow", true],
+          ["follow", false],
         ],
       },
     );
@@ -371,6 +386,99 @@ it.each(seedsFor("next-native-boundary-fence", [0xb604]))(
   },
   60000,
 );
+
+for (const seed of seedsFor("next-native-boundary-follow", [0xb627, 0xb628]))
+  it(`prepares original follow targets after each successful unique prefix ${String(seed)}`, async () => {
+    const reach = createReach("native follow checkpoint", NATIVE_BOUNDARY_FOLLOW_REACH);
+    await fc.assert(
+      fc.asyncProperty(
+        fc.integer({ min: 1, max: 4 }),
+        fc.boolean(),
+        fc.constantFrom(-1, 0, 1),
+        async (count, reject, budget) => {
+          reach.beginHistory();
+          const f = await fixture(1),
+            command = f.native.beginCommand(1, budget),
+            entries: ReferentialEntry[] = [],
+            trace: string[] = [];
+          let preparations = 0,
+            fail = false;
+          const uniqueError = Object.assign(new Error("native child duplicate"), {
+            sqlState: "23505",
+          });
+          try {
+            for (let i = 0; i < count; i++) entries.push(await f.entry(command));
+            f.setCheck(async () => {
+              trace.push("unique");
+              if (fail) throw uniqueError;
+            });
+            f.setFollow(async (token, signal) => {
+              expect(token).toEqual(command);
+              signal.throwIfAborted();
+              trace.push("follow");
+              preparations++;
+            });
+            await f.native.verifyCommandUnique(command, f.stop.signal);
+            expect(trace, "unique checks precede original identity capture").toEqual([
+              ...Array.from({ length: count }, () => "unique"),
+              "follow",
+            ]);
+            expect(preparations).toBe(1);
+            reach.reach("root preparation");
+            for (let i = 0; i < count; i++) {
+              const willFail = reject && i === count - 1;
+              trace.length = 0;
+              f.setAction(async () => {
+                trace.push("action");
+                await f.accept(command);
+                fail = willFail;
+              });
+              const entry = entries[i];
+              if (!entry) throw new Error("Missing native action");
+              const error = await f.native
+                .executeReferentialId(entry.id, hooks, f.stop.signal)
+                .then(
+                  () => null,
+                  (reason: unknown) => reason,
+                );
+              expect(error, "incremental child uniqueness controls the continuation").toBe(
+                willFail ? uniqueError : null,
+              );
+              expect(trace, "same-token actions prepare only after successful uniqueness").toEqual(
+                willFail ? ["action", "unique"] : ["action", "unique", "follow"],
+              );
+              if (willFail) reach.reach("failed uniqueness skips capture");
+              else reach.reach("successful action preparation");
+            }
+            expect(
+              preparations,
+              "later accepted work cannot use a token-only preparation cache",
+            ).toBe(count + (reject ? 0 : 1));
+            expect(f.unique).toBe(2 * count);
+            if (!reject) await f.native.verifyCommandReferences(command, f.stop.signal);
+            reach.reach("uniqueness before capture");
+            reach.reach("same token later rows");
+            if (count > 1) reach.reach("multiple actions");
+            reach.reach(budget === -1 ? "budget-1" : budget === 0 ? "budget0" : "budget1");
+          } finally {
+            await f.close();
+          }
+          reach.reach("zero ownership");
+        },
+      ),
+      {
+        seed,
+        numRuns: 12,
+        examples: [
+          [1, false, -1],
+          [4, false, 0],
+          [3, true, 1],
+          [1, true, -1],
+        ],
+      },
+    );
+    reach.assertReached();
+  }, 60000);
 it.each(seedsFor("next-native-boundary-listeners", [0xb605]))(
   "removes settled operation listeners instead of retaining row-count history seed %i",
   async (seed) => {

@@ -16,6 +16,8 @@ import type { ByteCharge } from "../vector/varlen.js";
 import type { NativeCommandChecks } from "./command-checks.js";
 import type { RegistryImages } from "./registry-images.js";
 import type { RegistryCommands } from "./registry-commands.js";
+import type { RegistryFollowing } from "./registry-following.js";
+import type { NativeFollowUnique } from "./follow-unique.js";
 
 function invalid(): never {
   throw new TypeError("Invalid native command execution");
@@ -29,7 +31,15 @@ export interface NativeCommandExecutionScope {
   readonly catalog: CatalogView;
   readonly commands: RegistryCommands;
   readonly images: Pick<RegistryImages, "readRowImages" | "readRowBindings" | "close">;
-  readonly checks: Pick<NativeCommandChecks, "verifyUnique" | "verifyReference" | "close">;
+  readonly checks: Pick<
+    NativeCommandChecks,
+    "verifyUnique" | "verifyReference" | "referenceMustCheck" | "close"
+  >;
+  /** Capture original follow identities after uniqueness, before named AFTER work. New
+   * accepted rows on an existing token need a fresh checkpoint; completed ranges never re-probe. */
+  readonly following: Pick<RegistryFollowing, "prepare" | "close">;
+  /** Concrete root supplies original-member deferral; absent only in callback-only fixtures. */
+  readonly followUnique?: NativeFollowUnique;
   readonly charge: ByteCharge;
   readonly signal: AbortSignal;
   /** Synchronous root-owned AbortController.abort, never a recursive close/rollback.
@@ -191,8 +201,17 @@ export class NativeCommandExecution implements NativeCommandBoundary {
   }
   verifyCommandUnique(command: CommandToken, signal: AbortSignal): Promise<void> {
     return this.#run(signal, async (stop) => {
-      const { commands, checks } = this.scope;
-      await commands.verify(command, "unique", (row, s) => checks.verifyUnique(row, s), stop);
+      const { commands, checks, following } = this.scope;
+      await commands.verify(
+        command,
+        "unique",
+        async (row, s) => {
+          if (!(await this.scope.followUnique?.defer(row, s))) await checks.verifyUnique(row, s);
+        },
+        stop,
+      );
+      this.#check(stop);
+      await following.prepare(command, stop);
     });
   }
   verifyCommandReferences(command: CommandToken, signal: AbortSignal): Promise<void> {
@@ -205,7 +224,8 @@ export class NativeCommandExecution implements NativeCommandBoundary {
           const table = this.scope.catalog.table(row.tableId) ?? invalid();
           for (const fk of table.foreignKeys) {
             this.#check(s);
-            if (fk.enforced) await checks.verifyReference(row, fk.id, s);
+            if (fk.enforced && (await checks.referenceMustCheck(row, fk.id, s)))
+              await checks.verifyReference(row, fk.id, s);
           }
         },
         stop,
@@ -243,14 +263,22 @@ export class NativeCommandExecution implements NativeCommandBoundary {
       const frame = this.#actions.indexOf(0);
       if (frame < 0) invalid();
       this.#actions[frame] = command.id;
+      let grouped = false;
       try {
+        if (entry.kind === "follow") {
+          if (hooks.followGroup && !this.scope.followUnique) invalid();
+          grouped = (await this.scope.followUnique?.begin(entry, stop)) ?? false;
+          if (grouped) hooks.followGroup?.(command, "begin", entry.triggerBudget);
+        }
         await this.scope.runReferential(entry, hooks, stop);
         this.#check(stop);
         // Never cache this by token: this action may have added new child work.
         await this.verifyCommandUnique(command, stop);
+        if (grouped) await this.scope.followUnique?.finish(command, stop);
         this.#check(stop);
         await commands.retireReferential(entry.id);
       } finally {
+        if (grouped) hooks.followGroup?.(command, "end", entry.triggerBudget);
         this.#actions[frame] = 0;
       }
     });
@@ -272,6 +300,8 @@ export class NativeCommandExecution implements NativeCommandBoundary {
       }
       await Promise.allSettled(this.#jobs.filter((job) => job !== null));
       for (const close of [
+        () => scope.followUnique?.close(),
+        () => scope.following.close(),
         () => scope.images.close(),
         () => scope.checks.close(),
         () => scope.commands.close(),

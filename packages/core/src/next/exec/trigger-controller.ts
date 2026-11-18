@@ -108,6 +108,8 @@ export class TriggerController implements NativeRowHooks {
   readonly #cancel = new AbortController();
   readonly #scope: TriggerBodyScope;
   readonly #frames: Frame[] = [];
+  /** At most one entry per admitted live native command, covered by FRAME_BYTES. */
+  readonly #followGroups: Frame[] = [];
   readonly #pending = new Set<Promise<void>>();
   readonly #programs: readonly PreparedRowTrigger[];
   readonly #routes: Route[] = [];
@@ -255,6 +257,28 @@ export class TriggerController implements NativeRowHooks {
     )
       invalid("foreign, retired or mismatched command");
     return frame;
+  }
+  followGroup(command: CommandToken, phase: "begin" | "end", budget: number): void {
+    if (phase === "begin") {
+      const frame = this.#frame(command, budget);
+      if (
+        this.#followGroups.length >= this.options.frameCount ||
+        this.#followGroups.includes(frame)
+      )
+        invalid("follow group depth");
+      this.#followGroups.push(frame);
+    } else {
+      // This is cleanup too: cancellation must not leave an active deferral anchor.
+      const frame = this.#followGroups.at(-1);
+      if (
+        frame?.command.id !== command.id ||
+        frame.command.frameId !== command.frameId ||
+        frame.command.rootId !== command.rootId ||
+        frame.budget !== budget
+      )
+        invalid("follow group completion");
+      this.#followGroups.pop();
+    }
   }
   #prepared(def: TriggerDef): PreparedRowTrigger | undefined {
     let lo = 0,
@@ -446,7 +470,12 @@ export class TriggerController implements NativeRowHooks {
     }
   }
   async #visit(packet: TriggerAfterEvent): Promise<void> {
-    const frame = this.#frame(packet.command, packet.budget);
+    const frame = this.#frame(
+      packet.command,
+      packet.kind === "deferredTrigger" ? undefined : packet.budget,
+    );
+    if (packet.kind === "deferredTrigger" && packet.budget > frame.budget)
+      invalid("deferred trigger budget");
     if (packet.kind === "referential") {
       frame.riDepth++;
       try {
@@ -455,6 +484,12 @@ export class TriggerController implements NativeRowHooks {
         frame.riDepth--;
       }
     } else {
+      const group = this.#followGroups[0];
+      if (group) {
+        if (group === frame) invalid("reentrant follow AFTER drain");
+        await group.queue.append({ ...packet, kind: "deferredTrigger", command: group.command });
+        return;
+      }
       if (packet.budget < 0) depth();
       const program = this.#programs.find((p) => p.definition.id === packet.id);
       if (
@@ -495,6 +530,7 @@ export class TriggerController implements NativeRowHooks {
     );
     return (this.#closing = (async () => {
       await Promise.allSettled([...this.#pending]);
+      this.#followGroups.length = 0;
       this.#routes.length = 0; // Drop cache before retiring its root ordinary charge.
       const results = await Promise.allSettled(this.#frames.map((frame) => this.#retire(frame)));
       this.#root = null;

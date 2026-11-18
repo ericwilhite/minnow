@@ -4288,8 +4288,8 @@ Accepted native-primary UPDATE/DELETE calls preserve the same FTS mutation notif
 funded row undo and atomic WAL history as legacy writers. Ordinary INSERT keeps insert deltas;
 rollback and savepoints retire this history with the rows.
 Its initial preflight refuses auto-increment and wide/variable indexed domains before writes.
-No SQL path installs it yet. The full native trigger/RI provider and compiled body-input host
-remain separate integration work; the existing SQL refusal guards remain in force.
+No SQL path installs it yet. A compiled body-input host now consumes this continuation;
+production admission and SQL dispatch remain separate integration work.
 
 `owner/command-execution.ts` assembles the native command boundary over those image,
 command and constraint components. Direct RI entries are compared with the canonical
@@ -4298,21 +4298,83 @@ retiring its scalar ID. No token-level cache or outer AFTER drain is used. Compl
 reference checks retire command slots for reuse. Callback slots are fixed by the prepared
 frame bound, cancellation listeners retire after each operation, and close fences callbacks
 and undelivered image leases before returning component credit. The root supplies a real
-child-capture/action executor and closes shared scratch/pins afterward. This assembly still
-has no compiled trigger-body host or generic SQL enablement; refusal guards remain.
+child-capture/action executor and closes shared scratch/pins afterward. The compiled body host
+uses this boundary, while generic SQL enablement remains guarded.
 
 `NativeCommandChecks.captureChildren` seals an OLD parent key's complete child identity
 range through the prepaid native support-index cursor and shared spilled directory. It
 uses projected key bindings, closes its phase pin/cursor before returning, and retains no
 per-child array. Root integration must capture every original follow range before RI
-writes and complete OLD/NEW input images before child mutations. The informational and
-invalid-index scan route, child action writer and compiled body provider remain guarded
-integration work; this helper alone does not enable FK/trigger scheduling.
+writes and complete OLD/NEW input images before child mutations. Informational references
+without support indexes use a projected native scan and the same bounded target directory;
+unrelated payloads are not decoded. Invalid enforced support indexes still refuse. This
+helper alone does not enable FK/trigger scheduling.
 
 Native command records keep independent accepted-row checkpoints for uniqueness,
 original follow-input preparation and reference checks. Completing one phase cannot
 suppress another phase or later writes on the same token. This is bookkeeping for
-the guarded provider; the follow preparation/action scheduler is not enabled here.
+the guarded provider; no SQL path installs its follow preparation/action executor yet.
+
+### Concrete native RI continuations
+
+`owner/native-rows.ts` runs one admitted BEFORE → generated rules → native primary
+continuation and registers actual child-reference and parent-action entries from accepted
+images. Generated calculations stay in the shared row-rule scope. Source/image loans and
+unused source credit retire before writer growth; immutable OLD/NEW refs survive queued
+AFTER uses. A bounded per-frame descriptor list covers one row, not the affected rowset.
+
+`owner/referential-mutations.ts` supplies the concrete registry action callback: CASCADE,
+SET NULL, lowered SET DEFAULT, RESTRICT/NO ACTION and original-identity rekey-follow.
+Every action seals complete child OLD inputs before mutation, then runs child BEFORE and
+appends child AFTER through the containing controller. It never drains outer AFTER work.
+Explicit actions normally check newly accepted child uniqueness before each action resolves. Omitted
+ON UPDATE follow applies the complete captured command/FK group and checks its child uniqueness
+before returning to user AFTER work or another outer RI action. This preserves unique child swaps and
+rotations; a nonunique completed group reports23505 with the child constraint identity. Group
+links share the root spill directory, with charged catalog-sized headers per live frame. A shared paged
+bitmap records each original child once per command/FK, so self-referential follow
+cannot recapture its own rewritten versions.
+While a follow group runs, nested user AFTER bodies append to its containing queue and wait
+for its uniqueness checkpoint. BEFORE bodies, nested RI actions and FK checks remain immediate.
+Uniqueness checks on the group's original children, including versions written by nested
+commands or RI, belong to that group checkpoint; unrelated rows keep their normal checks.
+Original trigger budgets and OLD/NEW images survive deferral. Both original membership and
+deferred accepted versions spill through the shared directory with fixed charged metadata.
+Producer-share headers are prepaid before source reservation, so the producer's own credit
+cannot block their admission.
+SET DEFAULT
+also checks remaining references to the old parent key; NO ACTION allows an equivalent live
+replacement parent, while RESTRICT reports23001. Informational references follow by bounded
+scan and skip delete/existence actions. Linked NEW scalar descriptors share parent/unchanged
+payload fragments without changing canonical OLD or materializing unrelated values.
+
+These internal components are composed with the actual native writer and B6 controller in
+generated PGlite action/rollback/key-order and small-cap tests. The later user-AFTER error
+adapter in the per-action uniqueness test is synthetic, not a compiled-body proof. Native
+primary preflight still refuses auto-increment and wide/variable indexed domains. Native
+sequence defaults retain their kernel refusal; RI assignments to generated FK columns also
+refuse rather than silently recomputing away the assignment. The compiled COMPLETE-MODIFY body host
+is exercised with actual native RI and user-body ordering; owner admission/dispatch and
+SQL enablement remain unfinished. SQL firing and advanced-RI refusal guards remain in place.
+No stored format changes.
+
+The source ordinary minimum includes the fixed native decoder/IO workspace. A wider point
+read first closes its decoder, arena and pin, returns unused producer credit, then funds the
+larger complete ordinary step and retries. Memory hints use the original fixed baseline;
+persisted decoders report exact one-row growth. A valid row is not rejected just because that
+working step exceeds the shared reserve. Cancellation fences the pending readmission before
+returning metadata charge. The in-memory
+spill test service looks up append-ordered offsets by binary search, so registry page count
+does not introduce a linear scan for every read. Its stored pages remain a test double for
+external scratch storage; the governor assertions cover native resident accounts.
+
+`owner/command-reach.ts` prepares only reachable live trigger definitions and actual FK
+mutation routes in a charged catalog-sized matrix. It tracks root/body budgets1/0/-1,
+keeps RI in its containing frame, includes generated rekeys and informational follow,
+and counts one row's queue scratch. Terminal matching triggers remain runtime errors;
+their unreachable bodies are not compiled. Its preparation charge retires after pending
+task work unwinds. This is owner-admission groundwork, not SQL enablement or a complete
+root working-set minimum.
 
 ### Portable snapshot load
 
@@ -4642,3 +4704,32 @@ CSV retains both headers and positions. Name-based `column`, `columnChunks` and
 `values` access rejects an ambiguous label with `MINNOW_AMBIGUOUS_RESULT_COLUMN`;
 use a zero-based ordinal instead. Internal binding names remain unique. The
 published 0.x engine keeps its existing numbered output names.
+
+`owner/body-host.ts` seals complete MODIFY inputs through `NativeInputProgram`, using native
+scalar parameters and root-backed query grants. Scratch input schemas stay outside the catalog
+and WAL; scalar descriptor links build complete OLD/NEW rows without copying payload fragments.
+A fixed set of live slots uses command identity, not the monotonically increasing frame ID.
+Each input's catalog/schema version is fixed, and native command mode refuses intervening DDL.
+Statement input and OLD capture finish before writes. Body parameter copies and execution-local
+operators retire before apply; cancellation also fences an accepted asynchronous sink before
+retiring its batch, arenas or credit. Command-local paged target bitmaps preserve first-match
+root joins without a resident target-ID collection. Volatile producers, FTS prefix reads,
+RETURNING and upsert remain outside this private host's supported preparation boundary.
+Body INSERT remains keyless and VALUES-only; body UPDATE/DELETE remain keyed and refuse FROM/USING,
+as enforced by the shared trigger lowering contract. No existing SQL guard is removed.
+
+### Native command graph assembly
+
+`owner/command-root.ts` installs the real primary, registry, RI executor, compiled body host
+and B6 controller in one already admitted root scope. `run(typedParameters)` seals input and
+returns the affected-row count; `end()` is its sole statement-ending entrypoint. The caller
+commits separately. `close()` cancels and fences the root producer and the complete end tail
+before retiring graph resources. Failed setup cannot close a different installed primary.
+Caller-owned rule bindings, preparation and grants remain caller-owned.
+
+`nativeCommandRootSetupBytes` measures this assembler's setup bound. It excludes caller
+preparation/bindings and complete source, image, binding and writer progress. The funding ports
+must supply that complete admitted work; this helper is not an execution minimum. Owner admission
+and SQL dispatch still keep their guards. Generated PG traces/errors, an actual compiled follow
+observer, foreign-scope/cancellation fences and competing-credit64MiB roots exercise the assembler.
+The initial SUM observer probe hit the existing initPlan refusal; no initPlan capability was added.

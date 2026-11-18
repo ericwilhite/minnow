@@ -51,6 +51,25 @@ PostgreSQL's empty match at the end. No migration or stored-format change is req
 The IndexedDB-only worker's gzip download budget increases by 128 bytes to account for
 the bounded boolean regex matcher. Runtime work and memory limits are unchanged.
 
+The unexported rebuild now has concrete native foreign-key action components, including
+complete child-row spooling, shared row rules and original-identity rekey-follow. Omitted-update
+follow checks uniqueness after its complete original-target group, preserving swaps and rotations;
+explicit actions normally check child uniqueness before each action returns. While an implicit
+follow group runs, nested user AFTER bodies wait for its completed uniqueness checkpoint.
+Nested RI actions and FK checks stay immediate; uniqueness of original follow children,
+including versions written by nested commands, is checked with the group. Unrelated rows
+keep their usual checks. Deferred bodies retain their original trigger budget and row images.
+A private compiled body host
+seals complete modification inputs, uses typed OLD/NEW parameters and runs bodies without ending
+the root statement. Its query workspace is funded by the root, and cancellation drains borrowed
+inputs before releasing credit. A low-level root assembler connects the native graph and fences
+its producer and complete end continuation; commit stays with its caller. SQL firing remains
+guarded while owner admission and dispatch are integrated. Fixed decoder workspace is admitted before native source reads.
+Wide native OLD-row reads now close their decoder and pin and return unused producer credit
+before funding a larger ordinary read step. They no longer mistake that step for a value-sized
+reserve loan. Cancellation waits for readmission cleanup.
+No released API, stored-format or migration change is required.
+
 The shipped engine’s fast path for SUM and AVG over floating-point columns adds values directly,
 recovering overhead introduced by the 0.19.3 integer-exactness checks. SQL integer aggregates
 still reject inexact intermediate results; floating-point accumulation order is unchanged.
@@ -147,8 +166,14 @@ Single-source index inputs retain original row locators and suppress repeated pr
 Cursors beneath join or set-operation inputs retain the internal diagnostic opt-in until
 their complete admission is proved. Reads use the statement
 snapshot; statement errors roll back earlier rows. Unique and foreign-key checks use the
-existing write path. CHECK constraints and stored generated columns now use the shared,
-charged row-rule program, retained through native FK actions. Set operations retain their
+existing write path. Uniqueness is checked at statement end: a later NOT NULL or CHECK
+failure wins over an earlier duplicate key, unlike PostgreSQL. For example, an existing
+primary key followed by a null in a NOT NULL column reports the null error; the shipped
+0.x engine reports the duplicate primary key first.
+Some multi-row key updates that PostgreSQL rejects succeed when their finished keys are
+unique. Either kind of failure still rolls back the whole statement. CHECK constraints and
+stored generated columns now use the shared, charged row-rule program, retained through native
+FK actions. Set operations retain their
 operator-specific progress-copy allowance when no DML override applies. Generation runs inside the
 statement rule scope; an earlier row's NOT NULL or named CHECK failure precedes a later
 row's generated-expression error. Closed text sets remain enforced alongside CHECK and

@@ -15,7 +15,7 @@ import { queryTerms, queryText, configureFtsWorkspace, ftsRuntimeBytes } from ".
 import type { CompileContext } from "./kernels/compile.js";
 import type { OutputArena } from "./kernels/vectors.js";
 import type { QueryRuntime, Program, OperatorIdentity } from "./run.js";
-import type { ResultSink } from "./result-sink.js";
+import type { ProgramSink } from "./run.js";
 import { validateParameterCount } from "./parameters.js";
 import type { TableScan } from "./table-scan.js";
 import type { ProjectOperator } from "./filter.js";
@@ -263,7 +263,7 @@ export class FtsPlan {
         plan.ftsParameters?.find((mapping) => mapping.slot === slot)?.source ?? slot;
       const validation: OperatorIdentity = { id: nextPhysicalId(), op: "fts" };
       return Object.assign(
-        async (runtime: QueryRuntime, sink: ResultSink) => {
+        async (runtime: QueryRuntime, sink: ProgramSink) => {
           validateParameterCount(plan, runtime.request.parameters);
           for (const query of queries)
             if (

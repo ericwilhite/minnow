@@ -8527,6 +8527,7 @@ export const NATIVE_BOUNDARY_REACH = [
 ] as const;
 
 export const NATIVE_BOUNDARY_FENCE_REACH = [
+  "follow",
   "image",
   "check",
   "action",
@@ -9869,4 +9870,718 @@ export const PUBLIC_RESULT_LABEL_REACH = [
   "ambiguous name rejects",
   "prepared labels",
   "cursor labels",
+] as const;
+
+/** Original follow capture follows each successful incremental unique checkpoint. */
+export const NATIVE_BOUNDARY_FOLLOW_REACH = [
+  "root preparation",
+  "uniqueness before capture",
+  "same token later rows",
+  "successful action preparation",
+  "failed uniqueness skips capture",
+  "multiple actions",
+  "budget-1",
+  "budget0",
+  "budget1",
+  "zero ownership",
+] as const;
+
+/** Deferred original follow targets bind by immutable action ID, not a resident rowset map. */
+export const REGISTRY_FOLLOWING_REACH = [
+  "published",
+  "resident",
+  "original key swap targets",
+  "no recapture",
+  "immutable queued descriptor",
+  "incremental same-token work",
+  "independent FK reference failure",
+  "fixed metadata",
+  "zero ownership",
+] as const;
+
+/** Follow input cancellation must fence native IO before its prepaid metadata retires. */
+export const REGISTRY_FOLLOWING_LIFETIME_REACH = [
+  "unprepared",
+  "retired",
+  "corrupt",
+  "cancel",
+  "close",
+  "published",
+  "resident",
+  "paid pending capture",
+  "no retained image lease",
+  "zero ownership",
+] as const;
+
+/** 1.0 deliberately reports later row rules before statement-end UNIQUE/PK errors. */
+export const MODIFY_UNIQUE_TIMING_REACH = [
+  "spooled input",
+  "direct input",
+  "PK",
+  "UNIQUE",
+  "NOT NULL",
+  "CHECK",
+  "VALUES",
+  "SELECT",
+  "same page",
+  "across pages",
+  "published",
+  "resident",
+  "RETURNING",
+  "no RETURNING",
+  "native row-level first",
+  "PG unique first",
+  "shipped primary unique-first",
+  "shipped secondary row-first",
+  "unique-only rejected",
+  "row-only rejected",
+  "atomic rollback",
+  "success",
+] as const;
+
+/** Full native OLD payload capture stays inside source/image ownership. */
+export const NATIVE_PREFIX_IMAGES_REACH = [
+  "single-row native sizing",
+  "source progress admission",
+  "fragmented payload",
+  "small payload",
+  "published",
+  "resident",
+  "NULLs",
+  "non-null",
+  "wide decoder tier",
+  "native decoder tier",
+  "full physical order",
+  "no legacy copies",
+  "source retired before replay",
+  "zero ownership",
+] as const;
+
+/** Payload capture fences native source/preparation work before retiring root scratch. */
+export const NATIVE_PREFIX_IMAGES_LIFETIME_REACH = [
+  "reentrant capture",
+  "reentrant close shares fence",
+  "prepare",
+  "payload",
+  "phase",
+  "fault",
+  "synchronous close",
+  "external close",
+  "caller cancellation",
+  "published",
+  "resident",
+  "paid pending work",
+  "source loan repaid",
+  "zero ownership",
+] as const;
+
+/** Complete native RI payload inputs remain replayable through mutations and handle retirement. */
+export const NATIVE_CHILD_INPUT_REACH = [
+  "shared files",
+  "empty",
+  "nonempty",
+  "many inputs",
+  "resident",
+  "published",
+  "fragmented payload",
+  "small payload",
+  "complete before continuation",
+  "replay after mutation",
+  "retired handle",
+  "images survive retirement",
+  "foreign handle",
+  "fixed metadata",
+  "zero ownership",
+] as const;
+
+export const NATIVE_CHILD_INPUT_FENCE_REACH = [
+  "IO fault",
+  "between rows",
+  "payload IO",
+  "phase change",
+  "caller cancellation",
+  "external close",
+  "pending metadata",
+  "no partial handle",
+  "source retired",
+  "zero ownership",
+] as const;
+
+/** RI image proposals preserve canonical OLD and share unchanged fragmented payloads. */
+export const REGISTRY_DERIVED_REACH = [
+  "insert NEW",
+  "linked parent scalar",
+  "owned scalar",
+  "published",
+  "resident",
+  "NULL replacement",
+  "value replacement",
+  "reverse replacements",
+  "ordered replacements",
+  "large shared payload",
+  "small shared payload",
+  "no payload copy",
+  "canonical OLD",
+  "successive derivations",
+  "zero ownership",
+] as const;
+
+export const NATIVE_PARENT_KEY_REACH = [
+  "removed parent",
+  "retained parent",
+  "resident",
+  "published",
+  "primary",
+  "secondary",
+  "changed",
+  "unchanged",
+  "parent present",
+  "parent absent",
+  "NULL OLD",
+  "NULL NEW",
+  "zero ownership",
+] as const;
+
+export const NATIVE_RI_RESTRICTION_REACH = [
+  "resident",
+  "published",
+  "restrict",
+  "noAction",
+  "empty children",
+  "referenced",
+  "replacement parent",
+  "no replacement",
+  "end failure",
+  "end success",
+  "zero ownership",
+] as const;
+
+export const NATIVE_INFORMATIONAL_CAPTURE_REACH = [
+  "resident",
+  "published",
+  "empty",
+  "matching",
+  "large unrelated payload",
+  "small payload",
+  "projected memory source",
+  "fixed metadata",
+  "zero ownership",
+] as const;
+
+export const NATIVE_RI_MUTATION_REACH = [
+  "plain",
+  "notNull",
+  "check",
+  "generated",
+  "CASCADE",
+  "SET NULL",
+  "SET DEFAULT",
+  "RESTRICT",
+  "NO ACTION",
+  "rekey",
+  "delete",
+  "published",
+  "resident",
+  "children",
+  "empty",
+  "valid",
+  "same",
+  "missing",
+  "commit",
+  "rollback",
+  "zero ownership",
+] as const;
+
+export const NATIVE_RI_FOLLOW_REACH = [
+  "informational scan",
+  "indexed follow",
+  "published",
+  "resident",
+  "swapped identities",
+  "generated child",
+  "zero ownership",
+] as const;
+
+export const NATIVE_RI_INCREMENTAL_UNIQUE_REACH = [
+  "published",
+  "resident",
+  "actions 1",
+  "actions 2",
+  "actions 3",
+  "child unique before later error",
+  "old reference before later error",
+  "zero ownership",
+] as const;
+
+export const NATIVE_RI_COMPOSITE_REACH = [
+  "CASCADE",
+  "SET NULL",
+  "SET DEFAULT",
+  "reversed key",
+  "declared key",
+  "rekey",
+  "delete",
+  "published",
+  "resident",
+  "zero ownership",
+] as const;
+
+export const NATIVE_RI_PRESSURE_REACH = [
+  "rekey",
+  "delete",
+  "published",
+  "resident",
+  "64MiB",
+  "competing credit",
+  "many child segments",
+  "bounded files",
+  "zero ownership",
+] as const;
+
+export const NATIVE_PREFIX_FIXED_STEP_REACH = [
+  "published",
+  "resident",
+  "payload",
+  "empty payload",
+  "64MiB competing credit",
+  "zero ownership",
+] as const;
+
+export const MEMORY_SPILL_OFFSET_REACH = [
+  "between pages",
+  "empty",
+  "many pages",
+  "few pages",
+  "absent",
+  "present",
+  "exact offset",
+] as const;
+
+export const MEMORY_SPILL_NATIVE_OFFSET_REACH = [
+  "checksum",
+  "payload",
+  "many pages",
+  "few pages",
+  "zero ownership",
+] as const;
+
+export const NATIVE_RI_LIFETIME_REACH = [
+  "published",
+  "resident",
+  "close fence",
+  "caller cancel",
+  "complete child input",
+  "no borrow across continuation",
+  "rollback",
+  "zero ownership",
+] as const;
+
+export const NATIVE_RI_GENERATED_KEY_REACH = [
+  "published",
+  "resident",
+  "delete cascade allowed",
+  "assignment refused",
+  "zero ownership",
+] as const;
+
+export const NATIVE_RI_REPLACEMENT_REACH = [
+  "CASCADE",
+  "SET NULL",
+  "SET DEFAULT",
+  "rekey",
+  "delete",
+  "published",
+  "resident",
+  "replacement parent",
+  "zero ownership",
+] as const;
+
+export const NATIVE_ROW_BORROW_REACH = [
+  "BEFORE placeholders",
+  "published",
+  "resident",
+  "frozen leases",
+  "generated values",
+  "zero ownership",
+] as const;
+
+export const NATIVE_REFERENCE_CHECKPOINT_REACH = [
+  "rekey",
+  "delete",
+  "current transaction insert",
+  "current transaction update",
+  "committed version",
+  "published",
+  "resident",
+  "zero ownership",
+] as const;
+
+export const NATIVE_PARAMETER_REACH = [
+  "clock",
+  "no clock",
+  "NULL",
+  "int64 exact",
+  "timestamp exact",
+  "numeric exact",
+  "payload",
+  "fixed",
+  "FTS alias",
+  "zero ownership",
+] as const;
+
+export const PREPAID_QUERY_REACH = [
+  "resident metadata",
+  "no recipe",
+  "many parts",
+  "few parts",
+  "loan",
+  "idle transfer",
+  "no hold and wait",
+  "zero ownership",
+] as const;
+
+export const NATIVE_INPUT_REACH = [
+  "resident",
+  "published",
+  "index input",
+  "scan input",
+  "VALUES input",
+  "terminal error prefix",
+  "successful prefix",
+  "parameters retired before apply",
+  "no writes",
+  "zero ownership",
+] as const;
+
+export const NATIVE_BODY_HOST_REACH = [
+  "INSERT",
+  "UPDATE",
+  "DELETE",
+  "published",
+  "resident",
+  "zero rows",
+  "rowset",
+  "later body prefix",
+  "rollback",
+  "success",
+  "zero ownership",
+] as const;
+
+export const NATIVE_BODY_RI_REACH = [
+  "CASCADE",
+  "SET NULL",
+  "SET DEFAULT",
+  "RESTRICT",
+  "NO ACTION",
+  "rekey",
+  "delete",
+  "published",
+  "resident",
+  "rowset",
+  "empty",
+  "rollback",
+  "named continuations",
+  "zero ownership",
+] as const;
+
+export const NATIVE_BODY_ERROR_REACH = [
+  "earlier CHECK",
+  "terminal expression",
+  "published",
+  "resident",
+  "zero ownership",
+] as const;
+
+export const NATIVE_BODY_PRESSURE_REACH = [
+  "published",
+  "resident",
+  "wide unused payload",
+  "small rows",
+  "64MiB competing credit",
+  "bounded files",
+  "zero ownership",
+] as const;
+
+export const NATIVE_BODY_LIFETIME_REACH = [
+  "root close",
+  "caller cancel",
+  "published",
+  "resident",
+  "pending producer fence",
+  "parameter lifetime",
+  "rollback",
+  "zero ownership",
+] as const;
+
+export const NATIVE_BODY_JOIN_REACH = [
+  "DELETE USING",
+  "UPDATE FROM",
+  "published",
+  "resident",
+  "duplicate targets",
+  "distinct source values",
+  "accepted images only",
+  "zero ownership",
+  "duplicate expression error",
+] as const;
+
+export const NATIVE_PARAMETER_VALIDATION_REACH = [
+  "count",
+  "clock slot",
+  "FTS slot",
+  "shape",
+  "type",
+  "int64 bound",
+  "int32 bound",
+] as const;
+
+export const NATIVE_INPUT_RETENTION_REACH = [
+  "empty literal",
+  "small literal",
+  "large literal",
+  "shared aliases",
+  "zero ownership",
+] as const;
+
+export const NATIVE_BODY_REFERENCE_REACH = [
+  "rekey",
+  "delete",
+  "earlier transaction INSERT",
+  "committed child",
+  "published",
+  "resident",
+  "zero ownership",
+] as const;
+
+export const NATIVE_FOLLOW_GROUP_REACH = [
+  "explicit CASCADE PG",
+  "omitted follow shipped",
+  "swap",
+  "rotation",
+  "nonunique completed group",
+  "unique completed group",
+  "child constraint identity",
+  "failure before later AFTER",
+  "published",
+  "resident",
+  "zero ownership",
+  "whole group OLD before writes",
+] as const;
+
+export const NATIVE_FOLLOW_GROUP_PRESSURE_REACH = [
+  "published",
+  "resident",
+  "rotation",
+  "64MiB competing credit",
+  "bounded files",
+  "fixed charged metadata",
+  "zero ownership",
+] as const;
+
+export const NATIVE_RI_SCHEMA_IDENTITY_REACH = [
+  "drop earlier position",
+  "drop later position",
+  "published",
+  "resident",
+  "rekey",
+  "delete",
+  "rollback",
+  "commit",
+  "stable index identities",
+  "add after RI",
+  "ordinary reopen",
+  "zero ownership",
+] as const;
+
+export const NATIVE_SELF_FOLLOW_REACH = [
+  "swap",
+  "rotation",
+  "published",
+  "resident",
+  "one follow per original target",
+  "shipped data",
+  "zero ownership",
+] as const;
+
+export const NATIVE_BODY_FOLLOW_GROUP_REACH = [
+  "swap",
+  "rotation",
+  "published",
+  "resident",
+  "23505 before user22012",
+  "parent and child AFTER see complete group",
+  "explicit CASCADE PG boundary",
+  "zero ownership",
+] as const;
+
+export const NATIVE_COMMAND_ROOT_REACH = [
+  "INSERT",
+  "UPDATE",
+  "DELETE",
+  "published",
+  "resident",
+  "zero matches",
+  "rollback",
+  "commit",
+  "atomic row/BEFORE error",
+  "zero ownership",
+] as const;
+
+export const NATIVE_COMMAND_ROOT_LIFETIME_REACH = [
+  "complete end tail",
+  "sealed source continuation",
+  "published",
+  "resident",
+  "zero ownership",
+] as const;
+
+export const NATIVE_COMMAND_ROOT_FOREIGN_REACH = [
+  "foreign primary refused",
+  "original graph usable",
+  "published",
+  "resident",
+  "zero ownership",
+] as const;
+
+export const NATIVE_COMMAND_ROOT_PRESSURE_REACH = [
+  "published",
+  "resident",
+  "64MiB competing credit",
+  "wide unrelated payload",
+  "bounded files",
+  "zero ownership",
+] as const;
+
+export const NATIVE_COMMAND_REACH = [
+  "frames1",
+  "frames2",
+  "frames3",
+  "published",
+  "resident",
+  "zero rows",
+  "terminal catalog error",
+  "unreachable volatile body excluded",
+  "UTF8 order",
+  "shipped data/error",
+  "zero ownership",
+] as const;
+
+export const NATIVE_COMMAND_FK_REACH = [
+  "follow",
+  "cascade",
+  "setNull",
+  "setDefault",
+  "restrict",
+  "noAction",
+  "DELETE",
+  "UPDATE",
+  "body generated parent key",
+  "informational follow",
+  "non-key update pruned",
+  "charged fixed metadata",
+  "zero ownership",
+] as const;
+
+export const NATIVE_COMMAND_REACH_LIFETIME = [
+  "pause retains prepaid metadata",
+  "cancel",
+  "complete",
+  "zero ownership",
+] as const;
+
+export const NATIVE_FOLLOW_VISITED_REACH = [
+  "wide IDs",
+  "low and high coexist",
+  "low IDs",
+  "dense bits",
+  "sparse blocks",
+  "command isolation",
+  "FK isolation",
+  "fixed charged metadata",
+  "one shared file",
+  "spilled replay",
+  "zero ownership",
+] as const;
+
+export const NATIVE_PREFIX_WIDE_STEP_REACH = [
+  "memory source",
+  "stored source",
+  "64MiB",
+  "128MiB",
+  "complete ordinary retry",
+  "pin and decoder retired",
+  "no reserve loan",
+  "exact payload",
+  "zero ownership",
+] as const;
+
+export const NATIVE_PREFIX_WIDE_LIFETIME_REACH = [
+  "cancel",
+  "close",
+  "no producer pin or credit",
+  "metadata fenced through admission",
+  "zero ownership",
+] as const;
+
+export const FOLLOW_NESTED_AFTER_REACH = [
+  "swap",
+  "rotation",
+  "first position",
+  "middle position",
+  "last position",
+  "published",
+  "resident",
+  "group23505 before nested22012",
+  "immutable nested images FIFO",
+  "mid-swap RI uniqueness waits",
+  "nested follow membership overlap",
+  "nested explicit RI",
+  "nested RI visible to next body",
+  "deferred nested versions checked",
+  "explicit PG action unchanged",
+  "zero native charge",
+  "body expression reads immediate RI",
+] as const;
+
+export const FOLLOW_NESTED_PRESSURE_REACH = [
+  "published",
+  "resident",
+  "64MiB competing credit",
+  "wide unchanged payload",
+  "bounded active files",
+  "deferred FIFO exact",
+  "zero native charge",
+] as const;
+
+export const FOLLOW_NESTED_BOUNDARY_REACH = [
+  "published",
+  "resident",
+  "nonmember immediate uniqueness",
+  "spent budget preserved",
+  "depth after completed group",
+  "atomic rollback",
+  "zero native charge",
+] as const;
+
+export const FOLLOW_UNIQUE_ALLOCATION_REACH = [
+  "frames1",
+  "frames2",
+  "frames3",
+  "denied before buffers",
+  "granted and released once",
+  "zero native charge",
+] as const;
+
+/** Follow's deferred USER AFTER state ends at the statement/savepoint, not transaction close. */
+export const FOLLOW_NESTED_RECOVERY_REACH = [
+  "deferred packets spilled",
+  "cancel after spill",
+  "failed statement inside savepoint",
+  "successful deferred effects before rollback",
+  "rollback to savepoint undoes successful deferred effects",
+  "zero graph charge and spill files before continuation",
+  "prefix and later command commit",
+  "resident",
+  "published",
+  "zero native charge",
 ] as const;
