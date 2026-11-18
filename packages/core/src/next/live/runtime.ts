@@ -456,7 +456,7 @@ export class LiveRuntime {
       // All affected queries publish in one synchronous turn.
       for (const entry of cohort) {
         if (entry.closed) continue;
-        entry.running = false;
+        // Retirement stays fenced through copy admission and synchronous delivery.
         if (entry.failed) {
           this.#emitFailure(entry);
           continue;
@@ -480,6 +480,8 @@ export class LiveRuntime {
           const cloneBytes = valueBytes(result);
           this.#charge(cloneBytes);
           entry.cloneBytes = cloneBytes;
+          // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- cache admission can dispose reentrantly before returning credit.
+          if (entry.closed) continue;
         } catch (error) {
           this.#free(entry.stageBytes);
           entry.stageBytes = 0;
@@ -489,6 +491,8 @@ export class LiveRuntime {
           continue;
         }
         this.#releaseBaseline(entry);
+        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- returning baseline credit may reenter disposal.
+        if (entry.closed) continue;
         entry.retained = result;
         entry.bytes = entry.stageBytes;
         entry.stage = null;

@@ -10776,3 +10776,21 @@ export const LIVE_EFFECT_INTEGRATION_REACH = [
   "snapshot load",
   "zero charges",
 ] as const;
+
+export const LIVE_ADMISSION_CLOSE_REACH = [
+  "cohort durability",
+  "begin",
+  "next frame",
+  "next end",
+  "frame durability",
+  "adoption",
+  "done",
+  "cleaned",
+  "dependencies",
+  "history",
+  "copy",
+  "deliver",
+  "handle",
+  "runtime",
+  "zero charges",
+] as const;
