@@ -6351,11 +6351,13 @@ class DeltaPublication {
     // pin) before the space reuses them.
     for (const extent of prepared.retire) retired.push(extent);
     if (this.sink !== null) {
+      // This allocation still belongs to internal preparation. Retry its pressure only
+      // after unwinding; the observer has not been entered and must not hear abort.
+      const additions = await captureWriterExtents(writer, this.budget);
+      this.#sinkAdditions = additions;
       this.#sinkAsked = true;
       let result: ExtentDeltaResult | null;
       try {
-        const additions = await captureWriterExtents(writer, this.budget);
-        this.#sinkAdditions = additions;
         result = await this.sink.prepare(attempt, {
           added: additions.added,
           ...(additions.addedInventory === undefined

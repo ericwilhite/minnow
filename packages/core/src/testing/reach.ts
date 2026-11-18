@@ -11376,3 +11376,12 @@ export const NATIVE_RECOVERY_CREDIT_REACH = [
   "continued native writes",
   "zero final charge",
 ] as const;
+
+export const WRITE_SINK_CAPTURE_REACH = [
+  "internal capture retries",
+  "sink error",
+  "sink pressure",
+  "no unasked sink abort",
+  "accepted rows survive reopen",
+  "zero final charge",
+] as const;

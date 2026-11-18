@@ -4950,3 +4950,10 @@ Native command statements retain their memory policy across end and commit. Endi
 the command scope must not reintroduce a future background-merge estimate into the
 commit step while another admitted execution retains its workspace. The next live
 statement selects its own policy; actual merge acquisition still funds its full step.
+
+Extent-delta capture remains internal preparation: allocate its immutable descriptor view
+before marking an external sink as entered. Internal `MetadataPressure` unwinds the
+provisional writer and keeper attempt before retry; an unentered sink receives no abort.
+An exception from the actual sink, including that same error class, stays fatal.
+`testing/write-sink-capture-pressure.test.ts` generates both boundaries and verifies
+reopen, observer attempts and final ownership.
