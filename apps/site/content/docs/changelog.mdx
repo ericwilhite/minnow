@@ -30,6 +30,12 @@ before accepting queries. Reopened databases keep their row workspace and live b
 funded without blocking a query behind completed recovery work. Released 0.x behavior is
 unchanged; no stored-format change or migration is required.
 
+The private 1.0 writer prepays all column-group buffers together and sizes TEXT buffers from
+the actual input. Oversized working sets return SQLSTATE `53200` before queueing; optional
+dictionaries leave mandatory workspace available. Serialized directories and distinct sketches
+are charged until storage consumes them. Released 0.x behavior is unchanged; no stored-format
+change or migration is required.
+
 The private 1.0 writer retries temporary memory pressure while capturing an extent
 publication before entering an external observer. Failures from the observer itself remain
 fatal. No stored-format change or migration is required; released 0.x behavior is unchanged.

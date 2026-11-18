@@ -11385,3 +11385,41 @@ export const WRITE_SINK_CAPTURE_REACH = [
   "accepted rows survive reopen",
   "zero final charge",
 ] as const;
+
+export const WRITE_GROUP_MINIMUM_REACH = [
+  "typed whole-group refusal",
+  "no admission queued",
+  "refused before any buffer allocation",
+  "zero final charge",
+] as const;
+
+export const WRITE_GROUP_FITTING_REACH = [
+  "actual short-value buffers",
+  "no emit-step growth",
+  "serialized tails charged before append",
+  "shared buffers dropped before refund",
+  "exact stored rows",
+  "zero final charge",
+] as const;
+
+export const WRITE_GROUP_VALUE_REACH = [
+  "out-of-line pointer bounds",
+  "inline limit",
+  "NULL",
+  "empty valid value",
+  "same-length rollback invalidates cached bounds",
+  "exact native group flush",
+  "zero final charge",
+] as const;
+
+export const WRITE_GROUP_FORECAST_REACH = [
+  "above whole-cap typed refusal",
+  "no admission attempted",
+  "zero final charge",
+] as const;
+
+export const WRITE_GROUP_TYPES_REACH = [
+  "all physical buffers within preflight",
+  "single row",
+  "multiple pages",
+] as const;

@@ -30,7 +30,7 @@
  *   `BlobRef`s carry their extent.
  *
  * ## Memory (bounded per column; everything charged before it is allocated)
- * Per column: the raw page buffer (≤ `rawPageBytes`, default 32 KiB, allocated on first use),
+ * Per column: raw page buffers sized from known input bytes (or a bounded generic target),
  * its validity, the distinct sketch (1 KiB), the page entries, and while the chunk is small its
  * inline pages (≤ `inlineBytes`). Shared by all columns: the encoder scratch (one page) and the
  * code/limb scratch. The group dictionary of a text or uuid column is charged separately and
@@ -63,7 +63,7 @@ import { compareBytes } from "../vector/varlen.js";
 import type { FlatVector, Int64Values, Vector } from "../vector/vector.js";
 import { copyBits, countBits, fillBits } from "./bits.js";
 import { DictionaryBuilder } from "./dictionary.js";
-import { encodeDirectory } from "./directory.js";
+import { encodeDirectory, MAX_DIRECTORY_BYTES } from "./directory.js";
 import {
   ByteBounds,
   encodeBoolPage,
@@ -95,6 +95,14 @@ import { encodeSortKey } from "../keys/key-encoding.js";
 export interface WriterColumn {
   readonly columnId: number;
   readonly type: PhysicalType;
+  /** Known total encoded input bytes, for allocating a small varlen buffer. A hint only. */
+  readonly valueBytes?: number;
+  /** Largest encoded slot (large values contribute only their pointer). */
+  readonly maxValueBytes?: number;
+  /** Bytes eligible for the dictionary, excluding out-of-line values. */
+  readonly dictionaryValueBytes?: number;
+  /** Out-of-line values, when the immutable native input is known. */
+  readonly largeValues?: number;
 }
 
 export interface GroupWriterOptions {
@@ -142,6 +150,11 @@ export const MAX_CHUNK_BYTES = 1024 * 1024 * 1024;
  */
 const MAX_RAW_PAGE_BYTES = MAX_BLOB_BYTES - 192 * 1024;
 const MAX_DICTIONARY_BYTES = 512 * 1024;
+// Retained directory entry, bounded statistic prefixes and append bookkeeping.
+const PAGE_ENTRY_BYTES = 512;
+const LARGE_PREFIX_BYTES = 256;
+// At most 64 part views/checksums and one pointer, shared by one append.
+const LARGE_SCRATCH_BYTES = 16 * 1024;
 const DEFAULTS = {
   pageBytes: 32 * 1024,
   rawPageBytes: 32 * 1024,
@@ -158,7 +171,10 @@ class Charged {
   #dictionaryBytes = 0;
   #peakWorking = 0;
   readonly dictionaries: ByteCharge;
-  constructor(readonly charge: ByteCharge | null) {
+  constructor(
+    readonly charge: ByteCharge | null,
+    readonly minimum = 0,
+  ) {
     this.dictionaries = {
       allocate: (bytes) => {
         if (!this.allocate(bytes, true)) return false;
@@ -185,7 +201,8 @@ class Charged {
     if (bytes <= 0) return true;
     if (this.charge !== null) {
       const admitted = optional
-        ? (this.charge.tryAllocate?.(bytes) ?? this.charge.allocate(bytes))
+        ? (this.charge.tryAllocate?.(bytes, Math.max(0, this.minimum - this.working)) ??
+          this.charge.allocate(bytes))
         : this.charge.allocate(bytes);
       if (!admitted) return false;
     }
@@ -323,7 +340,9 @@ class ChunkSink {
       pages.map((page) => page.bytes),
       pages.map((page) => page.entry),
     );
-    for (const page of pages) this.writer.memory.free(page.bytes.length);
+    const bytes = pages.reduce((sum, page) => sum + page.bytes.length, 0);
+    pages.length = 0;
+    this.writer.memory.free(bytes);
   }
 
   /**
@@ -498,6 +517,7 @@ abstract class ColumnWriter {
 
   async flushPage(): Promise<void> {
     if (this.rows === 0) return;
+    this.writer.memory.grow(PAGE_ENTRY_BYTES);
     const page = this.encode();
     await this.storePage(page);
     this.rowsWritten += this.rows;
@@ -1034,7 +1054,9 @@ class BytesWriter extends ColumnWriter {
     );
     super(writer, column, capacity, fixed ? 16 : 8);
     this.fixed = fixed;
-    this.bytes = writer.memory.uint8(fixed ? capacity * 16 : writer.options.rawPageBytes);
+    this.bytes = writer.memory.uint8(
+      fixed ? capacity * 16 : columnBufferBytes(column, writer.options.rawPageBytes),
+    );
     this.offsets = writer.memory.int32(fixed ? 1 : capacity + 1);
     this.#large = writer.memory.uint32(fixed ? 0 : (capacity + 31) >>> 5);
     this.dictionary = new DictionaryBuilder(
@@ -1167,6 +1189,16 @@ class BytesWriter extends ColumnWriter {
    * into the chunk's builder (no copy is held), and the page gets the pointer.
    */
   async #appendLarge(vector: Vector, index: number): Promise<void> {
+    this.writer.memory.grow(LARGE_SCRATCH_BYTES);
+    try {
+      await this.#writeLarge(vector, index);
+    } finally {
+      // The helper frame no longer retains part views, checksums or pointer bytes.
+      this.writer.memory.free(LARGE_SCRATCH_BYTES);
+    }
+  }
+
+  async #writeLarge(vector: Vector, index: number): Promise<void> {
     const data = sourceFlat(vector).data;
     if (data.layout !== "varlen") throw new TypeError("Expected varlen data");
     const row = sourceRow(vector, index);
@@ -1203,6 +1235,7 @@ class BytesWriter extends ColumnWriter {
     this.bytes.set(pointer, cursor);
     this.offsets[slot + 1] = cursor + pointer.length;
     this.#large[slot >>> 5] = (this.#large[slot >>> 5] ?? 0) | (1 << (slot & 31));
+    this.writer.memory.grow(LARGE_PREFIX_BYTES);
     this.#prefixes.set(slot, data.bytes.slice(start, start + STAT_PREFIX_BYTES + 1));
     this.rows++;
     this.bytesWritten += length;
@@ -1321,7 +1354,9 @@ class BytesWriter extends ColumnWriter {
     this.#regionStart = -1;
     if (this.#prefixes.size > 0) {
       this.#large.fill(0);
+      const bytes = this.#prefixes.size * LARGE_PREFIX_BYTES;
       this.#prefixes.clear();
+      this.writer.memory.free(bytes);
     }
   }
   override dictionaryPage(): Uint8Array | null {
@@ -1382,17 +1417,140 @@ interface ResolvedOptions {
   readonly dictionaryBytes: number;
 }
 
+/** Complete simultaneous raw/validity/sketch, inline pages and encoder workspace.
+ * Dictionary growth is optional and must leave this mandatory workspace available.
+ * The old/new scratch and raw-buffer overlap are included before either allocation.
+ */
+export function groupWriterMinimum(options: Omit<GroupWriterOptions, "writer" | "charge">): number {
+  const rows = options.maxRows ?? MAX_GROUP_ROWS;
+  const raw = Math.min(MAX_RAW_PAGE_BYTES, options.rawPageBytes ?? DEFAULTS.rawPageBytes);
+  const inline = options.inlineBytes ?? DEFAULTS.inlineBytes;
+  let resident = 16,
+    largestPage = 0,
+    codeRows = 0,
+    limbRows = 0,
+    largestDirectory = 0,
+    largeScratch = 0;
+  for (const column of options.columns) {
+    const kind = column.type.kind;
+    let width =
+      kind === "bool"
+        ? 1
+        : kind === "int32" || kind === "date" || kind === "float32"
+          ? 4
+          : kind === "int64" || kind === "time" || kind === "timestamp" || kind === "float64"
+            ? 8
+            : 16;
+    const bytesKind =
+      kind === "text" ||
+      kind === "bytes" ||
+      kind === "json" ||
+      kind === "array" ||
+      kind === "enum" ||
+      kind === "uuid";
+    const capacity = Math.min(rows, bytesKind && kind !== "uuid" ? 4096 : Math.floor(raw / width));
+    const validity = 4 * Math.ceil(capacity / 32);
+    let values = capacity * width;
+    if (kind === "decimal") {
+      values += capacity * (column.type.scale === null ? 3 : 1);
+      limbRows = Math.max(limbRows, capacity);
+    }
+    if (bytesKind) {
+      codeRows = Math.max(codeRows, capacity);
+      if (kind !== "uuid") {
+        const initial = columnBufferBytes(column, raw);
+        // Growth doubles and permits a single <=64KiB inline value past the target.
+        let peak = initial;
+        if (
+          column.maxValueBytes === undefined &&
+          (column.valueBytes === undefined || column.valueBytes > raw)
+        ) {
+          let size = initial;
+          while (size < raw + LARGE_VALUE_BYTES) size *= 2;
+          peak = size + size / 2;
+        }
+        values = peak + 4 * (capacity + 1) + validity;
+        width = 8;
+      } else values += 4;
+      const dictionary =
+        Math.min(
+          options.dictionaryBytes ?? 256 * 1024,
+          column.dictionaryValueBytes ?? column.valueBytes ?? Infinity,
+        ) +
+        4 * (Math.min(rows, options.dictionaryEntries ?? 65536) + 1) +
+        256;
+      largestPage = Math.max(largestPage, dictionary);
+    }
+    const maxSlot =
+      bytesKind && kind !== "uuid"
+        ? (column.maxValueBytes ?? LARGE_VALUE_BYTES)
+        : width + (kind === "decimal" ? 3 : 0);
+    const pageRows = Math.max(
+      1,
+      Math.min(
+        capacity,
+        Math.max(
+          64,
+          Math.floor((options.pageBytes ?? DEFAULTS.pageBytes) / (maxSlot + 8) / 64) * 64,
+        ),
+      ),
+    );
+    // Every non-final byte-cut page holds >= raw/2 bytes; other pages fill their
+    // row target. Allow a first page with the initial target and the final tail.
+    const pages = Math.min(
+      rows,
+      2 +
+        Math.ceil(rows / pageRows) +
+        (bytesKind && kind !== "uuid"
+          ? Math.ceil((column.valueBytes ?? rows * maxSlot) / (raw / 2))
+          : 0),
+    );
+    const pendingLarge =
+      bytesKind && kind !== "uuid" ? Math.min(capacity, column.largeValues ?? rows) : 0;
+    if (pendingLarge > 0) largeScratch = LARGE_SCRATCH_BYTES;
+    largestDirectory = Math.max(
+      largestDirectory,
+      Math.min(MAX_DIRECTORY_BYTES, 44 + 1028 + 256 * pages),
+    );
+    resident += pages * PAGE_ENTRY_BYTES + pendingLarge * LARGE_PREFIX_BYTES;
+    resident +=
+      1024 +
+      validity +
+      values +
+      Math.min(inline, capacity * width + (column.valueBytes ?? raw) + 256);
+    largestPage = Math.max(largestPage, values + validity + 256);
+  }
+  let scratch = 64 * 1024;
+  while (scratch < largestPage) scratch *= 2;
+  // One shared scratch (with resize overlap), code/limb growth overlap; not per column.
+  return (
+    resident +
+    (options.columns.length === 0
+      ? 0
+      : Math.max(scratch * 1.5, scratch + largestDirectory + 1028)) +
+    8 * codeRows +
+    16 * limbRows +
+    largeScratch
+  );
+}
+
+/** Known input bounds eliminate raw-buffer resize overlap on native flushes. */
+function columnBufferBytes(column: WriterColumn, raw: number): number {
+  const limit = column.maxValueBytes === undefined ? raw : raw + column.maxValueBytes;
+  return Math.max(1, Math.min(limit, column.valueBytes ?? raw));
+}
+
 export class GroupWriter {
   readonly options: ResolvedOptions;
   /** The caller's extent writer. */
   readonly extents: ExtentWriter;
   readonly memory: Charged;
   readonly scratch: PageScratch;
-  readonly #columns: ColumnWriter[];
+  #columns: ColumnWriter[];
   /** Extents this group sealed (handed back by `finish`, discarded by `abort`). */
   readonly #sealed: ExtentRef[] = [];
   /** One 128-bit slot for hashing a normalized coefficient. */
-  readonly limbScratch = new Uint32Array(4);
+  limbScratch: Uint32Array;
   #codes = new Int32Array(0);
   #pairs = new Int32Array(0);
   #rows = 0;
@@ -1417,7 +1575,10 @@ export class GroupWriter {
       maxChunkBytes: Math.min(MAX_CHUNK_BYTES, options.maxChunkBytes ?? MAX_CHUNK_BYTES),
     };
     this.extents = options.writer;
-    this.memory = new Charged(options.charge ?? null);
+    const minimum = groupWriterMinimum(options);
+    options.charge?.preflightAllocation?.(minimum);
+    this.memory = new Charged(options.charge ?? null, minimum);
+    this.limbScratch = this.memory.uint32(4);
     this.scratch = new PageScratch((grown, old) => {
       this.memory.grow(grown);
       this.memory.free(old);
@@ -1569,7 +1730,23 @@ export class GroupWriter {
     column: ColumnWriter,
     append: (parts: readonly Uint8Array[]) => Promise<PendingBlob[]>,
     base: number,
-  ): Promise<{ directory: PendingBlob; sketch: Uint8Array }> {
+  ): Promise<{ directory: PendingBlob; sketchLength: number; sketchChecksum: number }> {
+    const tail = await this.#encodeTail(column, append, base);
+    // The completed helper frame no longer retains either serialized buffer.
+    this.memory.free(tail.bytes);
+    return tail;
+  }
+
+  async #encodeTail(
+    column: ColumnWriter,
+    append: (parts: readonly Uint8Array[]) => Promise<PendingBlob[]>,
+    base: number,
+  ): Promise<{
+    directory: PendingBlob;
+    sketchLength: number;
+    sketchChecksum: number;
+    bytes: number;
+  }> {
     const dictionary = column.dictionaryPage();
     let dictionaryEntry: PageEntry | null = null;
     if (dictionary !== null) {
@@ -1578,27 +1755,34 @@ export class GroupWriter {
       const entry = this.#dictionaryEntry(column, blob);
       dictionaryEntry = entry === null ? null : { ...entry, offset: entry.offset - base };
     }
-    const sketch = column.sketch.serialize();
-    const directory = encodeDirectory({
-      tag: column.tag,
-      rowCount: this.#rows,
-      scale: column.scale(),
-      hasSpecials: column.hasSpecials(),
-      pages:
-        base === 0
-          ? column.sink.entries
-          : column.sink.entries.map((entry) => ({ ...entry, offset: entry.offset - base })),
-      dictionary: dictionaryEntry,
-      sketch,
-    });
+    const sketch = column.sketch.serialize(this.memory);
+    const directory = encodeDirectory(
+      {
+        tag: column.tag,
+        rowCount: this.#rows,
+        scale: column.scale(),
+        hasSpecials: column.hasSpecials(),
+        pages:
+          base === 0
+            ? column.sink.entries
+            : column.sink.entries.map((entry) => ({ ...entry, offset: entry.offset - base })),
+        dictionary: dictionaryEntry,
+        sketch,
+      },
+      this.memory,
+    );
+    const sketchLength = sketch.length,
+      sketchChecksum = xxHash32(sketch);
+    const bytes = sketch.length + directory.length;
     const [blob] = await append([directory]);
     if (blob === undefined) throw new Error("The directory was not appended");
-    return { directory: blob, sketch };
+    // Packs keep only descriptors; neither serialized buffer escapes this frame.
+    return { directory: blob, sketchLength, sketchChecksum, bytes };
   }
 
   async #finishStreamed(column: ColumnWriter): Promise<ColumnChunk> {
     const sink = column.sink;
-    const { directory, sketch } = await this.#tail(
+    const { directory, sketchLength, sketchChecksum } = await this.#tail(
       column,
       (parts) => sink.appendParts(parts, true),
       0,
@@ -1613,7 +1797,8 @@ export class GroupWriter {
       column,
       { extent: written.extent, offset: 0, length: written.extent.length },
       directory,
-      sketch,
+      sketchLength,
+      sketchChecksum,
     );
   }
 
@@ -1627,7 +1812,8 @@ export class GroupWriter {
       column: ColumnWriter;
       base: number;
       directory: PendingBlob;
-      sketch: Uint8Array;
+      sketchLength: number;
+      sketchChecksum: number;
     }> = [];
     try {
       for (const column of inline) {
@@ -1642,7 +1828,9 @@ export class GroupWriter {
             if (page !== undefined)
               sink.entries.push({ ...page.entry, offset: blob.offset, checksum: blob.checksum });
           });
-          for (const page of pages) this.memory.free(page.bytes.length);
+          const bytes = pages.reduce((sum, page) => sum + page.bytes.length, 0);
+          pages.length = 0;
+          this.memory.free(bytes);
           sink.inlineBytes = 0;
         }
         tails.push({ column, base, ...(await this.#tail(column, append, base)) });
@@ -1655,7 +1843,7 @@ export class GroupWriter {
     const written = await builder.seal();
     if (written === null) throw new Error("The pack sealed empty");
     this.#sealed.push(written.extent);
-    for (const { column, base, directory, sketch } of tails)
+    for (const { column, base, directory, sketchLength, sketchChecksum } of tails)
       chunks[this.#columns.indexOf(column)] = this.#chunk(
         column,
         // Pages, dictionary and directory: [base, end of the directory) of the pack.
@@ -1665,7 +1853,8 @@ export class GroupWriter {
           length: directory.offset + directory.length - base,
         },
         directory,
-        sketch,
+        sketchLength,
+        sketchChecksum,
       );
   }
 
@@ -1673,7 +1862,8 @@ export class GroupWriter {
     column: ColumnWriter,
     data: ChunkData,
     directory: PendingBlob,
-    sketch: Uint8Array,
+    sketchLength: number,
+    sketchChecksum: number,
   ): ColumnChunk {
     const extent = data.extent;
     const stats = column.stats;
@@ -1692,9 +1882,9 @@ export class GroupWriter {
       // The sketch is the directory blob's tail (directory.ts), under its own checksum.
       distinctSketch: {
         extent,
-        offset: directory.offset + directory.length - sketch.length,
-        length: sketch.length,
-        checksum: xxHash32(sketch),
+        offset: directory.offset + directory.length - sketchLength,
+        length: sketchLength,
+        checksum: sketchChecksum,
       },
     };
   }
@@ -1721,6 +1911,11 @@ export class GroupWriter {
 
   #close(): void {
     for (const column of this.#columns) column.close();
+    this.#columns = [];
+    this.scratch.clear();
+    this.limbScratch = new Uint32Array(0);
+    this.#codes = this.#pairs = new Int32Array(0);
+    this.#sealed.length = 0;
     this.memory.free(this.memory.bytes);
   }
 }

@@ -48,7 +48,9 @@ const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
  */
 export interface ByteCharge {
   /** Optional encoding optimizations may decline without requesting async admission. */
-  tryAllocate?(bytes: number): boolean;
+  tryAllocate?(bytes: number, reserve?: number): boolean;
+  /** Synchronous preflight for a complete step, before constructing any of its buffers. */
+  preflightAllocation?(bytes: number): void;
   allocate(bytes: number): boolean;
   free(bytes: number): void;
 }

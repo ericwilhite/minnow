@@ -162,6 +162,20 @@ nonwaiting admission and fall back to the smaller disk/plain route instead of de
 more credit. After durable installation, the keeper borrows its exact committed list from
 the already funded root, as on reopen; it releases the separate keeper reservation without
 releasing the root's ownership. Standalone keepers retain their own list charge.
+Before constructing a column group, the writer prepays its simultaneous column buffers,
+validity, sketches, directory entries, inline pages, encoder/resize overlap and one tail
+serialization. Native immutable chunks cache their actual row/value bounds; large values
+contribute pointer bytes to the page, with a separate bounded part/prefix allowance. Small
+TEXT inputs no longer allocate a full raw target for every column. Optional dictionaries
+leave the mandatory remainder prepaid and fall back to plain pages. Directory/sketch bytes
+are charged before serialization and dropped after append; packed tails retain descriptors.
+A complete group or step forecast above the cap raises SQLSTATE `53200` before allocation or
+queueing. Generated `write/group-minimum.test.ts` and `write/group-value-bounds.test.ts`
+check wide fitting/oversize schemas, mixed physical types, NULLs, inline/large boundaries,
+rollback cache invalidation, exact page-oracle output and zero final charge. The committed
+`next-writer-insert-bench.mts` compares narrow, wide numeric and wide TEXT native flushes;
+setup, decoded input creation, verification and close are outside its CPU clock.
+
 `testing/native-write-pressure.test.ts` covers six direct native 1 MiB TEXT
 inserts at 32 MiB, generated microtask interleavings, competing reader buffers, provisional
 writer unwind before admission, exact rows, one root charge before/after reopen and zero

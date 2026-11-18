@@ -3,7 +3,7 @@
  * allocation counter: storage may transfer a real buffer out through native takeFrom.
  */
 import type { Grant, MemoryGovernor } from "../memory/governor.js";
-import { GrantClosedError } from "../memory/governor.js";
+import { GrantClosedError, MemoryAdmissionError } from "../memory/governor.js";
 import type { MaybePromise } from "../access/key-index.js";
 import { releaseIdle } from "./budget.js";
 
@@ -190,6 +190,8 @@ export class WriteCredits {
     signal?: AbortSignal,
     includesProgress = false,
   ): MaybePromise<void> {
+    if (bytes > this.governor.capBytes)
+      throw new MemoryAdmissionError("write metadata step", bytes, this.governor.capBytes);
     const changed = this.#metadataHeadroom !== bytes;
     this.#metadataHeadroom = bytes;
     if (changed) this.#changed?.();

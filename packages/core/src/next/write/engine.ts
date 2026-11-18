@@ -160,6 +160,7 @@ import type {
 import { RunSink } from "./run-output.js";
 import { writeStepMinimum, type WriteStepMinimum } from "./minimum.js";
 import { MetadataBudget, MetadataPressure, releaseIdle } from "./budget.js";
+import { nativeGroupOptions } from "./group-options.js";
 import { GroupWriter } from "../page/writer.js";
 import type { StoreSession } from "../storage/contract.js";
 import { ExtentListKeeper, type ExtentList } from "../storage/extent-list.js";
@@ -5429,10 +5430,16 @@ export class WritePathImpl implements WritePath, EngineHooks {
   }
 
   async #writeGroup(writer: ExtentWriter, memtable: Memtable): Promise<GroupRoot> {
+    const dimensions = nativeGroupOptions(memtable);
+    let next = dimensions.next();
+    while (!next.done) {
+      this.#check();
+      if (taskClock.due()) await yieldTask();
+      next = dimensions.next();
+    }
     const group = new GroupWriter({
-      estimatedRows: memtable.rowCount,
-      // A catalog-only ALTER never rewrites an older immutable memtable's physical schema.
-      columns: memtable.columns.map((column) => ({ columnId: column.id, type: column.type })),
+      // A catalog-only ALTER never rewrites this immutable memtable's schema.
+      ...next.value,
       writer,
       // Page working buffers are metadata work, not a reclaimable row estimate.
       // Their owner aborts the provisional writer before #metadataAsync can wait.
