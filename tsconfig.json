@@ -21,6 +21,9 @@
     },
     {
       "path": "packages/kysely/next"
+    },
+    {
+      "path": "packages/react/next"
     }
   ]
 }
