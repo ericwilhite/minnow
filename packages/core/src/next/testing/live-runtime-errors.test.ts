@@ -6,7 +6,7 @@ import type { composeEngine } from "../owner/compose.js";
 import type { ClientLiveHandle } from "../owner/client.js";
 import type { Governor, EvictableCache } from "../memory/governor.js";
 import { decodeColumn } from "../write/columns.js";
-import { setup, until } from "./live-runtime.test-support.js";
+import { setup, until, publicationTurn } from "./live-runtime.test-support.js";
 
 const errorReach = createReach("next-live-errors", LIVE_ERROR_REACH);
 afterAll(() => errorReach.assertReached());
@@ -213,6 +213,7 @@ describe("native live-query runtime and MessageChannel transport", () => {
             model.set(finalId, rekey ? 1 : -1);
             const expected = await oracle();
             release?.();
+            await publicationTurn();
             await until(idle);
             expect(status, "a successful identical value must clear the error snapshot").toBe(
               "ready",
@@ -286,6 +287,7 @@ describe("native live-query runtime and MessageChannel transport", () => {
         refuse = false;
         await active.client.query("INSERT INTO same_error VALUES (3, -1)");
         const expected = (await active.client.query(sql)).rows();
+        await publicationTurn();
         await until(idle);
         expect(status, "ready must follow error even when the wire rows are identical").toBe(
           "ready",

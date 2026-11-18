@@ -164,6 +164,7 @@ for (const seed of seedsFor("next-live-effect-integration", [8864, 8865])) {
             unknown: false,
           });
         } else if (scenario === "migration") {
+          const prior = path.changes.probe();
           await migrateCatalog(
             path,
             core.lowerer,
@@ -174,7 +175,16 @@ for (const seed of seedsFor("next-live-effect-integration", [8864, 8865])) {
           );
           await turn();
           expect(events).toHaveLength(1);
-          expect(events[0]).toMatchObject({ catalog: true, replacement: false });
+          expect(events[0]).toMatchObject({
+            tables: [],
+            catalog: true,
+            replacement: false,
+            unknown: false,
+          });
+          expect(path.changes.rekeysSince(prior, path.changes.probe())).toEqual({
+            reset: true,
+            rekeys: [],
+          });
         } else {
           const chunks: Uint8Array[] = [];
           await exportSnapshot(

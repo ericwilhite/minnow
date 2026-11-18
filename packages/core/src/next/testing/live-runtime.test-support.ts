@@ -8,6 +8,10 @@ import { MemorySpillService } from "../spill/memory-spill.js";
 import { Governor } from "../memory/governor.js";
 import { Harness } from "../write/test-support.js";
 
+/** Native notification dispatch is a task after commit bookkeeping. Cross that boundary before
+ * interpreting a momentarily idle runtime as completion of the just-committed invalidation. */
+export const publicationTurn = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
 export async function until(check: () => boolean): Promise<void> {
   const deadline = Date.now() + 10000;
   while (!check()) {

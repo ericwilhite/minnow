@@ -5,7 +5,7 @@ import type { LiveHandle } from "../live/runtime.js";
 import { MemoryAdmissionError, type Governor } from "../memory/governor.js";
 import type { composeEngine } from "../owner/compose.js";
 import type { ClientLiveHandle } from "../owner/client.js";
-import { setup, until } from "./live-runtime.test-support.js";
+import { setup, until, publicationTurn } from "./live-runtime.test-support.js";
 
 const reach = createReach("next-live-lifecycle", LIVE_LIFECYCLE_REACH);
 afterAll(() => reach.assertReached());
@@ -343,6 +343,7 @@ describe("native live registration and dependency lifetimes", () => {
               expect(rows).toEqual((await active.client.query(sql)).rows());
               await active.client.query("INSERT INTO loading_reentry VALUES (99)");
               const expected = (await active.client.query(sql)).rows();
+              await publicationTurn();
               await until(
                 () =>
                   active.engine.live?.stats.dirty === 0 &&
@@ -498,6 +499,7 @@ describe("native live registration and dependency lifetimes", () => {
                 step === 0 && trigger === "unrelated-table" ? "lifecycle_ignored" : "lifecycle_new";
               await active.client.query(`INSERT INTO ${table} VALUES (${String(64 + step)})`);
               const expected = (await active.client.query(sql)).rows();
+              await publicationTurn();
               await until(idle);
               expect(
                 status,
@@ -517,6 +519,7 @@ describe("native live registration and dependency lifetimes", () => {
             for (const table of ["lifecycle_old", "lifecycle_ignored"]) {
               await active.client.query(`INSERT INTO ${table} VALUES (99)`);
               await active.client.query("SELECT 9");
+              await publicationTurn();
               await until(idle);
               expect(plans, "a recovered dependency proof skips unaffected tables").toBe(before);
               expect(rows).toEqual((await active.client.query(sql)).rows());

@@ -9,6 +9,8 @@ import { OwnerServer } from "../owner/server.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
 import { Harness } from "../write/test-support.js";
 
+const publicationTurn = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
 for (const seed of seedsFor("next-live-commit-oracle", [8804, 8805])) {
   it(`every explicit native commit reports surviving tables seed=${String(seed)}`, async () => {
     const h = new Harness("strict", "memory");
@@ -29,6 +31,7 @@ for (const seed of seedsFor("next-live-commit-oracle", [8804, 8805])) {
       await client.connect(port2);
       await client.query("CREATE TABLE a (id INTEGER)");
       await client.query("CREATE TABLE b (id INTEGER)");
+      await publicationTurn();
       const observed: number[][] = [];
       stop = engine.onCommit((tables) => {
         observed.push([...tables].sort((a, b) => a - b));
@@ -50,6 +53,7 @@ for (const seed of seedsFor("next-live-commit-oracle", [8804, 8805])) {
           expect(observed).toHaveLength(before);
         } else {
           await client.query("COMMIT");
+          await publicationTurn();
           expect(
             observed.slice(before),
             "one committed event, with rollback survivors only",
