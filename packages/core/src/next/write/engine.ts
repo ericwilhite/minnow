@@ -78,6 +78,11 @@ export type EngineInput = OpenWritePathInput & {
     };
     /** Tests: awaited by a flush after it wrote its groups, before it takes the publish lock. */
     readonly beforeFlushPublish?: () => Promise<void>;
+    /** Tests: pause around root catalog-cut selection at an existing asynchronous boundary. */
+    readonly rootSelectionBoundary?: (
+      phase: "before" | "after",
+      kind: PublicationKind,
+    ) => Promise<void>;
     /** Log bytes past which the log is recycled (default `LOG_RECYCLE_BYTES`). */
     readonly logRecycleBytes?: number;
     /** Tests: called after each R25 prepare, before the root is encoded; a throw fails there. */
@@ -566,6 +571,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
   readonly #mergeMode: "auto" | "manual" | "off";
   readonly #stallRuns: number;
   readonly #beforeFlushPublish: (() => Promise<void>) | null;
+  readonly #rootSelectionBoundary:
+    ((phase: "before" | "after", kind: PublicationKind) => Promise<void>) | null;
   readonly #logRecycleBytes: number;
   /** The running log recycle, if any. */
   #recycling: Promise<void> | null = null;
@@ -735,6 +742,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#mergeMode = merges?.mode ?? "auto";
     this.#stallRuns = merges?.stallRuns ?? 3 * this.#mergePolicy.fanIn;
     this.#beforeFlushPublish = input.tuning?.beforeFlushPublish ?? null;
+    this.#rootSelectionBoundary = input.tuning?.rootSelectionBoundary ?? null;
     this.#logRecycleBytes = input.tuning?.logRecycleBytes ?? LOG_RECYCLE_BYTES;
     this.#idleGarbageBytes = input.tuning?.idleGarbageBytes ?? IDLE_GARBAGE_BYTES;
     this.#extentDeltas = input.extentDeltas ?? null;
@@ -3765,6 +3773,15 @@ export class WritePathImpl implements WritePath, EngineHooks {
         new Map([[state.tableId, tableRoot]]),
         delta,
       );
+      // Catalog commits do not take the publication lock. Root preparation can yield and
+      // select a durable cut after DROP, even after the validation above succeeded. Such a
+      // root cannot own any of this flush's output; discard it BEFORE preparing its list.
+      // A coherent older root which still contains the table remains publishable.
+      if (!root.tables.some((table) => table.tableId === state.tableId)) {
+        await writer.abort();
+        this.maintenance.flushesAbandoned += 1;
+        return;
+      }
       root = await this.#listed(
         root,
         (sequence) => delta.prepare(sequence, writer, retired),
@@ -5355,7 +5372,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
     incarnation: ManifestRoot["log"] | null = null,
   ): Promise<ManifestRoot> {
     await this.#stagePendingRetirements(publication);
+    if (this.#rootSelectionBoundary !== null)
+      await this.#rootSelectionBoundary("before", publication.kind);
     const globalLsn = this.#rootLsn(changed);
+    if (this.#rootSelectionBoundary !== null)
+      await this.#rootSelectionBoundary("after", publication.kind);
     let fts = this.#root.fts;
     let ftsThrough = this.#ftsCoveredLsn;
     const pending = this.#ftsPending;

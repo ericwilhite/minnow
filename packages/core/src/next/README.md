@@ -4762,3 +4762,10 @@ must supply that complete admitted work; this helper is not an execution minimum
 and SQL dispatch still keep their guards. Generated PG traces/errors, an actual compiled follow
 observer, foreign-scope/cancellation fences and competing-credit64MiB roots exercise the assembler.
 The initial SUM observer probe hit the existing initPlan refusal; no initPlan capability was added.
+
+A flush rechecks that its assembled checkpoint contains the table before preparing its R25
+extent list. Ordinary catalog commits can advance a durable DROP while root preparation
+awaits, even though the flush holds the publication lock. A checkpoint which omits the table
+abandons the provisional writer and releases all fresh output. An older coherent checkpoint
+which still contains the table may publish; WAL replay carries the later DROP. Older read
+pins retain their values in both histories. This changes no stored bytes or format selector.
