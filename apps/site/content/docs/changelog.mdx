@@ -85,6 +85,17 @@ It stabilizes writer/storage holdings before root funding, counts their protecte
 once, and preserves separate image and rule workspace. This does not enable SQL triggers.
 No released API, stored-format or migration change is required.
 
+The private 1.0 owner client accepts cancellation signals on buffered requests.
+A mutation waits for the owner's terminal acknowledgement. Confirmed cancellation before
+commit rolls it back; after the commit call starts, the actual commit or failure outcome wins.
+Autocommit RETURNING rows remain withheld until commit is acknowledged; results inside an
+explicit transaction remain provisional. Cancellation listeners
+retire with the request. The wire cancellation error retains code and SQLSTATE57014.
+Sent mutations that become unreachable now report an unknown outcome while retaining their
+original request identity for late acknowledgement. Committed replay with lost RETURNING rows
+stays distinct from an unknown outcome. Typed wire errors retain code, SQLSTATE and bounded
+causes through a client-side domain registry. No published 0.x API or stored format changes.
+
 The shipped engine’s fast path for SUM and AVG over floating-point columns adds values directly,
 recovering overhead introduced by the 0.19.3 integer-exactness checks. SQL integer aggregates
 still reject inexact intermediate results; floating-point accumulation order is unchanged.

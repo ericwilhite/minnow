@@ -2644,6 +2644,35 @@ API is `exportStream(sql, params?, { session?, windowBytes? })`. It is not a pub
 It accepts queries, including queries in a session, and rejects modifying/control statements.
 `query()` and the existing cursor retain their current lifetimes and 1 MiB source target.
 
+Buffered `query`, `send`, prepared `execute` and transaction-control calls accept an
+optional `signal`. Facade-owned call options also identify mutation intent; an
+explicit transaction's statement result remains provisional. An abort before posting
+sends nothing. Once posted, cancellation waits for the owner's terminal reply.
+Only confirmed `MINNOW_CANCELLED` maps back to the original signal reason; a
+successful commit or a different failure keeps its actual outcome. The owner's
+call to `commit()` is the boundary. Cancellation listeners end with the request,
+and cancellation intent survives a resend of its original identity. Manual wire
+cancellation retains `CancelledError`, code `MINNOW_CANCELLED` and SQLSTATE57014.
+No published facade or export map changes here.
+`attachSignal(seq, signal)` binds an already-issued facade task to the same pending
+state; callers combine scope and call signals before binding. The task returned by
+`send` has a separate `retired` promise: keep copied input leases charged until it
+resolves, since a caller Unknown may precede a retry. Retirement means this client
+will not resend that input; it does not prove commitment. `cancel(seq)` records
+intent, so reconnect resends cancellation with the original identity. Typed writes
+and COMMIT (including known SQL/prepared COMMIT) identify mutation intent directly;
+other SQL effect classification belongs to the facade, not a SQL-text guess here.
+A sent classified mutation that becomes unreachable rejects with `OutcomeUnknownError`
+and keeps its wire sequence unresolved for late terminal collection. Late result
+frames return credit without being decoded or retained. A mutation rejected after
+ledger expiry gets `OutcomeUnknownError` with the original typed expiry cause.
+A committed replay with requested RETURNING rows gets `CommittedWithoutResultError`
+and original counts, rather than an empty result or a cancellation reason.
+Never-sent requests retain proven no effect; low-level reads keep their existing
+reachability errors. `ProtocolClientOptions.errorRegistry` copies client-side domain
+prototypes once, with owner builtins protected. Wire code, SQLSTATE, identity fields
+and bounded causes survive rehydration without importing the executor into client.
+
 ```ts
 const stream = client.exportStream("SELECT * FROM t");
 const columns = await stream.columns; // resolves with the first reply, before iteration completes

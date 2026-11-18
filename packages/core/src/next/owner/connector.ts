@@ -76,7 +76,12 @@ import {
   type LifecycleEvent,
   type SkewSignal,
 } from "./election.js";
-import { ClientClosedError, ConnectionRefusedError, OwnerUnreachableError } from "./errors.js";
+import {
+  ClientClosedError,
+  ConnectionRefusedError,
+  OwnerUnreachableError,
+  OwnerUnresponsiveError,
+} from "./errors.js";
 import type { OwnerHostCommand, OwnerHostInit, OwnerHostStatus } from "./host.js";
 import {
   ALIVE_INTERVAL_MS,
@@ -331,7 +336,10 @@ export class OwnerConnector {
     this.#unresponsiveTimer = setTimeout(() => {
       this.#unresponsiveTimer = null;
       if (this.#status === "closed" || this.#status === "connected") return;
-      this.#client.giveUp(`no database owner was reachable for ${String(ms)} ms`);
+      this.#client.giveUp(
+        `no database owner was reachable for ${String(ms)} ms`,
+        new OwnerUnresponsiveError(ms),
+      );
     }, ms);
   }
 
@@ -857,7 +865,8 @@ export class OwnerConnector {
     this.#disarmUnresponsive();
     // A reload prompt is not completion of queued SQL. Preserve sent/never-sent effects even
     // when no compatible connection can ever be made by this client version.
-    this.#client.giveUp("a newer database owner superseded this client; reload this page");
+    const detail = "a newer database owner superseded this client; reload this page";
+    this.#client.giveUp(detail, new OwnerUnreachableError(detail));
     this.#options.onSuperseded?.();
   }
 
