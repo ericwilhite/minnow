@@ -1124,6 +1124,11 @@ class Connection {
         this.post({ t: "liveEnded", seq: request.seq, reason: "unacknowledged" });
       },
     );
+    // A cache admission can retire this peer before its handle has reached the map.
+    if (this.#state === "closed" || this.#server.steppingDown !== null) {
+      handle.close();
+      return;
+    }
     this.#live.set(request.seq, handle);
     this.#watchIfNeeded();
     this.#updateAlive();

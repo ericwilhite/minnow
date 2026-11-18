@@ -45,6 +45,9 @@ export async function setup(
   return {
     h,
     client,
+    get server() {
+      return server;
+    },
     get engine() {
       return engine;
     },

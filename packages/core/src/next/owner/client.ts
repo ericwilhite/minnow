@@ -679,19 +679,28 @@ export class ProtocolClient {
       this.#port?.postMessage({ t: "cancel", target: state.seq, close: true });
   }
   #startLive(state: ClientLiveState): void {
+    const token = ++state.token;
+    const generation = this.#generation;
+    state.initialErrorHandled = false;
+    state.generation = generation;
     try {
       state.options.onLoading?.();
     } catch {
       /* Consumer isolation. */
     }
-    const token = ++state.token;
-    state.initialErrorHandled = false;
-    state.generation = this.#generation;
+    // Loading may close, refresh or reconnect synchronously. Only its current job registers.
+    if (state.closed || this.#closed || state.token !== token || generation !== this.#generation)
+      return;
     const request = this.#request({ t: "subscribe", text: state.sql, params: state.params });
     state.seq = request.seq;
     this.#liveBySeq.set(state.seq, state);
     void request.promise.catch((error: unknown) => {
-      if (!state.closed && state.token === token && !state.initialErrorHandled)
+      if (
+        !state.closed &&
+        state.token === token &&
+        generation === this.#generation &&
+        !state.initialErrorHandled
+      )
         this.#liveError(state, error);
     });
   }

@@ -156,6 +156,10 @@
     "next-live-errors": [
       8828,
       8829
+    ],
+    "next-live-lifecycle": [
+      8830,
+      8831
     ]
   }
 }

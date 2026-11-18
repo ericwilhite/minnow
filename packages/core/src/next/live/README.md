@@ -7,12 +7,18 @@ site changelog's unreleased section.
 
 - `LiveRuntime` belongs to one native owner. `composeEngine().live` creates it lazily from the
   native writer's `ChangeFeed`. Ordinary committed changes use the table dependency index;
-  catalog, replacement, unknown and missed notifications widen invalidation. A cohort pins
+  catalog, replacement, unknown and missed notifications widen invalidation. Failed planning
+  or dependency admission invalidates the old proof: later commits retry conservatively until
+  a fresh proof succeeds, then unaffected tables are excluded again. A cohort pins
   synchronously, executes at most eight queries concurrently, then delivers in one turn.
 - `ProtocolClient.subscribeLive()` returns synchronous `refresh()` and `close()` handles.
   Refresh registers a fresh read and explicitly resets the result. It captures parameters
-  privately. Reconnect retires old request IDs and registers fresh subscriptions; it never
-  resends a subscription through mutation replay. Initial `done` settles the ordinary request
+  privately, admitting complete backing-buffer capacity before cloning a byte view. The private
+  owner protocol refuses shared buffers. Retirement during admission/capture cannot publish a
+  new subscription or leave an index link behind. Reconnect retires old request IDs and registers fresh subscriptions; it never
+  resends a subscription through mutation replay. A loading callback may synchronously close
+  or refresh its handle; its token is established before the callback, so an outer superseded
+  job cannot register another read. Peers retiring during admission close the late handle. Initial `done` settles the ordinary request
   slot. Subsequent `live` updates use a separate handle and acknowledgement token.
 - `onResult` receives columnar `ClientResult`, acknowledgement version, connection generation,
   and `{ reset, keyChanges }`. Use `result.summary.lsn` for snapshot versions; the callback
@@ -99,6 +105,8 @@ Run the focused evidence with:
 ```sh
 npx vitest run packages/core/src/next/live \
   packages/core/src/next/testing/live-runtime.test.ts \
+  packages/core/src/next/testing/live-runtime-errors.test.ts \
+  packages/core/src/next/testing/live-runtime-lifecycle.test.ts \
   packages/core/src/next/write/changes.test.ts \
   packages/core/src/next/testing/live-commit-oracle.test.ts \
   packages/core/src/next/exec/result-retain.test.ts --maxWorkers=2

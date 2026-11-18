@@ -10661,6 +10661,33 @@ export const LIVE_PUBLICATION_REACH = [
   "zero charges",
 ] as const;
 
+export const LIVE_LIFECYCLE_REACH = [
+  "full parameter backing preflight",
+  "parameter copy funded before allocation",
+  "parameter bytes captured privately",
+  "shared parameters refused",
+  "loading closes subscription",
+  "loading refresh supersedes registration",
+  "loading refresh transition",
+  "loading reconnect transition",
+  "loading owner-change transition",
+  "one current client registration",
+  "peer retirement during registration",
+  "registration admission retirement",
+  "parameter-copy retirement",
+  "owner retirement",
+  "runtime retirement",
+  "dependency admission retirement",
+  "no retired dependency links",
+  "planning proof unknown",
+  "dependency proof admission refused",
+  "new dependency invalidation",
+  "unknown proof widens globally",
+  "recovered proof excludes unaffected tables",
+  "scratch oracle after commits",
+  "zero charges",
+] as const;
+
 export const LIVE_ERROR_REACH = [
   "error baseline evictable",
   "diagnostic admission retirement",

@@ -34,6 +34,7 @@ interface Entry {
   readonly abort: AbortController;
   tables: readonly number[];
   dependencyBytes: number;
+  dependenciesKnown: boolean;
   retired: boolean;
   ready: Promise<void> | null;
   dirty: boolean;
@@ -81,7 +82,13 @@ function valueBytes(value: unknown): number {
   if (typeof value === "string") return stringBytes(value);
   if (typeof value === "bigint") return 64 + value.toString(16).length;
   if (value === null || typeof value !== "object") return 32;
-  if (ArrayBuffer.isView(value)) return 128 + value.byteLength;
+  if (value instanceof ArrayBuffer) return 128 + value.byteLength;
+  if (ArrayBuffer.isView(value)) {
+    if (!(value.buffer instanceof ArrayBuffer))
+      throw new TypeError("The owner protocol does not accept SharedArrayBuffer values");
+    // Structured clone copies the complete backing store, even for a narrow parameter view.
+    return 128 + value.buffer.byteLength;
+  }
   if (value instanceof Date) return 64;
   let bytes = 128;
   for (const key of Object.keys(value))
@@ -210,6 +217,9 @@ export class LiveRuntime {
     this.#charge(metadata);
     let entry: Entry;
     try {
+      // Admission can synchronously retire this owner through an eviction callback.
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- admission may have reentered close.
+      if (this.#closed) throw new Error("Live runtime is closed");
       entry = {
         sql,
         params: structuredClone(params),
@@ -220,6 +230,7 @@ export class LiveRuntime {
         abort: new AbortController(),
         tables: [],
         dependencyBytes: 0,
+        dependenciesKnown: false,
         retired: false,
         ready: null,
         dirty: true,
@@ -241,6 +252,9 @@ export class LiveRuntime {
         session: null,
         plan: null,
       };
+      // Parameter capture is consumer code too; it cannot publish after retirement.
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- capture may have reentered close.
+      if (this.#closed) throw new Error("Live runtime is closed");
       this.#entries.add(entry);
     } catch (failure) {
       this.#free(metadata);
@@ -280,8 +294,7 @@ export class LiveRuntime {
     if (missed || event.catalog || event.replacement || event.unknown) {
       for (const entry of this.#entries) entry.dirty = true;
     } else {
-      for (const entry of this.#entries)
-        if (entry.tables.length === 0 && entry.retained === null) entry.dirty = true;
+      for (const entry of this.#entries) if (!entry.dependenciesKnown) entry.dirty = true;
       for (let i = 0; i < event.tableCount; i++) {
         for (const entry of this.#byTable.get(event.tables[i] ?? -1) ?? []) entry.dirty = true;
       }
@@ -306,6 +319,10 @@ export class LiveRuntime {
     const tables = this.engine.readSet(plan);
     const bytes = 256 * tables.length;
     this.#charge(bytes);
+    if (entry.closed) {
+      this.#free(bytes);
+      return;
+    }
     for (const table of entry.tables) {
       const bucket = this.#byTable.get(table);
       bucket?.delete(entry);
@@ -328,6 +345,7 @@ export class LiveRuntime {
     }
     this.#free(entry.dependencyBytes);
     entry.dependencyBytes = bytes;
+    entry.dependenciesKnown = true;
   }
   #prepareFailure(entry: Entry, error: unknown): void {
     if (entry.closed) return;
@@ -401,6 +419,8 @@ export class LiveRuntime {
     for (const entry of cohort) {
       entry.dirty = false;
       entry.running = true;
+      // A failed replan cannot keep using the previous catalog's dependency proof.
+      entry.dependenciesKnown = false;
     }
     try {
       const durable = this.engine.durable(lsn);

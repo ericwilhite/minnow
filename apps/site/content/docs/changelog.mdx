@@ -44,6 +44,10 @@ codecs, ledger outcomes, or released 0.x behavior.
 
 The private 1.0 rebuild adds native commit summaries and an internal live-query runtime.
 Only committed changes invalidate queries; rollback and savepoint rollback discard their effects.
+Failed replanning widens invalidation until a complete dependency proof is restored. Refresh and
+reconnect honor teardown or another refresh requested from a loading callback, and owner
+retirement cannot publish a late subscription. Parameter capture charges complete byte-buffer
+capacity before making its private copy.
 Disposal drains native admission, execution and sizing cleanup through a separate resource fence;
 commit, durability and result-outcome boundaries are unchanged. Decoder errors preserve the
 last accepted result and rekey watermark, so later updates can recover without losing notices.
