@@ -30,6 +30,14 @@ including when releasing part of its reserved space fails. Idle maintenance can 
 those statistics without a reservation error. Released 0.x behavior is unchanged;
 no stored-format change or migration is required.
 
+The private 1.0 core uses one UTF-8 progress helper for parameter binding, varlen
+builders and write codecs. Exact-capacity destinations remain byte-exact when
+Node 26's encoder returns a short write; the helper completes the tail in the
+same buffer without padding or temporary copies. Undersized destinations get
+the typed `MINNOW_UTF8_CAPACITY` error. Stored strings also retain a leading
+U+FEFF character. Released 0.x behavior and stored-format grammars are unchanged;
+no migration is required.
+
 The private 1.0 executor handles short UTF-8 encoder writes, including Node 26's
 exact-capacity tail behavior, without truncating or refusing valid text parameters.
 It keeps the measured byte count separate from reservation bounds and funds one

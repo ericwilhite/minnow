@@ -11726,3 +11726,38 @@ export const PARAMETER_RESULT_PROGRESS_REACH = [
   "frame progress",
   "zero retained",
 ] as const;
+
+export const UTF8_SITES_REACH = [
+  "empty",
+  "one byte",
+  "two bytes",
+  "three bytes",
+  "four bytes",
+  "valid pair",
+  "lone high",
+  "lone low",
+  "BOM character",
+  "longer than chunk",
+  "pair across chunk",
+  "exact recipe",
+  "generous recipe",
+  "native prefix",
+  "native zero",
+  "zero retained",
+] as const;
+
+export const UTF8_DURABILITY_REACH = [
+  "WAL reopen",
+  "catalog names and defaults",
+  "JSON ledger",
+  "published pages reopen",
+  "continued writing",
+  "NULL payload",
+  "non-NULL payload",
+  "chunk-boundary pair and lone surrogates",
+  "two bytes",
+  "three bytes",
+  "four bytes",
+  "BOM catalog and payload",
+  "zero retained",
+] as const;
