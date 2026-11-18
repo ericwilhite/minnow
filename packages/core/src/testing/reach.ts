@@ -11637,6 +11637,7 @@ export const INSPECTION_RECONNECT_REACH = [
 ] as const;
 
 export const NATIVE_DEVTOOLS_REACH = [
+  "JSON and JSONB spelling",
   "exact bigint",
   "numeric scale",
   "microsecond timestamp",
@@ -11668,4 +11669,17 @@ export const INSPECTION_RETIREMENT_REACH = [
   "closed before reply arrival",
   "cancelled before reply arrival",
   "no late ownership",
+] as const;
+
+export const NATIVE_PREVIEW_DECODE_REACH = [
+  "flat",
+  "constant",
+  "dictionary",
+  "multiple frames",
+  "one-cell decode",
+  "visible-only decoding",
+  "empty preview",
+  "bounded preview",
+  "cached entry reuse",
+  "off-screen refusal",
 ] as const;

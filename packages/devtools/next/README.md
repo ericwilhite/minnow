@@ -8,7 +8,8 @@ exports keep their positions. BIGINT, NUMERIC and microsecond temporal text are 
 converted to Number or Date. Object rows on the canonical Result retain the last label.
 
 The preview is bounded to 1,000 rows and adds lazy display getters rather than retaining
-another full payload cache. Results and the panel's presentation are caller-owned memory;
+another full payload cache. Each getter decodes only its positional cell through the internal
+canonical decoder; off-screen rows stay undecoded. Results and the panel's presentation are caller-owned memory;
 the new catalog/explain replies remain charged until receipt. Explain does not execute SQL or report
 measured timings. Catalog FTS and trigger entries are definitions, not runtime health.
 

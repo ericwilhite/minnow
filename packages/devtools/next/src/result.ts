@@ -1,4 +1,5 @@
 /** Positional, caller-owned result presentation. Exact values remain in the Result. */
+import { resultCell } from "../../../core/dist/next/owner/result.js";
 import type { Result, Value } from "../../../core/dist/next/owner/api.js";
 import type { QueryRow, QueryValue } from "@minnowdb/core";
 import { createGrid, type GridColumn } from "../../dist/results/grid.js";
@@ -59,7 +60,7 @@ export function resultPresentation(result: Result, limit = NATIVE_PREVIEW_ROWS) 
       ordinal >= columns.length
     )
       throw new RangeError("Invalid native preview position");
-    return result.values(ordinal)[row] ?? null;
+    return resultCell(result, row, ordinal);
   };
   // Bounded row wrappers with lazy display getters. No Result.rows()/tuples() cache,
   // canonical payload copy, per-cell text cache or duplicate-label object lookup.

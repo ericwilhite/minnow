@@ -88,6 +88,58 @@ it("quotes clipboard text without losing label positions or NULL distinction", (
 it("renders catalog and explain as text with no invented runtime health", () => {
   const input: CatalogDescription = {
     ...catalog,
+    tables: [
+      {
+        id: 2,
+        name: "<table>",
+        schemaVersion: 1,
+        managed: false,
+        primaryKey: null,
+        columns: [
+          {
+            id: 3,
+            name: "body<img>",
+            sqlType: "text",
+            typeId: null,
+            autoIncrement: false,
+            nullable: true,
+            defaultSql: null,
+            generatedSql: null,
+            identity: null,
+            enumValues: null,
+          },
+        ],
+        indexes: [],
+        checks: [],
+        foreignKeys: [],
+      },
+    ],
+    fts: [
+      {
+        id: 4,
+        tableId: 2,
+        columnId: 3,
+        tokenizerVersion: 1,
+        rendererVersion: 2,
+        scorerVersion: 1,
+        configVersion: 1,
+      },
+    ],
+    triggers: [
+      {
+        id: 5,
+        name: "<trigger>",
+        tableId: 2,
+        timing: "before",
+        event: "delete",
+        statements: [
+          {
+            sql: "INSERT INTO audit VALUES($1)",
+            bindings: [{ source: "old", columnId: 3, name: "body<img>" }],
+          },
+        ],
+      },
+    ],
     types: [{ id: 1, name: "<script>", labels: ["ok"] }],
     sequences: [
       {
@@ -116,6 +168,9 @@ it("renders catalog and explain as text with no invented runtime health", () => 
   document.body.append(node);
   expect(node.querySelector("script,img")).toBeNull();
   expect(node.textContent).toContain("9007199254740993");
+  expect(node.textContent).toContain("<trigger>: before delete (definition)");
+  expect(node.textContent).toContain("FTS 4: column body<img> (definition only)");
+  expect(node.textContent).not.toMatch(/\b(?:healthy|running|firing)\b/u);
   expect(node.textContent).toContain("definition only");
   expect(node.textContent).toContain("__proto__");
   expect(editorSchema(input).__proto__).toEqual(["a.b"]);

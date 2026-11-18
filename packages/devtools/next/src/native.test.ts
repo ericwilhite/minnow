@@ -56,6 +56,45 @@ function binaryResult(integer: bigint, binary: Uint8Array, nested: boolean) {
     },
   });
 }
+/** JSON bind/source-envelope support is separate from presentation. Use real canonical
+ * C9 JSON/JSONB frames, with the spelling supplied independently by PostgreSQL. */
+function jsonResult(values: readonly [string, string]) {
+  return decodeResult({
+    columns: values.map((_, i) => ({
+      name: i === 0 ? "j" : "b",
+      type: { kind: "json" as const, binary: i === 1 },
+      sqlType: i === 0 ? "json" : "jsonb",
+      nullable: false,
+      render: null,
+    })),
+    frames: [
+      {
+        sequence: 0,
+        rowCount: 1,
+        dictionaries: [],
+        columns: values.map((value) => {
+          const bytes = new TextEncoder().encode(value);
+          return {
+            form: "flat" as const,
+            length: 1,
+            validity: null,
+            data: { layout: "varlen" as const, bytes, offsets: Int32Array.of(0, bytes.length) },
+          };
+        }),
+      },
+    ],
+    summary: {
+      command: "SELECT",
+      rowCount: 1,
+      counts: null,
+      lsn: null,
+      replayed: false,
+      closedEarly: false,
+      transaction: "idle",
+      catalogVersion: 1,
+    },
+  });
+}
 const quote = (name: string) => `"${name.replaceAll('"', '""')}"`;
 for (const seed of seedsFor("next-native-devtools", [46976, 46977]))
   it(`presents canonical data and catalog through the real native facade (${String(seed)})`, async () => {
@@ -120,6 +159,20 @@ for (const seed of seedsFor("next-native-devtools", [46976, 46977]))
                 reach.reach("object last wins");
                 expect(() => result.values(label)).toThrow("ordinal");
               } else reach.reach("empty result");
+              const json = JSON.stringify({ [label]: [coefficient, null, "é漢\n"] });
+              const jsonAuthority = (
+                await pg.query<{ j: string; b: string }>(
+                  "SELECT ($1::json)::text j,($1::jsonb)::text b",
+                  [json],
+                )
+              ).rows[0];
+              if (!jsonAuthority) throw new Error("Missing PostgreSQL JSON spelling");
+              const jsonModel = resultPresentation(jsonResult([jsonAuthority.j, jsonAuthority.b]));
+              expect(jsonModel.value(0, 0)).toBe(jsonAuthority.j);
+              expect(jsonModel.value(0, 1)).toBe(jsonAuthority.b);
+              expect(jsonModel.rows[0]?.["@0"]).toBe(jsonAuthority.j);
+              expect(jsonModel.rows[0]?.["@1"]).toBe(jsonAuthority.b);
+              reach.reach("JSON and JSONB spelling");
               // SQL ARRAY construction is still a typed refusal on this base. The
               // array/BYTEA presentation law uses real decoded C9 frames independently.
               await expect(target.query("SELECT ARRAY[1]")).rejects.toMatchObject({
