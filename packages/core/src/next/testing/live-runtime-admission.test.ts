@@ -53,11 +53,6 @@ for (const seed of seedsFor("next-live-admission-close", [8866, 8867]))
                 }
                 return accepted;
               },
-              takeFrom(source, bytes) {
-                const accepted = cache.takeFrom(source, bytes);
-                trip("adoption");
-                return accepted;
-              },
             };
           });
           void engine.live;
@@ -94,7 +89,18 @@ for (const seed of seedsFor("next-live-admission-close", [8866, 8867]))
                   next: async () => {
                     const frame = await next();
                     trip(frame === null ? "next end" : "next frame");
-                    return frame;
+                    if (frame?.adopt === undefined) return frame;
+                    const adopt = frame.adopt.bind(frame);
+                    return {
+                      ...frame,
+                      adopt(take: Parameters<typeof adopt>[0]) {
+                        // governor.ts law8 and ResultFrame.adopt require atomic ownership change.
+                        // Cancel after the complete capability, never inside cache.takeFrom.
+                        const bytes = adopt(take);
+                        if (bytes !== null) trip("adoption");
+                        return bytes;
+                      },
+                    };
                   },
                 },
                 done: execution.done.then((value) => {
