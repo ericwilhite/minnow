@@ -1,6 +1,7 @@
 /** Concrete low-level root-graph fixture. Funding ports model prepaid test workspace;
  * production owner admission/dispatch remain separate and guarded. */
 import { expect } from "vitest";
+import type { WriteTransaction } from "../access/write-path.js";
 import type { Grant } from "../memory/governor.js";
 import { Governor } from "../memory/governor.js";
 import { StatementImpl } from "../write/transaction.js";
@@ -39,6 +40,7 @@ export async function commandRootFixture(
   published = false,
   cap = 64 << 20,
   reachableOnly = false,
+  beforeStatement?: (tx: WriteTransaction) => Promise<void>,
 ) {
   const core = new StorageCore(256);
   Object.defineProperty(core.harness, "governor", { value: new Governor(cap) });
@@ -48,8 +50,9 @@ export async function commandRootFixture(
     await core.harness.path.recycleLog();
     await core.harness.path.quiesce();
   }
-  const tx = await core.harness.path.begin(),
-    catalog = tx.catalog,
+  const tx = await core.harness.path.begin();
+  await beforeStatement?.(tx);
+  const catalog = tx.catalog,
     stop = new AbortController(),
     signal = stop.signal,
     lowered = core.lowerer.lower(sql, { ...core.context(), catalog });
@@ -188,12 +191,11 @@ export async function commandRootFixture(
     };
   const root = await NativeCommandRoot.create(scope);
   expect(metadata.allocated - before).toBeLessThanOrEqual(setupBytes);
-  let retiring: Promise<void> | null = null;
-  const retire = () =>
-    (retiring ??= (async () => {
+  let retiringStatement: Promise<void> | null = null;
+  const retireStatement = () =>
+    (retiringStatement ??= (async () => {
       await root.close();
       statement.rollback();
-      tx.rollback();
       for (const binding of tables) binding.rules.close();
       nativeReach?.close();
       if (reachGrant) {
@@ -207,6 +209,10 @@ export async function commandRootFixture(
       source.close();
       expect(spill.bytesInUse).toBe(0);
     })());
+  const retire = async () => {
+    await retireStatement();
+    tx.rollback();
+  };
   return {
     core,
     tx,
@@ -220,6 +226,7 @@ export async function commandRootFixture(
     setupBytes,
     nativeReach,
     retire,
+    retireStatement,
     async commit() {
       await root.end();
       const receipt = await tx.commit(null);

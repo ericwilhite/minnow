@@ -73,12 +73,18 @@ for (const seed of seedsFor("next-follow-nested-after", [0xb703, 0xb704]))
                 `CREATE TABLE c(id INT PRIMARY KEY,pid INT UNIQUE REFERENCES p(id)${explicit ? " ON UPDATE CASCADE" : ""}${route === 0 ? ",g INT GENERATED ALWAYS AS(CASE WHEN pid>100 THEN 1 ELSE pid END) STORED,CONSTRAINT child_group_unique UNIQUE(g)" : ""}${route >= 2 ? `,k INT DEFAULT 99 REFERENCES s(id)${route === 2 && explicitCandidate ? "" : " ON UPDATE CASCADE"} ON DELETE SET DEFAULT,marker INT${route === 3 ? ",CONSTRAINT child_k_unique UNIQUE(k)" : ""}` : ""})`,
                 `INSERT INTO p VALUES${Array.from({ length: count }, (_, i) => `(${String(i + 1)})`).join(",")}`,
                 `INSERT INTO c(id,pid${route >= 2 ? ",k,marker" : ""}) VALUES${Array.from({ length: count }, (_, i) => `(${String(i + 1)},${String(i + 1)}${route >= 2 ? `,${String(route === 3 ? i + 1 : i === count - 2 ? 1 : 99)},0` : ""})`).join(",")}`,
+                ...(route === 2
+                  ? [
+                      "CREATE TABLE ri_observer(id INT PRIMARY KEY,k INT REFERENCES s(id) ON UPDATE CASCADE,v INT)",
+                      "INSERT INTO ri_observer VALUES(1,1,0)",
+                    ]
+                  : []),
               ],
               before =
                 route < 2
                   ? `UPDATE audit SET v=v+1 WHERE ${selected}`
                   : route === 2
-                    ? `UPDATE s SET id=id+10 WHERE id=1 AND ${selected}; UPDATE audit SET v=v+1 WHERE ${selected}`
+                    ? `UPDATE s SET id=id+10 WHERE id=1 AND ${selected}; UPDATE ri_observer SET v=1/(k-1) WHERE id=1 AND ${selected}; UPDATE audit SET v=v+1 WHERE ${selected}`
                     : `DELETE FROM s WHERE id<=2 AND ${selected}; UPDATE audit SET v=v+1 WHERE ${selected}`,
               after =
                 route === 1
@@ -131,6 +137,7 @@ for (const seed of seedsFor("next-follow-nested-after", [0xb703, 0xb704]))
                   ) {
                     expect(nestedChildren).toBeGreaterThan(0);
                     reach.reach("nested RI visible to next body");
+                    reach.reach("body expression reads immediate RI");
                   }
                   return out;
                 });

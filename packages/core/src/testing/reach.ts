@@ -10134,6 +10134,7 @@ export const FOLLOW_NESTED_AFTER_REACH = [
   "deferred nested versions checked",
   "explicit PG action unchanged",
   "zero native charge",
+  "body expression reads immediate RI",
 ] as const;
 
 export const FOLLOW_NESTED_PRESSURE_REACH = [
@@ -10161,5 +10162,19 @@ export const FOLLOW_UNIQUE_ALLOCATION_REACH = [
   "frames3",
   "denied before buffers",
   "granted and released once",
+  "zero native charge",
+] as const;
+
+/** Follow's deferred USER AFTER state ends at the statement/savepoint, not transaction close. */
+export const FOLLOW_NESTED_RECOVERY_REACH = [
+  "deferred packets spilled",
+  "cancel after spill",
+  "failed statement inside savepoint",
+  "successful deferred effects before rollback",
+  "rollback to savepoint undoes successful deferred effects",
+  "zero graph charge and spill files before continuation",
+  "prefix and later command commit",
+  "resident",
+  "published",
   "zero native charge",
 ] as const;
