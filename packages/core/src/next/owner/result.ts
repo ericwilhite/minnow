@@ -38,9 +38,10 @@ class NativeResult<TRow> implements Result<TRow> {
   readonly #views = new Map<number, ColumnView>();
   readonly #chunks = new Map<number, readonly ColumnView[]>();
   readonly #values = new Map<number, Value[]>();
-  readonly #rows = new Map<number, TRow>();
+  readonly #completeValues = new Set<number>();
+  readonly #entries = new Map<number, WeakMap<WireFlat, Map<number, Value>>>();
+  readonly #rows: TRow[] = [];
   readonly #dictionaryViews = new Map<number, WireFlat>();
-  #allRows: TRow[] | null = null;
   #tuples: Value[][] | null = null;
   constructor(input: ResultInput) {
     if (input.columns.some((column) => column.type.kind === "locator"))
@@ -173,34 +174,67 @@ class NativeResult<TRow> implements Result<TRow> {
     this.#views.set(index, view);
     return view;
   }
-  values(column: string | number): Value[] {
-    const index = this.#index(column),
-      existing = this.#values.get(index);
-    if (existing) return existing;
-    const meta = required(this.#meta[index]),
-      values: Value[] = [];
-    for (const frame of this.#frames)
-      for (let row = 0; row < frame.rowCount; row++) {
-        const slot = this.#slot(required(frame.columns[index]), row);
-        values.push(
-          valid(slot.flat, slot.row) ? scalarValue(meta, slot.flat.data, slot.row) : null,
-        );
+  #value(column: number, index: number, vector: WireVector, row: number): Value {
+    let values = this.#values.get(column);
+    if (values === undefined) {
+      values = [];
+      this.#values.set(column, values);
+    }
+    if (Object.hasOwn(values, index)) return values[index] ?? null;
+    const slot = this.#slot(vector, row);
+    let value: Value = null;
+    if (valid(slot.flat, slot.row)) {
+      if (vector.form === "flat")
+        value = scalarValue(required(this.#meta[column]), slot.flat.data, slot.row);
+      else {
+        // Decode one entry once, including row(i)-before-values() access. All expansions
+        // and row/tuple projections retain references to that same payload.
+        let entries = this.#entries.get(column);
+        if (entries === undefined) {
+          entries = new WeakMap();
+          this.#entries.set(column, entries);
+        }
+        let decoded = entries.get(slot.flat);
+        if (decoded === undefined) {
+          decoded = new Map();
+          entries.set(slot.flat, decoded);
+        }
+        if (!decoded.has(slot.row))
+          decoded.set(
+            slot.row,
+            scalarValue(required(this.#meta[column]), slot.flat.data, slot.row),
+          );
+        value = required(decoded.get(slot.row));
       }
-    this.#values.set(index, values);
+    }
+    values[index] = value;
+    return value;
+  }
+  values(column: string | number): Value[] {
+    const index = this.#index(column);
+    if (!this.#completeValues.has(index)) {
+      let offset = 0;
+      for (const frame of this.#frames) {
+        const vector = required(frame.columns[index]);
+        for (let row = 0; row < frame.rowCount; row++)
+          this.#value(index, offset + row, vector, row);
+        offset += frame.rowCount;
+      }
+      this.#completeValues.add(index);
+    }
+    let values = this.#values.get(index);
+    if (values === undefined) {
+      values = [];
+      this.#values.set(index, values);
+    }
     return values;
   }
   row(index: number): TRow {
-    const at = this.#locate(index);
-    if (this.#rows.has(index)) return required(this.#rows.get(index));
+    const at = this.#locate(index); // Validate even when no columns exist.
+    if (Object.hasOwn(this.#rows, index)) return required(this.#rows[index]);
     const row = {} as Record<string, Value>;
     this.columns.forEach((column, k) => {
-      const cached = this.#values.get(k),
-        slot = this.#slot(required(at.frame.columns[k]), at.row);
-      const value = cached
-        ? cached[index]
-        : valid(slot.flat, slot.row)
-          ? scalarValue(required(this.#meta[k]), slot.flat.data, slot.row)
-          : null;
+      const value = this.#value(k, index, required(at.frame.columns[k]), at.row);
       Object.defineProperty(row, column.name, {
         value,
         enumerable: true,
@@ -208,11 +242,12 @@ class NativeResult<TRow> implements Result<TRow> {
         configurable: true,
       });
     });
-    this.#rows.set(index, row as TRow);
+    this.#rows[index] = row as TRow;
     return row as TRow;
   }
   rows(): TRow[] {
-    return (this.#allRows ??= Array.from({ length: this.rowCount }, (_, i) => this.row(i)));
+    for (let i = 0; i < this.rowCount; i++) this.row(i);
+    return this.#rows;
   }
   tuples(): Value[][] {
     return (this.#tuples ??= Array.from({ length: this.rowCount }, (_, i) =>

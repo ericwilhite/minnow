@@ -7,7 +7,11 @@
  * - A `Result` holds the transferred frames (frame.ts) as they arrived. `column()` and
  *   `columnChunks()` give typed views over those buffers without copying (except `column()` on a
  *   multi-frame result, which concatenates once and caches).
+ * - A completed ordinary Result is caller-owned memory: its transferred/cloned frames and
+ *   lazy views/rows are outside the engine's working-memory cap. The engine retains no pooled
+ *   buffer alias. Live stores retained by the engine remain charged.
  * - Row objects, tuples and decoded JS values are built only when asked for, and cached.
+ *   Rows and tuples reference the same decoded per-column values, including shared entries.
  * - JS values follow DECISIONS.md: BIGINT → `bigint` (D2); COUNT and SUM(int2/int4) → `number`
  *   (`WireColumnMeta.render`); NUMERIC, DATE, TIME, TIMESTAMP(TZ) (ISO, six fraction digits, D1),
  *   INTERVAL, UUID, JSON/JSONB → `string`; REAL/DOUBLE → `number`; BYTEA → `Uint8Array`; arrays

@@ -9652,3 +9652,23 @@ export const PUBLIC_CONNECT_REACH = [
 ] as const;
 
 export const PUBLIC_CONNECT_CLOSE_REACH = ["blocked", "reentrant"] as const;
+
+/** Caller-owned Result projections reuse one decoded payload per dictionary/constant entry. */
+export const PUBLIC_RESULT_RETENTION_REACH = [
+  "dictionary entry shared",
+  "constant entry shared",
+  "nested array shared",
+  "bytea shared",
+  "row before values",
+  "tuples before values",
+  "views only on explicit request",
+] as const;
+
+/** Ordinary delivery relinquishes engine charge without recycling caller-held buffers. */
+export const PUBLIC_RESULT_OWNERSHIP_REACH = [
+  "delivered frame charge released",
+  "actual native return-pool reuse",
+  "held Results survive zero owner charge",
+  "small cloned delivery",
+  "large transferred delivery",
+] as const;
