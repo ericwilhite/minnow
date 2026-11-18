@@ -5039,3 +5039,13 @@ later producer rejection cannot escape as an unhandled rejection. This does not 
 for the producer before reporting cancellation; native source and image cleanup still
 fence outstanding borrows separately. Owner cancel-versus-commit and lost-reply policy
 remain separate qualification work; this does not enable SQL firing.
+
+The native owner funding controller uses the real statement's protected-step witness and
+the same governor. It reserves retained root metadata, parameters, rule workspace and the
+next source once, then transfers only fresh credit. A changed native footprint retries
+funding alone; it never retries SQL or a default/generated expression. Rule credit remains
+protected while image metadata is funded. Source/image producers and progress loans must
+retire before a fresh wait. Premature root-account close refuses to uncharge live callers.
+Generated histories cover both existing admission modes, invalidation, competing grants,
+cancellation and cleanup on the real native boundary. This controller alone does not wire
+owner SQL dispatch or enable trigger firing.

@@ -11479,3 +11479,18 @@ export const PIPELINE_ABORT_WAIT_REACH = [
   "settled producer",
   "original cancellation reason",
 ] as const;
+
+export const NATIVE_ROOT_CREDITS_REACH = [
+  "control precharged",
+  "rule workspace protected from image funding",
+  "complete private mode",
+  "ordinary reserve mode",
+  "root floor included once",
+  "invalidated funding retried",
+  "loan cannot span funding",
+  "source cannot span funding",
+  "temporary pressure cancels",
+  "temporary pressure waits",
+  "premature close preserves ownership",
+  "zero root ownership",
+] as const;
