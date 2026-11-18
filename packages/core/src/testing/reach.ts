@@ -9708,3 +9708,13 @@ export const PUBLIC_SESSION_OUTCOME_REACH = [
 ] as const;
 
 export const PUBLIC_SESSION_FLAGS_REACH = ["default", "missing", "null", "wrongflag"] as const;
+
+/** Internal per-store boot: each selected backend reaches the real owner and drains its lease. */
+export const PUBLIC_STORE_ENTRY_REACH = [
+  "memory native worker",
+  "indexeddb native worker",
+  "opfs native worker",
+  "exact worker rows",
+  "captured lifecycle policy",
+  "worker lease and charge cleanup",
+] as const;

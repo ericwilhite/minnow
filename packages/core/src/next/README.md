@@ -4515,7 +4515,7 @@ Connection prepared handles use a bounded governor-charged cache, rather than ho
 outside its original cache's charge. Executions include the original SQL as an exact fallback
 for eviction or reconnection, under the same protocol sequence and ledger identity. Private-DDL
 preparation runs in its session and does not retain the private plan beyond that session cache.
-The unreleased protocol profile is 7 for these optional owner-side call guards/session binding;
+The unreleased protocol profile is 8 for these optional owner-side call guards/session binding;
 this changes no stored bytes or published package entry. Raw id-only execution requires a live
 cached handle; the internal facade always supplies fallback SQL.
 
@@ -4563,3 +4563,16 @@ It does not wait for a user callback that may itself await close. Closing fences
 scoped SQL/prepared/cursor entry with `ClientClosedError`; an already committed
 terminal reply still determines the outcome. These bindings remain internal pending
 cutover; no public entry, option default or stored format changed.
+
+### Internal cutover entries (B6)
+
+`owner/entries/storage/{memory,indexeddb,opfs,auto}` exposes native backends only.
+Matching worker entries add the explicit `installNativeOwnerWorker` recipe; import
+does not install a handler. The application provides the backend namespace and worker
+wrapper. `owner/entries/client` adds `connectNativeWorkerClient`: one existing
+election/protocol lifecycle, explicit worker factory/broker/context/locks, no engine
+in the client bundle. Native auto selection retains legacy-data/conflict refusal.
+No 0.x BlockStore cast, manifest/export/default change or public memory default.
+The packed cutover must qualify native registration side effects (`lower/window-inputs`).
+Named lowering imports retain that registration today; the 0.x sideEffects list still
+produces a bare-import warning when bundling internal native worker sources.
