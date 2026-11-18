@@ -102,6 +102,7 @@ export default tseslint.config(
       // Node-only bundle inspection and real worker-thread qualification; never shipped.
       "packages/core/src/next/owner/client-isolation.test.ts",
       "packages/core/src/next/owner/entries.test.ts",
+      "packages/core/src/next/testing/worker-bundles.test.ts",
       "packages/core/src/next/testing/public-worker-boot.test.ts",
       // Reads executor sources to reject variable-size native argument lists. Test only.
       "packages/core/src/next/exec/call-spreads.test.ts",

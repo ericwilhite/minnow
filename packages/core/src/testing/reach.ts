@@ -9746,3 +9746,12 @@ export const NATIVE_EXPORT_REACH = [
   "duplicate columns",
   "cancel closes cursor",
 ] as const;
+
+export const NATIVE_WORKER_BUNDLE_REACH = [
+  "variable lag",
+  "variable lead",
+  "lazy default",
+  "signed row offset",
+  "minified real entry SQL",
+  "native cleanup",
+] as const;

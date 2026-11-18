@@ -109,9 +109,12 @@ function completeWindowInputs(
       : { fallbackExpression: defaultInput(metadata.fallbackExpression) }),
   });
 }
-registerWindowInputs({
-  read: windowInputsOf,
-  map: mapWindowInputs,
-  parse: typedWindowShift,
-  complete: completeWindowInputs,
-});
+/** A used value import keeps the private grammar reachable under sideEffects:false. */
+export function installWindowInputs(): void {
+  registerWindowInputs({
+    read: windowInputsOf,
+    map: mapWindowInputs,
+    parse: typedWindowShift,
+    complete: completeWindowInputs,
+  });
+}

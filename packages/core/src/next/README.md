@@ -4573,6 +4573,6 @@ wrapper. `owner/entries/client` adds `connectNativeWorkerClient`: one existing
 election/protocol lifecycle, explicit worker factory/broker/context/locks, no engine
 in the client bundle. Native auto selection retains legacy-data/conflict refusal.
 No 0.x BlockStore cast, manifest/export/default change or public memory default.
-The packed cutover must qualify native registration side effects (`lower/window-inputs`).
-Named lowering imports retain that registration today; the 0.x sideEffects list still
-produces a bare-import warning when bundling internal native worker sources.
+Native parsing explicitly installs its window-input hooks through a used value import.
+It does not rely on bare module side effects surviving package tree shaking. Minified
+worker-entry execution tests cover row-dependent LAG/LEAD and lazy defaults.
