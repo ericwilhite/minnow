@@ -80,6 +80,16 @@ guarded while owner admission and dispatch are integrated. Fixed decoder workspa
 Wide native OLD-row reads now close their decoder and pin and return unused producer credit
 before funding a larger ordinary read step. They no longer mistake that step for a value-sized
 reserve loan. Cancellation waits for readmission cleanup.
+Native OLD-image capture now funds its actual source at a fresh boundary. A resident
+point read retains only its requested chunk after funding; a published read funds its
+actual decoder growth. It no longer reserves a maximum-size published reader for every
+small resident row. Retries reject a changed statement prefix and release source pins
+and reservations before waiting for more credit. Source sizing also uses the measured
+size of a short input instead of reserving output for absent rows. Oversized rows keep
+their complete measured allowance. Input-only producers no longer reserve an unused
+second modification spool, and a single complete-key probe avoids redundant locator sorting.
+Queries sharing the writer's memory budget can also use the charged mixed-source
+reader after a modification leaves both published rows and a new memory tail.
 The private native write owner now supplies a cancellable, invalidatable memory boundary.
 It stabilizes writer/storage holdings before root funding, counts their protected memory
 once, and preserves separate image and rule workspace. This does not enable SQL triggers.

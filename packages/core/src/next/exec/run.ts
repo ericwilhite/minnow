@@ -265,6 +265,7 @@ export class QueryRuntime {
     // A buffered producer cannot offer a frame before its delivery handoff. Keep only
     // bounded empty-sink metadata, rather than an unused full consumer byte window.
     const spool =
+      this.modifyOutput !== null &&
       this.plan.root.op === "modify" &&
       this.plan.root.returning === null &&
       this.plan.root.kind !== "upsert" &&
@@ -377,7 +378,7 @@ export class QueryRuntime {
       this.signal.throwIfAborted();
       if (this.#closed) throw new QueryCancelledError();
       if (!table.prepareRead) return;
-      if (this.plan.root.op !== "modify") {
+      if (this.plan.root.op !== "modify" && table.segments.length === 1) {
         const recipe = table.prepareRead();
         if (recipe) {
           this.#sourceRecipes.set(tableId, recipe);

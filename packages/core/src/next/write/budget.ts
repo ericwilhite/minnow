@@ -60,8 +60,10 @@ export class MetadataBudget implements ByteBudget {
 
   tryAllocate(bytes: number): boolean {
     if (bytes > this.capBytes) return false;
-    if (this.grant.allocate(bytes)) return true;
-    return this.reclaimWriter() > 0 && this.grant.allocate(bytes);
+    if (!this.grant.allocate(bytes) && !(this.reclaimWriter() > 0 && this.grant.allocate(bytes)))
+      return false;
+    if (bytes) this.changed?.();
+    return true;
   }
 
   allocate(bytes: number): boolean {

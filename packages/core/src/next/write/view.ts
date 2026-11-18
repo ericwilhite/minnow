@@ -48,6 +48,7 @@ import {
   type TableReadOptions,
   type TableSnapshot,
   type TableReadRecipe,
+  type TableReadRecipeOptions,
 } from "../access/snapshot.js";
 import type { ByteBudget, SpacePin } from "../access/space.js";
 import type {
@@ -341,6 +342,7 @@ class MemorySegmentImpl implements MemorySegment {
   borrowed = -1;
   #reads: MemoryReads | null = null;
   #retained: readonly MemoryColumn[] | null = null;
+  #retainedChunk = -1;
 
   #storedIndex(columnId: number): number {
     // The ordinary path keeps its O(1) lookup. Only a catalog-only ALTER needs remapping.
@@ -350,23 +352,29 @@ class MemorySegmentImpl implements MemorySegment {
   }
 
   /** One existing owner-charged chunk. Never captures a flat view across append growth. */
-  retainResident(): (() => void) | null {
+  retainResident(chunk?: number): (() => void) | null {
+    const index = chunk ?? 0;
     if (
       this.rowCount < 1 ||
-      this.rowCount > MEMORY_CHUNK_ROWS ||
+      (chunk === undefined && this.rowCount > MEMORY_CHUNK_ROWS) ||
+      !Number.isSafeInteger(index) ||
+      index < 0 ||
+      index * MEMORY_CHUNK_ROWS >= this.rowCount ||
       this.memtable.published !== null ||
       this.#retained
     )
       return null;
-    const columns = this.memtable.chunks.map((list) => need(list[0]));
-    this.memtable.borrow(0, this.borrowed);
-    this.borrowed = 0;
+    const columns = this.memtable.chunks.map((list) => need(list[index]));
+    this.memtable.borrow(index, this.borrowed);
+    this.borrowed = index;
     this.#retained = columns;
+    this.#retainedChunk = index;
     return () => this.releaseResident();
   }
   releaseResident(): void {
     if (this.#retained === null) return;
     this.#retained = null;
+    this.#retainedChunk = -1;
     this.#reads?.invalidateHints();
     if (this.borrowed >= 0) this.memtable.unborrow(this.borrowed);
     this.borrowed = -1;
@@ -381,7 +389,7 @@ class MemorySegmentImpl implements MemorySegment {
       // Staged replay must remain lazy at open. The group's validated ID list, not
       // the current catalog used to construct its wrapper, owns physical membership.
       publishedMissing: (id) => missingScalar(need(this.view.column(id))),
-      retained: (chunk) => chunk === 0 && this.#retained !== null,
+      retained: (chunk) => chunk === this.#retainedChunk && this.#retained !== null,
       ...(this.memtable.schemaVersion === this.view.schemaVersion
         ? {}
         : {
@@ -389,8 +397,12 @@ class MemorySegmentImpl implements MemorySegment {
               this.#storedIndex(id) >= 0 ? null : missingScalar(need(this.view.column(id))),
           }),
       resident: (columnId, chunk) => {
-        const retained = chunk === 0 ? this.#retained?.[this.#storedIndex(columnId)] : undefined;
-        if (retained) return retained.view(this.rowCount);
+        const retained =
+          chunk === this.#retainedChunk ? this.#retained?.[this.#storedIndex(columnId)] : undefined;
+        if (retained)
+          return retained.view(
+            Math.min(MEMORY_CHUNK_ROWS, this.rowCount - chunk * MEMORY_CHUNK_ROWS),
+          );
         if (this.memtable.published !== null) return null;
         const stored = this.memtable.chunks[this.#storedIndex(columnId)]?.[chunk];
         if (stored === undefined) throw new RangeError("A memtable chunk is missing");
@@ -472,6 +484,8 @@ class MemorySegmentImpl implements MemorySegment {
 
   portableChunk(columnId: number, chunk: number): MaybePromise<PortableChunk> {
     this.view.snapshot.checkRead();
+    if (this.#retained !== null && chunk !== this.#retainedChunk)
+      throw new RangeError("A point source recipe only retains its selected chunk");
     const first = chunk * MEMORY_CHUNK_ROWS;
     const length = Math.min(MEMORY_CHUNK_ROWS, this.rowCount - first);
     if (!(Number.isInteger(chunk) && chunk >= 0 && length > 0))
@@ -513,6 +527,8 @@ class MemorySegmentImpl implements MemorySegment {
   ): MaybePromise<ChunkResult> {
     this.view.snapshot.checkRead();
     if (step !== undefined) return this.#bounded().chunk(columnId, chunk, out, startRow, step);
+    if (this.#retained !== null && chunk !== this.#retainedChunk)
+      throw new RangeError("A point source recipe only retains its selected chunk");
     const first = chunk * MEMORY_CHUNK_ROWS;
     const length = Math.min(MEMORY_CHUNK_ROWS, this.rowCount - first);
     if (!(length > 0)) throw new RangeError(`Chunk ${String(chunk)} is outside the segment`);
@@ -713,17 +729,31 @@ export class TableSnapshotImpl implements TableSnapshot {
   /** Admission fallback: retain one existing chunk per native tail. No-options callers
    * keep the single-segment contract; multiple tails require prepaid metadata.
    * Query close and snapshot close both release retention. */
-  prepareRead(options?: { readonly budget: ByteBudget }): TableReadRecipe | null {
+  prepareRead(options?: TableReadRecipeOptions): TableReadRecipe | null {
     const segments = this.segments;
+    const locator = options?.locator;
+    const selected = locator === undefined ? null : Math.floor(locator / 65536);
+    if (
+      locator !== undefined &&
+      (!Number.isSafeInteger(locator) ||
+        locator < 0 ||
+        !segments[selected ?? -1] ||
+        locator % 65536 >= need(segments[selected ?? -1]).rowCount)
+    )
+      throw new RangeError("Invalid source-recipe locator");
     let memory = 0;
-    for (const segment of segments)
-      if (segment instanceof MemorySegmentImpl && segment.rowCount > 0) memory++;
+    if (selected !== null) {
+      if (segments[selected] instanceof MemorySegmentImpl) memory = 1;
+    } else
+      for (const segment of segments)
+        if (segment instanceof MemorySegmentImpl && segment.rowCount > 0) memory++;
     if (memory === 0 || (segments.length !== 1 && options === undefined)) return null;
     // A source may contain stored groups and several small native tails. Retain
     // only each tail's existing single chunk, all still charged to the write owner.
     // The query prepays every retained-column reference, replacement and close token.
     const bytes = options ? 8192 + memory * (1024 + this.columns.length * 16) : 0;
     if (bytes > 0 && !options?.budget.allocate(bytes)) return null;
+    const chosen = selected === null ? segments : [need(segments[selected])];
     const closes: Array<() => void> = [];
     const replacements = new Map<number, GroupSegment>();
     let live = true;
@@ -736,11 +766,13 @@ export class TableSnapshotImpl implements TableSnapshot {
       if (bytes > 0) options?.budget.free(bytes);
     };
     try {
-      for (const segment of segments) {
+      for (const segment of chosen) {
         if (!(segment instanceof MemorySegmentImpl) || segment.rowCount === 0) continue;
         const published = segment.memtable.published;
         if (published === null) {
-          const end = segment.retainResident();
+          const end = segment.retainResident(
+            locator === undefined ? undefined : Math.floor((locator % 65536) / MEMORY_CHUNK_ROWS),
+          );
           if (end === null) {
             close();
             return null;

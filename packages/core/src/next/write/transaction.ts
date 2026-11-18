@@ -957,18 +957,24 @@ export class StatementImpl implements Statement {
     if (this.#ownReads !== null) this.#mutation++;
   }
 
-  readOwn(): SnapshotImpl {
+  /** Metadata-only data-phase fence. Unlike a pin it retains no native reader or
+   * source; callers use it while unwinding and re-funding a representation retry. */
+  readOwnCheck(): () => void {
     this.#checkOpen();
+    this.#ownReads ??= new Set();
     const mutation = this.#mutation;
-    const view = this.#fresh(
-      () => this.#ownReads?.delete(view),
-      () => {
-        if (mutation !== this.#mutation)
-          throw new TransactionStateError(
-            "A current-prefix pin is locator-only after mutation begins",
-          );
-      },
-    );
+    return () => {
+      this.#checkOpen();
+      if (mutation !== this.#mutation)
+        throw new TransactionStateError(
+          "A current-prefix pin is locator-only after mutation begins",
+        );
+    };
+  }
+
+  readOwn(): SnapshotImpl {
+    const checkRead = this.readOwnCheck();
+    const view = this.#fresh(() => this.#ownReads?.delete(view), checkRead);
     (this.#ownReads ??= new Set()).add(view);
     (this.#ownOrigins ??= new WeakSet()).add(view);
     return view;

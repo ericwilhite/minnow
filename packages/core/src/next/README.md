@@ -4817,3 +4817,19 @@ check before admission and allocation, and retire provisional funding before ret
 changed boundary. Never replay SQL. Release the boundary before execution/statement end;
 use the command's cancellation signal for execution. This internal API does not enable SQL
 triggers or change the released API or stored format.
+
+Native OLD-image capture starts with descriptor and point-recipe metadata, not a
+publication-worst-case decoder. `TableSnapshot.prepareRead({budget, locator})` retains
+only the selected existing owner-charged memory chunk after funding; an already
+published source uses its group reader. Exact decode growth retries only after the
+recipe, decoder, pin and unused source credit retire. A metadata-only statement phase
+fence prevents fresh funding from rereading a logically changed prefix. Generated
+32MiB compound-owner tests cover exact payloads, cancellation, publication and phase
+invalidation. Memory-source output bounds use the smaller measured logical input,
+with each oversized row still covered in full; shifted-prefix generators check that
+refinement against native hints. Source alternatives also account for a query sharing
+the native writer's governor, without treating temporary pressure as an intrinsic
+refusal. Multi-segment queries prepay the existing mixed-source recipe metadata;
+the single-segment shortcut remains available. Input-only producers do not reserve a second, unused generic modification
+spool. Single complete-key probes use their existing row-ID order; multiple probes
+and composite prefixes keep the bounded locator sort. SQL trigger dispatch remains guarded.

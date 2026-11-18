@@ -22,7 +22,16 @@ for (const seed of seedsFor("next-native-write-owner-step", [0xb70f, 0xb710]))
       fc.asyncProperty(
         fc.constantFrom(32, 64),
         fc.boolean(),
-        fc.constantFrom("release", "cancel", "close", "grow", "oversize", "misuse", "metadata"),
+        fc.constantFrom(
+          "release",
+          "cancel",
+          "close",
+          "grow",
+          "oversize",
+          "misuse",
+          "metadata",
+          "try-metadata",
+        ),
         fc.integer({ min: 1, max: 16 }),
         async (cap, progress, phase, units) => {
           reach.beginHistory();
@@ -239,11 +248,14 @@ for (const seed of seedsFor("next-native-write-owner-step", [0xb70f, 0xb710]))
                 expect(settled).toBe(false);
                 reach.reach("native metadata invalidates funding");
               }
-              if (phase === "metadata") {
+              if (phase === "metadata" || phase === "try-metadata") {
                 const budget = native.metadata;
                 if (!budget) throw Error("native metadata budget");
                 const delta = units * 1024;
-                expect(budget.allocate(delta)).toBe(true);
+                expect(
+                  phase === "try-metadata" ? budget.tryAllocate(delta) : budget.allocate(delta),
+                ).toBe(true);
+                if (phase === "try-metadata") reach.reach("optional metadata invalidates funding");
                 native.buffer = new Uint8Array(delta);
                 native.buffer[0] = 41;
                 if (progress) {
@@ -345,6 +357,8 @@ for (const seed of seedsFor("next-native-write-owner-step", [0xb70f, 0xb710]))
           [64, true, "misuse", 2],
           [64, true, "metadata", 2],
           [32, false, "metadata", 2],
+          [64, true, "try-metadata", 2],
+          [32, false, "try-metadata", 3],
         ],
       },
     );

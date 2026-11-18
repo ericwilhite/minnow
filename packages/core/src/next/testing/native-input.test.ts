@@ -1,7 +1,7 @@
 /** Law: COMPLETE MODIFY input uses the root's native workspace and retains a successful
  * source prefix before a terminal data error; it never mutates or ends the statement. */
 import fc from "fast-check";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import {
   createReach,
@@ -36,7 +36,8 @@ for (const seed of seedsFor("next-native-input", [0xb659, 0xb65a]))
         fc.integer({ min: 1, max: 9 }),
         fc.boolean(),
         fc.boolean(),
-        async (kind, n, published, dataError) => {
+        fc.boolean(),
+        async (kind, n, published, dataError, multiProbe) => {
           reach.beginHistory();
           const core = await new StorageCore(16).open();
           let program: NativeInputProgram | null = null,
@@ -56,9 +57,13 @@ for (const seed of seedsFor("next-native-input", [0xb659, 0xb65a]))
               kind === 0
                 ? `INSERT INTO t VALUES(4,$1),(5,${dataError ? "1/0" : "$1+1"})`
                 : kind === 1
-                  ? "UPDATE t SET v=v+$1 WHERE id=2"
+                  ? multiProbe
+                    ? "UPDATE t SET v=v+$1 WHERE id IN(2,3)"
+                    : "UPDATE t SET v=v+$1 WHERE id=2"
                   : kind === 2
-                    ? "DELETE FROM t WHERE id=$1"
+                    ? multiProbe
+                      ? "DELETE FROM t WHERE id IN($1,1)"
+                      : "DELETE FROM t WHERE id=$1"
                     : "UPDATE t SET v=v+$1 WHERE v>0";
             const lowered = core.lowerer.lower(sql, core.context());
             if (lowered.kind !== "modify") throw new Error("modify");
@@ -92,6 +97,21 @@ for (const seed of seedsFor("next-native-input", [0xb659, 0xb65a]))
               prepareMetadata: async (bytes, signal) => {
                 if (!(await meta.makeRoom?.(bytes, signal))) throw new Error("metadata minimum");
               },
+            });
+            const admit = query.admitGroup.bind(query);
+            vi.spyOn(query, "admitGroup").mockImplementation((options) => {
+              for (const part of options.grants)
+                if (part.label.endsWith("/result/minimum"))
+                  expect(
+                    part.minimumBytes,
+                    "input-only producer owns no generic modify spool",
+                  ).toBe(0);
+              if ((kind === 1 || kind === 2) && options.label.endsWith("/fixed-buffers")) {
+                const sorted = options.grants.some((p) => /\/sort#[0-9]+\/minimum$/u.test(p.label));
+                expect(sorted, "only multiple probes need locator restoration").toBe(multiProbe);
+                reach.reach(multiProbe ? "multiple probe sort" : "single probe already ordered");
+              }
+              return admit(options);
             });
             const native = Object.freeze(numbers(I32, [n]));
             const seen: unknown[][] = [];
@@ -135,13 +155,30 @@ for (const seed of seedsFor("next-native-input", [0xb659, 0xb65a]))
               const failure = kind === 0 && dataError;
               expect(error?.sqlState ?? null).toBe(failure ? "22012" : null);
               const count =
-                kind === 0 ? (failure ? 1 : 2) : kind === 1 ? 1 : kind === 2 ? (n <= 3 ? 1 : 0) : 3;
+                kind === 0
+                  ? failure
+                    ? 1
+                    : 2
+                  : kind === 1
+                    ? multiProbe
+                      ? 2
+                      : 1
+                    : kind === 2
+                      ? multiProbe
+                        ? n > 1 && n <= 3
+                          ? 2
+                          : 1
+                        : n <= 3
+                          ? 1
+                          : 0
+                      : 3;
               expect(seen).toHaveLength(count);
               if (kind === 0) {
                 expect(seen[0]).toEqual([4, n]);
                 if (!failure) expect(seen[1]).toEqual([5, n + 1]);
               }
-              if (kind === 1) expect(seen[0]?.[1]).toBe(20 + n);
+              if (kind === 1)
+                expect(seen.map((row) => row[1])).toEqual(multiProbe ? [20 + n, 30 + n] : [20 + n]);
               if (kind === 3) expect(seen.map((row) => row[1])).toEqual([10 + n, 20 + n, 30 + n]);
               if (failure) reach.reach("terminal error prefix");
               else reach.reach("successful prefix");
@@ -151,6 +188,7 @@ for (const seed of seedsFor("next-native-input", [0xb659, 0xb65a]))
               if (native.data.layout === "i32") expect(native.data.values[0]).toBe(n);
               expect(pin.released).toBe(false);
               reach.reach("parameters retired before apply");
+              reach.reach("no unused modification spool");
             } finally {
               await program.close();
               program = null;

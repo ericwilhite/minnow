@@ -10253,6 +10253,9 @@ export const NATIVE_INPUT_REACH = [
   "parameters retired before apply",
   "no writes",
   "zero ownership",
+  "no unused modification spool",
+  "multiple probe sort",
+  "single probe already ordered",
 ] as const;
 
 export const NATIVE_BODY_HOST_REACH = [
@@ -10656,6 +10659,7 @@ export const NATIVE_WRITE_STEP_REACH = [
   "native footprint equals protected holdings",
   "private native metadata progresses",
   "ordinary native metadata waits",
+  "optional metadata invalidates funding",
 ] as const;
 
 export const NATIVE_WRITE_STEP_BORROW_REACH = [
@@ -10751,4 +10755,67 @@ export const MUTATION_ERRORS_REACH = [
   "cause depth bounded",
   "unicode cause",
   "zero native charge",
+] as const;
+
+export const NATIVE_PREFIX_MINIMUM_REACH = [
+  "published",
+  "resident",
+  "payload",
+  "empty payload",
+  "protected compound minimum at 32MiB",
+  "no pin across funding",
+  "exact PostgreSQL payload",
+  "zero ownership",
+] as const;
+
+export const NATIVE_PREFIX_MINIMUM_LIFETIME_REACH = [
+  "logical mutation rejected",
+  "cancelled funding",
+  "publication retry preserves prefix",
+  "wider funding boundary",
+  "initial funding boundary",
+  "zero ownership",
+] as const;
+
+export const NATIVE_PREFIX_POINT_RECIPE_REACH = [
+  "owner-charged publication retention",
+  "published",
+  "resident",
+  "second chunk",
+  "third chunk",
+  "exact selected row",
+  "zero ownership",
+] as const;
+
+export const NATIVE_PREFIX_OUTPUT_BOUND_REACH = [
+  "retained",
+  "publication-stable hint",
+  "one row",
+  "several rows",
+  "oversized row",
+  "short source below target",
+  "all shifted prefixes covered",
+  "zero ownership",
+] as const;
+
+export const NATIVE_QUERY_SOURCE_PRESSURE_REACH = [
+  "published",
+  "resident",
+  "one row",
+  "several rows",
+  "compound minimum before admission",
+  "exact PostgreSQL rows",
+  "zero ownership",
+  "indexed order",
+  "plain order",
+  "resident indexed order",
+  "mixed source",
+] as const;
+
+export const NATIVE_INPUT_PROBE_ORDER_REACH = [
+  "single complete key",
+  "multiple probes",
+  "composite prefix",
+  "non-key insertion order",
+  "zero ownership",
 ] as const;

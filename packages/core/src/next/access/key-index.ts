@@ -77,7 +77,9 @@ export interface IndexReader {
    * `desc`). `ordered` indexes only; an `equality` index throws `TypeError` (use `probe`).
    */
   range(range: KeyRange, direction: "asc" | "desc"): IndexCursor;
-  /** Streaming equality-prefix probe, including equality-only indexes. Key stays immutable through close. */
+  /** Streaming equality-prefix probe, including equality-only indexes. A complete
+   * key emits matches in increasing row-id/locator order; a partial composite key
+   * may span keys. Key stays immutable through close. */
   planProbe?(key: Uint8Array): IndexRangePlan;
   /** Plan without native allocations or admission; range bounds must remain immutable. */
   planRange?(range: KeyRange, direction: "asc" | "desc"): IndexRangePlan;
