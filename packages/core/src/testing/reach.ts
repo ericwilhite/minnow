@@ -7660,6 +7660,8 @@ export const WRITE_MERGE_RETIREMENT_REACH = [
 ] as const;
 
 export const MODIFY_PROGRESS_REACH = [
+  "first seeded history",
+  "second seeded history",
   "finished merge credit retired",
   "healthy merge completion",
   "64 MiB",

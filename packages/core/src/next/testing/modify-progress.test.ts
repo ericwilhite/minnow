@@ -1,6 +1,6 @@
 /** access/modify.ts memory contract: one statement, bounded charged input, no producer/writer hold-and-wait. */
 import fc from "fast-check";
-import { expect, it, vi } from "vitest";
+import { afterAll, expect, it, vi } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach, MODIFY_PROGRESS_REACH } from "../../testing/reach.js";
 import { WriteCredits } from "../write/credits.js";
@@ -10,12 +10,31 @@ import { watchGrants } from "../write/test-support.js";
 import { StorageCore } from "./storage-core.js";
 import { oracleRows } from "./differential-adapter.js";
 
-it.each(seedsFor("next-modify-progress", [0xb5ba]))(
-  "completes large modifications at 64 MiB with retired producer reservations (seed %i)",
-  async (seed) => {
-    const reach = createReach("modification progress", MODIFY_PROGRESS_REACH);
-    await fc.assert(
-      fc.asyncProperty(fc.integer({ min: 1, max: 3 }), async (delta) => {
+const historyPaths = ["0", "1"] as const;
+const campaigns = seedsFor("next-modify-progress", [0xb5ba]).map((seed) => ({
+  seed,
+  reach: createReach("modification progress", MODIFY_PROGRESS_REACH),
+  completed: new Map<string, { count: number; delta: number }>(),
+}));
+
+afterAll(() => {
+  for (const { seed, completed, reach } of campaigns) {
+    for (const path of historyPaths)
+      expect(
+        completed.get(path)?.count,
+        `one full history per 120000ms test budget: seed ${String(seed)}, path ${path}`,
+      ).toBe(1);
+    expect(completed.size, "both original generated histories must run").toBe(2);
+    expect([...completed.keys()].sort(), "both original replay paths must run").toEqual(["0", "1"]);
+    reach.assertReached();
+  }
+});
+
+for (const path of historyPaths)
+  for (const campaign of campaigns)
+    it(`completes large modifications at 64 MiB with retired producer reservations (seed ${String(campaign.seed)}, history ${path})`, async () => {
+      const { seed, reach, completed } = campaign;
+      const property = fc.asyncProperty(fc.integer({ min: 1, max: 3 }), async (delta) => {
         reach.beginHistory();
         const core = new StorageCore(256);
         Object.defineProperty(core.harness, "governor", { value: new Governor(64 * 1024 * 1024) });
@@ -149,10 +168,14 @@ it.each(seedsFor("next-modify-progress", [0xb5ba]))(
         ).toBeNull();
         expect(core.harness.path.maintenance.merges).toBeGreaterThan(0);
         reach.reach("healthy merge completion");
-      }),
-      { seed, numRuns: 2 },
-    );
-    reach.assertReached();
-  },
-  120000,
-);
+        const previous = completed.get(path);
+        completed.set(path, { count: (previous?.count ?? 0) + 1, delta });
+        reach.reach(path === "0" ? "first seeded history" : "second seeded history");
+      });
+      await fc.assert(property, { seed, numRuns: 1, path });
+      // Replay paths partition the original two draws without changing their RNG or shrinking.
+      const expected = fc.sample(property, { seed, numRuns: 2 })[Number(path)];
+      expect(completed.get(path)?.delta, "the original seeded draw is preserved").toBe(
+        expected?.[0],
+      );
+    }, 120000);

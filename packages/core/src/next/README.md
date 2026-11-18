@@ -157,6 +157,12 @@ between pieces of the same call; uniqueness, foreign keys and rollback still spa
 statement. `write/batch-admission.test.ts` generates these calls with another real working
 buffer occupying ordinary capacity, over memory and the IndexedDB fake, through durable reopen.
 
+`testing/modify-progress.test.ts` keeps two generated 20,000-row UPDATE/DELETE histories
+per seed at 64 MiB. Each original RNG position has its own 120-second test budget;
+the UPDATE still has its 30-second assertion. The campaign checks both histories,
+their unchanged generated inputs, and the union of producer-retirement, merge-credit,
+row-result and cleanup reach. This partitions the test budget, not the native workload.
+
 `write/low-cap.test.ts` generates loads under 32/48/64 MiB caps over memory and the IndexedDB
 adapter on its fake. It exercises idle estimates, allocated working buffers, active loans,
 merges, metadata growth, exact rows and durable reopen, with declared reach. Its stored rows
