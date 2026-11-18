@@ -4841,3 +4841,8 @@ Serialized-array CASE/COALESCE selectors use the same bounded projection progres
 text and bytes. Their one-row path borrows the original encoded payload, preserving
 shape, bounds and element representation without parsing or an output copy. Array
 casts are certified only when their complete physical element types agree.
+
+Native command statements retain their memory policy across end and commit. Ending
+the command scope must not reintroduce a future background-merge estimate into the
+commit step while another admitted execution retains its workspace. The next live
+statement selects its own policy; actual merge acquisition still funds its full step.

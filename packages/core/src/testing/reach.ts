@@ -10130,6 +10130,8 @@ export const NATIVE_RI_COMPOSITE_REACH = [
 ] as const;
 
 export const NATIVE_RI_PRESSURE_REACH = [
+  "commit while competitor retains bytes",
+  "no future merge at commit",
   "rekey",
   "delete",
   "published",

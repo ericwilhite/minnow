@@ -279,6 +279,9 @@ export class TransactionImpl implements WriteTransaction {
   ftsSeal: FtsClaimSeal | null = null;
   #ordinal = 0;
   #open: StatementImpl | null = null;
+  // Statement.end retires the command scope before commit. Keep its funding policy
+  // across that boundary; commit does not execute a future background merge.
+  #lastNativeCommands = false;
   #savepointMap: Map<number, number> | null = null;
 
   get #savepoints(): Map<number, number> {
@@ -309,11 +312,14 @@ export class TransactionImpl implements WriteTransaction {
 
   /** @internal */
   ended(statement: StatementImpl): void {
-    if (this.#open === statement) this.#open = null;
+    if (this.#open === statement) {
+      this.#lastNativeCommands = statement.nativeCommandMode;
+      this.#open = null;
+    }
   }
 
   get nativeCommands(): boolean {
-    return this.#open?.nativeCommandMode === true;
+    return this.#open?.nativeCommandMode ?? this.#lastNativeCommands;
   }
 
   checkCurrentStatement(statement: StatementImpl): void {

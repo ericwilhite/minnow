@@ -94,6 +94,7 @@ their complete measured allowance. Input-only producers no longer reserve an unu
 second modification spool, and a single complete-key probe avoids redundant locator sorting.
 Queries sharing the writer's memory budget can also use the charged mixed-source
 reader after a modification leaves both published rows and a new memory tail.
+Native command commits keep the statement's protected-memory policy after its command scope closes. Commit funds its own work without waiting to reserve a future background merge; actual merges still fund their complete workspace before running.
 The private native write owner now supplies a cancellable, invalidatable memory boundary.
 It stabilizes writer/storage holdings before root funding, counts their protected memory
 once, and preserves separate image and rule workspace. This does not enable SQL triggers.

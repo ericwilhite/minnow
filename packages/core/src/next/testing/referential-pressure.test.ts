@@ -40,6 +40,24 @@ for (const seed of seedsFor("next-native-ri-pressure", [0xb641, 0xb642]))
               }),
               creates = vi.spyOn(f.spill, "create");
             expect(competing.allocate(competing.held)).toBe(true);
+            const retained = competing.allocated,
+              admitGroup = governor.admitGroup.bind(governor),
+              commit = f.tx.commit.bind(f.tx);
+            let committing = false,
+              futureMerge = 0;
+            const commitSpy = vi.spyOn(f.tx, "commit").mockImplementation((request) => {
+              committing = true;
+              return commit(request);
+            });
+            const admissionSpy = vi.spyOn(governor, "admitGroup").mockImplementation((options) => {
+              if (committing && options.label === "grow write merge credit") {
+                futureMerge++;
+                // Release only to turn the forbidden wait into a finite semantic RED.
+                // The good path retains the real competing allocation through commit.
+                competing.close();
+              }
+              return admitGroup(options);
+            });
             try {
               await pg.exec("DROP TABLE IF EXISTS c,p CASCADE");
               for (const sql of setup) await pg.exec(sql);
@@ -66,6 +84,11 @@ for (const seed of seedsFor("next-native-ri-pressure", [0xb641, 0xb642]))
               }
               const paid = f.charge.allocated;
               await f.end();
+              expect(futureMerge, "commit must not fund a future background merge").toBe(0);
+              expect(committing).toBe(true);
+              expect(competing.allocated).toBe(retained);
+              reach.reach("commit while competitor retains bytes");
+              reach.reach("no future merge at commit");
               expect(f.source.allocated).toBe(0);
               expect(f.source.loaned).toBe(0);
               expect(f.charge.allocated).toBeLessThanOrEqual(paid);
@@ -98,6 +121,8 @@ for (const seed of seedsFor("next-native-ri-pressure", [0xb641, 0xb642]))
               reach.reach("bounded files");
             } finally {
               creates.mockRestore();
+              commitSpy.mockRestore();
+              admissionSpy.mockRestore();
               competing.close();
               await f.close();
             }
