@@ -82,6 +82,8 @@ guarded while owner admission and dispatch are integrated. Fixed decoder workspa
 Wide native OLD-row reads now close their decoder and pin and return unused producer credit
 before funding a larger ordinary read step. They no longer mistake that step for a value-sized
 reserve loan. Cancellation waits for readmission cleanup.
+Serialized-array CASE and COALESCE outputs can split into borrowed single-row steps when another execution holds the remaining memory. This keeps array bounds, element NULLs and encoded numeric scales unchanged.
+
 Native OLD-image capture now funds its actual source at a fresh boundary. A resident
 point read retains only its requested chunk after funding; a published read funds its
 actual decoder growth. It no longer reserves a maximum-size published reader for every

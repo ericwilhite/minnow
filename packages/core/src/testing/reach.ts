@@ -10820,3 +10820,14 @@ export const NATIVE_INPUT_PROBE_ORDER_REACH = [
   "non-key insertion order",
   "zero ownership",
 ] as const;
+
+export const PROJECTION_ARRAY_STEP_REACH = [
+  "CASE",
+  "COALESCE",
+  "dense",
+  "sparse",
+  "exact encoding",
+  "no payload allocation",
+  "nondefault bounds",
+  "element NULL",
+] as const;

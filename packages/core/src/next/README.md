@@ -4836,3 +4836,8 @@ refusal. Multi-segment queries prepay the existing mixed-source recipe metadata;
 the single-segment shortcut remains available. Input-only producers do not reserve a second, unused generic modification
 spool. Single complete-key probes use their existing row-ID order; multiple probes
 and composite prefixes keep the bounded locator sort. SQL trigger dispatch remains guarded.
+
+Serialized-array CASE/COALESCE selectors use the same bounded projection progress as
+text and bytes. Their one-row path borrows the original encoded payload, preserving
+shape, bounds and element representation without parsing or an output copy. Array
+casts are certified only when their complete physical element types agree.
