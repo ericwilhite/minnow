@@ -11018,17 +11018,24 @@ class Parser {
       const start = this.#index;
       const expression = this.#expression();
       let alias = this.#spelledCallName(start, expression) ?? defaultAlias(expression);
+      let quotedLabel =
+        recordDeclaredTypes &&
+        expression.kind === "column" &&
+        (identifierSource(expression)?.quoted.at(-1) ?? false);
       if (this.#isKeyword("AS")) {
         this.#keyword("AS");
+        quotedLabel = recordDeclaredTypes && this.#peek().quoted === true;
         alias = this.#identifier();
       } else if (this.#bareLabelAhead()) {
         // `SELECT amount total`: a label needs no AS, as in PostgreSQL and SQLite.
+        quotedLabel = recordDeclaredTypes && this.#peek().quoted === true;
         alias = this.#identifier();
       }
       const item = { expression, alias };
       if (recordDeclaredTypes) {
-        rememberRowOutputName(expression, alias);
-        rememberRowOutputName(item, alias);
+        const label = quotedLabel ? alias : alias.toLowerCase();
+        rememberRowOutputName(expression, label);
+        rememberRowOutputName(item, label);
       }
       items.push(item);
       if (!this.#punctuation(",")) break;
@@ -15084,10 +15091,12 @@ function mergedWildcardSelect(
   const items = expanded.flat().map((entry): SelectItem => {
     if ("item" in entry) return entry.item;
     const { name, reference } = entry.column;
-    return {
+    const item: SelectItem = {
       expression: { kind: "column", reference },
       alias: (contributed.get(name) ?? 0) > 1 ? reference : name,
     };
+    if (recordDeclaredTypes) rememberRowOutputName(item, name);
+    return item;
   });
   numberRepeatedOutputs(items);
   return items;
@@ -15980,6 +15989,9 @@ function usingCondition(
 function numberRepeatedOutputs(items: readonly SelectItem[]): void {
   const aliases = new Set<string>();
   for (const item of items) {
+    // Native display labels survive collision numbering; the 0.x binding/output ids stay identical.
+    if (recordDeclaredTypes && rowOutputName(item) === undefined)
+      rememberRowOutputName(item, item.alias);
     if (aliases.has(item.alias)) {
       const base = item.alias;
       let suffix = 2;

@@ -4576,3 +4576,13 @@ No 0.x BlockStore cast, manifest/export/default change or public memory default.
 Native parsing explicitly installs its window-input hooks through a used value import.
 It does not rely on bare module side effects surviving package tree shaking. Minified
 worker-entry execution tests cover row-dependent LAG/LEAD and lazy defaults.
+
+### Result labels
+
+The 1.0 native facade preserves duplicate SQL result labels, as PostgreSQL does.
+`SELECT 1 AS x, 2 AS x` has labels `["x", "x"]` and tuples `[[1, 2]]`.
+Object rows use the last occurrence (`{ x: 2 }`), as do Kysely, React and NDJSON.
+CSV retains both headers and positions. Name-based `column`, `columnChunks` and
+`values` access rejects an ambiguous label with `MINNOW_AMBIGUOUS_RESULT_COLUMN`;
+use a zero-based ordinal instead. Internal binding names remain unique. The
+published 0.x engine keeps its existing numbered output names.

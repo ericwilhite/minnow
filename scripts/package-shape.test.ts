@@ -248,7 +248,9 @@ describe("published core tarball", () => {
       // Raise once by 1,500 over main; unpacked/isolation budgets and next/ exclusion stay.
       // Exact native FK provenance, schema-action comparison and matrix classification:
       // 1,028,455 packed bytes. Raise packed once by 500; unpacked/isolation caps stay.
-      expect(report?.size, "packed bytes").toBeLessThanOrEqual(1_028_500);
+      // Native display-label provenance: 1,028,540 packed bytes (40 over the old cap).
+      // Raise packed once by 250; unpacked/isolation caps and next/ exclusion stay.
+      expect(report?.size, "packed bytes").toBeLessThanOrEqual(1_028_750);
       expect(report?.unpackedSize, "unpacked bytes").toBeLessThanOrEqual(4_500_000);
       const emitted = await readFile(join(isolatedCore, "dist", "engine", "optimizer.js"), "utf8");
       expect(emitted).not.toContain("/**");

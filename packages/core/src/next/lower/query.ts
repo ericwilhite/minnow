@@ -6,7 +6,7 @@
  * The FROM clause (sources, joins and their order, subqueries) is lower/from.ts.
  */
 import { strongestRowLock } from "../../engine/row-locking.js";
-import { jsonCallSource } from "../../engine/json-call-sources.js";
+import { rowOutputName, jsonCallSource } from "../../engine/json-call-sources.js";
 import type { AggregateCall, AggregateFn, Bound, Rel, ScalarExpr, SortKey } from "../ir/ir.js";
 import { aggregateArgument, aggregateResult } from "../ir/functions.js";
 import type { PhysicalType } from "../types.js";
@@ -806,6 +806,14 @@ export function lowerBlock(
   }
   const columns: RelColumn[] = projected.map((item, index) => ({
     name: names[index] ?? `(order ${String(index - names.length + 1)})`,
+    ...(select[index] === undefined
+      ? {}
+      : {
+          label:
+            rowOutputName(select[index]) ??
+            rowOutputName(select[index].expression) ??
+            select[index].alias,
+        }),
     type: item.expr.type,
     nullable: item.nullable,
     big: item.big,

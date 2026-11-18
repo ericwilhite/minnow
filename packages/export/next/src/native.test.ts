@@ -1,3 +1,4 @@
+import { PGlite } from "@electric-sql/pglite";
 import fc from "fast-check";
 import { encodeArrayValue } from "../../../core/dist/next/vector/array-value.js";
 import { decodeResult } from "../../../core/dist/next/owner/result.js";
@@ -82,12 +83,12 @@ for (const seed of seedsFor("next-native-exports", [46958, 46959]))
                 elements: [1n, null, 9007199254740993n, n],
               },
             );
-            const binarySource: QueryCursorSource = {
+            const binarySource = (duplicate: boolean): QueryCursorSource => ({
               cursor<TRow>() {
                 const result = decodeResult<TRow>({
                   columns: [
                     {
-                      name: "x",
+                      name: duplicate ? "x" : "b",
                       type: { kind: "bytes" },
                       sqlType: "bytea",
                       nullable: false,
@@ -141,15 +142,18 @@ for (const seed of seedsFor("next-native-exports", [46958, 46959]))
                   },
                 };
               },
-            };
+            });
             const arrayText = `[[1,null],[9007199254740993,${n.toString()}]]`;
-            expect(await text(streamNdjson(binarySource, "frame"))).toBe(
-              `{"x":${JSON.stringify(expectedHex)},"x":${arrayText}}\n`,
+            expect(await text(streamNdjson(binarySource(true), "frame"))).toBe(
+              `{"x":${arrayText}}\n`,
             );
-            expect(csv(await text(streamCsv(binarySource, "frame")))).toEqual([
+            expect(csv(await text(streamCsv(binarySource(true), "frame")))).toEqual([
               ["x", "x"],
               [expectedHex, arrayText],
             ]);
+            expect(await text(streamNdjson(binarySource(false), "frame"))).toBe(
+              `{"b":${JSON.stringify(expectedHex)},"x":${arrayText}}\n`,
+            );
             reach.reach("bytea hex");
             reach.reach("multiple frames");
             const records = csv(await text(streamCsv(native, sql, options)));
@@ -214,20 +218,25 @@ it("rejects invalid options before opening a query", () => {
   expect(source.cursor).not.toHaveBeenCalled();
 });
 
-// OPEN-ISSUES: "Native SQL duplicate result labels" (B6). The canonical serializer
-// preserves supplied labels; this pins the separate front-end-to-wire metadata bug.
-it.fails("keeps duplicate SQL labels in native metadata (known B6 blocker)", async () => {
+it("matches PG duplicate SQL labels, positional CSV and last-wins NDJSON", async () => {
+  const pg = new PGlite();
   const native = await MinnowDatabase.open({
     backend: new MemoryBackend({ locks: new SimLocks() }),
     memoryLimitBytes: 64 << 20,
   });
   try {
-    expect((await native.query("SELECT 1 x,2 x")).columns.map((column) => column.name)).toEqual([
-      "x",
-      "x",
-    ]);
+    const expected = await pg.query<number[]>("SELECT 1 x,2 x", [], { rowMode: "array" });
+    const result = await native.query("SELECT 1 x,2 x");
+    expect(result.columns.map((column) => column.name)).toEqual(
+      expected.fields.map((field) => field.name),
+    );
+    expect(result.tuples()).toEqual(expected.rows);
+    expect(result.rows()).toEqual([{ x: 2 }]);
+    expect(await text(streamCsv(native, "SELECT 1 x,2 x"))).toBe("x,x\r\n1,2\r\n");
+    expect(await text(streamNdjson(native, "SELECT 1 x,2 x"))).toBe('{"x":2}\n');
   } finally {
     await native.close();
+    await pg.close();
   }
 });
 

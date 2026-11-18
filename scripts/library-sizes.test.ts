@@ -50,9 +50,12 @@ describe("compressed download budgets", () => {
     // and only shared parser/provenance modules grow. No next/ or test input ships.
     // Exact native FK provenance / schema-action comparison: 573,644 combined gzip bytes.
     // Raise once by 256; client stays byte-identical and private rebuild inputs stay excluded.
+    // Native display-label provenance: 573,743 combined gzip bytes (+75 versus a249070e).
+    // The client is byte-identical; only shared engine/query.js grows (186 raw bytes).
+    // Raise once by 256 bytes; the audit finds no native/test input or new module.
     expect(
       worker.totalGzipBytes + client.totalGzipBytes,
       "worker plus client gzip bytes",
-    ).toBeLessThanOrEqual(560.25 * 1024);
+    ).toBeLessThanOrEqual(560.5 * 1024);
   });
 });

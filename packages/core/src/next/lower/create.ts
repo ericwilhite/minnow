@@ -166,7 +166,9 @@ function planned(plan: Planning, root: Rel, columns: readonly RelColumn[], catal
   return {
     rowLocking: rowLockIntent(plan.builder.rowLocking),
     plan: physicalPlan(root, outputColumns(columns), plan, catalog),
-    columns: columns.map((column) => resultColumn(column, column.big)),
+    columns: columns.map((column) =>
+      resultColumn({ ...column, name: column.label ?? column.name }, column.big),
+    ),
     reads: [...plan.builder.reads].sort((a, b) => a - b),
     // Empty when no shape decision read statistics: such a plan never needs re-lowering for them.
     basis: plan.builder.statisticsDependent

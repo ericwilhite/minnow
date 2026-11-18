@@ -25,3 +25,5 @@ Differences approved by the 1.0 API plan and DECISIONS D1/D2/C1–C6:
 The existing adapter suite continues qualifying 0.x; native contract tests separately
 exercise these bindings. Running the old suite unchanged does not constitute running
 its whole old Result/Date/schema DSL contract against the new native facade.
+
+Duplicate SQL result labels use the last occurrence in object rows, as in node-postgres.

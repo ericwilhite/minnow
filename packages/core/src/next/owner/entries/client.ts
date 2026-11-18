@@ -14,3 +14,5 @@ export type {
   CallOptions,
   CursorOptions,
 } from "../api.js";
+
+export { AmbiguousResultColumnError } from "../result.js";

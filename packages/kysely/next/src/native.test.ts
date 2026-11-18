@@ -51,6 +51,7 @@ for (const seed of seedsFor("next-native-kysely", [46956, 46957]))
             expect(await db.selectFrom("t").selectAll().orderBy("id").execute()).toEqual(expected);
             reach.reach("exact int8");
             reach.reach("nullable text");
+            expect((await sql`SELECT 1 x,2 x`.execute(db)).rows).toEqual([{ x: 2 }]);
             const precise = await sql<{
               n: string;
               t: string;
@@ -113,6 +114,9 @@ for (const seed of seedsFor("next-native-kysely", [46956, 46957]))
                   )
                 ).rows,
               ).toEqual([{ n: 12.34, j: null, b: { a: 1 } }]);
+              expect((await sql`SELECT 1::numeric x,2::numeric x`.execute(decoded)).rows).toEqual([
+                { x: 2 },
+              ]);
             } finally {
               await decoded.destroy();
             }

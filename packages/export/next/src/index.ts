@@ -178,11 +178,17 @@ export function streamNdjson(
   sql: string,
   options: ExportOptions = {},
 ): ReadableStream<Uint8Array> {
+  let fields: ReadonlyArray<[string, number]> | null = null;
   return stream(cursor(source, sql, options), null, (result) => {
+    if (fields === null) {
+      const last = new Map<string, number>();
+      result.columns.forEach((column, i) => last.set(column.name, i));
+      fields = [...last];
+    }
     const lines: string[] = [];
     for (const row of result.tuples())
       lines.push(
-        `{${result.columns.map((column, i) => `${JSON.stringify(column.name)}:${json(row[i] ?? null, new Set())}`).join(",")}}`,
+        `{${fields.map(([name, i]) => `${JSON.stringify(name)}:${json(row[i] ?? null, new Set())}`).join(",")}}`,
       );
     return lines.length === 0 ? "" : lines.join("\n") + "\n";
   });

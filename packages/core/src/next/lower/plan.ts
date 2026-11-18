@@ -18,6 +18,8 @@ import type { OuterResolver } from "./from.js";
 export interface RelColumn {
   readonly record?: true;
   readonly name: string;
+  /** SQL display label; name remains the unique internal binding identity. */
+  readonly label?: string;
   readonly type: PhysicalType;
   readonly nullable: boolean;
   /** Renders as a JS bigint (R17.1). */

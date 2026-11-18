@@ -151,11 +151,12 @@ export interface Result<TRow = Row> {
   readonly affectedRows: number | null;
   /** This answer came from the request ledger after a reconnect: the write had committed. */
   readonly replayed: boolean;
-  /** One contiguous view (concatenated once if the result has several frames). */
+  /** One contiguous view (concatenated once if the result has several frames).
+   * Duplicate labels require an ordinal; name lookup throws AmbiguousResultColumnError. */
   column(column: string | number): ColumnView;
   /** One view per frame, no copy. */
   columnChunks(column: string | number): readonly ColumnView[];
-  /** The column's values decoded to JS values. */
+  /** The column's values decoded to JS values. Ambiguous labels require an ordinal. */
   values(column: string | number): Value[];
   /** Row objects. Duplicate column names: the last one wins; use `tuples()` instead. */
   rows(): TRow[];

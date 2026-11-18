@@ -24,6 +24,14 @@ const NULL_SLOT: Slot = {
   },
   row: 0,
 };
+/** A duplicate label cannot select a unique positional column. Constructed locally, never owner-sent. */
+export class AmbiguousResultColumnError extends TypeError {
+  readonly code = "MINNOW_AMBIGUOUS_RESULT_COLUMN";
+  override readonly name = "AmbiguousResultColumnError";
+  constructor(readonly columnName: string) {
+    super(`Result column ${JSON.stringify(columnName)} is ambiguous; use a column ordinal`);
+  }
+}
 class NativeResult<TRow> implements Result<TRow> {
   readonly columns;
   readonly command;
@@ -67,10 +75,13 @@ class NativeResult<TRow> implements Result<TRow> {
       this.#ends.push(count);
     }
     this.rowCount = count;
-    input.columns.forEach((column, i) => this.#names.set(column.name, i));
+    input.columns.forEach((column, i) =>
+      this.#names.set(column.name, this.#names.has(column.name) ? -1 : i),
+    );
   }
   #index(column: string | number): number {
     const index = typeof column === "string" ? this.#names.get(column) : column;
+    if (typeof column === "string" && index === -1) throw new AmbiguousResultColumnError(column);
     if (
       index === undefined ||
       !Number.isInteger(index) ||

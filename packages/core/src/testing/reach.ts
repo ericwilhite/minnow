@@ -9755,3 +9755,27 @@ export const NATIVE_WORKER_BUNDLE_REACH = [
   "minified real entry SQL",
   "native cleanup",
 ] as const;
+
+export const PUBLIC_RESULT_LABEL_REACH = [
+  "direct",
+  "derived",
+  "cte",
+  "union",
+  "except",
+  "distinct",
+  "group",
+  "window",
+  "join",
+  "view",
+  "empty",
+  "unquoted",
+  "aliasList",
+  "0.x binding identities unchanged",
+  "dotted labels",
+  "case-sensitive labels",
+  "object-property labels",
+  "escaped labels",
+  "ambiguous name rejects",
+  "prepared labels",
+  "cursor labels",
+] as const;
