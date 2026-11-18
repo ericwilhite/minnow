@@ -39,6 +39,7 @@ for (const seed of seedsFor("next-native-recovery-credit", [47223, 47224]))
           let closing: Promise<void> | undefined;
           const opened = WriteCredits.open.bind(WriteCredits),
             originalOpen = backend.open.bind(backend),
+            // eslint-disable-next-line @typescript-eslint/unbound-method -- Called with its original governor below.
             admit = Governor.prototype.admitGroup;
           const capture = vi.spyOn(WriteCredits, "open").mockImplementation(async (...args) => {
             credits = await opened(...args);
@@ -64,27 +65,27 @@ for (const seed of seedsFor("next-native-recovery-credit", [47223, 47224]))
                   minimumBytes: free,
                   spillable: true,
                 });
-                let competitor: Uint8Array | undefined, workspace: Uint8Array | undefined;
+                const buffers: { competitor?: Uint8Array; workspace?: Uint8Array } = {};
                 let owned = false;
                 try {
                   expect(holder.allocate(free)).toBe(true);
-                  competitor = new Uint8Array(free).fill(29);
+                  buffers.competitor = new Uint8Array(free).fill(29);
                   reach.reach("recovery competitor owns real bytes");
                   owned = current.rows.allocate(working);
                   expect(
                     owned,
                     "recovery's key/row workspace must coexist with its still-borrowed frame",
                   ).toBe(true);
-                  workspace = new Uint8Array(working).fill(31);
+                  buffers.workspace = new Uint8Array(working).fill(31);
                   await yieldTask();
-                  expect(workspace.at(-1)).toBe(31);
-                  expect(competitor.at(-1)).toBe(29);
+                  expect(buffers.workspace.at(-1)).toBe(31);
+                  expect(buffers.competitor.at(-1)).toBe(29);
                   reach.reach("recovery read and working buffers coexist");
                   return await read(offset, length);
                 } finally {
-                  workspace = undefined;
+                  delete buffers.workspace;
                   if (owned) current.rows.free(working);
-                  competitor = undefined;
+                  delete buffers.competitor;
                   holder.free(holder.allocated);
                   holder.close();
                 }
@@ -110,17 +111,17 @@ for (const seed of seedsFor("next-native-recovery-credit", [47223, 47224]))
             )
               return pending;
             return (async () => {
-              let settled = false;
+              const settlement = { complete: false };
               void pending.then(
                 () => {
-                  settled = true;
+                  settlement.complete = true;
                 },
                 () => {
-                  settled = true;
+                  settlement.complete = true;
                 },
               );
               await yieldTask();
-              if (!settled) {
+              if (!settlement.complete) {
                 denied++;
                 const row = credits?.rows;
                 if (row) {
@@ -193,7 +194,7 @@ for (const seed of seedsFor("next-native-recovery-credit", [47223, 47224]))
           } finally {
             await close();
           }
-          expect(owner?.governor.usedBytes).toBe(0);
+          expect(owner.governor.usedBytes).toBe(0);
           reach.reach("zero final charge");
         },
       ),
