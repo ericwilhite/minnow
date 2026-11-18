@@ -3742,6 +3742,7 @@ export const SORT_PROGRESS_PRESSURE_REACH = [
   "with ties boundary row",
   "peer rows across runs",
   "both complete",
+  "queued WITH TIES completes",
   "cancel waiting sort",
   "later admitted sort",
   "zero resources",

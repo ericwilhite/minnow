@@ -2467,7 +2467,10 @@ shipped-engine or stored-format change.
   The wide complete boundary-row step fits alone at 176 MiB (128 MiB for plain
   sort). `testing/sort-progress-pressure.test.ts` runs the five-TEXT SQL shape, including WITH
   TIES peers across runs, through real lowering/execution at 128 MiB under resident pressure
-  and queued cancellation.
+  and queued cancellation. Native scalar sort admission also measures each physical
+  payload column and encoded key separately: shrinking a source to one-row batches
+  cannot remove merge output or the retained WITH TIES boundary row from its minimum.
+  These widths size workspace without evaluating expressions or borrowing row images.
   Concurrent executions share one immutable snapshot so their physical input and read minimum
   stay the same. A later snapshot may require a different complete minimum. These are liveness
   and correctness checks, not performance acceptance or exhaustive I/O failure injection.
