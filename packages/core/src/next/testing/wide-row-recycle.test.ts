@@ -6,7 +6,8 @@ import { afterAll, expect, it, vi } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach, WIDE_ROW_RECYCLE_STATES } from "../../testing/reach.js";
 import { StorageCore } from "./storage-core.js";
-import { Governor, type Grant } from "../memory/governor.js";
+import { Governor } from "../memory/governor.js";
+import { MetadataBudget } from "../write/budget.js";
 import { GroupWriter } from "../page/writer.js";
 import { ChunkReader } from "../page/reader.js";
 import { defined, targetFor, valueAt, vectorOf } from "../page/test-support.js";
@@ -104,10 +105,16 @@ for (const seed of seedsFor("next-wide-row-recycle", [46912]))
             .mockImplementation(async function (this: GroupWriter, ...args) {
               appends++;
               const charge = this.memory.charge;
-              expect(charge, "native encoder must own charged storage").not.toBeNull();
+              // The native working budget wraps its grant; ByteCharge itself does not
+              // promise Grant's accounting fields. Keep the same live-byte bound.
+              expect(charge, "native encoder uses metadata admission").toBeInstanceOf(
+                MetadataBudget,
+              );
+              if (!(charge instanceof MetadataBudget))
+                throw new Error("Missing native metadata budget");
               const check = () => {
                 expect(this.retainedBytes).toBeGreaterThan(0);
-                expect((charge as Grant).allocated).toBeGreaterThanOrEqual(this.retainedBytes);
+                expect(charge.grant.allocated).toBeGreaterThanOrEqual(this.retainedBytes);
               };
               check();
               const taken = await append.apply(this, args);

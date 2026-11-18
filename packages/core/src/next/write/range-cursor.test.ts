@@ -483,8 +483,34 @@ it.each([false, true])("waits at admission and can close the wait (%s)", async (
         ).id ?? 0;
     });
     await autocommit(p, (st) => st.table(t).insert(batch(ints([1, 2])), null));
+    // Finish asynchronous publication/reclamation before filling ordinary credit.
+    // Otherwise its legitimate release can admit the cursor during the next task.
+    await p.quiesce();
     const view = p.pin(),
       reader = view.index(t, p.catalog.table(t)?.primaryKey ?? 0);
+    // Drain cooperative reclaim/cache eviction first. Filling a snapshot of free
+    // credit alone is not pressure: the cursor may legitimately reclaim more.
+    const reclaim = new AbortController();
+    const drained = h.governor
+      .admit({
+        label: "drain reclaimable native credit",
+        minimumBytes: h.governor.capBytes - h.governor.reserveBytes,
+        spillable: false,
+        signal: reclaim.signal,
+      })
+      .then(
+        (grant) => {
+          grant.close();
+          return "unexpected full-cap grant";
+        },
+        (error: unknown) => error,
+      );
+    try {
+      await yieldTask();
+    } finally {
+      reclaim.abort();
+    }
+    expect(await drained).toBe(reclaim.signal.reason);
     const held = await h.governor.admit({
       label: "reader pressure",
       minimumBytes: h.governor.capBytes - h.governor.reserveBytes - h.governor.usedBytes,
