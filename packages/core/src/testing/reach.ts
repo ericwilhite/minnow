@@ -10648,7 +10648,6 @@ export const NATIVE_WRITE_GROWTH_REACH = [
   "zero final charge",
 ] as const;
 
-
 export const STORE_NAME_REACH = [
   "empty",
   "high surrogate",
