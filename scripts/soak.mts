@@ -41,7 +41,7 @@ const SUITES: Suite[] = [
   { name: "next-live-dispatch", file: "packages/core/src/next/write/changes-deferred.test.ts" },
   {
     name: "next-live-effect-integration",
-    file: "packages/core/src/next/write/changes-integration.test.ts",
+    file: "packages/core/src/next/testing/changes-integration.test.ts",
   },
   { name: "next-live-publication", file: "packages/core/src/next/write/changes.test.ts" },
   {
