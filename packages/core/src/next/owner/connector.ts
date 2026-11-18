@@ -1,4 +1,4 @@
-import { validateStoreName } from "../storage/store-name.js";
+import { validateStoreName } from "../store-name.js";
 /**
  * The client side of election (election.ts): keeps one `ProtocolClient` connected to the
  * database's owner, electing this context when there is none.

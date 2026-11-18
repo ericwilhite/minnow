@@ -4832,3 +4832,7 @@ Snapshot imports admit incoming transport and scratch-spool memory together. A q
 retains no partial transport grant. Replay admission includes the source handle and owner
 control memory that must survive retries; a combined minimum above the whole cap refuses
 with `MINNOW_MEMORY_ADMISSION`, rather than waiting for its own retained memory.
+
+Native store-name validation and encoding live in the shared, pure `store-name.ts` module.
+The thin connector validates the same 80-byte Unicode name domain without importing a storage
+backend. This preserves the client bundle boundary and changes no valid name or stored byte.

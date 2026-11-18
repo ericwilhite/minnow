@@ -1,4 +1,4 @@
-import { validateStoreName } from "../storage/store-name.js";
+import { validateStoreName } from "../store-name.js";
 /**
  * The owner runtime: what runs inside the owner worker (a dedicated worker a page started, or a
  * dedicated worker hosting in place). It takes the fence, opens the engine, serves clients and

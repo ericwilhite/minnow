@@ -5,11 +5,7 @@ import { createReach, STORE_NAME_REACH } from "../../testing/reach.js";
 import { startOwnerHost } from "../owner/host.js";
 import { OwnerConnector } from "../owner/connector.js";
 import { chooseBackend, type StoragePlatform } from "../storage/select.js";
-import {
-  InvalidStoreNameError,
-  validateStoreName,
-  encodeStoreName,
-} from "../storage/store-name.js";
+import { InvalidStoreNameError, validateStoreName, encodeStoreName } from "../store-name.js";
 
 for (const seed of seedsFor("next-store-name", [0xb2d5, 0xb2d6]))
   it(`refuses invalid names before platform or connector activity ${String(seed)}`, async () => {

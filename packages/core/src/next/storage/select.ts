@@ -1,4 +1,4 @@
-import { validateStoreName, encodeStoreName } from "./store-name.js";
+import { validateStoreName, encodeStoreName } from "../store-name.js";
 /**
  * Which backend a database gets (the ownership track calls this in the owner worker).
  *
