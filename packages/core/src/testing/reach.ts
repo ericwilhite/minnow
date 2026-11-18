@@ -9672,3 +9672,39 @@ export const PUBLIC_RESULT_OWNERSHIP_REACH = [
   "small cloned delivery",
   "large transferred delivery",
 ] as const;
+
+/** Callback scopes own no persistent server, preparation or transaction-state entries. */
+export const PUBLIC_SESSION_RETIRE_REACH = [
+  "sequential callbacks",
+  "concurrent callbacks",
+  "rollback retires session",
+  "commit retires session",
+  "twenty or more callback rounds",
+  "zero retained callback credit",
+  "scoped preparations retired",
+  "unprepared callbacks",
+] as const;
+export const PUBLIC_REENTRANT_CLOSE_REACH = [
+  "body closes without waiting on itself",
+  "savepoint closes without waiting on itself",
+  "cursor closes without waiting on itself",
+  "closed scope rejects every entry",
+  "reentrant teardown drains native state",
+] as const;
+export const CALLBACK_LEDGER_RETIRE_REACH = [
+  "single final marker",
+  "concurrent final markers",
+  "transaction retry refused before ACK",
+  "COMMIT replay retained before ACK",
+  "ACK frees callback tombstones",
+  "old requests stale after ACK",
+] as const;
+
+export const PUBLIC_SESSION_OUTCOME_REACH = [
+  "lost COMMIT replays after retirement",
+  "failed rollback reply retires local recovery state",
+  "callback body never replayed",
+  "default session is not retired",
+] as const;
+
+export const PUBLIC_SESSION_FLAGS_REACH = ["default", "missing", "null", "wrongflag"] as const;

@@ -23,6 +23,7 @@ export function clientCursor<TRow = Row>(
   options: CursorOptions,
   retired: () => void,
   prepared: number | null = null,
+  check: () => void = () => undefined,
 ): Cursor<TRow> {
   options.signal?.throwIfAborted();
   for (const [label, value] of [
@@ -74,12 +75,14 @@ export function clientCursor<TRow = Row>(
       return this;
     },
     async next() {
+      check();
       if (ended) return { done: true, value: undefined };
       // A misuse error must not retire the valid read already waiting for a frame.
       if (pulling) throw new TypeError("Only one cursor next() may be pending");
       pulling = true;
       try {
         const frame = await raw.frames.next();
+        check();
         if (frame.done) {
           await raw.done;
           end();

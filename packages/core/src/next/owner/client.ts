@@ -332,6 +332,14 @@ export class ProtocolClient {
     return this.#pending.size;
   }
 
+  /** Retained transaction-state entries (ordinary diagnostics, not live subscriptions). */
+  get retainedSessionCount(): number {
+    return this.#sessions.size;
+  }
+  get retainedPreparedCount(): number {
+    return this.#preparedKinds.size;
+  }
+
   /** Whether the owner holds pins for this client: an open transaction or an open cursor. */
   get hasPins(): boolean {
     if (this.#cursors > 0) return true;
@@ -554,6 +562,10 @@ export class ProtocolClient {
     this.#welcome = null;
     welcome?.reject(new ClientClosedError());
     for (const pending of [...this.#pending.values()]) this.#fail(pending, new ClientClosedError());
+    this.#sessions.clear();
+    this.#lostCauses.clear();
+    this.#preparedKinds.clear();
+    this.#session0.transaction = "idle";
   }
 
   // ---- requests ----
@@ -642,6 +654,18 @@ export class ProtocolClient {
 
   rollback(session: number): Promise<ClientResult> {
     return this.#request({ t: "rollback", session }).promise;
+  }
+
+  /** An ended callback never reuses its positive session id. Forget local recovery state
+   * only after all requests/cursors settled; default-session loss protection is unchanged. */
+  retireSession(session: number): void {
+    if (!Number.isSafeInteger(session) || session <= 0)
+      throw new TypeError("Only a callback session may retire");
+    for (const pending of this.#pending.values())
+      if (pending.session === session)
+        throw new TypeError("A callback session still has pending requests");
+    this.#sessions.delete(session);
+    this.#lostCauses.delete(session);
   }
 
   /** Sends a request and returns its seq with its promise (for cancellation and retries in tests). */
@@ -1173,8 +1197,15 @@ export class ProtocolClient {
           )
             this.#discharge(pending.session, pending.seq);
           if (pending.session === 0) this.#session0.transaction = message.summary.transaction;
-          if (pending.session !== null)
-            this.#sessions.set(pending.session, message.summary.transaction);
+          if (pending.session !== null) {
+            if (
+              (pending.body.t === "commit" || pending.body.t === "rollback") &&
+              pending.body.retire === true &&
+              message.summary.transaction === "idle"
+            )
+              this.#sessions.delete(pending.session);
+            else this.#sessions.set(pending.session, message.summary.transaction);
+          }
           this.#settle(message.seq);
           const result = makeResult(
             pending.columns ?? [],

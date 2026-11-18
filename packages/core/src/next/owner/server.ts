@@ -148,6 +148,8 @@ interface SessionSlot {
   readonly timer: IdleTransactionTimer;
   /** Requests running or queued, for the idle timer. */
   pending: number;
+  /** Terminal callback request, reclaimed only after every queued task finished. */
+  retireSequence: number | null;
 }
 
 const hexToBytes = (hex: string): Uint8Array => {
@@ -209,6 +211,15 @@ export class OwnerServer {
 
   get inFlight(): Map<string, Promise<void>> {
     return this.#inFlight;
+  }
+
+  /** Ordinary session slots, including disconnected work still draining. */
+  get sessionCount(): number {
+    let count = 0;
+    for (const connection of this.#connections) count += connection.sessionCount;
+    for (const connection of this.#draining)
+      if (!this.#connections.has(connection)) count += connection.sessionCount;
+    return count;
   }
 
   get stats(): OwnerServerStats {
@@ -334,6 +345,10 @@ class Connection {
     this.#server = server;
     this.#port = port;
     this.#prepared = server.engine.createPreparedCache();
+  }
+
+  get sessionCount(): number {
+    return this.#sessions.size;
   }
 
   get outstandingFrames(): number {
@@ -516,6 +531,7 @@ class Connection {
         queue: [],
         busy: false,
         pending: 0,
+        retireSequence: null,
         timer: new IdleTransactionTimer(timeoutMs, () => {
           created.engine?.expire();
           this.post({ t: "sessionAborted", session: id, reason: "idleTimeout" });
@@ -592,6 +608,7 @@ class Connection {
     const state = slot.engine?.transaction ?? "idle";
     slot.timer.setOpen(state === "open" || state === "failed");
     slot.timer.end();
+    if (slot.pending === 0 && slot.retireSequence !== null) this.#closeSession(slot);
     this.#watchIfNeeded();
   }
 
@@ -607,7 +624,22 @@ class Connection {
       });
       return;
     }
+    const ending = request.t === "commit" || request.t === "rollback";
+    if (
+      ending &&
+      (session === null ||
+        (request.retire !== undefined && typeof request.retire !== "boolean") ||
+        (request.retire === true && session === 0))
+    ) {
+      this.post({
+        t: "error",
+        seq: request.seq,
+        error: toWireError(new ProtocolError("Invalid transaction-end session or retire flag")),
+      });
+      return;
+    }
     const slot = this.#slot(session ?? 0);
+    if (ending && request.retire === true) slot.retireSequence = request.seq;
     if (
       (request.t === "prepare" && session === null) ||
       request.t === "subscribe" ||
@@ -1627,11 +1659,18 @@ class Connection {
 
   /** Rolls back a session of an ended connection and ends its generation in the ledger. */
   #closeSession(slot: SessionSlot): void {
+    if (this.#sessions.get(slot.id) !== slot) return;
     slot.queue.length = 0;
     slot.timer.dispose();
-    slot.engine?.close();
-    this.#endGeneration(slot);
-    this.#sessions.delete(slot.id);
+    try {
+      slot.engine?.close();
+    } finally {
+      try {
+        this.#endGeneration(slot);
+      } finally {
+        this.#sessions.delete(slot.id);
+      }
+    }
   }
 
   /** Ends this connection's generation of `slot`'s session in the ledger (idempotent). */
@@ -1642,6 +1681,7 @@ class Connection {
         String(slot.id),
         this.generation,
         this.#server.now(),
+        slot.retireSequence ?? undefined,
       );
   }
 }

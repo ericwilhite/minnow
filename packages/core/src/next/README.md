@@ -4548,3 +4548,18 @@ the fence. Generated ordinary open/reopen tests cover memory and native IndexedD
 uses MemorySpillService, as the native spill contract allows; durable backends use charged
 ScratchSpillService. This Node evidence is not a new supported Node product or real-browser
 qualification. Snapshot replacement, public DTO/CRUD wiring and B8's live binding remain separate.
+
+### Internal facade callback lifetime
+
+A callback transaction gets a positive session ID for that callback only. Its final
+COMMIT or ROLLBACK retires the native session, idle timer and slot after the queue
+drains; scoped preparations are unprepared too. The terminal COMMIT outcome remains
+retryable in the request ledger. Callback end markers disappear after their final
+request is acknowledged, while ordinary disconnected-session fences retain their
+existing expiry. Default SQL session 0 keeps its recovery protection.
+
+Client close waits for native requests and cursor cleanup, then native host teardown.
+It does not wait for a user callback that may itself await close. Closing fences every
+scoped SQL/prepared/cursor entry with `ClientClosedError`; an already committed
+terminal reply still determines the outcome. These bindings remain internal pending
+cutover; no public entry, option default or stored format changed.

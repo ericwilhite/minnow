@@ -217,7 +217,7 @@ export type TransactionState = "idle" | "open" | "failed" | "timedOut";
 export const DEFAULT_TRANSACTION_IDLE_TIMEOUT_MS = 30_000;
 
 /** Bumped by every change to a message in this file or in frame.ts. */
-export const PROTOCOL_VERSION = 7;
+export const PROTOCOL_VERSION = 8;
 
 /** The owner sends `alive` at least this often while a client has requests in flight. */
 export const ALIVE_INTERVAL_MS = 1_000;
@@ -375,6 +375,9 @@ export interface BeginRequest extends RequestHeader {
 export interface EndRequest extends RequestHeader {
   readonly t: "commit" | "rollback";
   readonly session: SessionId;
+  /** Final callback boundary. Retire after its queue drains; never reuse this session id.
+   * The standalone terminal outcome remains retryable through the ordinary request ledger. */
+  readonly retire?: boolean;
 }
 
 /**

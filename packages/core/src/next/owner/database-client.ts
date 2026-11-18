@@ -36,6 +36,7 @@ interface Shared {
 }
 interface Scope {
   active: boolean;
+  readonly preparations: Set<PreparedStatement>;
   readonly calls: Set<Promise<unknown>>;
   readonly cursors: Set<Cursor<unknown>>;
   failure: { error: unknown } | null;
@@ -53,9 +54,10 @@ class ClientSql implements SqlExecutor {
     return AbortSignal.any([this.scopeSignal, signal]);
   }
   protected check(): void {
+    if (this.shared.closing) throw new ClientClosedError();
     if (this.scope !== null) {
       if (!this.scope.active) throw new TypeError("Transaction is closed");
-    } else if (this.shared.closing) throw new ClientClosedError();
+    }
   }
   protected track<T>(promise: Promise<T>): Promise<T> {
     this.shared.calls.add(promise);
@@ -146,6 +148,7 @@ class ClientSql implements SqlExecutor {
         this.scope?.cursors.delete(cursor);
       },
       prepared,
+      () => this.check(),
     );
     this.shared.cursors.add(cursor);
     this.scope?.cursors.add(cursor);
@@ -157,12 +160,18 @@ class ClientSql implements SqlExecutor {
     signal?.throwIfAborted();
     const task = this.shared.protocol.prepareTask(sql, this.session);
     const info = await this.track(callTask(this.shared.protocol, task, signal));
+    try {
+      this.check();
+    } catch (error) {
+      this.shared.protocol.unprepare(info.id);
+      throw error;
+    }
     let closed = false;
     const check = () => {
       this.check();
       if (closed) throw new TypeError("Prepared statement is closed");
     };
-    return {
+    const prepared: PreparedStatement = {
       sql,
       columns: info.columns.map(resultColumn),
       parameters: info.parameters,
@@ -181,9 +190,12 @@ class ClientSql implements SqlExecutor {
       close: () => {
         if (closed) return;
         closed = true;
+        this.scope?.preparations.delete(prepared);
         this.shared.protocol.unprepare(info.id);
       },
     };
+    this.scope?.preparations.add(prepared);
+    return prepared;
   }
   private async write(
     op: "insert" | "upsert" | "update" | "delete",
@@ -249,25 +261,37 @@ export class MinnowDatabaseClient extends ClientSql {
     if (this.shared.nextSession === Number.MAX_SAFE_INTEGER)
       return Promise.reject(new RangeError("Transaction session ids are exhausted"));
     const session = ++this.shared.nextSession;
-    const scope: Scope = { active: true, calls: new Set(), cursors: new Set(), failure: null };
+    const scope: Scope = {
+      active: true,
+      calls: new Set(),
+      cursors: new Set(),
+      preparations: new Set(),
+      failure: null,
+    };
     const tx = new ClientSql(this.shared, session, scope, signal);
     const run = async () => {
       try {
-        await callTask(
-          this.shared.protocol,
-          this.shared.protocol.send({ t: "begin", session, readOnly }),
-          signal,
+        await this.track(
+          callTask(
+            this.shared.protocol,
+            this.shared.protocol.send({ t: "begin", session, readOnly }),
+            signal,
+          ),
         );
+        this.check();
         signal?.throwIfAborted();
         const value = await body(tx);
         await Promise.allSettled([...scope.cursors].map((cursor) => cursor.close()));
         await Promise.allSettled([...scope.calls]);
         scope.active = false;
         signal?.throwIfAborted();
-        const committed = await callTask(
-          this.shared.protocol,
-          this.shared.protocol.send({ t: "commit", session }),
-          signal,
+        this.check();
+        const committed = await this.track(
+          callTask(
+            this.shared.protocol,
+            this.shared.protocol.send({ t: "commit", session, retire: true }),
+            signal,
+          ),
         );
         // An ERROR reply does not carry transaction state. The owner's COMMIT reply is the
         // authority: caught errors may have recovered through a savepoint, or left it failed.
@@ -281,16 +305,22 @@ export class MinnowDatabaseClient extends ClientSql {
         await Promise.allSettled([...scope.cursors].map((cursor) => cursor.close()));
         await Promise.allSettled([...scope.calls]);
         try {
-          await this.shared.protocol.rollback(session);
+          await this.track(
+            this.shared.protocol.send({ t: "rollback", session, retire: true }).promise,
+          );
         } catch {
           /* Preserve terminal cause, including unknown effect. */
         }
         throw error;
       } finally {
         scope.active = false;
+        for (const prepared of scope.preparations) prepared.close();
+        this.shared.protocol.retireSession(session);
       }
     };
-    return this.track(run());
+    // User callbacks may await close(). Only actual requests/cursors are teardown
+    // dependencies: tracking the callback itself would make close wait on itself.
+    return run();
   }
   async catalog(options: CallOptions = {}): Promise<unknown> {
     this.check();
