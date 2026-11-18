@@ -11683,3 +11683,12 @@ export const NATIVE_PREVIEW_DECODE_REACH = [
   "cached entry reuse",
   "off-screen refusal",
 ] as const;
+
+export const DIRECTORY_OPENER_SETTLEMENT_REACH = [
+  "success before owner work",
+  "failure before owner work",
+  "success after owner work",
+  "failure after owner work",
+  "deferred consumer",
+  "original error retained",
+] as const;

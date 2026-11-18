@@ -261,6 +261,16 @@ function interruptionCases(seed: number): void {
         }
     }, 300_000);
 }
+/** Observe an opener immediately, before its owner does work/cleanup. The settlement
+ * never rejects early; the caller still throws the original error at its existing await. */
+export function settleDirectoryOpen<T>(
+  opening: Promise<T>,
+): Promise<{ db: T } | { error: unknown }> {
+  return opening.then(
+    (db) => ({ db }),
+    (error: unknown) => ({ error }),
+  );
+}
 function competingOpenCases(transition: Transition): void {
   for (const first of ["current", "peer"] as const)
     it(`two competing opens: ${first} owns ${transition}`, async () => {
@@ -269,10 +279,12 @@ function competingOpenCases(transition: Transition): void {
         locks = new SimLocks();
       const owner = await (first === "current" ? openDirectory : old.open)(files, locks);
       let settled = false;
-      const waiting = (first === "current" ? old.open : openDirectory)(files, locks).then((db) => {
-        settled = true;
-        return db;
-      });
+      const waiting = settleDirectoryOpen(
+        (first === "current" ? old.open : openDirectory)(files, locks).then((db) => {
+          settled = true;
+          return db;
+        }),
+      );
       try {
         await yieldTask();
         await yieldTask();
@@ -283,7 +295,9 @@ function competingOpenCases(transition: Transition): void {
       } finally {
         await owner.close();
       }
-      const next = await waiting;
+      const opened = await waiting;
+      if ("error" in opened) throw opened.error;
+      const next = opened.db;
       try {
         deepStrictEqual(await next.rows(), values(transition));
         await next.insert([10000]);
