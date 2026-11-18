@@ -9884,3 +9884,20 @@ export const WRITER_ABORT_STATS_REACH = [
   "capture refuses aborting writer",
   "zero final charge",
 ] as const;
+
+export const NATIVE_WRITE_PRESSURE_REACH = [
+  "idle row credit reclaimed",
+  "competing reader owns real bytes",
+  "admission after provisional unwind",
+  "six 1 MiB native commits",
+  "exact durable rows",
+  "32 MiB peak",
+  "zero final charge",
+] as const;
+
+export const NATIVE_WRITE_OPTIONAL_REACH = [
+  "preferred size declined",
+  "cheaper path exact",
+  "no grant growth",
+  "zero final charge",
+] as const;

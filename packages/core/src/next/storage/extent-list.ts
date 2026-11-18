@@ -518,7 +518,8 @@ export class ExtentListKeeper {
       if (!spool && inventory === undefined && delta.released.length > 0) {
         let admitted: boolean;
         try {
-          admitted = this.#budget.allocate(residentRequired);
+          admitted =
+            this.#budget.tryAllocate?.(residentRequired) ?? this.#budget.allocate(residentRequired);
         } catch (error) {
           if (!(error instanceof ReadDeniedError)) throw error;
           refusal = error;

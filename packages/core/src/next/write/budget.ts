@@ -20,6 +20,7 @@ export function releaseIdle(grant: Grant, minimum = 0): number {
 /** A single resident allocation cannot fit even if every other holder releases. */
 export class MetadataAllocationTooLargeError extends RangeError {
   readonly code = "MINNOW_METADATA_ALLOCATION_TOO_LARGE";
+  readonly sqlState = "53200";
   constructor(
     readonly bytes: number,
     readonly cap: number,
@@ -30,7 +31,7 @@ export class MetadataAllocationTooLargeError extends RangeError {
 }
 
 /** Only the owning async operation handles pressure, after unwinding its provisional state. */
-class MetadataPressure extends ParseBudgetError {
+export class MetadataPressure extends ParseBudgetError {
   constructor(
     bytes: number,
     readonly wanted: number,

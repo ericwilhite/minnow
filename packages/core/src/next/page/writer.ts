@@ -36,7 +36,9 @@
  * code/limb scratch. The group dictionary of a text or uuid column is charged separately and
  * bounded (`dictionaryEntries`, `dictionaryBytes`); `workingBytes` and `peakWorkingBytes`
  * report the rest. With a `charge` (a grant), a refused dictionary growth falls back to plain
- * pages; any other refusal is a `RangeError` (the one size error: a value larger than the grant).
+ * pages. With a plain charge, another refusal is a `RangeError`; a working-budget wrapper
+ * may instead throw its owner's admission request. The caller must abort provisional state
+ * before handling that request asynchronously.
  *
  * ## Values
  * - Input vectors may be flat, constant or dictionary. Their type must equal the column's.
@@ -159,7 +161,7 @@ class Charged {
   constructor(readonly charge: ByteCharge | null) {
     this.dictionaries = {
       allocate: (bytes) => {
-        if (!this.allocate(bytes)) return false;
+        if (!this.allocate(bytes, true)) return false;
         this.#dictionaryBytes += bytes;
         return true;
       },
@@ -179,9 +181,14 @@ class Charged {
   get peakWorking(): number {
     return this.#peakWorking;
   }
-  allocate(bytes: number): boolean {
+  allocate(bytes: number, optional = false): boolean {
     if (bytes <= 0) return true;
-    if (this.charge !== null && !this.charge.allocate(bytes)) return false;
+    if (this.charge !== null) {
+      const admitted = optional
+        ? (this.charge.tryAllocate?.(bytes) ?? this.charge.allocate(bytes))
+        : this.charge.allocate(bytes);
+      if (!admitted) return false;
+    }
     this.#charged += bytes;
     this.#peakWorking = Math.max(this.#peakWorking, this.#charged - this.#dictionaryBytes);
     return true;

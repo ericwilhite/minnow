@@ -140,7 +140,7 @@ import { CommandMaintenance, waitCommandMaintenance } from "./command-wait.js";
 import { WriteCredits, WRITE_ROW_STEP_BYTES, type PreparedWriteCredit } from "./credits.js";
 import { RunSink } from "./run-output.js";
 import { writeStepMinimum, type WriteStepMinimum } from "./minimum.js";
-import { MetadataBudget, releaseIdle } from "./budget.js";
+import { MetadataBudget, MetadataPressure, releaseIdle } from "./budget.js";
 import { GroupWriter } from "../page/writer.js";
 import type { StoreSession } from "../storage/contract.js";
 import { ExtentListKeeper, type ExtentList } from "../storage/extent-list.js";
@@ -840,7 +840,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       let catalog: Catalog;
       let lists: ExtentListKeeper;
       if (space.root === null) {
-        lists = new ExtentListKeeper([], { reader: space, budget: grant });
+        lists = new ExtentListKeeper([], { reader: space, budget: metadataBudget });
         catalog = Catalog.empty();
         const { writer, catalogRef } = await metadataBudget.retry(
           async () => {
@@ -920,7 +920,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         rootCharge = parsed.charge;
         root = parsed.value;
         // Built from the durable root's list, never from earlier callbacks (ruling R25).
-        lists = new ExtentListKeeper(root.extentList, { reader: space, budget: grant });
+        lists = new ExtentListKeeper(root.extentList, { reader: space, budget: metadataBudget });
         catalog = await metadataBudget.retry(
           async () => {
             const buffers = new CatalogBuffers(metadataBudget);
@@ -5165,7 +5165,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
       // A catalog-only ALTER never rewrites an older immutable memtable's physical schema.
       columns: memtable.columns.map((column) => ({ columnId: column.id, type: column.type })),
       writer,
-      charge: this.#grant,
+      // Page working buffers are metadata work, not a reclaimable row estimate.
+      // Their owner aborts the provisional writer before #metadataAsync can wait.
+      charge: this.#metadataBudget,
     });
     const chunks = Math.ceil(memtable.rowCount / MEMORY_CHUNK_ROWS);
     for (let chunk = 0; chunk < chunks; chunk++) {
@@ -6064,6 +6066,9 @@ class DeltaPublication {
         writer,
       });
     } catch (error) {
+      // Only our keeper's internal admission request may retry, outside the provisional
+      // writer and publication lock. A real external sink failure remains fatal below.
+      if (error instanceof MetadataPressure) throw error;
       throw new ExtentSinkError(error); // settle() aborts the attempt
     }
     this.#listPrepared = true;
