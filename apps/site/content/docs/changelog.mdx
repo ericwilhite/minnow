@@ -27,6 +27,7 @@ The private 1.0 writer waits for temporary memory pressure while preparing retir
 metadata or column-group pages, instead of refusing a fitting write after idle row credit
 was reclaimed. Optional dictionaries and resident retirement lists keep their smaller
 fallbacks. Committed extent metadata keeps one owning charge through publication and reopen.
+Native credit growth returns unused credit before waiting for more, keeping cancellation responsive.
 No stored-format change or migration is required; released 0.x behavior is unchanged.
 
 The private 1.0 storage writer keeps sealed-extent ownership in a charged fixed window and

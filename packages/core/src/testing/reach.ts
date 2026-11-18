@@ -9911,3 +9911,14 @@ export const NATIVE_ROOT_LIST_FUNDING_REACH = [
   "root survives keeper close",
   "zero final charge",
 ] as const;
+
+export const NATIVE_WRITE_GROWTH_REACH = [
+  "real competing buffers",
+  "complete deficit after surrender",
+  "task runs while growth waits",
+  "rows",
+  "metadata",
+  "cancellation without competitor release",
+  "net new credit completes",
+  "zero final charge",
+] as const;

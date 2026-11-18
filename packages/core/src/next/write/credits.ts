@@ -158,15 +158,21 @@ export class WriteCredits {
       if (moved > 0 && !this.governor.transferCredit(this.rows, grant, moved))
         throw new Error("Idle write credit was not transferred");
       if (grant.held >= wanted || grant.tryGrow(wanted - grant.held)) return;
+      // Admission asks spillable holders to reclaim. Surrender our target's idle
+      // credit first and request the whole remaining deficit: otherwise that request
+      // can be funded by reclaiming this same account, transferred back, and repeated
+      // forever without net growth or a task turn. Preserve live bytes/loans and the
+      // prepared row floor or metadata headroom, exactly as normal reclaim does.
+      if (grant === this.rows) this.reclaimRows();
+      else if (grant === this.metadata) this.reclaimMetadata();
+      const deficit = wanted - grant.held;
+      if (deficit <= 0) continue;
       const [credit] = await this.governor.admitGroup({
         label: `grow ${grant.label}`,
         grants: [
           {
             label: "write growth credit",
-            minimumBytes: Math.min(
-              wanted - grant.held,
-              this.governor.capBytes - this.governor.reserveBytes,
-            ),
+            minimumBytes: Math.min(deficit, this.governor.capBytes - this.governor.reserveBytes),
             spillable: false,
           },
         ],

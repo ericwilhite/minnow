@@ -145,6 +145,12 @@ writer unwind before admission, exact rows, one root charge before/after reopen 
 final charge. `testing/native-root-list-funding.test.ts` pins the identity and pending-state
 handoff guards and the standalone keeper lifetime. Its optional-workspace
 companion pins both cheaper fallbacks under fully occupied ordinary credit.
+Growth surrenders the target account's reclaimable estimates before admitting its full
+remaining deficit. Asking for the old deficit lets admission reclaim that same account,
+hand its credit back, and repeat without net growth or a task turn. Live buffers, loans,
+the prepared-row floor and metadata headroom stay owned. `write/credit-growth.test.ts`
+generates row/metadata growth, real competing buffers, completion/cancellation, one
+complete-deficit admission and zero final charge under 32 MiB.
 Oversized insert calls admit at most 2,048 rows at once, so an entire call's conservative
 estimate does not need to fit beside other working grants. Eligible pending chunks stage
 between pieces of the same call; uniqueness, foreign keys and rollback still span the whole
