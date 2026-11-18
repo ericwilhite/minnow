@@ -4483,6 +4483,15 @@ The disk route admits its smaller working window before copying or consuming ent
 
 ### Bounded native writer ownership
 
+Abort detaches each builder before consuming its reservation. Its remaining disk bytes move
+into one scalar writer owner, then into `releasingBytes` for each platform release. A failed
+release returns those bytes to the failed writer; successfully freed ranges are not counted
+again. Stats and the idle-publication predicate remain exact through every await. Inventory
+captures reject an aborting writer; audit waits for its mutation barrier and reports the typed
+space failure instead of enumerating an unsuccessful abort's consumed records.
+`testing/writer-abort-stats.test.ts` observes those boundaries, including spilled inventories,
+fragmented reservations and partial release failures. This changes no stored format.
+
 Native `ExtentWriter` owns a charged window of at most 64 sealed extents. Larger histories
 spill through the existing `MetadataJournal` chunk queue, pair sort and retirement-inventory
 cursors. Seal ordinals remain monotone across discard and address reuse; a per-part capture

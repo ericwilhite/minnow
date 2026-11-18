@@ -1,3 +1,4 @@
+import { idleGarbageOverBound } from "./idle-garbage.js";
 import { StagedExtents, EMPTY_STAGED_EXTENTS } from "./staged-extents.js";
 import {
   captureWriterExtents,
@@ -4587,8 +4588,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
   }
 
   #garbageOverBound(): boolean {
-    const stats = this.#space.stats;
-    return stats.waitingBytes > Math.max(this.#idleGarbageBytes, 0.05 * stats.dataBytes);
+    return idleGarbageOverBound(this.#space, this.#idleGarbageBytes);
   }
 
   /**

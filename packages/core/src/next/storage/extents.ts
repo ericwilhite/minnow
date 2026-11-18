@@ -554,7 +554,7 @@ export interface SpaceStats {
   /** Proven free bytes forgotten by the capped arena; never allocated. Debt can survive reopen
    * when fragmentation still exceeds capacity, and disappears when the rebuilt gaps fit. */
   readonly untrackedFreeBytes: number;
-  /** Reserved or sealed by writers not yet published or aborted. */
+  /** Unpublished space owned by writers, including failed abort releases. Excludes releasingBytes. */
   readonly writerBytes: number;
   /** Retired, waiting for the next publish or an older pin (garbage debt). */
   readonly waitingBytes: number;

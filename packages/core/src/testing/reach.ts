@@ -9870,3 +9870,17 @@ export const PUBLIC_RESULT_LABEL_REACH = [
   "prepared labels",
   "cursor labels",
 ] as const;
+
+export const WRITER_ABORT_STATS_REACH = [
+  "stats observed mid-abort",
+  "metadata await observed",
+  "release batch boundary",
+  "idle publish observed mid-abort",
+  "fragmented builder",
+  "spilled sealed inventory",
+  "failed ranges remain owned",
+  "partial release failure",
+  "successful abort audit",
+  "capture refuses aborting writer",
+  "zero final charge",
+] as const;

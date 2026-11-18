@@ -382,7 +382,7 @@ class Space implements ExtentSpace {
   #initialized = false;
   #reclaimWanted = false;
   #reclaimPending: Promise<void> | null = null;
-  /** Writers not yet published or aborted. */
+  /** Unpublished owners, including abort ranges whose platform release failed. */
   readonly writers = new Set<Writer>();
   readonly #publishing = new Mutex();
   readonly #mutations = new Mutex();
@@ -913,22 +913,24 @@ class Space implements ExtentSpace {
     ranges: Iterable<DataRange>,
     guard: MutationGuard,
     retired = false,
+    transfer?: (bytes: number) => void,
   ): Promise<void> {
     this.#guard(guard);
     let batch: DataRange[] = [];
     for (const range of ranges) {
       batch.push(range);
       if (batch.length === 256) {
-        if (!(await this.#releaseBatch(batch, guard, retired))) return;
+        if (!(await this.#releaseBatch(batch, guard, retired, transfer))) return;
         batch = [];
       }
     }
-    if (batch.length > 0) await this.#releaseBatch(batch, guard, retired);
+    if (batch.length > 0) await this.#releaseBatch(batch, guard, retired, transfer);
   }
   async #releaseBatch(
     ranges: readonly DataRange[],
     guard: MutationGuard,
     retired: boolean,
+    transfer?: (bytes: number) => void,
   ): Promise<boolean> {
     this.#guard(guard);
     let bytes = 0;
@@ -936,12 +938,16 @@ class Space implements ExtentSpace {
       this.#cache.dropExtent(range.offset);
       bytes += range.length;
     }
+    // Move ownership synchronously into releasingBytes before the platform await.
+    // On failure the map still owns these ranges, so return them to their writer.
+    transfer?.(bytes);
     this.#releasingBytes += bytes;
     if (retired) this.#releasingRetired += bytes;
     try {
       await this.#session.releaseData(ranges);
     } catch (error) {
       this.fail(error);
+      transfer?.(-bytes);
       this.#releasingBytes -= bytes;
       if (retired) this.#releasingRetired -= bytes;
       return false;
@@ -1100,6 +1106,10 @@ class Space implements ExtentSpace {
       for (const writer of writers) {
         if (!(writer instanceof Writer) || writer.space !== this)
           throw new TypeError("Foreign native ownership source");
+        // A failed abort keeps only an exact scalar ownership count. Its old sealed
+        // records may already be released; do not audit them as live extents.
+        if (writer.state === "aborted" && this.#failed !== null)
+          throw new SpaceFailedError(this.#failed);
         await enqueue((await writer.inventory.captureInside(io, 0, work)).handle);
         if (includeBuilders && writer.builders.size > 0)
           await enqueue(
@@ -1774,6 +1784,8 @@ class Writer implements ExtentWriter {
   busy = 0;
   readonly #idle: Array<() => void> = [];
   #abortPromise: Promise<void> | null = null;
+  /** Detached abort ownership; in-flight releases temporarily belong to Space instead. */
+  #abortingBytes = 0;
   get abortRequested(): boolean {
     return this.#abortPromise !== null;
   }
@@ -1807,9 +1819,10 @@ class Writer implements ExtentWriter {
   }
 
   get bytes(): number {
-    let bytes = 0;
-    for (const builder of this.builders) bytes += builder.capacity;
-    bytes += this.state === "published" ? this.publishedBytes : this.inventory.bytes;
+    let bytes = this.#abortingBytes;
+    for (const builder of this.builders) bytes += builder.ownedBytes;
+    if (this.state !== "aborted")
+      bytes += this.state === "published" ? this.publishedBytes : this.inventory.bytes;
     return bytes;
   }
 
@@ -1927,9 +1940,17 @@ class Writer implements ExtentWriter {
           this.space.mutate(async (guard) => {
             if (this.state !== "open") throw new TypeError(`Writer ${this.label} is ${this.state}`);
             this.state = "aborted";
+            this.#abortingBytes = this.inventory.bytes;
+            const transfer = (bytes: number) => {
+              this.#abortingBytes -= bytes;
+            };
             for (const builder of this.builders) {
               if (this.space.staged?.builder === builder) this.space.staged = null;
-              await this.space.freeGuarded(builder.abandon(), guard);
+              // Detach before abandon can empty its reservation. Stats never dereference
+              // that consumed reservation; its ranges keep exactly one scalar owner.
+              this.#abortingBytes += builder.ownedBytes;
+              this.builders.delete(builder);
+              await this.space.freeGuarded(builder.abandon(), guard, false, transfer);
             }
             await pairPhase(this.space.journal, io, "merge", async (slots) => {
               const pairs = await openPairs(this.space.journal, handle, slots.left, true);
@@ -1940,17 +1961,18 @@ class Writer implements ExtentWriter {
                   if (!(typeof pending === "boolean" ? pending : await pending)) break;
                   batch.push({ offset: pairs.offset, length: this.space.map.sizeOf(pairs.length) });
                   if (batch.length === this.inventory.capacity) {
-                    await this.space.freeGuarded(batch, guard);
+                    await this.space.freeGuarded(batch, guard, false, transfer);
                     batch = [];
                   }
                 }
-                if (batch.length > 0) await this.space.freeGuarded(batch, guard);
+                if (batch.length > 0) await this.space.freeGuarded(batch, guard, false, transfer);
               } finally {
                 await pairs.close();
               }
             });
-            this.builders.clear();
-            this.space.writers.delete(this);
+            // A failed platform release leaves ranges allocated. Keep their scalar
+            // ownership visible until the failed space closes, even after inventory IO ends.
+            if (this.#abortingBytes === 0) this.space.writers.delete(this);
           }),
         );
       } finally {
@@ -1958,7 +1980,9 @@ class Writer implements ExtentWriter {
           if (handle !== 0) await disposeSnapshot(this.space.journal, handle);
         } finally {
           for (const builder of this.builders) builder.releaseBuffer();
-          await this.inventory.closeInside();
+          // A failed abort remains in Space.writers. Its bounded controls stay funded
+          // until space close drains that owner, as well as preserving its disk-byte count.
+          if (!this.space.writers.has(this)) await this.inventory.closeInside();
         }
       }
     });
@@ -1990,6 +2014,12 @@ class Builder implements ExtentBuilder {
 
   get capacity(): number {
     return this.reservation.capacity;
+  }
+
+  get ownedBytes(): number {
+    return this.#leftover === null
+      ? this.capacity
+      : this.#leftover.reduce((bytes, range) => bytes + range.length, 0);
   }
 
   get length(): number {

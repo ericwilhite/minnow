@@ -10,6 +10,11 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The private 1.0 storage writer keeps space statistics exact while aborting a write,
+including when releasing part of its reserved space fails. Idle maintenance can read
+those statistics without a reservation error. Released 0.x behavior is unchanged;
+no stored-format change or migration is required.
+
 The shared parser now records each SELECT output's original label for the private 1.0
 engine, which follows PostgreSQL for duplicate labels (`SELECT 1 AS x, 2 AS x` returns two
 columns named `x`). The released 0.x engine keeps its numbered names (`x`, `x_2`) and its
