@@ -11692,3 +11692,24 @@ export const DIRECTORY_OPENER_SETTLEMENT_REACH = [
   "deferred consumer",
   "original error retained",
 ] as const;
+
+export const PARAMETER_UTF8_REACH = [
+  "one byte",
+  "two bytes",
+  "three bytes",
+  "four bytes",
+  "lone high",
+  "lone low",
+  "pair crosses 8192",
+  "pair before 8192",
+  "pair after 8192",
+  "mixed slots",
+  "null slot",
+  "enum slot",
+  "text first",
+  "text middle",
+  "text last",
+  "sizing and binding yield",
+  "short write",
+  "zero retained",
+] as const;

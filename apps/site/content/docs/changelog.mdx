@@ -30,6 +30,12 @@ including when releasing part of its reserved space fails. Idle maintenance can 
 those statistics without a reservation error. Released 0.x behavior is unchanged;
 no stored-format change or migration is required.
 
+The private 1.0 executor handles short UTF-8 encoder writes, including Node 26's
+exact-capacity tail behavior, without truncating or refusing valid text parameters.
+It keeps the measured byte count separate from reservation bounds and funds one
+temporary encoding slice across sequential parameter slots. Released 0.x behavior
+and stored formats are unchanged; no migration is required.
+
 The private 1.0 devtools binding reads canonical results, detached catalog descriptions and
 logical explain plans. Duplicate labels keep their column positions; exact integers, NUMERIC
 and microsecond timestamps retain their canonical values. Metadata stays charged until receipt.
