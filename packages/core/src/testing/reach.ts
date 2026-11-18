@@ -11494,3 +11494,77 @@ export const NATIVE_ROOT_CREDITS_REACH = [
   "premature close preserves ownership",
   "zero root ownership",
 ] as const;
+
+export const NATIVE_COMMAND_FUNDED_REACH = [
+  "pressure cancellation",
+  "pressure release",
+  "exact root count",
+  "update RI",
+  "delete RI",
+  "nested bodies and ordered trace",
+  "empty root",
+  "nonempty root",
+  "published source",
+  "resident source",
+  "zero retained ownership",
+] as const;
+
+/** Guarded production SQL owner: same native provider, with no fixture funding slack. */
+export const NATIVE_TRIGGER_SQL_REACH = [
+  "update RI",
+  "delete RI",
+  "BEFORE and AFTER name order",
+  "published source",
+  "resident source",
+  "late parent failure",
+  "late child failure",
+  "failed SQL transaction",
+  "exact savepoint recovery",
+  "successful body undo",
+  "transaction continues",
+  "exact committed rows",
+  "zero ownership",
+] as const;
+
+export const NATIVE_TRIGGER_SQL_FOLLOW_REACH = [
+  "shift",
+  "swap",
+  "rotate",
+  "self",
+  "child",
+  "enforced",
+  "informational",
+  "published",
+  "resident",
+  "raw PG cascade",
+  "captured-identity PG",
+  "nested bodies",
+  "root counts",
+  "exact rows",
+  "zero ownership",
+] as const;
+export const NATIVE_TRIGGER_SQL_CANCEL_REACH = [
+  "update",
+  "delete",
+  "published",
+  "resident",
+  "cancel after earlier rows",
+  "no committed effects",
+  "transaction continues",
+  "exact PG rows",
+  "zero ownership",
+] as const;
+
+export const NATIVE_TRIGGER_SQL_INSERT_REACH = [
+  "empty input",
+  "nonempty input",
+  "NULL binding",
+  "integer binding",
+  "published target",
+  "resident target",
+  "BEFORE and AFTER bodies",
+  "one further level",
+  "PG and shipped exact rows",
+  "root count",
+  "zero ownership",
+] as const;

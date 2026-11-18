@@ -5049,3 +5049,26 @@ retire before a fresh wait. Premature root-account close refuses to uncharge liv
 Generated histories cover both existing admission modes, invalidation, competing grants,
 cancellation and cleanup on the real native boundary. This controller alone does not wire
 owner SQL dispatch or enable trigger firing.
+
+### Guarded ordinary SQL trigger qualification
+
+`owner/native-command.ts` prepares the concrete native graph, rule programs and
+parameter bindings under `NativeRootCredits`, keeping separate source/image and
+row-rule funding. It retires graph I/O and leases before rules and credit. The
+ordinary owner's existing session and commit boundary dispatches to this consumer
+only behind `native-trigger-gate.ts`, which remains false. There is no public
+option to override it and no package or default-engine switch.
+
+The qualification suites run at 64 MiB; `MINNOW_TRIGGER_CAP_MIB=32` selects the
+same funded/SQL histories for the final prefix-reservation acceptance run. These
+are `FOR EACH ROW` triggers only. `FOR EACH STATEMENT` and transaction control
+inside bodies remain refused. Generated PostgreSQL comparisons check BEFORE/AFTER
+name order, RI and nested bodies, statement rollback, failed SQL transaction state,
+enclosing savepoint recovery, successful-body undo and exact committed rows.
+The native component suites also cover original-target follow, error precedence,
+cancellation and the shipped one-further-level cascade contract.
+
+This staged consumer currently refuses RETURNING/conflict/MERGE roots, volatile,
+FTS or init-plan inputs, auto-increment/index domains lacking native preflight,
+and parameterized or growing/structural CHECK/generated-column workspace. These are typed refusals before root
+writes, not uncharged fallbacks. Ordinary SQL firing is not enabled by this unit.

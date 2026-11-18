@@ -1,5 +1,8 @@
 import { LiveRuntime } from "../live/runtime.js";
 import type { OwnerSnapshotOperations } from "./snapshot-connection.js";
+import { statementRuleReach } from "../exec/statement-reach.js";
+import { nativeTriggerFiringEnabled } from "./native-trigger-gate.js";
+import { executeNativeCommand } from "./native-command.js";
 import { StatementRules } from "../exec/statement-rules.js";
 /**
  * The composition root's engine: `OwnerEngine` and `EngineSession` (engine.ts) over the planner
@@ -288,7 +291,7 @@ const statementTimeOf = (ms: number): bigint =>
   BigInt(Math.trunc(ms)) * 1000n - PG_EPOCH_UNIX_MICROS;
 
 function countsOf(
-  summary: ExecutionSummary,
+  summary: Pick<ExecutionSummary, "rowCount">,
   lowered: LoweredModify,
   catalog: CatalogView,
 ): Record<string, number> {
@@ -1061,6 +1064,16 @@ class ComposedSession implements EngineSession {
   }
 
   #modify(lowered: LoweredModify, params: readonly WireValue[], context: RunContext): Run {
+    const root = lowered.plan.root;
+    if (root.op === "modify" && nativeTriggerFiringEnabled()) {
+      const reach = statementRuleReach(
+        this.#tx?.catalog ?? this.#writePath().catalog,
+        root.tableId,
+        root,
+      );
+      if (reach.triggers || reach.unsupportedReferentialActions)
+        return this.#nativeModify(lowered, params, context);
+    }
     if (this.#state === "open" && this.#tx !== null) {
       const tx = this.#tx;
       if (lowered.plan.root.op !== "modify") throw new TypeError("Missing modification root");
@@ -1146,6 +1159,65 @@ class ComposedSession implements EngineSession {
           },
         };
       },
+      context,
+    );
+  }
+
+  /** Same SQL/session/commit boundary as ordinary modifications; no public guard override. */
+  #nativeModify(lowered: LoweredModify, params: readonly WireValue[], context: RunContext): Run {
+    const execute = async (tx: WriteTransaction) => {
+      const options = this.#engine.options,
+        queryId = this.#engine.nextQueryId();
+      const result = await executeNativeCommand({
+        transaction: tx,
+        rootId: queryId,
+        plan: lowered.plan,
+        parameters: params,
+        planner: options.planner,
+        context: {
+          catalog: tx.catalog,
+          statistics: options.statistics ?? { table: () => null },
+          costs: options.costs ?? EXECUTOR_COSTS,
+        },
+        governor: options.governor,
+        signal: context.signal,
+        execution: {
+          reads: options.reads,
+          spill: options.spill,
+          queryId,
+          statementTime: this.#statementTime(),
+          sequences: this.#sequenceAccess,
+          sequenceSession: this.sequences,
+          returning: "atExecuted",
+        },
+      });
+      return {
+        command: lowered.command,
+        rowCount: result.rowCount,
+        counts: countsOf(result, lowered, tx.catalog),
+        tables: result.tables,
+      };
+    };
+    if (this.#state === "open" && this.#tx !== null) {
+      const done = execute(this.#tx).then(({ command, rowCount, counts }) => {
+        for (const [table, rows] of Object.entries(counts))
+          this.#txCounts[table] = (this.#txCounts[table] ?? 0) + rows;
+        return { command, rowCount, counts, lsn: null };
+      });
+      return {
+        results: emptyStream(),
+        done: this.#abortOnFailure(done),
+        reachedCommit: false,
+        commits: false,
+      };
+    }
+    return this.#autocommit(
+      lowered.columns,
+      (tx) => ({
+        executed: execute(tx),
+        acknowledge: () => undefined,
+        abort: () => undefined,
+      }),
       context,
     );
   }

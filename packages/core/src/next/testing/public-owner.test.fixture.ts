@@ -1,12 +1,16 @@
 /** Real native write path and executor behind the owner protocol; no stand-in engine. */
+import { Governor } from "../memory/governor.js";
 import { ProtocolClient } from "../owner/client.js";
 import { composeEngine } from "../owner/compose.js";
 import { OwnerServer } from "../owner/server.js";
 import { ChunkReader } from "../page/reader.js";
 import { StorageCore } from "./storage-core.js";
 
-export async function publicOwner(options: { planCacheBytes?: number } = {}) {
-  const core = await new StorageCore().open();
+export async function publicOwner(options: { planCacheBytes?: number; capBytes?: number } = {}) {
+  const core = new StorageCore();
+  if (options.capBytes !== undefined)
+    Object.defineProperty(core.harness, "governor", { value: new Governor(options.capBytes) });
+  await core.open();
   const engine = composeEngine({
     planner: core.lowerer,
     ...(options.planCacheBytes === undefined ? {} : { planCacheBytes: options.planCacheBytes }),
