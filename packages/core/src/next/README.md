@@ -4536,3 +4536,109 @@ the non-evictable account only after a successful copy. Native close fences resi
 inputs and their accepted reads before clearing payloads and refunding credit once.
 `testing/writer-resident.test.ts` covers these pressure and lifetime histories, and
 `storage/writer-resident.test.ts` rejects a small view over an oversized backing buffer.
+
+## Internal public-API preparation
+
+`owner/result.ts` implements the canonical lazy `Result` contract in `owner/api.ts`, behind
+internal imports only. Scalar decoding follows DECISIONS D1/D2 and C1–C6: int8 is bigint unless
+lowering marks a checked-number result, timestamps are ISO strings with six fractional digits,
+and exact NUMERIC retains its display scale. `columnChunks()` aliases flat received buffers;
+`column()` concatenates only when requested. Dictionary views retain codes and a stable entry
+prefix. Constants expand only for column access. NULL payloads are never interpreted.
+JavaScript arrays have zero-based nested dimensions; the original SQL bounds remain available
+in the array column's encoded bytes. Caller-retained views live with the Result and must not
+be passed to the explicit recycling export API. There is no package entry-point switch here.
+
+The internal protocol client now preserves the PREPARE parameter types and structured admin
+reply values that the owner already sends. Ordinary cursors expose column metadata, terminal
+completion and immutable dictionary prefixes for the canonical Result decoder. Closing or
+returning a cursor releases the owner's stream without detaching consumer-held ordinary
+views. An unsent cancellation settles locally, so a later connection cannot run it. Explicit
+recycling exports retain their separate return-buffer contract. These are internal transport
+bindings; the public entry points and default engine have not switched.
+
+### Internal SQL facade
+
+`owner/database-client.ts` binds SQL calls, opaque preparation, ordinary cursors and callback
+transactions to ProtocolClient. `query` and `cursor` accept SELECT plans; `execute` accepts any
+statement. The owner checks these rules after lowering. Callback transactions own their
+BEGIN/COMMIT/ROLLBACK boundary; savepoints remain available. Their native sessions isolate
+uncommitted writes from the default session, and their handles cannot outlive the callback.
+Cancellation waits for the native terminal reply: an acknowledged commit wins over abort,
+a proved no-effect cancellation returns the caller's reason, and unknown effects stay unknown.
+
+Connection prepared handles use a bounded governor-charged cache, rather than holding a plan
+outside its original cache's charge. Executions include the original SQL as an exact fallback
+for eviction or reconnection, under the same protocol sequence and ledger identity. Private-DDL
+preparation runs in its session and does not retain the private plan beyond that session cache.
+The unreleased protocol profile is 8 for these optional owner-side call guards/session binding;
+this changes no stored bytes or published package entry. Raw id-only execution requires a live
+cached handle; the internal facade always supplies fallback SQL.
+
+CRUD input conversion preserves the native write-request shape, cloned inputs and typed validity.
+Native `ComposedSession.write` remains an explicit stub pending B5b's input/admission wiring;
+these convenience calls are not yet enabled. SQL execution is tested against the real native
+write path/executor. B8's live runtime binding remains separate; native boot is described below.
+
+### Internal native boot
+
+`owner/native-boot.ts` composes an actual backend lease/session, extent space, native write-path
+recovery, governor, shared spill service, lowerer and real executor. Recovery precedes scratch
+sweep and ready. Startup uses actual charged allocations, without the harness's 8 MiB reserve.
+`owner/database.ts` supplies a local no-broker database over this owner; `native-worker.ts`
+installs the same composition into the existing owner host/election/lifecycle runtime. Worker
+and store barrels remain held for cutover. No test engine or old BlockStore cast is used.
+
+`owner/client-connect.ts` assembles the thin client from one `ProtocolClient`, the existing
+owner connector and the canonical database-client facade. Settings are captured before
+asynchronous election. Closing waits for this client's started owners to stop, including
+startup that reenters close before returning its handle. It does not stop another context's
+owner. Backend, worker, broker and platform selection remain explicit internal inputs;
+the client bundle includes neither native storage nor execution. Generated MessageChannel
+tests use real native owner boot, continued writes after restart and blocked startup cleanup.
+
+The cap is explicit until B4b supplies the reviewed public default/minimum. The base native
+write-owner minimum does not fit a 16 MiB cap; boot surfaces its typed 53200 refusal and releases
+the fence. Generated ordinary open/reopen tests cover memory and native IndexedDB at fitting
+32/64 MiB caps, continued writes, exact values and zero native charges after close. Memory alone
+uses MemorySpillService, as the native spill contract allows; durable backends use charged
+ScratchSpillService. This Node evidence is not a new supported Node product or real-browser
+qualification. Snapshot replacement, public DTO/CRUD wiring and B8's live binding remain separate.
+
+### Internal facade callback lifetime
+
+A callback transaction gets a positive session ID for that callback only. Its final
+COMMIT or ROLLBACK retires the native session, idle timer and slot after the queue
+drains; scoped preparations are unprepared too. The terminal COMMIT outcome remains
+retryable in the request ledger. Callback end markers disappear after their final
+request is acknowledged, while ordinary disconnected-session fences retain their
+existing expiry. Default SQL session 0 keeps its recovery protection.
+
+Client close waits for native requests and cursor cleanup, then native host teardown.
+It does not wait for a user callback that may itself await close. Closing fences every
+scoped SQL/prepared/cursor entry with `ClientClosedError`; an already committed
+terminal reply still determines the outcome. These bindings remain internal pending
+cutover; no public entry, option default or stored format changed.
+
+### Internal cutover entries (B6)
+
+`owner/entries/storage/{memory,indexeddb,opfs,auto}` exposes native backends only.
+Matching worker entries add the explicit `installNativeOwnerWorker` recipe; import
+does not install a handler. The application provides the backend namespace and worker
+wrapper. `owner/entries/client` adds `connectNativeWorkerClient`: one existing
+election/protocol lifecycle, explicit worker factory/broker/context/locks, no engine
+in the client bundle. Native auto selection retains legacy-data/conflict refusal.
+No 0.x BlockStore cast, manifest/export/default change or public memory default.
+Native parsing explicitly installs its window-input hooks through a used value import.
+It does not rely on bare module side effects surviving package tree shaking. Minified
+worker-entry execution tests cover row-dependent LAG/LEAD and lazy defaults.
+
+### Result labels
+
+The 1.0 native facade preserves duplicate SQL result labels, as PostgreSQL does.
+`SELECT 1 AS x, 2 AS x` has labels `["x", "x"]` and tuples `[[1, 2]]`.
+Object rows use the last occurrence (`{ x: 2 }`), as do Kysely, React and NDJSON.
+CSV retains both headers and positions. Name-based `column`, `columnChunks` and
+`values` access rejects an ambiguous label with `MINNOW_AMBIGUOUS_RESULT_COLUMN`;
+use a zero-based ordinal instead. Internal binding names remain unique. The
+published 0.x engine keeps its existing numbered output names.

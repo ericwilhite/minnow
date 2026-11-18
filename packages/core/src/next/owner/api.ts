@@ -7,7 +7,11 @@
  * - A `Result` holds the transferred frames (frame.ts) as they arrived. `column()` and
  *   `columnChunks()` give typed views over those buffers without copying (except `column()` on a
  *   multi-frame result, which concatenates once and caches).
+ * - A completed ordinary Result is caller-owned memory: its transferred/cloned frames and
+ *   lazy views/rows are outside the engine's working-memory cap. The engine retains no pooled
+ *   buffer alias. Live stores retained by the engine remain charged.
  * - Row objects, tuples and decoded JS values are built only when asked for, and cached.
+ *   Rows and tuples reference the same decoded per-column values, including shared entries.
  * - JS values follow DECISIONS.md: BIGINT → `bigint` (D2); COUNT and SUM(int2/int4) → `number`
  *   (`WireColumnMeta.render`); NUMERIC, DATE, TIME, TIMESTAMP(TZ) (ISO, six fraction digits, D1),
  *   INTERVAL, UUID, JSON/JSONB → `string`; REAL/DOUBLE → `number`; BYTEA → `Uint8Array`; arrays
@@ -147,11 +151,12 @@ export interface Result<TRow = Row> {
   readonly affectedRows: number | null;
   /** This answer came from the request ledger after a reconnect: the write had committed. */
   readonly replayed: boolean;
-  /** One contiguous view (concatenated once if the result has several frames). */
+  /** One contiguous view (concatenated once if the result has several frames).
+   * Duplicate labels require an ordinal; name lookup throws AmbiguousResultColumnError. */
   column(column: string | number): ColumnView;
   /** One view per frame, no copy. */
   columnChunks(column: string | number): readonly ColumnView[];
-  /** The column's values decoded to JS values. */
+  /** The column's values decoded to JS values. Ambiguous labels require an ordinal. */
   values(column: string | number): Value[];
   /** Row objects. Duplicate column names: the last one wins; use `tuples()` instead. */
   rows(): TRow[];
@@ -178,7 +183,8 @@ export interface CursorOptions extends CallOptions {
 /**
  * Rows streamed one frame at a time, with backpressure: the owner sends a frame only when the
  * consumer's window has room for it. Holds a snapshot pin until it ends; `return()` (a `break` in
- * `for await`) or `close()` releases it.
+ * `for await`) or `close()` releases it. Only one next() may be pending; overlap rejects
+ * without retiring the active read.
  */
 export interface Cursor<TRow = Row> extends AsyncIterableIterator<Result<TRow>> {
   readonly columns: Promise<readonly ResultColumn[]>;
@@ -188,16 +194,22 @@ export interface Cursor<TRow = Row> extends AsyncIterableIterator<Result<TRow>> 
 /** SQL execution. A transaction and the client both implement it. */
 export interface SqlExecutor {
   /**
-   * Runs one statement. Any statement: SELECT, DML (with RETURNING), DDL, and on the client's
-   * default session also `BEGIN`/`COMMIT`/`ROLLBACK` (as one PostgreSQL connection would).
+   * Runs a SELECT. The owner checks the planned statement kind before execution.
+   * Use execute for DML, DDL and transaction-control SQL.
    */
   query<TRow = Row>(
     sql: string,
     params?: readonly Param[],
     options?: CallOptions,
   ): Promise<Result<TRow>>;
+  /** Runs any one statement, including DML/DDL and default-session transaction control. */
+  execute<TRow = Row>(
+    sql: string,
+    params?: readonly Param[],
+    options?: CallOptions,
+  ): Promise<Result<TRow>>;
   cursor<TRow = Row>(sql: string, params?: readonly Param[], options?: CursorOptions): Cursor<TRow>;
-  /** Plans once on the owner; executions send an id and parameters only. */
+  /** Opaque preparation. The bounded owner cache may re-plan after eviction or reconnection. */
   prepare(sql: string, options?: CallOptions): Promise<PreparedStatement>;
   insert(table: string, rows: WriteInput, options?: InsertOptions): Promise<Result>;
   upsert(table: string, rows: WriteInput, options?: WriteOptions): Promise<Result>;
@@ -212,6 +224,7 @@ export interface PreparedStatement {
   readonly columns: readonly ResultColumn[];
   readonly parameters: readonly PhysicalType[];
   query<TRow = Row>(params?: readonly Param[], options?: CallOptions): Promise<Result<TRow>>;
+  execute<TRow = Row>(params?: readonly Param[], options?: CallOptions): Promise<Result<TRow>>;
   cursor<TRow = Row>(params?: readonly Param[], options?: CursorOptions): Cursor<TRow>;
   /** Frees the plan on the owner. Idempotent. */
   close(): void;

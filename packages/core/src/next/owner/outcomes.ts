@@ -51,7 +51,14 @@ export interface OwnerLedger {
    * Generations ≤ `generation` of the session ended: drop their `transaction`-scope requests and
    * outcomes; its standalone requests (commits in progress) and every other session keep theirs.
    */
-  endSession(clientId: string, sessionId: string, generation: number, nowMs: number): void;
+  endSession(
+    clientId: string,
+    sessionId: string,
+    generation: number,
+    nowMs: number,
+    /** Callback IDs never recur; the end marker is reclaimable after this terminal ACK. */
+    terminalSequence?: number,
+  ): void;
 }
 
 export interface AnsweredRequest {

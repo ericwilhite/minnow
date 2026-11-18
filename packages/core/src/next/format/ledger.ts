@@ -61,6 +61,11 @@
  * client saw that connection end (within the owner liveness timeout of `endSession`, far below a
  * window), so by then its retries are `expired`. A client's ended sessions go with the client.
  *
+ * Final callback session IDs never recur. Their end markers carry the final request sequence
+ * and are dropped once it is acknowledged: all old retries are then stale. Before the ACK,
+ * these markers fit the outstanding sequence window. The final COMMIT stays standalone and
+ * retryable. Other disconnected-session fences keep the existing two-window expiry.
+ *
  * ## Durability and bounds
  * - Committed outcomes are durable: the commit's log frame carries the request (log-frame.ts
  *   `CommitFrameBody.request`), and the root's ledger checkpoints them (`globalLsn`, replay.ts).
@@ -150,11 +155,18 @@ interface ClientState {
   readonly outcomes: Map<number, Held>;
   readonly inFlight: Map<number, Owner>;
   /** Per session: generations ≤ `generation` have ended, at `atMs`. */
-  readonly ended: Map<string, { generation: number; atMs: number }>;
+  readonly ended: Map<string, { generation: number; atMs: number; terminalSequence?: number }>;
 }
 
 export class RequestLedger {
   readonly #clients = new Map<string, ClientState>();
+
+  /** Transient end markers, bounded by the outstanding sequence window for callbacks. */
+  get endedSessionCount(): number {
+    let count = 0;
+    for (const client of this.#clients.values()) count += client.ended.size;
+    return count;
+  }
 
   #client(id: string, nowMs: number): ClientState {
     let client = this.#clients.get(id);
@@ -208,11 +220,22 @@ export class RequestLedger {
    * `transaction`-scope requests and outcomes; its standalone requests (commits in progress) and
    * every other session keep theirs.
    */
-  endSession(clientId: string, sessionId: string, generation: number, nowMs: number): void {
+  endSession(
+    clientId: string,
+    sessionId: string,
+    generation: number,
+    nowMs: number,
+    terminalSequence?: number,
+  ): void {
     const client = this.#clients.get(clientId);
     if (client === undefined) return;
     if (generation > (client.ended.get(sessionId)?.generation ?? 0))
-      client.ended.set(sessionId, { generation, atMs: nowMs });
+      if (terminalSequence === undefined || terminalSequence > client.resolvedThrough)
+        client.ended.set(sessionId, {
+          generation,
+          atMs: nowMs,
+          ...(terminalSequence === undefined ? {} : { terminalSequence }),
+        });
     const ended = (owner: Owner | null) =>
       owner !== null &&
       owner.scope === "transaction" &&
@@ -243,6 +266,11 @@ export class RequestLedger {
   #acknowledge(client: ClientState, resolvedThrough: number): void {
     if (resolvedThrough <= client.resolvedThrough) return;
     client.resolvedThrough = resolvedThrough;
+    // Terminal callback IDs are never reused. Once their final request is acknowledged,
+    // every possible old retry is stale, so retain no per-callback tombstone forever.
+    for (const [session, ended] of client.ended)
+      if (ended.terminalSequence !== undefined && ended.terminalSequence <= resolvedThrough)
+        client.ended.delete(session);
     for (const sequence of client.outcomes.keys())
       if (sequence <= resolvedThrough) client.outcomes.delete(sequence);
   }

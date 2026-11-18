@@ -10,6 +10,14 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The shared parser now records each SELECT output's original label for the private 1.0
+engine, which follows PostgreSQL for duplicate labels (`SELECT 1 AS x, 2 AS x` returns two
+columns named `x`). The released 0.x engine keeps its numbered names (`x`, `x_2`) and its
+results are unchanged. The main bundle measures 1,179,975 raw / 353,974 gzip bytes and OPFS
+1,592,412 / 460,959; raise their raw/gzip caps once by 512/128. The combined worker/client cap
+rises by 256 (573,743 measured) and the packed core cap by 250 (1,028,540 measured).
+No stored-format change or migration is required.
+
 The private 1.0 storage writer keeps sealed-extent ownership in a charged fixed window and
 spills larger histories through the existing native metadata inventory. Publication, staging,
 snapshot loading and abort consume immutable cursors instead of copying a whole write's

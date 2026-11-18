@@ -478,6 +478,14 @@ class ComposedEngine implements CatalogOwnerEngine {
     );
   }
 
+  createPreparedCache() {
+    return new PlanCache<{ readonly text: string; readonly planned: PlannedStatement }>(
+      this.#options.governor,
+      this.#options.planCacheSize,
+      this.#options.planCacheBytes,
+    );
+  }
+
   privatePlans(): PlanCache<PlannedStatement> {
     const cache = new PlanCache<PlannedStatement>(
       this.#options.governor,

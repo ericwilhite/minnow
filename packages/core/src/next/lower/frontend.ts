@@ -1,4 +1,4 @@
-import "./window-inputs.js";
+import { installWindowInputs } from "./window-inputs.js";
 import { identifierSource, rememberIdentifierSource } from "../../engine/identifier-sources.js";
 import { bindViewSources, viewSources } from "./view-sources.js";
 import { rememberRowField } from "../../engine/json-call-sources.js";
@@ -84,6 +84,7 @@ export function frontEndCatalog(catalog: CatalogView): FrontEndCatalog {
 
 /** Parses one statement with declared widths (C5, R17.4). */
 export function parseStatement(text: string): NativeStatement {
+  installWindowInputs();
   const parsed = compileWithDeclaredTypes(() => compileStatement(text));
   const drop = catalogDrop(parsed);
   return parsed.kind === "drop-table" && drop
@@ -110,6 +111,7 @@ export function parseAny(
 
 /** Parses a SELECT with declared widths. */
 export function parseQuery(text: string): CompiledQuery {
+  installWindowInputs();
   return compileWithDeclaredTypes(() => compileQuery(text));
 }
 

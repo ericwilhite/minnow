@@ -99,6 +99,11 @@ export default tseslint.config(
       "packages/core/src/storage/contract-boundaries.test.ts",
       // The same, for the rebuild core's module layers (next/README.md).
       "packages/core/src/next/dependency-rules.test.ts",
+      // Node-only bundle inspection and real worker-thread qualification; never shipped.
+      "packages/core/src/next/owner/client-isolation.test.ts",
+      "packages/core/src/next/owner/entries.test.ts",
+      "packages/core/src/next/testing/worker-bundles.test.ts",
+      "packages/core/src/next/testing/public-worker-boot.test.ts",
       // Reads executor sources to reject variable-size native argument lists. Test only.
       "packages/core/src/next/exec/call-spreads.test.ts",
       // Exact native byte oracle in a Node-only pool test; no production module imports it.

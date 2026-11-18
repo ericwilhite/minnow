@@ -1,3 +1,4 @@
+import { rememberRowOutputName } from "../../engine/json-call-sources.js";
 import { viewSources } from "./view-sources.js";
 /**
  * A FROM clause (`base` + `joins` of a compiled block, or a DML statement's target and sources)
@@ -111,6 +112,7 @@ interface Unit {
 type EntryKind = "base" | "inner" | "left" | "semi" | "anti" | "full";
 
 interface Resolved {
+  readonly label?: string;
   readonly record?: true;
   readonly local: number;
   readonly type: PhysicalType;
@@ -180,6 +182,7 @@ function relationEntry(
       ? undefined
       : {
           local,
+          label: found.label ?? found.name,
           type: found.type,
           nullable: found.nullable,
           big: found.big,
@@ -355,6 +358,7 @@ export function lowerFrom(
               columns: inner.columns.map((col, index) => ({
                 ...col,
                 name: aliases[index] ?? col.name,
+                label: aliases[index] ?? col.label ?? col.name,
               })),
             };
       return relationEntry(id, kind, nullSupplied, qualifiers, renamed, builder);
@@ -835,10 +839,14 @@ export function lowerFrom(
             (qualifier === undefined || entry.qualifiers.includes(qualifier)),
         )
         .flatMap((entry) =>
-          entry.names().map((name): Expression => ({
-            kind: "column",
-            reference: `${entry.qualifiers[0] ?? ""}.${name}`,
-          })),
+          entry.names().map((name): Expression => {
+            const expression: Expression = {
+              kind: "column",
+              reference: `${entry.qualifiers[0] ?? ""}.${name}`,
+            };
+            rememberRowOutputName(expression, entry.resolve(name)?.label ?? name);
+            return expression;
+          }),
         ),
     build: (where) => {
       const fullTextWhere = fullText.used ? where : [];

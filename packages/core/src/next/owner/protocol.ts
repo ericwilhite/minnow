@@ -217,7 +217,7 @@ export type TransactionState = "idle" | "open" | "failed" | "timedOut";
 export const DEFAULT_TRANSACTION_IDLE_TIMEOUT_MS = 30_000;
 
 /** Bumped by every change to a message in this file or in frame.ts. */
-export const PROTOCOL_VERSION = 6;
+export const PROTOCOL_VERSION = 8;
 
 /** The owner sends `alive` at least this often while a client has requests in flight. */
 export const ALIVE_INTERVAL_MS = 1_000;
@@ -338,9 +338,14 @@ export interface ResultRequest {
 export interface StatementRequest extends RequestHeader {
   readonly t: "statement";
   readonly session: SessionId;
-  /** SQL text, or null when `prepared` names a statement prepared on this connection. */
+  /** SQL text. With a prepared id, also serves as its exact fallback after cache eviction or
+   * reconnect. Null requires a live connection-owned cache entry. */
   readonly text: string | null;
   readonly prepared: number | null;
+  /** Familiar public query/cursor API: owner refuses non-query plans before any execution. */
+  readonly queryOnly?: boolean;
+  /** A callback transaction owns BEGIN/COMMIT/ROLLBACK; SQL savepoints remain allowed. */
+  readonly scopedTransaction?: boolean;
   /** Catalog version of the columns the client already holds for `prepared`, or −1. */
   readonly knownColumnsVersion: number;
   readonly params: readonly WireValue[];
@@ -350,6 +355,8 @@ export interface StatementRequest extends RequestHeader {
 /** Plans `text` and names it `id` (client-chosen, unique on the connection). */
 export interface PrepareRequest extends RequestHeader {
   readonly t: "prepare";
+  /** Present for facade preparation against this session's catalog, including private DDL. */
+  readonly session?: SessionId;
   readonly id: number;
   readonly text: string;
 }
@@ -368,6 +375,9 @@ export interface BeginRequest extends RequestHeader {
 export interface EndRequest extends RequestHeader {
   readonly t: "commit" | "rollback";
   readonly session: SessionId;
+  /** Final callback boundary. Retire after its queue drains; never reuse this session id.
+   * The standalone terminal outcome remains retryable through the ordinary request ledger. */
+  readonly retire?: boolean;
 }
 
 /**
@@ -799,6 +809,14 @@ export function parseClientMessage(value: unknown): ClientMessage {
     )
       throw new ProtocolError("Request releases must be { target, through } pairs");
   }
+  if (kind === "statement" && "queryOnly" in value && typeof value.queryOnly !== "boolean")
+    throw new ProtocolError("Statement queryOnly must be a boolean");
+  if (
+    kind === "statement" &&
+    "scopedTransaction" in value &&
+    typeof value.scopedTransaction !== "boolean"
+  )
+    throw new ProtocolError("Statement scopedTransaction must be a boolean");
   if (kind === "hello" && (value as Partial<Hello>).protocol === undefined)
     throw new ProtocolError("Hello without a protocol version");
   if (kind === "returnBuffers") {

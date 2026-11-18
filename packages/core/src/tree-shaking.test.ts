@@ -60,8 +60,10 @@ const SQL_ENGINE_MODULES =
 // by 512 bytes and gzip by 128 (353,621 gzip); private-input/isolation caps stay.
 // Exact native FK provenance / schema-action comparison: 1,179,776 raw / 353,876 gzip.
 // Raise raw once by 512 and gzip by 256; client/private-input isolation stays unchanged.
-const COMPLETE_ENTRY_RAW_BUDGET = 1152.25 * 1024;
-const COMPLETE_ENTRY_GZIP_BUDGET = 345.625 * 1024;
+// Native display-label provenance (PostgreSQL duplicate labels): 1,179,975 raw / 353,974 gzip.
+// Raise raw once by 512 and gzip by 128; private-input isolation stays unchanged.
+const COMPLETE_ENTRY_RAW_BUDGET = 1152.75 * 1024;
+const COMPLETE_ENTRY_GZIP_BUDGET = 345.75 * 1024;
 // The engine with the larger durable adapter, OPFS.
 // JSON_TABLE metadata: 1,585,069 raw / 458,168 gzip bytes; counterfactual
 // 1,584,618 / 458,049 (+451 / +119). Raw cap +512 once, gzip cap unchanged.
@@ -81,8 +83,10 @@ const COMPLETE_ENTRY_GZIP_BUDGET = 345.625 * 1024;
 // gzip cap +128 once (460,583 gzip); private-input/isolation checks stay.
 // Exact native FK provenance / schema-action comparison: 1,592,207 raw / 460,862 gzip.
 // Raise raw once by 512 and gzip by 256; no next/ or test input is reachable.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1555 * 1024;
-const ENGINE_WITH_OPFS_GZIP_BUDGET = 450.125 * 1024;
+// Native display-label provenance (PostgreSQL duplicate labels): 1,592,412 raw / 460,959 gzip.
+// Raise raw once by 512 and gzip by 128; no next/ or test input is reachable.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1555.5 * 1024;
+const ENGINE_WITH_OPFS_GZIP_BUDGET = 450.25 * 1024;
 // The IndexedDB-only worker entry: the whole engine, the host, and one adapter, bundled without
 // code splitting the way Vite's default iife worker format does.
 // JSON_TABLE metadata: 1,581,102 raw / 455,735 gzip bytes; counterfactual

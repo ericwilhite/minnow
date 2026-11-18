@@ -9635,3 +9635,238 @@ export const WRITER_MIXED_CUT_REACH = [
   "exact crossing suffix",
   "all mixed-cut credit returned",
 ] as const;
+
+/** Canonical Result decoding changes representation without changing values or frame ownership. */
+export const PUBLIC_RESULT_REACH = [
+  "exact int64",
+  "three decimal tiers",
+  "ISO microseconds",
+  "NULL garbage ignored",
+  "dictionary deltas",
+  "constant expansion",
+  "multi-frame concatenation",
+  "zero-copy flat view",
+] as const;
+
+export const PUBLIC_RESULT_PG_REACH = [
+  "executor frames",
+  "PG exact numeric",
+  "D1 timestamp",
+  "D2 bigint",
+  "float32 boundary",
+  "SQL array",
+  "NULL result",
+  "typed column metadata",
+] as const;
+
+export const PUBLIC_RESULT_CHANNEL_REACH = [
+  "MessageChannel native execution",
+  "safe int8 stays bigint",
+  "wide int8 stays exact",
+  "numeric display scale",
+] as const;
+
+export const PUBLIC_TRANSPORT_REACH = [
+  "prepared parameter types",
+  "structured admin reply",
+  "ordinary cursor metadata and completion",
+  "views live after close",
+  "immutable dictionary prefix",
+  "unsent close and cancellation",
+  "early return terminal fence",
+] as const;
+
+export const PUBLIC_FACADE_REACH = [
+  "owner query-only guard",
+  "transaction isolation and scope fence",
+  "callback rollback",
+  "savepoint recovery",
+  "private preparation and owned transaction boundary",
+  "prepared catalog invalidation",
+  "charged bounded prepared cache",
+  "uncached prepared fallback",
+  "cursor return retains Result and drains pin",
+] as const;
+
+export const PUBLIC_FACADE_OUTCOME_REACH = [
+  "abort before commit is no effect",
+  "commit wins over abort",
+  "lost reply ledger replay",
+  "lost RETURNING stays committed without result",
+  "cursor abort preserves prefix and terminal reason",
+] as const;
+
+export const PUBLIC_CLIENT_BINDING_REACH = [
+  "int32 input",
+  "float64 input",
+  "int64 input",
+  "empty input",
+  "validity word boundary",
+  "terminal success beats abort",
+  "no-effect reason and unknown effect",
+  "cursor metadata abort reason",
+] as const;
+
+export const PUBLIC_BOOT_REACH = [
+  "native fixed-minimum refusal releases fence",
+  "native IDB scratch service",
+  "memory backend spill exception",
+  "recovery and continued writes",
+  "exact native rows",
+  "all native charges closed",
+] as const;
+
+export const PUBLIC_WORKER_BOOT_REACH = [
+  "worker native SQL and exact decode",
+  "worker isolated transaction",
+  "worker cursor close retains views",
+  "worker complete native teardown",
+] as const;
+
+export const PUBLIC_WORKER_LIFETIME_REACH = ["before-init", "during-resolve", "malformed"] as const;
+
+export const PUBLIC_CURSOR_CONCURRENCY_REACH = [
+  "abort all reads settle",
+  "close all reads settle",
+  "two calls",
+  "many calls",
+] as const;
+
+export const PUBLIC_CONNECT_REACH = [
+  "queued SQL and captured settings",
+  "native owner restart and recovery",
+  "native owner retained",
+  "exact continued native writes",
+  "all started owners and locks drained",
+] as const;
+
+export const PUBLIC_CONNECT_CLOSE_REACH = ["blocked", "reentrant"] as const;
+
+/** Caller-owned Result projections reuse one decoded payload per dictionary/constant entry. */
+export const PUBLIC_RESULT_RETENTION_REACH = [
+  "dictionary entry shared",
+  "constant entry shared",
+  "nested array shared",
+  "bytea shared",
+  "row before values",
+  "tuples before values",
+  "views only on explicit request",
+] as const;
+
+/** Ordinary delivery relinquishes engine charge without recycling caller-held buffers. */
+export const PUBLIC_RESULT_OWNERSHIP_REACH = [
+  "delivered frame charge released",
+  "actual native return-pool reuse",
+  "held Results survive zero owner charge",
+  "small cloned delivery",
+  "large transferred delivery",
+] as const;
+
+/** Callback scopes own no persistent server, preparation or transaction-state entries. */
+export const PUBLIC_SESSION_RETIRE_REACH = [
+  "sequential callbacks",
+  "concurrent callbacks",
+  "rollback retires session",
+  "commit retires session",
+  "twenty or more callback rounds",
+  "zero retained callback credit",
+  "scoped preparations retired",
+  "unprepared callbacks",
+] as const;
+
+export const PUBLIC_REENTRANT_CLOSE_REACH = [
+  "body closes without waiting on itself",
+  "savepoint closes without waiting on itself",
+  "cursor closes without waiting on itself",
+  "closed scope rejects every entry",
+  "reentrant teardown drains native state",
+] as const;
+
+export const CALLBACK_LEDGER_RETIRE_REACH = [
+  "single final marker",
+  "concurrent final markers",
+  "transaction retry refused before ACK",
+  "COMMIT replay retained before ACK",
+  "ACK frees callback tombstones",
+  "old requests stale after ACK",
+] as const;
+
+export const PUBLIC_SESSION_OUTCOME_REACH = [
+  "lost COMMIT replays after retirement",
+  "failed rollback reply retires local recovery state",
+  "callback body never replayed",
+  "default session is not retired",
+] as const;
+
+export const PUBLIC_SESSION_FLAGS_REACH = ["default", "missing", "null", "wrongflag"] as const;
+
+/** Internal per-store boot: each selected backend reaches the real owner and drains its lease. */
+export const PUBLIC_STORE_ENTRY_REACH = [
+  "memory native worker",
+  "indexeddb native worker",
+  "opfs native worker",
+  "exact worker rows",
+  "captured lifecycle policy",
+  "worker lease and charge cleanup",
+] as const;
+
+/** Companion adapters use the exact canonical facade, not the legacy Result/Date boundary. */
+export const NATIVE_KYSELY_REACH = [
+  "exact int8",
+  "nullable text",
+  "NUMERIC scale",
+  "timestamp microseconds",
+  "bounded stream",
+  "early cursor close",
+  "isolated callback",
+  "rollback",
+  "savepoint recovery",
+  "catalog SQL widths",
+  "explicit decoding",
+  "live unbound",
+] as const;
+
+export const NATIVE_EXPORT_REACH = [
+  "BIGINT decimal tokens",
+  "NUMERIC and temporal text",
+  "escaped CSV",
+  "NULL and arrays",
+  "bytea hex",
+  "multiple frames",
+  "empty header",
+  "duplicate columns",
+  "cancel closes cursor",
+] as const;
+
+export const NATIVE_WORKER_BUNDLE_REACH = [
+  "variable lag",
+  "variable lead",
+  "lazy default",
+  "signed row offset",
+  "minified real entry SQL",
+  "native cleanup",
+] as const;
+
+export const PUBLIC_RESULT_LABEL_REACH = [
+  "direct",
+  "derived",
+  "cte",
+  "union",
+  "except",
+  "distinct",
+  "group",
+  "window",
+  "join",
+  "view",
+  "empty",
+  "unquoted",
+  "aliasList",
+  "0.x binding identities unchanged",
+  "dotted labels",
+  "case-sensitive labels",
+  "object-property labels",
+  "escaped labels",
+  "ambiguous name rejects",
+  "prepared labels",
+  "cursor labels",
+] as const;
