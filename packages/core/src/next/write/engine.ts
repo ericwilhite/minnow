@@ -6180,14 +6180,20 @@ class DeltaPublication {
     this.#attempt = null;
     if (attempt === null) return;
     const listPrepared = this.#listPrepared;
+    const preparedList = this.#preparedList;
     const sinkAsked = this.#sinkAsked;
     this.#listPrepared = false;
     this.#preparedList = null;
     this.#sinkAsked = false;
     try {
       if (listPrepared) {
-        if (this.#durable) this.lists.commit(attempt, this.#sequence);
-        else this.lists.abort(attempt);
+        if (this.#durable) {
+          this.lists.commit(attempt, this.#sequence);
+          if (preparedList === null) throw new TypeError("Installed root has no prepared list");
+          // Every native publisher funds its root before publish; that root owns this
+          // same array. Reopen already borrows it. Keep one reservation after install.
+          this.lists.borrowCommittedList(preparedList);
+        } else this.lists.abort(attempt);
       }
     } catch (error) {
       this.fail(new ExtentSinkError(error));

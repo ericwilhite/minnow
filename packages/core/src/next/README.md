@@ -136,9 +136,14 @@ reclaimed idle row credit is never mistaken for prepaid publication workspace. O
 keeper's internal metadata-pressure request can reach the outer retry; genuine external
 extent-sink errors remain fatal. Optional resident release lists and page dictionaries use
 nonwaiting admission and fall back to the smaller disk/plain route instead of demanding
-more credit. `testing/native-write-pressure.test.ts` covers six direct native 1 MiB TEXT
+more credit. After durable installation, the keeper borrows its exact committed list from
+the already funded root, as on reopen; it releases the separate keeper reservation without
+releasing the root's ownership. Standalone keepers retain their own list charge.
+`testing/native-write-pressure.test.ts` covers six direct native 1 MiB TEXT
 inserts at 32 MiB, generated microtask interleavings, competing reader buffers, provisional
-writer unwind before admission, exact rows and zero final charge. Its optional-workspace
+writer unwind before admission, exact rows, one root charge before/after reopen and zero
+final charge. `testing/native-root-list-funding.test.ts` pins the identity and pending-state
+handoff guards and the standalone keeper lifetime. Its optional-workspace
 companion pins both cheaper fallbacks under fully occupied ordinary credit.
 Oversized insert calls admit at most 2,048 rows at once, so an entire call's conservative
 estimate does not need to fit beside other working grants. Eligible pending chunks stage

@@ -26,7 +26,8 @@ No stored-format change or migration is required.
 The private 1.0 writer waits for temporary memory pressure while preparing retirement
 metadata or column-group pages, instead of refusing a fitting write after idle row credit
 was reclaimed. Optional dictionaries and resident retirement lists keep their smaller
-fallbacks. No stored-format change or migration is required; released 0.x behavior is unchanged.
+fallbacks. Committed extent metadata keeps one owning charge through publication and reopen.
+No stored-format change or migration is required; released 0.x behavior is unchanged.
 
 The private 1.0 storage writer keeps sealed-extent ownership in a charged fixed window and
 spills larger histories through the existing native metadata inventory. Publication, staging,

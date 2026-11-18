@@ -9886,6 +9886,7 @@ export const WRITER_ABORT_STATS_REACH = [
 ] as const;
 
 export const NATIVE_WRITE_PRESSURE_REACH = [
+  "one funded root list through reopen",
   "idle row credit reclaimed",
   "competing reader owns real bytes",
   "admission after provisional unwind",
@@ -9899,5 +9900,14 @@ export const NATIVE_WRITE_OPTIONAL_REACH = [
   "preferred size declined",
   "cheaper path exact",
   "no grant growth",
+  "zero final charge",
+] as const;
+
+export const NATIVE_ROOT_LIST_FUNDING_REACH = [
+  "pending funding preserved",
+  "standalone keeper stays funded",
+  "different identity refused",
+  "one root reservation",
+  "root survives keeper close",
   "zero final charge",
 ] as const;

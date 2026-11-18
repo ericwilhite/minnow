@@ -6,6 +6,7 @@ import type { ExtentWriter } from "../storage/extents.js";
 import { seedsFor } from "../../testing/seeds.js";
 import { Governor, type Grant } from "../memory/governor.js";
 import * as writers from "../page/writer.js";
+import { PIN_HEADER_BYTES } from "../storage/root-pins.js";
 import { ExtentListKeeper } from "../storage/extent-list.js";
 import { WriteCredits } from "../write/credits.js";
 import { autocommit, batch, rowsOf, texts } from "../write/test-support.js";
@@ -138,8 +139,21 @@ for (const boundary of ["retirement", "group"] as const) {
             reach.reach("six 1 MiB native commits");
             await core.harness.path.quiesce();
             releaseReader();
+            const checkRootFunding = () => {
+              expect(core.harness.space.stats.pinCount).toBe(1);
+              const label = core.harness.space.stats.oldestPin?.label;
+              expect(label).toBe("current state");
+              expect(credits?.metadata.allocated).toBe(
+                core.harness.path.residentMetadataBytes +
+                  PIN_HEADER_BYTES +
+                  2 * "current state".length,
+              );
+            };
+            checkRootFunding();
             armed = false;
             await core.harness.reopen();
+            checkRootFunding();
+            reach.reach("one funded root list through reopen");
             const view = core.harness.path.pin();
             try {
               expect(await rowsOf(view, table.id)).toEqual(

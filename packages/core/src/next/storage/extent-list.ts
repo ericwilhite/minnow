@@ -420,6 +420,18 @@ export class ExtentListKeeper {
     this.#sequence = sequence;
   }
 
+  /**
+   * An already funded installed root now owns this exact list. Borrow it, as on open,
+   * instead of retaining a second reservation for the same descriptors. The caller
+   * must keep the root's charge alive for its readers. Preparation/abort cannot adopt.
+   */
+  borrowCommittedList(list: ExtentList): void {
+    if (this.#preparing || this.#pending !== null || list !== this.#committed)
+      throw new TypeError("Only the committed list can borrow its installed root's funding");
+    this.#budget.free(this.#owned);
+    this.#owned = 0;
+  }
+
   /** The root sequence of the last committed publication (0 before any). */
   get sequence(): number {
     return this.#sequence;
