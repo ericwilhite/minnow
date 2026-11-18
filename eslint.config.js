@@ -114,6 +114,8 @@ export default tseslint.config(
       "packages/core/src/next/testing/durable-long-keys.test.ts",
       // Inspects own/private retained allocator objects; this Node-only guard never ships.
       "packages/core/src/next/testing/scratch-metadata-guards.test.ts",
+      // Test-only closed-file fingerprints stream images through Node SHA-256.
+      "packages/core/src/next/testing/closed-disk-fixture.test-support.ts",
       // Frozen native-file compatibility fixtures use Node I/O and bulk array checks.
       // These unexported test helpers never enter a browser package entry point.
       "packages/core/src/next/write/directory-compatibility.test.ts",

@@ -2,7 +2,7 @@
  * generation under R25's complete inventory and R8's two-root reclamation contract. */
 import fc from "fast-check";
 import { afterAll, describe, expect, it } from "vitest";
-import { closedDiskFixture } from "./closed-disk-fixture.js";
+import { closedDiskFixture } from "./closed-disk-fixture.test-support.js";
 import { seedsFor } from "../../testing/seeds.js";
 import {
   createReach,
@@ -596,9 +596,14 @@ for (const seed of seedsFor("next-snapshot-fts-cuts", [0xb2bf, 0xb2c0]))
                   reach.reach("ordinary reopen");
                   return steps;
                 } finally {
-                  if (!closed) await h.close();
-                  expect(h.governor.usedBytes).toBe(0);
-                  expect(loader.usedBytes).toBe(0);
+                  try {
+                    if (!closed) await h.close();
+                    expect(h.governor.usedBytes).toBe(0);
+                    expect(loader.usedBytes).toBe(0);
+                  } finally {
+                    fork.verify();
+                    reach.reach("shared fixture fingerprint verified");
+                  }
                 }
               };
               const steps = await run(null);

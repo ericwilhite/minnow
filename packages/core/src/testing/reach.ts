@@ -9143,6 +9143,7 @@ export const SNAPSHOT_VALIDATOR_LEASE_REACH = [
 
 export const SNAPSHOT_FTS_CUT_REACH = [
   "one native preparation per configuration",
+  "shared fixture fingerprint verified",
   "checkpoint target",
   "checkpoint and staged target",
   "document and term payloads",
@@ -10873,4 +10874,15 @@ export const CLOSED_DISK_FIXTURE_REACH = [
   "isolated truncate",
   "same seeded power loss",
   "consumed random stream refused",
+] as const;
+
+export const CLOSED_DISK_FINGERPRINT_REACH = [
+  "current",
+  "durable",
+  "pending bytes",
+  "queued bytes",
+  "pending offset",
+  "queued offset",
+  "pending truncate",
+  "queued truncate",
 ] as const;

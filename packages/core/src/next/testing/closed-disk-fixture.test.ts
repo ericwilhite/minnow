@@ -2,9 +2,13 @@
 import fc from "fast-check";
 import { expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
-import { createReach, CLOSED_DISK_FIXTURE_REACH } from "../../testing/reach.js";
+import {
+  createReach,
+  CLOSED_DISK_FIXTURE_REACH,
+  CLOSED_DISK_FINGERPRINT_REACH,
+} from "../../testing/reach.js";
 import { SimDisk } from "../storage/sim-disk.js";
-import { closedDiskFixture } from "./closed-disk-fixture.js";
+import { closedDiskFixture } from "./closed-disk-fixture.test-support.js";
 function state(disk: SimDisk) {
   const file = disk.files.get("data");
   if (file === undefined) throw new Error("missing data");
@@ -91,9 +95,59 @@ for (const seed of seedsFor("next-closed-disk-fixture", [0xb2fb, 0xb2fc]))
             reach.reach("consumed random stream refused");
             expect(state(source).current).toEqual(before);
             expect(state(source).durable).toEqual(durable);
+            fork.verify();
           }
         },
       ),
+      { seed, numRuns: 40, endOnFailure: true },
+    );
+    reach.assertReached();
+  });
+
+for (const seed of seedsFor("next-closed-disk-fingerprint", [0xb2fd, 0xb2fe]))
+  it(`closed fixture fingerprint detects shared mutations ${String(seed)}`, () => {
+    const reach = createReach("closed disk fingerprint", CLOSED_DISK_FINGERPRINT_REACH);
+    fc.assert(
+      fc.property(fc.uint8Array({ minLength: 8, maxLength: 64 }), (initial) => {
+        reach.beginHistory();
+        for (const mutation of CLOSED_DISK_FINGERPRINT_REACH) {
+          const options = { flush: "honest" as "honest" | "lying" },
+            source = new SimDisk(options),
+            handle = source.open("data", false);
+          handle.write(initial, { at: 0 });
+          handle.flush();
+          options.flush = "lying";
+          handle.write(new Uint8Array([17]), { at: 1 });
+          handle.truncate(initial.length + 1);
+          handle.flush();
+          handle.write(new Uint8Array([23]), { at: 0 });
+          handle.truncate(initial.length + 2);
+          handle.close();
+          const fork = closedDiskFixture(source),
+            branch = fork(options),
+            file = state(branch);
+          // An older helper has no guard: the RED then fails the mutation assertion,
+          // rather than failing while looking up a missing method.
+          const verify = () => {
+            const method: unknown = Reflect.get(fork, "verify");
+            if (typeof method === "function") Reflect.apply(method, fork, []);
+          };
+          expect(() => verify()).not.toThrow();
+          if (mutation === "current" || mutation === "durable") {
+            file[mutation][0] = (file[mutation][0] ?? 0) ^ 1;
+          } else {
+            const operations = mutation.startsWith("pending") ? file.pending : file.queued,
+              truncate = mutation.endsWith("truncate"),
+              operation = operations.find((op) => op.kind === (truncate ? "truncate" : "write"));
+            if (operation === undefined) throw new Error("Missing mutation operation");
+            if (operation.kind === "truncate") Reflect.set(operation, "size", operation.size + 1);
+            else if (mutation.endsWith("offset")) Reflect.set(operation, "at", operation.at + 1);
+            else operation.bytes[0] = (operation.bytes[0] ?? 0) ^ 1;
+          }
+          expect(() => verify(), mutation).toThrow("Shared closed disk fixture changed");
+          reach.reach(mutation);
+        }
+      }),
       { seed, numRuns: 40, endOnFailure: true },
     );
     reach.assertReached();
