@@ -9142,6 +9142,7 @@ export const SNAPSHOT_VALIDATOR_LEASE_REACH = [
 ] as const;
 
 export const SNAPSHOT_FTS_CUT_REACH = [
+  "one native preparation per configuration",
   "checkpoint target",
   "checkpoint and staged target",
   "document and term payloads",
@@ -10859,4 +10860,17 @@ export const SNAPSHOT_RETAINED_ADMISSION_REACH = [
   "spool",
   "typed combined refusal",
   "zero final charges",
+] as const;
+
+export const CLOSED_DISK_FIXTURE_REACH = [
+  "live handles refused",
+  "pending writes",
+  "lying queued writes",
+  "honest durable bytes",
+  "epoch carried",
+  "isolated append",
+  "isolated overwrite",
+  "isolated truncate",
+  "same seeded power loss",
+  "consumed random stream refused",
 ] as const;
