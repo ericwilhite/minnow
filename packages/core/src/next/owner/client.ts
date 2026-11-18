@@ -166,7 +166,7 @@ type QueuedLiveDelivery =
 
 interface ClientLiveState {
   readonly sql: string;
-  readonly params: readonly WireValue[];
+  params: readonly WireValue[];
   readonly options: ClientLiveOptions;
   delivering: boolean;
   initialErrorHandled: boolean;
@@ -176,6 +176,7 @@ interface ClientLiveState {
   token: number;
   closed: boolean;
 }
+const EMPTY_LIVE_PARAMS: readonly WireValue[] = Object.freeze([]);
 
 /** A request body: the header is the client's. */
 type Body = Request extends infer R
@@ -612,6 +613,8 @@ export class ProtocolClient {
     for (const live of this.#live) {
       live.closed = true;
       live.token++;
+      live.queued = null;
+      live.params = EMPTY_LIVE_PARAMS;
     }
     this.#live.clear();
     this.#liveBySeq.clear();
@@ -663,6 +666,7 @@ export class ProtocolClient {
         if (!state.closed) {
           state.closed = true;
           this.#retireLive(state);
+          state.params = EMPTY_LIVE_PARAMS;
           this.#live.delete(state);
           this.onActivity?.();
         }

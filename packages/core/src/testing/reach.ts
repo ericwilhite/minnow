@@ -10661,6 +10661,15 @@ export const LIVE_PUBLICATION_REACH = [
   "zero charges",
 ] as const;
 
+export const LIVE_CLOSE_REACH = [
+  "native captures released",
+  "active decoder and replacement",
+  "handle captures released",
+  "client replacement released",
+  "no delivery after disposal",
+  "zero charges",
+] as const;
+
 export const LIVE_LIFECYCLE_REACH = [
   "full parameter backing preflight",
   "parameter copy funded before allocation",

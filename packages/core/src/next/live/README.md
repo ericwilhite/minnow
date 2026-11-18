@@ -71,7 +71,10 @@ history copies, bounded diagnostic scratch and error-copy overlap. Live retained
 state uses at most one quarter of ordinary owner capacity. A slow subscriber owns one delivery
 (result or error) and one dirty watermark. Acknowledged baselines remain evictable during
 an error delivery and their next execution;
-no pin remains between sweeps. Dispose cancels admission/execution and owner close drains it. Internal `Run.cleaned`
+no pin remains between sweeps. Terminal disposal drops private parameter captures, dependency
+vectors and queued replacements, even if application code retains the closed handle. Refresh
+and reconnect preserve the captured parameters. Active consumer jobs retain their receiving
+charges until they drain. Dispose cancels admission/execution and owner close drains it. Internal `Run.cleaned`
 forwards `Execution.settled()`, including deferred launch, program, delivery and sizing-job
 cleanup. The cohort launcher installs its work fence before synchronous planning/admission,
 so reentrant close cannot resolve with diagnostic scratch still held. `Run.done` alone is the producer/outcome boundary and does not guarantee retirement.
@@ -107,6 +110,7 @@ npx vitest run packages/core/src/next/live \
   packages/core/src/next/testing/live-runtime.test.ts \
   packages/core/src/next/testing/live-runtime-errors.test.ts \
   packages/core/src/next/testing/live-runtime-lifecycle.test.ts \
+  packages/core/src/next/testing/live-runtime-close.test.ts \
   packages/core/src/next/write/changes.test.ts \
   packages/core/src/next/testing/live-commit-oracle.test.ts \
   packages/core/src/next/exec/result-retain.test.ts --maxWorkers=2

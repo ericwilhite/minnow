@@ -26,7 +26,7 @@ export interface LiveHandle {
 }
 interface Entry {
   readonly sql: string;
-  readonly params: readonly WireValue[];
+  params: readonly WireValue[];
   readonly deliver: (result: LiveDelivery) => void;
   readonly error: (error: WireError, version: number) => void;
   readonly ended: () => void;
@@ -56,6 +56,7 @@ interface Entry {
   session: EngineSession | null;
   plan: PlannedStatement | null;
 }
+const EMPTY_CAPTURE: readonly never[] = Object.freeze([]);
 
 function equal(left: unknown, right: unknown): boolean {
   if (Object.is(left, right)) return true;
@@ -281,6 +282,7 @@ export class LiveRuntime {
         }
       },
       refresh: () => {
+        if (entry.closed) return;
         entry.dirty = true;
         this.#schedule();
       },
@@ -620,6 +622,7 @@ export class LiveRuntime {
   #retire(entry: Entry): void {
     if (entry.retired) return;
     entry.retired = true;
+    entry.params = EMPTY_CAPTURE;
     entry.failure = null;
     const failureBytes = entry.failureBytes;
     entry.failureBytes = 0;
@@ -629,6 +632,7 @@ export class LiveRuntime {
     entry.cloneBytes = 0;
     this.#free(entry.dependencyBytes);
     entry.dependencyBytes = 0;
+    entry.tables = EMPTY_CAPTURE;
     entry.stage = null;
     this.#free(entry.stageBytes);
     entry.stageBytes = 0;

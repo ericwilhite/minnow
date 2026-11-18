@@ -47,7 +47,8 @@ Only committed changes invalidate queries; rollback and savepoint rollback disca
 Failed replanning widens invalidation until a complete dependency proof is restored. Refresh and
 reconnect honor teardown or another refresh requested from a loading callback, and owner
 retirement cannot publish a late subscription. Parameter capture charges complete byte-buffer
-capacity before making its private copy.
+capacity before making its private copy. Disposal drops private captures and queued replacements
+while active consumer callbacks finish.
 Disposal drains native admission, execution and sizing cleanup through a separate resource fence;
 commit, durability and result-outcome boundaries are unchanged. Decoder errors preserve the
 last accepted result and rekey watermark, so later updates can recover without losing notices.

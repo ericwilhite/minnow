@@ -48,6 +48,7 @@ const SUITES: Suite[] = [
     name: "next-live-lifecycle",
     file: "packages/core/src/next/testing/live-runtime-lifecycle.test.ts",
   },
+  { name: "next-live-close", file: "packages/core/src/next/testing/live-runtime-close.test.ts" },
   { name: "next-live-row-values", file: "packages/core/src/next/live/rows.test.ts" },
   { name: "differential-harness", file: "packages/core/src/testing/differential-harness.test.ts" },
   { name: "block-format-properties", file: "packages/core/src/block-format/properties.test.ts" },
