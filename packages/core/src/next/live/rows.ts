@@ -3,7 +3,7 @@ import { dateMilliseconds } from "../../date-value.js";
  * result decoder. Explicit resets never invent identity continuity across a missing history.
  */
 import type { ByteBudget } from "../storage/extents.js";
-import { MemoryAdmissionError, bigintBytes, stringBytes } from "../memory/governor.js";
+import { MemoryAdmissionError, bigintBytes, stringBytes } from "../memory-values.js";
 
 export type LiveKey = string | number | boolean | bigint | Date;
 export type LiveKeyOf<R extends object> = {

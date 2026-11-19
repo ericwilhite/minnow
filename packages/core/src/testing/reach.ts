@@ -11299,3 +11299,30 @@ export const PROJECTION_ARRAY_STEP_REACH = [
   "nondefault bounds",
   "element NULL",
 ] as const;
+
+/** The shared native/page column grammar preserves representations and error boundaries. */
+export const LIVE_COLUMN_CODEC_REACH = [
+  "bool",
+  "i32",
+  "f32",
+  "f64",
+  "i64-safe",
+  "i64-wide",
+  "decimal-safe",
+  "decimal-i64",
+  "decimal-i128",
+  "decimal-mixed",
+  "text",
+  "enum",
+  "fixed16",
+  "interval",
+  "date",
+  "time",
+  "timestamp",
+  "shared definitions",
+  "nullable",
+  "all valid",
+  "unaligned input",
+  "same encoded bytes",
+  "typed malformed refusal",
+] as const;

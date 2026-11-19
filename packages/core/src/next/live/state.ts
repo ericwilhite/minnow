@@ -1,6 +1,6 @@
 /** Snapshot transitions only; B6 owns decoder/facade binding, refresh and subscription lifetime. */
 import type { ByteBudget } from "../storage/extents.js";
-import { MemoryAdmissionError } from "../memory/governor.js";
+import { MemoryAdmissionError } from "../memory-values.js";
 
 export type NativeLiveSnapshot<R> =
   | { readonly status: "loading"; readonly rows: readonly R[] }

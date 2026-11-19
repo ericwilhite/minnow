@@ -27,6 +27,10 @@ interface Suite {
 
 /** Every suite whose corpus is generated from a seed. A suite with a fixed corpus gains nothing here. */
 const SUITES: Suite[] = [
+  {
+    name: "next-live-column-codec",
+    file: "packages/core/src/next/testing/live-column-codec.test.ts",
+  },
   { name: "next-live-row-binary", file: "packages/core/src/next/live/rows-binary.test.ts" },
   { name: "next-live-row-identity", file: "packages/core/src/next/live/rows-identity.test.ts" },
   { name: "next-live-row-backing", file: "packages/core/src/next/live/rows-backing.test.ts" },

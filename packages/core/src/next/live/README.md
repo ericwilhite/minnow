@@ -135,3 +135,10 @@ in `testing/reach.ts`. The parent-API commit oracle fails on the parent, and mut
 missed dirty table, clearing the raced final watermark, retaining one queue record per commit,
 and fabricating rekey provenance. The handoff records commands, observed failures and full-gate
 results. No browser or performance qualification is implied by the Node evidence.
+
+The page decoder uses the same column grammar as native replay through
+`vector/column-codec.ts`. Native replay keeps its `ByteReader` and `StoreCorruptionError`;
+`owner/live-column.ts` supplies page-only byte access and `ProtocolError`. Shared immutable
+sizing functions and `MemoryAdmissionError` live in `memory-values.ts`, re-exported by the
+governor. The page therefore imports neither a native writer nor governor state. This extraction
+changes no stored encoding, memory admission policy or published export.
