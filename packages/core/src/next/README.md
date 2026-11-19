@@ -182,12 +182,22 @@ writer unwind before admission, exact rows, one root charge before/after reopen 
 final charge. `testing/native-root-list-funding.test.ts` pins the identity and pending-state
 handoff guards and the standalone keeper lifetime. Its optional-workspace
 companion pins both cheaper fallbacks under fully occupied ordinary credit.
-Growth surrenders the target account's reclaimable estimates before admitting its full
-remaining deficit. Asking for the old deficit lets admission reclaim that same account,
-hand its credit back, and repeat without net growth or a task turn. Live buffers, loans,
-the prepared-row floor and metadata headroom stay owned. `write/credit-growth.test.ts`
-generates row/metadata growth, real competing buffers, completion/cancellation, one
-complete-deficit admission and zero final charge under 32 MiB.
+Growth first moves idle row, metadata, WAL and merge credit into the next step. Before a
+global wait it returns unused forecasts and admits the complete remaining requirement in
+one group. Live buffers, loans, prepared rows and funded active steps remain owned. Cold
+run readers open before private merge credit or a provisional writer is retained. The
+merge's ByteBudget prepays its I/O, so its complete admission can use the whole cap without
+a legacy reserve loan. The funded metadata window survives the merge-account handoff.
+An idle writer returns forecasts when a fitting reader needs them. A read-only SELECT in
+an existing writable transaction retains its read view without pinning future write credit;
+row, DDL and native-command writes are forbidden on that internal read-only statement.
+`write/credit-growth.test.ts` keeps all competing accounts backed by real buffers while
+checking completion, cancellation, one complete deficit and zero final charge. The idle
+credit and write/query suites cover prepared handoffs, phase notifications, forecast reuse
+and exact SQL reads at 52, 56, 60 and 64 MiB. A zero-progress reclaim callback returns
+without notifying its own governor drain; genuine phase settlement wakes queued requests.
+Native maintenance, cold-merge and WAL-continuation
+suites keep active work funded while unrelated phases wait or grow.
 Oversized insert calls admit at most 2,048 rows at once, so an entire call's conservative
 estimate does not need to fit beside other working grants. Eligible pending chunks stage
 between pieces of the same call; uniqueness, foreign keys and rollback still span the whole

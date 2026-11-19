@@ -32,6 +32,7 @@ export class WriteCredits {
   readonly #abort: () => void;
   #closed = false;
   #mergeActive: Grant | null = null;
+  #mergeFloor = 0;
   #metadataHeadroom = 0;
   #rowMinimum: number;
   #rowFloor = 0;
@@ -82,6 +83,30 @@ export class WriteCredits {
       this.merge,
       Math.max(0, Math.max(this.minimum.merge, mergeMinimum) - (this.#mergeActive?.held ?? 0)),
     );
+  }
+
+  #workingMinimum: () => Partial<WriteMinimum> = () => ({});
+
+  /** Actual suspended native steps, not forecasts for a later phase. */
+  bindWorkingMinimum(work: () => Partial<WriteMinimum>): void {
+    this.#workingMinimum = work;
+  }
+
+  /** Includes the funded handoff before the private account is returned. */
+  get hasMergeStep(): boolean {
+    return this.#mergeFloor !== 0 || this.#mergeActive !== null;
+  }
+
+  /** Commit encoding and visibility installation use one atomic prepayment. */
+  prepareCommit(signal?: AbortSignal): MaybePromise<void> {
+    return this.commits.held >= this.minimum.commits
+      ? undefined
+      : this.#growTo(
+          this.commits,
+          this.minimum.commits,
+          signal,
+          this.metadata.allocated + this.#metadataHeadroom,
+        );
   }
 
   private constructor(
@@ -140,12 +165,32 @@ export class WriteCredits {
     return released;
   }
 
-  /** Retire completed recovery credit, preserving actual/loan/prepared ownership. */
+  /** Retire a completed phase's row forecast; allocations, loans and an admitted
+   * row step remain owned. This never asks another owner for credit. */
   retireRowsMinimum(bytes: number): number {
     if (!Number.isSafeInteger(bytes) || bytes < 0)
       throw new RangeError("Row working minimum must be a nonnegative safe integer");
     this.#rowMinimum = Math.min(this.#rowMinimum, bytes);
     return this.reclaimRows();
+  }
+
+  /** The owner calls this only between native steps. Future phase estimates are
+   * revocable; live allocations, loans and a prepared row still belong to us. */
+  reclaimIdleForecasts(): number {
+    const working = this.#workingMinimum();
+    this.#metadataHeadroom = 0;
+    return (
+      releaseIdle(this.rows, Math.max(this.#rowFloor, working.rows ?? 0)) +
+      releaseIdle(this.metadata, working.metadata ?? 0) +
+      releaseIdle(this.commits, working.commits ?? 0) +
+      releaseIdle(this.merge, Math.max(this.#mergeFloor, working.merge ?? 0))
+    );
+  }
+
+  /** Phase settlement may expose idle credit without freeing a live buffer. Wake
+   * already queued admissions so they can ask our cooperative reclaimer again. */
+  notifyReclaimable(): void {
+    this.rows.release(0);
   }
 
   /** Protect already admitted writer progress BEFORE opening the root's image lease.
@@ -185,114 +230,217 @@ export class WriteCredits {
   }
 
   /** Keep the next metadata step prepaid in addition to actual native live allocations. */
-  prepareMetadata(
-    bytes: number,
-    signal?: AbortSignal,
-    includesProgress = false,
-  ): MaybePromise<void> {
+  prepareMetadata(bytes: number, signal?: AbortSignal, includesProgress = false): MaybePromise<void> {
+    const before = this.#metadataHeadroom;
+    // The complete simultaneous workspace, before any of its allocations or waits.
+    // Existing reader/cache allocations are temporary ownership, not this step's minimum.
     if (bytes > this.governor.capBytes)
       throw new MemoryAdmissionError("write metadata step", bytes, this.governor.capBytes);
-    const changed = this.#metadataHeadroom !== bytes;
-    this.#metadataHeadroom = bytes;
-    if (changed) this.#changed?.();
     const wanted = this.metadata.allocated + bytes;
-    return this.metadata.held >= wanted
-      ? undefined
-      : this.growTo(this.metadata, wanted, signal, includesProgress);
+    if (this.metadata.held >= wanted) {
+      this.#metadataHeadroom = bytes;
+      if (before !== bytes) this.#changed?.();
+      return undefined;
+    }
+    // A pending or cancelled request owns no forecast. Retain only workspace
+    // already funded; install the larger requirement when admission succeeds.
+    this.#metadataHeadroom = Math.min(this.#metadataHeadroom, bytes);
+    if (before !== this.#metadataHeadroom) this.#changed?.();
+    return this.growTo(this.metadata, wanted, signal, includesProgress);
   }
 
-  get metadataReady(): boolean {
-    return this.metadata.held >= this.metadata.allocated + this.#metadataHeadroom;
-  }
+  get metadataReady(): boolean { return this.metadata.held >= this.metadata.allocated + this.#metadataHeadroom; }
 
   reclaimMetadata(): number {
-    const released = releaseIdle(this.metadata, this.metadata.allocated + this.#metadataHeadroom);
+    const released = releaseIdle(
+      this.metadata,
+      Math.max(
+        this.metadata.allocated + this.#metadataHeadroom,
+        this.#workingMinimum().metadata ?? 0,
+      ),
+    );
     if (released) this.#changed?.();
     return released;
+  }
+
+  /** A reclaim callout must not wake its own drain when it returns no credit. */
+  reclaimIdleMetadata(): number {
+    this.#metadataHeadroom = 0;
+    return this.reclaimMetadata();
   }
 
   /** Cancelled provisional work can lower its forecast without attempting fresh admission.
    * Existing allocations, loans and a newer/higher live minimum remain owned. */
   retireMetadataHeadroom(bytes: number): number {
     this.#metadataHeadroom = Math.min(this.#metadataHeadroom, bytes);
-    return this.reclaimMetadata();
+    const returned = this.reclaimMetadata();
+    this.notifyReclaimable();
+    return returned;
   }
 
-  /** Fund a larger bounded step before it creates inputs or provisional publication state. */
-  async growTo(
+  /** Fund a next step after its provisional state has unwound. Only actual live
+   * bytes and the complete minimum of an already-running step survive the wait. */
+  growTo(grant: Grant, wanted: number, signal?: AbortSignal, includesProgress = false): Promise<void> {
+    return this.#growTo(grant, wanted, signal, 0, includesProgress);
+  }
+
+  async #growTo(
     grant: Grant,
     wanted: number,
     signal?: AbortSignal,
+    metadata = 0,
     includesProgress = false,
   ): Promise<void> {
     const stop =
       signal === undefined ? this.#stop.signal : AbortSignal.any([signal, this.#stop.signal]);
+    const accounts = [this.rows, this.metadata, this.commits, this.merge];
+    const target = accounts.indexOf(grant);
+    if (target < 0) throw new Error("Growth must belong to the native write owner");
     for (;;) {
       this.#check();
       stop.throwIfAborted();
-      const missing = wanted - grant.held;
-      if (missing <= 0) return;
-      // A root waiting on fresh admission must unwind before native growth queues
-      // behind it. Credit transfers below remain within this one write owner.
+      if (grant.held >= wanted && this.metadata.held >= metadata) {
+        this.#rememberFundedMetadata(grant, wanted, metadata);
+        return;
+      }
       this.#changed?.();
-      const idle =
-        this.rows.held -
-        Math.max(this.#rowMinimum, this.rows.allocated + this.rows.loaned, this.#rowFloor);
-      const moved = grant === this.rows ? 0 : Math.min(missing, Math.max(0, idle));
-      if (moved > 0 && !this.governor.transferCredit(this.rows, grant, moved))
-        throw new Error("Idle write credit was not transferred");
-      if (grant.held >= wanted) return;
-      if (grant.tryGrow(wanted - grant.held)) {
+      const working = this.#workingMinimum();
+      const floors = [
+        Math.max(this.#rowFloor, working.rows ?? 0),
+        working.metadata ?? 0,
+        working.commits ?? 0,
+        Math.max(this.#mergeFloor, working.merge ?? 0),
+      ];
+      const desired = accounts.map((account, i) =>
+        Math.max(account.allocated + account.loaned, floors[i] ?? 0),
+      );
+      desired[target] = Math.max(desired[target] ?? 0, wanted);
+      desired[1] = Math.max(desired[1] ?? 0, metadata);
+      // Net this owner's idle accounts before requesting anybody else's memory.
+      // Unused row estimates go first; keep the bounded WAL/merge progress
+      // windows warm until this actual step needs their credit.
+      for (let i = 0; i < accounts.length; i++) {
+        const targetAccount = accounts[i];
+        if (!targetAccount) continue;
+        for (const j of [0, 2, 3, 1]) {
+          const source = accounts[j];
+          if (!source || i === j) continue;
+          const missing = Math.max(0, (desired[i] ?? 0) - targetAccount.held);
+          if (missing === 0) break;
+          const spare = Math.max(0, source.held - (desired[j] ?? 0));
+          const moved = Math.min(missing, spare);
+          if (moved > 0 && !this.governor.transferCredit(source, targetAccount, moved))
+            throw new Error("Idle native phase credit was not transferred");
+          if (moved > 0 && source === this.metadata) this.#trimMetadataHeadroom();
+        }
+      }
+      if (grant.held >= wanted && this.metadata.held >= metadata) {
+        this.#rememberFundedMetadata(grant, wanted, metadata);
+        return;
+      }
+      if (this.metadata.held >= metadata && grant.tryGrow(Math.max(0, wanted - grant.held))) {
         this.#changed?.(true);
+        this.#rememberFundedMetadata(grant, wanted, metadata);
         return;
       }
       this.#changed?.(true);
-      // Admission asks spillable holders to reclaim. Surrender our target's idle
-      // credit first and request the whole remaining deficit: otherwise that request
-      // can be funded by reclaiming this same account, transferred back, and repeated
-      // forever without net growth or a task turn. Preserve live bytes/loans and the
-      // prepared row floor or metadata headroom, exactly as normal reclaim does.
-      if (grant === this.rows) this.reclaimRows();
-      else if (grant === this.metadata) this.reclaimMetadata();
-      const deficit = wanted - grant.held;
-      if (deficit <= 0) continue;
-      const [credit] = await this.governor.admitGroup({
-        label: `grow ${grant.label}`,
-        includesProgress,
-        grants: [
-          {
-            label: "write growth credit",
-            minimumBytes: Math.min(
-              deficit,
-              this.governor.capBytes - (includesProgress ? 0 : this.governor.reserveBytes),
-            ),
-            spillable: false,
-          },
-        ],
+      // Dormant row, WAL, metadata and merge forecasts are all revocable. Admit
+      // the next phase together instead of waiting for a deficit while holding
+      // another owner's progress hostage. A live step's prepaid buffers stay owned.
+      for (let i = 0; i < accounts.length; i++) {
+        const account = accounts[i];
+        if (account) releaseIdle(account, floors[i] ?? 0);
+      }
+      this.#trimMetadataHeadroom();
+      const credits = await this.governor.admitGroup({
+        label: `complete grow ${grant.label}`,
+        ...(includesProgress ? { includesProgress: true } : {}),
+        grants: accounts.map((account, i) => ({
+          label: `write growth ${account.label}`,
+          minimumBytes: Math.max(0, (desired[i] ?? 0) - account.held),
+          spillable: false,
+        })),
         signal: stop,
       });
-      if (!credit) throw new Error("Missing write growth credit");
       try {
         this.#check();
         stop.throwIfAborted();
-        // Another publication may have funded the same headroom while this admission waited.
-        const missing = Math.max(0, wanted - grant.held);
-        if (!this.governor.transferCredit(credit, grant, Math.min(credit.held, missing)))
-          throw new Error("Admitted write credit was not transferred");
+        for (let i = 0; i < accounts.length; i++) {
+          const account = accounts[i],
+            credit = credits[i];
+          if (!account || !credit) throw new Error("Incomplete native growth admission");
+          const missing = Math.max(0, (desired[i] ?? 0) - account.held);
+          if (!this.governor.transferCredit(credit, account, Math.min(credit.held, missing)))
+            throw new Error("Admitted write credit was not transferred");
+        }
+        this.#rememberFundedMetadata(grant, wanted, metadata);
       } finally {
-        credit.close();
+        for (const credit of credits) credit.close();
       }
     }
   }
 
+  #rememberFundedMetadata(grant: Grant, wanted: number, metadata: number): void {
+    const nextMetadata = Math.max(grant === this.metadata ? wanted : 0, metadata);
+    const before = this.#metadataHeadroom;
+    if (nextMetadata > 0)
+      this.#metadataHeadroom = Math.max(
+        this.#metadataHeadroom,
+        nextMetadata - this.metadata.allocated,
+      );
+    if (before !== this.#metadataHeadroom) this.#changed?.();
+  }
+
+  #trimMetadataHeadroom(): void {
+    // A later phase cannot reserve a forecast whose credit was already donated.
+    // Active metadata steps are protected by workingMinimum and cannot donate it.
+    this.#metadataHeadroom = Math.min(
+      this.#metadataHeadroom,
+      Math.max(0, this.metadata.held - this.metadata.allocated - this.metadata.loaned),
+    );
+  }
+
   prepareMerge(bytes: number, signal?: AbortSignal): MaybePromise<void> {
+    return this.#prepareMerge(bytes, signal, false);
+  }
+
+  #prepareMerge(
+    bytes: number,
+    signal: AbortSignal | undefined,
+    complete: boolean,
+    headroom = this.#metadataHeadroom,
+  ): MaybePromise<void> {
     const wanted = Math.max(0, bytes - (this.#mergeActive?.held ?? 0));
-    return this.merge.held >= wanted ? undefined : this.growTo(this.merge, wanted, signal);
+    const metadata = this.metadata.allocated + headroom;
+    return this.merge.held >= wanted && this.metadata.held >= metadata
+      ? undefined
+      : this.#growTo(this.merge, wanted, signal, metadata, complete);
   }
 
   async acquireMerge(label: string, bytes: number): Promise<Grant> {
-    if (this.#mergeActive) throw new Error("Merge credit is already in use");
-    await this.prepareMerge(bytes);
+    if (this.#mergeActive || this.#mergeFloor !== 0)
+      throw new Error("Merge credit is already in use");
+    const headroom = this.#metadataHeadroom;
+    for (;;) {
+      // mergeRuns consumes a ByteBudget: its entire I/O/encoder workspace is
+      // prepaid here and never borrows the shared legacy reserve (rules2/3/5).
+      const ready = this.#prepareMerge(bytes, undefined, true, headroom);
+      if (ready instanceof Promise) await ready;
+      this.#check();
+      // A foreign admission can reclaim idle forecasts while preparation awaits.
+      // Pin only funded credit, synchronously with its last check.
+      if (this.merge.held >= bytes && this.metadata.held >= this.metadata.allocated + headroom)
+        break;
+    }
+    this.#mergeFloor = bytes;
+    try {
+      return await this.#takeMerge(label, bytes);
+    } finally {
+      this.#mergeFloor = 0;
+    }
+  }
+
+  async #takeMerge(label: string, bytes: number): Promise<Grant> {
     const [grant] = await this.governor.admitGroup({
       label,
       grants: [{ label, minimumBytes: 0, spillable: false }],
@@ -350,7 +498,7 @@ export class WriteCredits {
   /** Closing readers may inherit the existing row account, without re-admission/copying. */
   close({ keepRowsForReaders = false }: { readonly keepRowsForReaders?: boolean } = {}): void {
     if (this.#closed) return;
-    if (this.#mergeActive || this.#rowStep !== 0)
+    if (this.#mergeActive || this.#mergeFloor !== 0 || this.#rowStep !== 0)
       throw new Error("Native write steps must settle before their accounts close");
     this.#closed = true;
     this.#changed = null;

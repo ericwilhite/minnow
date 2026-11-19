@@ -8315,6 +8315,7 @@ export const NATIVE_COMMAND_CHECK_LIFETIME_REACH = [
 ] as const;
 
 export const PREPARED_ROW_CREDIT_REACH = [
+  "other accounts own actual buffers",
   "one prepared slot",
   "owner close refuses live step",
   "reclaim keeps floor",
@@ -10642,6 +10643,8 @@ export const NATIVE_WRITE_PRESSURE_REACH = [
   "exact durable rows",
   "32 MiB peak",
   "zero final charge",
+  "completed metadata workspace returned",
+  "resident metadata overlaps writer step",
 ] as const;
 
 export const NATIVE_WRITE_SETTLEMENT_REACH = [
@@ -10668,6 +10671,8 @@ export const NATIVE_ROOT_LIST_FUNDING_REACH = [
 ] as const;
 
 export const NATIVE_WRITE_GROWTH_REACH = [
+  "other native accounts own real buffers",
+  "unused working floors surrendered",
   "real competing buffers",
   "complete deficit after surrender",
   "task runs while growth waits",
@@ -11422,4 +11427,113 @@ export const WRITE_GROUP_TYPES_REACH = [
   "all physical buffers within preflight",
   "single row",
   "multiple pages",
+] as const;
+
+export const WRITE_STEP_CONCURRENCY_REACH = [
+  "only live ownership at growth admission",
+  "two owners",
+  "three owners",
+  "four owners",
+  "reader retained",
+  "merge retained",
+  "bounded progress",
+  "all owners complete",
+  "zero final charge",
+] as const;
+
+export const WRITE_MERGE_ADMISSION_REACH = [
+  "metadata owned through native merge handoff",
+  "cold read under competing credit",
+  "metadata retry reached",
+  "no private merge during admission",
+  "exact merged rows",
+  "zero final charge",
+  "other accounts own real buffers",
+  "real global metadata wait",
+] as const;
+
+export const WRITE_COMMIT_CONTINUATION_REACH = [
+  "reader retained during prefix",
+  "growth during active WAL step",
+  "later frame produced with prepaid credit",
+  "completed metadata window retired",
+  "exact strict commit and reopen",
+  "zero final charge",
+] as const;
+
+export const WRITE_MAINTENANCE_CREDIT_REACH = [
+  "maintenance queued behind transaction",
+  "idle metadata moves before row admission",
+  "writer progresses before slot release",
+  "maintenance completes after rollback",
+  "zero final charge",
+  "completed WAL window returned",
+] as const;
+
+/** A writer's idle forecasts cannot block a fitting native SQL reader. */
+export const WRITE_QUERY_RECLAIM_REACH = [
+  "52 MiB",
+  "56 MiB",
+  "60 MiB",
+  "64 MiB",
+  "reader and live ownership fit together",
+  "reported reader minimum",
+  "larger real reader workspace",
+  "initial exact rows",
+  "accepted keyed mutation",
+  "post-write query progressed",
+  "exact updated rows",
+  "continued writes after reclamation",
+  "zero final charge",
+  "idle explicit transaction",
+  "autocommit writer",
+] as const;
+
+/** Idle reclamation keeps actual buffers and prepared native handoffs owned. */
+export const WRITE_IDLE_FORECAST_REACH = [
+  "funded metadata retained across await",
+  "live row metadata and WAL buffers",
+  "funded merge retained across await",
+  "prepared row retained across reclaim",
+  "all other dormant credit returned",
+  "merge consumes its prepaid buffers",
+  "zero final charge",
+] as const;
+
+/** Pending readers must be reconsidered when a protected native step becomes idle. */
+export const WRITE_IDLE_NOTIFICATION_REACH = [
+  "reader queued during active step",
+  "real buffers retained",
+  "settlement wakes existing admission",
+  "zero final charge",
+] as const;
+
+/** Reused credit cannot also remain promised as an old metadata forecast. */
+export const WRITE_DONATED_METADATA_REACH = [
+  "metadata forecast funded",
+  "metadata credit donated to row step",
+  "merge retains only still funded metadata",
+  "real later metadata step readmitted",
+  "zero final charge",
+] as const;
+
+export const WRITE_PRIVATE_MERGE_REACH = [
+  "complete step exceeds ordinary capacity",
+  "whole cap admitted without loan",
+  "all private buffers funded",
+  "exact whole cap",
+  "below whole cap",
+  "zero final charge",
+] as const;
+
+export const WRITE_RECLAIM_PROGRESS_REACH = [
+  "competitor owns real buffers",
+  "zero-progress callback returns",
+  "waiting admission cancelled",
+  "waiting admission completed",
+  "exact native rows",
+  "32 MiB",
+  "48 MiB",
+  "64 MiB",
+  "zero final charge",
 ] as const;

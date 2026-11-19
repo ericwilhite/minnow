@@ -511,6 +511,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
   readonly #sequenceBody: ByteWriter;
   readonly #commitBuffers: CommitBuffers;
   readonly #commitRuns = new Set<Promise<unknown>>();
+  #commitEncoding = 0;
+  #metadataWriters = 0;
+  #runReadersPending = 0;
   readonly #commitTemporaries: Uint8Array[] = [];
   readonly #commitAllocator = {
     create: (bytes: number) => {
@@ -786,31 +789,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.sequences = new Sequences({
       check: () => this.#check(),
       definition: (id) => this.#catalog.sequence(id) ?? this.#holder?.catalog.sequence(id),
-      logReservation: (sequenceId, reservedThrough) => {
-        if (!this.#commitBuffers.grant.allocate(1024))
-          throw new Error("Bounded sequence workspace was exhausted");
-        try {
-          const lsn = this.#appender.append(
-            encodeBody(
-              {
-                request: null,
-                effects: [{ kind: "sequence", sequenceId, reservedThrough }],
-              },
-              this.#sequenceBody,
-            ),
-          );
-          // Standalone frames count toward the log bound too (review B3-p2b-1 #5).
-          if (lsn instanceof Promise)
-            return lsn.then((value) => {
-              this.#afterAppend();
-              return value;
-            });
-          this.#afterAppend();
-          return lsn;
-        } finally {
-          this.#commitBuffers.grant.free(1024);
-        }
-      },
+      logReservation: (sequenceId, reservedThrough) =>
+        this.#logSequence(sequenceId, reservedThrough),
       now: this.#now,
     });
     for (const { sequenceId, reservedThrough } of root.sequences)
@@ -828,6 +808,38 @@ export class WritePathImpl implements WritePath, EngineHooks {
       bitmap: (ref, rowCount) => this.#bitmap(ref, rowCount),
     };
     this.#unbindMetadataCaches = bindMetadataCaches(input.space, caches);
+  }
+
+  #logSequence(sequenceId: number, reservedThrough: bigint): MaybePromise<number> {
+    const ready = this.#credits.prepareCommit(this.#commitAbort.signal);
+    if (ready instanceof Promise)
+      return ready.then(() => {
+        this.#check();
+        return this.#logSequence(sequenceId, reservedThrough);
+      });
+    if (!this.#commitBuffers.grant.allocate(1024))
+      throw new Error("Bounded sequence workspace was exhausted");
+    try {
+      const lsn = this.#appender.append(
+        encodeBody(
+          {
+            request: null,
+            effects: [{ kind: "sequence", sequenceId, reservedThrough }],
+          },
+          this.#sequenceBody,
+        ),
+      );
+      // Standalone frames count toward the log bound too (review B3-p2b-1 #5).
+      if (lsn instanceof Promise)
+        return lsn.then((value) => {
+          this.#afterAppend();
+          return value;
+        });
+      this.#afterAppend();
+      return lsn;
+    } finally {
+      this.#commitBuffers.grant.free(1024);
+    }
   }
 
   // ── Open and recovery ────────────────────────────────────────────────────────────────────
@@ -851,14 +863,39 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const grant = credits.rows;
     const metadataGrant = credits.metadata;
     let engine: WritePathImpl | null = null;
+    credits.bindWorkingMinimum(() =>
+      engine === null
+        ? { rows: MINIMUM_BYTES, commits: COMMIT_MINIMUM_BYTES }
+        : {
+            rows: engine.#recovering ? MINIMUM_BYTES : 0,
+            // A running attempt must finish or unwind before its prepaid window moves.
+            metadata:
+              engine.#metadataWriters > 0 ||
+              credits.hasMergeStep ||
+              engine.#commitEncoding > 0 ||
+              (!engine.#recovering && engine.#appender.hasPendingWork)
+                ? metadataGrant.held
+                : 0,
+            commits:
+              engine.#commitEncoding > 0 || (!engine.#recovering && engine.#appender.hasPendingWork)
+                ? COMMIT_MINIMUM_BYTES
+                : 0,
+          },
+    );
     const reclaimWriter = () => {
       if (engine !== null) engine.#arenaPool.clear();
-      return credits.reclaimRows();
+      return engine !== null && engine.#canRetireIdleForecasts()
+        ? credits.reclaimIdleForecasts()
+        : credits.reclaimRows();
     };
     grant.onReclaimRequest(reclaimWriter);
     metadataGrant.onReclaimRequest(() => {
-      if (engine === null || engine.#ftsMutations === null) return credits.reclaimMetadata();
-      return engine.#ftsMutations.reclaim().then(() => credits.reclaimMetadata());
+      const retire = () =>
+        engine !== null && engine.#canRetireIdleForecasts()
+          ? credits.reclaimIdleMetadata()
+          : credits.reclaimMetadata();
+      if (engine === null || engine.#ftsMutations === null) return retire();
+      return engine.#ftsMutations.reclaim().then(retire);
     });
     const metadataBudget = new MetadataBudget(
       metadataGrant,
@@ -1253,6 +1290,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       },
       this.#commitBuffers,
       () => this.#check(),
+      () => this.#credits.retireMetadataHeadroom(0),
     );
   }
 
@@ -1945,6 +1983,32 @@ export class WritePathImpl implements WritePath, EngineHooks {
     free: (bytes: number) => this.#chargeMetadata(-bytes),
   };
 
+  /** Reclaim dormant forecasts only while no native step can still consume them. */
+  #canRetireIdleForecasts(): boolean {
+    // This is a phase boundary, not a guess that a pending writer will soon finish.
+    // A queued/retrying preparation must either recheck its own admission or keep
+    // its prepaid workspace through the actual step. Idle readers own allocations.
+    return (
+      !this.#recovering &&
+      this.#holder?.hasWritableStatement !== true &&
+      !this.#claimed &&
+      !this.#maintenanceHolds &&
+      this.#metadataWriters === 0 &&
+      !this.#credits.hasMergeStep &&
+      this.#commitEncoding === 0 &&
+      !this.#appender.hasPendingWork &&
+      this.#commitRuns.size === 0 &&
+      this.#minimumRuns.size === 0 &&
+      this.#flushing.size === 0 &&
+      !this.#flushScheduled &&
+      !this.#mergeScheduled &&
+      !this.#merging &&
+      this.#recycling === null &&
+      this.#idleRun === null &&
+      this.#runReadersPending === 0
+    );
+  }
+
   /** Retry only after an operation has aborted its provisional writer and released its lock. */
   #metadataRetry<T>(work: () => MaybePromise<T>, signal?: AbortSignal): MaybePromise<T> {
     return this.#metadataBudget.retry(
@@ -1965,14 +2029,17 @@ export class WritePathImpl implements WritePath, EngineHooks {
   }
 
   async #metadataAsync<T>(work: () => Promise<T>, signal?: AbortSignal): Promise<T> {
-    return await this.#metadataRetry(work, signal);
+    try {
+      return await this.#metadataRetry(work, signal);
+    } finally {
+      this.#credits.retireMetadataHeadroom(0);
+    }
   }
 
   readonly #minimumRuns = new Set<Promise<void>>();
   #minimumState: WriteState | null = null;
   #minimumCatalog: Catalog | null = null;
   #minimumMetadata = 0;
-  #minimumMerge = 0;
   #minimumReaders = 0;
 
   // This cached check is deliberately closure-free: single-row writes take it repeatedly.
@@ -1997,13 +2064,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
       signal,
       !!native && includesProgress,
     );
-    if (metadata instanceof Promise) return this.#finishMinimumGrowth(metadata, signal, !!native);
-    if (native) {
-      this.#credits.reclaimNativeStep();
-      return;
-    }
-    const merge = this.#credits.prepareMerge(this.#minimumMerge, signal);
-    return merge instanceof Promise ? this.#trackMinimum(merge) : undefined;
+    if (metadata instanceof Promise)
+      return this.#trackMinimum(metadata.then(() => { if (native) this.#credits.reclaimNativeStep(); }));
+    if (native) this.#credits.reclaimNativeStep();
+    // A future background merge admits its own complete step after cold readers open.
+    return undefined;
   }
 
   #metadataHeadroom(catalog: Catalog): number {
@@ -2028,19 +2093,6 @@ export class WritePathImpl implements WritePath, EngineHooks {
     );
   }
 
-  #finishMinimumGrowth(
-    metadata: Promise<void>,
-    signal?: AbortSignal,
-    native = false,
-  ): Promise<void> {
-    return this.#trackMinimum(
-      metadata.then(() => {
-        if (native) this.#credits.reclaimNativeStep();
-        else return this.#credits.prepareMerge(this.#minimumMerge, signal);
-      }),
-    );
-  }
-
   #recalculateMinimum(catalog: Catalog, signal?: AbortSignal): MaybePromise<void> {
     const state = this.#state;
     const readers = this.#minimumReaders;
@@ -2052,7 +2104,6 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (state !== this.#state || readers !== this.#minimumReaders)
         return this.#recalculateMinimum(catalog, signal);
       this.#minimumMetadata = minimum.metadata;
-      this.#minimumMerge = minimum.merge;
       this.#minimumState = state;
       this.#minimumCatalog = catalog;
       return;
@@ -2095,6 +2146,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       .finally(() => {
         this.#minimumRuns.delete(run);
         this.#nativeProgress();
+        this.#credits.notifyReclaimable();
       })
       .catch(() => undefined);
     return run;
@@ -2873,6 +2925,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       unlock = await this.#lock();
       this.#check();
       writer = this.#space.beginWrite("FTS preparation", { ownershipBudget: this.#metadataBudget });
+      this.#metadataWriters++;
       const write = writer.write.bind(writer);
       writer.write = async (parts) => {
         // Prepay the returned extent/blob records and the writer's retained extent array,
@@ -2957,12 +3010,20 @@ export class WritePathImpl implements WritePath, EngineHooks {
         retryCompact = true;
       else throw error;
     } finally {
-      await delta.settle();
-      if (madeRoot) this.#releaseRoot(madeRoot);
-      unlock?.();
-      // eslint-disable-next-line no-useless-assignment -- drop sealed descriptor references before refund or retry
-      writer = null;
-      if (ownedWorkspace) this.#chargeMetadata(-ownedWorkspace);
+      const hadWriter = writer !== null;
+      try {
+        await delta.settle();
+        if (madeRoot) this.#releaseRoot(madeRoot);
+        unlock?.();
+        // eslint-disable-next-line no-useless-assignment -- drop sealed descriptor references before refund or retry
+        writer = null;
+        if (ownedWorkspace) this.#chargeMetadata(-ownedWorkspace);
+      } finally {
+        if (hadWriter) {
+          this.#metadataWriters--;
+          this.#credits.retireMetadataHeadroom(0);
+        }
+      }
     }
     if (retryCompact) return this.#stageFts(tx, false);
     return { renderer, workspaceBytes: rendererWorkspace, invalidatesAll };
@@ -2979,6 +3040,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
       const minimum = this.#prepareMinimum(tx.catalog);
       if (minimum instanceof Promise)
         return this.#commitAfterMinimum(minimum, tx, request, staged, preflighted);
+      const commit = this.#credits.prepareCommit(this.#commitAbort.signal);
+      if (commit instanceof Promise)
+        return this.#commitAfterMinimum(commit, tx, request, staged, preflighted);
       const workspace = tx.commitWorkspaceBytes();
       if (workspace > SMALL_COMMIT_BYTES)
         return this.#trackCommit(this.#streamCommit(tx, request, staged), tx);
@@ -3046,6 +3110,20 @@ export class WritePathImpl implements WritePath, EngineHooks {
     request: CommitRequest | null,
     staged: (tableId: number) => PublishedRows | null,
   ): Promise<CommitReceipt> {
+    this.#commitEncoding++;
+    try {
+      return await this.#encodepreflightCommit(tx, request, staged);
+    } finally {
+      this.#commitEncoding--;
+      this.#credits.retireMetadataHeadroom(0);
+    }
+  }
+
+  async #encodepreflightCommit(
+    tx: TransactionImpl,
+    request: CommitRequest | null,
+    staged: (tableId: number) => PublishedRows | null,
+  ): Promise<CommitReceipt> {
     const releaseWorkspace = this.#commitBuffers.reserve(16 * 1024);
     const scratch = this.#commitBuffers.create(4096);
     let length: number;
@@ -3074,12 +3152,40 @@ export class WritePathImpl implements WritePath, EngineHooks {
       .finally(() => {
         this.#commitRuns.delete(settled);
         this.#nativeProgress();
+        this.#credits.notifyReclaimable();
       })
       .catch(() => undefined);
     return settled;
   }
 
   async #streamCommit(
+    tx: TransactionImpl,
+    request: CommitRequest | null,
+    staged: (tableId: number) => PublishedRows | null,
+  ): Promise<CommitReceipt> {
+    // Keyed FTS mutations enter here directly. A preceding read may have
+    // reclaimed the dormant WAL forecast; fund it again before any codec buffer.
+    // Recheck after an admission await because another phase may have used it.
+    for (;;) {
+      const metadata = this.#prepareMinimum(tx.catalog);
+      if (metadata instanceof Promise) {
+        await metadata;
+        continue;
+      }
+      const ready = this.#credits.prepareCommit(this.#commitAbort.signal);
+      if (!(ready instanceof Promise)) break;
+      await ready;
+    }
+    this.#commitEncoding++;
+    try {
+      return await this.#encodestreamCommit(tx, request, staged);
+    } finally {
+      this.#commitEncoding--;
+      this.#credits.retireMetadataHeadroom(0);
+    }
+  }
+
+  async #encodestreamCommit(
     tx: TransactionImpl,
     request: CommitRequest | null,
     staged: (tableId: number) => PublishedRows | null,
@@ -3597,14 +3703,19 @@ export class WritePathImpl implements WritePath, EngineHooks {
       RunReader.open(this.#space, ref, this.#grant, this.#metadataBudget),
     );
     if (opened instanceof Promise) {
-      const pending = opened.then((reader) => {
-        // A drop while it opened took the entry away: give the charge back.
-        if (this.#runReaders.get(key) === pending) {
-          this.#runReaders.set(key, reader);
-          this.#rememberReader(ref, reader);
-        } else this.#chargeMetadata(-reader.bytes);
-        return reader;
-      });
+      this.#runReadersPending++;
+      const pending = opened
+        .then((reader) => {
+          // A drop while it opened took the entry away: give the charge back.
+          if (this.#runReaders.get(key) === pending) { this.#runReaders.set(key, reader); this.#rememberReader(ref, reader); }
+          else this.#chargeMetadata(-reader.bytes);
+          return reader;
+        })
+        .finally(() => {
+          this.#runReadersPending--;
+          this.#credits.notifyReclaimable();
+          this.#nativeProgress();
+        });
       this.#runReaders.set(key, pending);
       pending.catch(() => this.#runReaders.delete(key));
       return pending;
@@ -3702,6 +3813,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const done = () => {
       if (this.#flushing.get(state) === flush) this.#flushing.delete(state);
       this.#nativeProgress();
+      this.#credits.notifyReclaimable();
     };
     void flush.then(done, done);
     return flush;
@@ -3719,6 +3831,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const writer = this.#space.beginWrite(`flush t${String(state.tableId)}`, {
       ownershipBudget: this.#metadataBudget,
     });
+    this.#metadataWriters++;
     const outputs: RunSummary[] = [];
     const retired: ExtentRef[] = [];
     // Directory chunks and the root this publication made: it owns them until a state holds them.
@@ -4141,16 +4254,20 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (writer.state === "open") await writer.abort().catch(() => undefined);
       throw error;
     } finally {
-      for (const output of outputs) output.release();
-      if (definitionCharge > 0) this.#chargeMetadata(-definitionCharge);
-      await delta.settle();
-      created?.releaseCreation();
-      pinned?.release();
-      if (madeRoot !== null) this.#releaseRoot(madeRoot);
-      unlock?.();
-      if (writing) this.#flushesWriting -= 1;
+      try {
+        for (const output of outputs) output.release();
+        if (definitionCharge > 0) this.#chargeMetadata(-definitionCharge);
+        await delta.settle();
+        created?.releaseCreation();
+        pinned?.release();
+        if (madeRoot !== null) this.#releaseRoot(madeRoot);
+        unlock?.();
+        if (writing) this.#flushesWriting -= 1;
+      } finally {
+        this.#metadataWriters--;
+        this.#credits.retireMetadataHeadroom(0);
+      }
     }
-    await this.#prepareMinimum();
     this.#scheduleMerge();
   }
 
@@ -4282,6 +4399,24 @@ export class WritePathImpl implements WritePath, EngineHooks {
   }
 
   async #restageNow(tx: TransactionImpl, id: number): Promise<Map<number, PublishedRows>> {
+    // Truncation rewrites these inputs with a provisional writer. Open their
+    // cold metadata first, so a retry never waits while retaining that writer
+    // or the publication lock. The transaction still owns each staged part.
+    for (const state of this.#tables.values()) {
+      const staging = state.stagings.get(id);
+      if (staging === undefined) continue;
+      for (const memtable of staging.memtables) {
+        this.#check();
+        if (taskClock.due()) await yieldTask();
+        if (memtable.rowCount === 0 || memtable.rowCount >= memtable.storedRows) continue;
+        for (const runs of need(memtable.staged).runs.values())
+          for (const run of runs) {
+            await this.#runReader(run);
+            this.#check();
+            if (taskClock.due()) await yieldTask();
+          }
+      }
+    }
     const unlock = await this.#lock();
     try {
       this.#check();
@@ -4320,6 +4455,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     if (tables.size === 0) return;
     id ??= this.#nextStagingId++;
     const writer = this.#space.beginWrite("stage", { ownershipBudget: this.#metadataBudget });
+    this.#metadataWriters++;
     const write = writer.write.bind(writer);
     writer.write = async (...args) => {
       this.#check();
@@ -4505,12 +4641,17 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (writer.state === "open") await writer.abort().catch(() => undefined);
       throw error;
     } finally {
-      await delta.settle();
-      if (madeRoot !== null) this.#releaseRoot(madeRoot);
-      for (const output of outputs) output.release();
-      if (!installed) {
-        for (const pin of owned.pins) pin.release();
-        for (const residual of owned.deltas) residual.releaseCharge();
+      try {
+        await delta.settle();
+        if (madeRoot !== null) this.#releaseRoot(madeRoot);
+        for (const output of outputs) output.release();
+        if (!installed) {
+          for (const pin of owned.pins) pin.release();
+          for (const residual of owned.deltas) residual.releaseCharge();
+        }
+      } finally {
+        this.#metadataWriters--;
+        this.#credits.retireMetadataHeadroom(0);
       }
     }
   }
@@ -4878,6 +5019,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         })
         .finally(() => {
           if (this.#idleRun === run) this.#idleRun = null;
+          this.#credits.notifyReclaimable();
         });
       this.#idleRun = run;
     }, IDLE_FLUSH_MS);
@@ -4921,6 +5063,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const writer = this.#space.beginWrite("idle publish", {
       ownershipBudget: this.#metadataBudget,
     });
+    this.#metadataWriters++;
     try {
       // The lock may have waited: closed, or garbage reclaimed by a publish meanwhile.
       if (this.closed || !this.#garbageOverBound()) {
@@ -4949,9 +5092,14 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (writer.state === "open") await writer.abort().catch(() => undefined);
       throw error;
     } finally {
-      await delta.settle();
-      if (madeRoot !== null) this.#releaseRoot(madeRoot);
-      unlock();
+      try {
+        await delta.settle();
+        if (madeRoot !== null) this.#releaseRoot(madeRoot);
+        unlock();
+      } finally {
+        this.#metadataWriters--;
+        this.#credits.retireMetadataHeadroom(0);
+      }
     }
   }
 
@@ -4977,6 +5125,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       })
       .finally(() => {
         this.#recycling = null;
+        this.#credits.notifyReclaimable();
         this.#armIdlePublish();
       });
   }
@@ -5109,6 +5258,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
           });
       }
       writer = this.#space.beginWrite("log recycle", { ownershipBudget: this.#metadataBudget });
+      this.#metadataWriters++;
       const salt = (crypto.getRandomValues(new Uint32Array(1))[0] ?? 1) >>> 0 || 1;
       const sequence = this.#root.sequence + 1;
       const incarnation = { salt, firstLsn: cut + 1, rootSequence: sequence };
@@ -5147,16 +5297,23 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (writer?.state === "open") await writer.abort().catch(() => undefined);
       throw error;
     } finally {
-      // Before the switch the deferred frames go to the old log; a failure after it (the reset,
-      // the new incarnation) fails the appender, so nothing waits on the deferred frames forever.
-      if (!switched) this.#appender.abandonRecycle();
-      else if (this.#appender.recycling)
-        this.#appender.failRecycle(new Error("The log reset after a recycle's publish failed"));
-      await delta.settle();
-      if (madeRoot !== null) this.#releaseRoot(madeRoot);
-      unlock?.();
-      this.#maintenanceHolds = false;
-      this.#passSlot();
+      try {
+        // Before the switch the deferred frames go to the old log; a failure after it (the reset,
+        // the new incarnation) fails the appender, so nothing waits on the deferred frames forever.
+        if (!switched) this.#appender.abandonRecycle();
+        else if (this.#appender.recycling)
+          this.#appender.failRecycle(new Error("The log reset after a recycle's publish failed"));
+        await delta.settle();
+        if (madeRoot !== null) this.#releaseRoot(madeRoot);
+        unlock?.();
+        this.#maintenanceHolds = false;
+        this.#passSlot();
+      } finally {
+        if (writer !== null) {
+          this.#metadataWriters--;
+          this.#credits.retireMetadataHeadroom(0);
+        }
+      }
     }
   }
 
@@ -5275,7 +5432,40 @@ export class WritePathImpl implements WritePath, EngineHooks {
     /** The split bound is divided by this (a retry after a failure). */
     divisor = 1,
   ): Promise<void> {
+    const current = state.view.runs.get(indexId) ?? [],
+      at = current.indexOf(need(inputs[0]));
+    if (
+      this.#tables.get(state.tableId) !== state ||
+      at < 0 ||
+      inputs.some((run, k) => current[at + k] !== run)
+    )
+      return;
+    // Cold-reader admission can await before the private merge account exists.
+    // Keep this selected generation and its cached reader charges owned meanwhile;
+    // concurrent DROP/flush may replace the live view but cannot retire these inputs.
+    const pinned = this.#internalSnapshot();
+    try {
+      await this.#mergePinned(state, indexId, plan, inputs, divisor);
+    } finally {
+      pinned.release();
+    }
+  }
+
+  async #mergePinned(
+    state: TableState,
+    indexId: number,
+    plan: MergePlan,
+    inputs: readonly RunRef[],
+    divisor: number,
+  ): Promise<void> {
     const started = performance.now();
+    // This actual phase, rather than a previous flush's unused high-water credit,
+    // funds run metadata and publication before any private merge state exists.
+    await this.#prepareMinimum();
+    // Opening run metadata may need admission. Do it before the private merge
+    // grant and provisional writer exist; its retry cannot retain either one.
+    const readers: RunReader[] = [];
+    for (const ref of inputs) readers.push(await this.#runReader(ref));
     const grant = await this.#credits.acquireMerge(
       `merge t${String(state.tableId)} i${String(indexId)}`,
       mergeWorkingBytes(inputs),
@@ -5286,6 +5476,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         ownershipBudget: this.#metadataBudget,
         budget: grant,
       });
+      this.#metadataWriters++;
     } catch (error) {
       this.#credits.releaseMerge(grant);
       throw error;
@@ -5305,8 +5496,6 @@ export class WritePathImpl implements WritePath, EngineHooks {
     );
     this.#merging = true;
     try {
-      const readers: RunReader[] = [];
-      for (const ref of inputs) readers.push(await this.#runReader(ref));
       output = await mergeRuns({
         space: this.#space,
         writer,
@@ -5390,7 +5579,6 @@ export class WritePathImpl implements WritePath, EngineHooks {
       // merge forecast can wait behind a query that needs this very credit.
       this.#credits.releaseMerge(grant);
       mergeCreditReleased = true;
-      await this.#prepareMinimum();
       const counters = this.maintenance;
       counters.merges += 1;
       if (this.#flushesWriting > 0) counters.mergesDuringFlush += 1;
@@ -5407,13 +5595,18 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (writer.state === "open") await writer.abort().catch(() => undefined);
       throw error;
     } finally {
-      this.#merging = false;
-      await delta.settle();
-      if (madeRoot !== null) this.#releaseRoot(madeRoot);
-      unlock?.();
-      output?.release();
-      if (!mergeCreditReleased) this.#credits.releaseMerge(grant);
-      this.#nativeProgress();
+      try {
+        this.#merging = false;
+        await delta.settle();
+        if (madeRoot !== null) this.#releaseRoot(madeRoot);
+        unlock?.();
+        output?.release();
+        if (!mergeCreditReleased) this.#credits.releaseMerge(grant);
+      } finally {
+        this.#metadataWriters--;
+        this.#credits.retireMetadataHeadroom(0);
+        this.#nativeProgress();
+      }
     }
   }
 

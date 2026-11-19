@@ -103,13 +103,12 @@ export function writeStepMinimum(
           ? FTS_PUBLICATION_MINIMUM_BYTES
           : 0,
         WRITER_OWNERSHIP_STEP_BYTES +
-          // The keeper's decoded/output list-page window overlaps run/root buffers.
-          256 * LIST_PAGE_EXTENTS +
+          // Group buffers close before the keeper window; retain one phase peak.
+          Math.max(256 * LIST_PAGE_EXTENTS, groupBytes) +
           RUN_ENCODER_MINIMUM +
           (keyBytes > 2048 ? 8 * keyBytes : 0) +
           4096 +
           directory +
-          groupBytes +
           runMetadata +
           2 * parseCharge(largest) +
           5 * (raw + 512),

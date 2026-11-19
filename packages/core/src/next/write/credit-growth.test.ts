@@ -1,4 +1,4 @@
-/** Governor rules 4/7: surrender reclaimable target credit before admitting its full deficit. */
+/** Governor rules2/4/7: surrender dormant forecasts and admit the whole remaining step. */
 import fc from "fast-check";
 import { expect, it, vi } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
@@ -37,6 +37,7 @@ for (const seed of seedsFor("next-native-write-growth", [0xb7a5, 0xb7a6]))
               head: Uint8Array | undefined,
               tail: Uint8Array | undefined;
             let holder: Grant | undefined;
+            const otherBuffers = new Map<Grant, Uint8Array>();
             let pending: Promise<unknown> | undefined;
             let restore: () => void = () => undefined;
             const stop = new AbortController(),
@@ -46,6 +47,21 @@ for (const seed of seedsFor("next-native-write-growth", [0xb7a5, 0xb7a6]))
               paidLive = liveBytes;
               live = new Uint8Array(liveBytes).fill(3);
               await credits.prepareMetadata(MiB);
+              // Rules2/4/7 make other accounts' forecasts revocable. Give them
+              // real buffers so this unchanged requested step actually needs
+              // external credit; never count a future estimate as live input.
+              for (const account of [
+                credits.rows,
+                credits.metadata,
+                credits.commits,
+                credits.merge,
+              ]) {
+                if (account === target) continue;
+                const bytes = account.held;
+                expect(account.allocate(bytes)).toBe(true);
+                otherBuffers.set(account, new Uint8Array(bytes).fill(41));
+              }
+              reach.reach("other native accounts own real buffers");
               const floor = kind === "rows" ? credits.minimum.rows : liveBytes + MiB;
               const idle = idleMiB * MiB,
                 wanted = floor + idle + delta;
@@ -92,9 +108,11 @@ for (const seed of seedsFor("next-native-write-growth", [0xb7a5, 0xb7a6]))
                   throw new Error("Growth completed before competing credit was released");
                 }),
               ]);
-              expect(requests).toEqual([idle + delta]);
-              expect(target.held).toBe(floor);
+              expect(requests).toEqual([wanted - liveBytes]);
+              expect(target.held).toBe(liveBytes);
               expect(target.allocated).toBe(liveBytes);
+              for (const buffer of otherBuffers.values()) expect(buffer.at(-1)).toBe(41);
+              reach.reach("unused working floors surrendered");
               reach.reach("complete deficit after surrender");
               await yieldTask();
               expect(settled).toBe(false);
@@ -128,6 +146,12 @@ for (const seed of seedsFor("next-native-write-growth", [0xb7a5, 0xb7a6]))
               // eslint-disable-next-line no-useless-assignment -- drop the live buffer before refund
               live = undefined;
               target.free(paidLive);
+              for (const [account, buffer] of otherBuffers) {
+                const bytes = buffer.byteLength;
+                expect(buffer.at(-1)).toBe(41);
+                otherBuffers.delete(account);
+                account.free(bytes);
+              }
               credits.close();
             }
             expect(governor.usedBytes).toBe(0);

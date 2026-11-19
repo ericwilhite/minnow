@@ -30,6 +30,13 @@ before accepting queries. Reopened databases keep their row workspace and live b
 funded without blocking a query behind completed recovery work. Released 0.x behavior is
 unchanged; no stored-format change or migration is required.
 
+The private 1.0 writer admits complete phase requirements after returning unused forecasts.
+Fitting queries can reclaim idle write credit, including after UPDATE and inside an existing
+transaction. Active buffers, prepared rows and merge handoffs remain funded; private merge
+I/O uses its prepaid budget. Pressure waits remain cancellable when no idle credit is available.
+Released 0.x behavior is unchanged; no stored-format change or
+migration is required.
+
 The private 1.0 writer prepays all column-group buffers together and sizes TEXT buffers from
 the actual input. Oversized working sets return SQLSTATE `53200` before queueing; optional
 dictionaries leave mandatory workspace available. Serialized directories and distinct sketches
