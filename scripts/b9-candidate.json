@@ -564,5 +564,12 @@
     }
   },
   "measuredComponentSourceSha256": "8f647e48e35954c621d1eadc5c186a62d21a863e28c81096876622db085ba2ab",
-  "scaffoldRepair": "Rebase originally omitted35 harness-only Reach lines: generated fixture/float/ordinal checks rejected missing declarations; restored them over unchanged main84 Reach, then15/15 PASS. Fresh-apply guard also correctly refused two verifier-only dependency symlinks; removed only those links. No engine code or measured component changed."
+  "scaffoldRepair": "Rebase originally omitted35 harness-only Reach lines: generated fixture/float/ordinal checks rejected missing declarations; restored them over unchanged main84 Reach, then15/15 PASS. Fresh-apply guard also correctly refused two verifier-only dependency symlinks; removed only those links. No engine code or measured component changed.",
+  "testShards": {
+    "count": 4,
+    "serial": true,
+    "targetMinutes": [30, 45],
+    "unchangedPopulationCapsSeedsDeadlines": true,
+    "limits": "Native Vitest sharding covers each arm full population.1203-entry enumeration belongs to priority candidate, not this NDV source. No NDV execution claim from listing."
+  }
 }

@@ -14,19 +14,23 @@ export const GATES = [
   { name: "format", command: "npm", args: ["run", "format"] },
   { name: "api", command: "npm", args: ["run", "api:check"] },
   { name: "version", command: "npm", args: ["run", "version:check"] },
-  {
-    name: "tests",
+  // Four serial commands target 30–45 minute shards; every required path stays.
+  ...[1, 2, 3, 4].map((shard) => ({
+    name: "tests" as const,
+    shard: `${shard}/4`,
     command: "node",
     args: [
       "node_modules/vitest/vitest.mjs",
       "run",
       "--maxWorkers=2",
       "--reporter=verbose",
+      "--shard",
+      `${shard}/4`,
       "packages/core/src/next",
       "scripts",
       "packages/core/src/engine",
     ],
-  },
+  })),
 ] as const;
 
 interface Arm {
@@ -49,7 +53,10 @@ export function executeGates(
   for (const arm of arms)
     for (const gate of GATES) {
       const started = Date.now(),
-        log = resolve(output, `${arm.name}-${gate.name}.log`);
+        log = resolve(
+          output,
+          `${arm.name}-${gate.name}${"shard" in gate ? `-${gate.shard.replace("/", "-of-")}` : ""}.log`,
+        );
       console.log(JSON.stringify({ arm: arm.name, gate: gate.name, phase: "start" }));
       let result: Status;
       try {
@@ -60,6 +67,7 @@ export function executeGates(
       const record = {
         arm: arm.name,
         gate: gate.name,
+        shard: "shard" in gate ? gate.shard : null,
         command: [gate.command, ...gate.args],
         exit: result.status,
         signal: result.signal,
