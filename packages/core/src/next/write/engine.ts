@@ -2061,13 +2061,16 @@ export class WritePathImpl implements WritePath, EngineHooks {
     // Native producer/rule steps do not run a future background merge. Its real
     // acquireMerge prepares the exact step again; active merge credit stays protected.
     if (native) this.#credits.reclaimNativeStep();
-    const metadata = this.#credits.prepareMetadata(
-      this.#metadataHeadroom(catalog),
-      signal,
-      !!native && includesProgress,
-    );
+    const headroom = this.#metadataHeadroom(catalog);
+    const metadata = native
+      ? this.#credits.prepareNativeMinimum(headroom, signal, includesProgress)
+      : this.#credits.prepareMetadata(headroom, signal);
     if (metadata instanceof Promise)
-      return this.#trackMinimum(metadata.then(() => { if (native) this.#credits.reclaimNativeStep(); }));
+      return this.#trackMinimum(
+        metadata.then(() => {
+          if (native) this.#credits.reclaimNativeStep();
+        }),
+      );
     if (native) this.#credits.reclaimNativeStep();
     // A future background merge admits its own complete step after cold readers open.
     return undefined;
@@ -2156,8 +2159,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
 
   /** Non-evictable storage accounts are part of the same compound native owner.
    * Cached pages/foreign read leases remain temporary governor pressure, not this floor. */
-  #protectedNativeBytes(): number {
-    return this.#credits.protectedBytes() + FIXED_CACHE_BYTES + this.#space.stats.retainedBytes;
+  #protectedNativeBytes(headroom?: number): number {
+    return (
+      this.#credits.protectedBytes(undefined, headroom) +
+      FIXED_CACHE_BYTES +
+      this.#space.stats.retainedBytes
+    );
   }
 
   #checkNativeStep(owner: object): asserts owner is StatementImpl {
@@ -2208,8 +2215,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
           this.#space.stats.retainedBytes,
         mandatory =
           FIXED_CACHE_BYTES +
-          this.#credits.minimum.rows +
-          this.#credits.commits.held +
+          this.#credits.rowMinimum +
+          Math.max(this.#credits.minimum.commits, this.#credits.commits.held) +
           this.#credits.minimum.merge +
           headroom;
       if (
@@ -2246,7 +2253,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
       // generation AFTER retiring that pin, and recheck the observed borrower
       // synchronously so a release during the scan cannot lose its only wakeup.
       if (observedState !== this.#state || borrower?.borrowedBytes === 0) continue;
-      if (this.#protectedNativeBytes() + rootBytes <= capacity && !this.#credits.hasLoans) continue;
+      // Relief may have returned the old metadata forecast. Compare the next
+      // complete step, not merely the currently funded (smaller) footprint, or
+      // an intrinsic refusal spins forever trying to admit the missing headroom.
+      const nextBytes = this.#protectedNativeBytes(this.#metadataHeadroom(owner.catalog));
+      if (nextBytes + rootBytes <= capacity && !this.#credits.hasLoans) continue;
       const version = this.#nativeSteps.version;
       if (
         borrower ||
@@ -2259,11 +2270,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         await this.#nativeSteps.wait(version, signal);
         continue;
       }
-      throw new MemoryAdmissionError(
-        "native root and writer",
-        this.#protectedNativeBytes() + rootBytes,
-        capacity,
-      );
+      throw new MemoryAdmissionError("native root and writer", nextBytes + rootBytes, capacity);
     }
   }
 
@@ -3017,7 +3024,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         await delta.settle();
         if (madeRoot) this.#releaseRoot(madeRoot);
         unlock?.();
-        // eslint-disable-next-line no-useless-assignment -- drop sealed descriptor references before refund or retry
+        // Drop sealed descriptor references before refund or retry.
         writer = null;
         if (ownedWorkspace) this.#chargeMetadata(-ownedWorkspace);
       } finally {
@@ -3709,8 +3716,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
       const pending = opened
         .then((reader) => {
           // A drop while it opened took the entry away: give the charge back.
-          if (this.#runReaders.get(key) === pending) { this.#runReaders.set(key, reader); this.#rememberReader(ref, reader); }
-          else this.#chargeMetadata(-reader.bytes);
+          if (this.#runReaders.get(key) === pending) {
+            this.#runReaders.set(key, reader);
+            this.#rememberReader(ref, reader);
+          } else this.#chargeMetadata(-reader.bytes);
           return reader;
         })
         .finally(() => {

@@ -4957,6 +4957,12 @@ cancellation; an intrinsic compound minimum above the selected capacity fails wi
 Ordinary funding preserves the governor reserve. Only an already-proven complete private
 progress step may use the existing whole-cap mode.
 
+Idle readers can retire every unused account forecast. The next native producer re-admits
+its row, publication, WAL and merge companion minima in one request before publishing a
+witness; it never reports donated credit as still owned. Completed recovery scan credit is
+excluded. A relief pass compares the full next publication headroom when deciding whether
+to retry or refuse, including headroom not yet funded, so an impossible step cannot spin.
+
 Keep no image, producer borrow or progress loan across preparation or fresh admission.
 Include retained preparation/rules/parameters and all simultaneous next-step maxima in
 `rootBytes`; exclude the native floor already reported by the boundary. Protect rule and

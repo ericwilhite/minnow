@@ -11145,6 +11145,7 @@ export const NATIVE_WRITE_STEP_REACH = [
 ] as const;
 
 export const NATIVE_WRITE_STEP_BORROW_REACH = [
+  "unfunded headroom refusal has bounded work",
   "foreign native chunk waits",
   "cancel with borrower still live",
   "borrow release sufficient before snapshot close",
@@ -11157,6 +11158,8 @@ export const NATIVE_WRITE_STEP_BORROW_REACH = [
 ] as const;
 
 export const NATIVE_WRITE_STEP_CREDIT_REACH = [
+  "unchanged-floor transfer invalidates witness",
+  "native funding restored after idle donation",
   "control charged before retention",
   "primary floor survives reclaim",
   "metadata and commit buffers once",
@@ -11358,6 +11361,7 @@ export const BIGINT_REPOINT_REACH = [
 ] as const;
 
 export const WRITE_RECOVERY_CREDIT_REACH = [
+  "retired scan excluded from native witness",
   "scan buffer owned through suspension",
   "completed scan returned",
   "small live rows",

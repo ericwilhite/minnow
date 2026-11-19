@@ -65,6 +65,19 @@ for (const seed of seedsFor("next-write-recovery-credit", [47221, 47222]))
             expect(holder.tryGrow(1)).toBe(false);
             const returned = credits.retireRowsMinimum(working);
             expect(
+              credits.protectedBytes(),
+              "the native witness excludes completed scan ownership",
+            ).toBe(
+              Math.max(
+                working,
+                live + (prepared ? WRITE_ROW_STEP_BYTES : 0),
+                prepared ? working + RECOVERY_SCAN_BYTES / 2 : 0,
+              ) +
+                minimum.commits +
+                minimum.merge,
+            );
+            reach.reach("retired scan excluded from native witness");
+            expect(
               returned,
               "an unused open-only reservation must end with recovery",
             ).toBeGreaterThan(0);

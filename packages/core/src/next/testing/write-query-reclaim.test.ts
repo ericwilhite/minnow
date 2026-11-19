@@ -48,6 +48,23 @@ for (const seed of seedsFor("next-write-query-reclaim", [47225, 47226]))
           });
           // eslint-disable-next-line @typescript-eslint/unbound-method -- Invoked with the original governor below.
           const admit = Governor.prototype.admitGroup;
+          // Exercise the queued group-admission boundary even when main's
+          // optimistic fixed-buffer route could immediately admit the unpadded query.
+          // Padding is actual reader ownership and must be part of that one request.
+          // eslint-disable-next-line @typescript-eslint/unbound-method -- original receiver below.
+          const tryAdmit = Governor.prototype.tryAdmit;
+          const immediate = vi.spyOn(Governor.prototype, "tryAdmit").mockImplementation(function (
+            this: Governor,
+            options,
+          ) {
+            if (
+              state.observe &&
+              options.label.startsWith("query#") &&
+              options.label.endsWith("/fixed-buffers")
+            )
+              return null;
+            return tryAdmit.call(this, options);
+          });
           const admission = vi.spyOn(Governor.prototype, "admitGroup").mockImplementation(function (
             this: Governor,
             options,
@@ -131,6 +148,7 @@ for (const seed of seedsFor("next-write-query-reclaim", [47225, 47226]))
               await db?.close();
               capture.mockRestore();
               admission.mockRestore();
+              immediate.mockRestore();
             })());
           onTestFinished(close);
           try {

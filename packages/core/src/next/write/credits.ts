@@ -57,12 +57,49 @@ export class WriteCredits {
   ): number {
     const active = this.#mergeActive?.held ?? 0;
     return (
-      Math.max(this.minimum.rows, this.rows.allocated + this.rows.loaned, this.#rowFloor) +
+      Math.max(this.#rowMinimum, this.rows.allocated + this.rows.loaned, this.#rowFloor) +
       this.metadata.allocated +
-      Math.max(this.metadata.loaned, metadataHeadroom, this.#commitMetadataFunding - this.metadata.allocated, this.#mergeMetadataFunding - this.metadata.allocated) +
-      this.commits.held +
-      Math.max(this.minimum.merge, mergeMinimum, this.#mergeFloor, active + this.merge.allocated + this.merge.loaned)
+      Math.max(
+        this.metadata.loaned,
+        metadataHeadroom,
+        this.#commitMetadataFunding - this.metadata.allocated,
+        this.#mergeMetadataFunding - this.metadata.allocated,
+      ) +
+      Math.max(this.minimum.commits, this.commits.held) +
+      Math.max(
+        this.minimum.merge,
+        mergeMinimum,
+        this.#mergeFloor,
+        active + this.merge.allocated + this.merge.loaned,
+      )
     );
+  }
+
+  #nativeReady(): boolean {
+    return (
+      this.rows.held >= Math.max(this.#rowMinimum, this.#rowFloor) &&
+      this.commits.held >= this.minimum.commits &&
+      this.merge.held >= Math.max(0, this.minimum.merge - (this.#mergeActive?.held ?? 0))
+    );
+  }
+
+  /** Recovery-only buffers are not part of a later native producer's minimum. */
+  get rowMinimum(): number {
+    return this.#rowMinimum;
+  }
+
+  /** Admit the native producer's entire companion workspace together. Idle query
+   * reclaim may have donated any account since the previous statement. */
+  prepareNativeMinimum(
+    headroom: number,
+    signal?: AbortSignal,
+    includesProgress = false,
+  ): MaybePromise<void> {
+    const metadata = this.metadata.allocated + headroom;
+    if (this.#nativeReady() && this.metadata.held >= metadata) {
+      return this.prepareMetadata(headroom, signal, includesProgress);
+    }
+    return this.#growTo(this.metadata, metadata, signal, 0, includesProgress, undefined, true);
   }
 
   get hasLoans(): boolean {
@@ -84,7 +121,10 @@ export class WriteCredits {
     this.reclaimMetadata();
     releaseIdle(
       this.merge,
-      Math.max(this.#mergeFloor, Math.max(0, Math.max(this.minimum.merge, mergeMinimum) - (this.#mergeActive?.held ?? 0))),
+      Math.max(
+        this.#mergeFloor,
+        Math.max(0, Math.max(this.minimum.merge, mergeMinimum) - (this.#mergeActive?.held ?? 0)),
+      ),
     );
   }
 
@@ -188,15 +228,16 @@ export class WriteCredits {
   reclaimIdleForecasts(): number {
     const working = this.#workingMinimum();
     this.#metadataHeadroom = 0;
-    return (
+    const released =
       releaseIdle(this.rows, Math.max(this.#rowFloor, working.rows ?? 0)) +
       releaseIdle(
         this.metadata,
         Math.max(working.metadata ?? 0, this.#commitMetadataFunding, this.#mergeMetadataFunding),
       ) +
       releaseIdle(this.commits, Math.max(working.commits ?? 0, this.#commitFunding)) +
-      releaseIdle(this.merge, Math.max(this.#mergeFloor, working.merge ?? 0))
-    );
+      releaseIdle(this.merge, Math.max(this.#mergeFloor, working.merge ?? 0));
+    if (released) this.#changed?.();
+    return released;
   }
 
   /** Phase settlement may expose idle credit without freeing a live buffer. Wake
@@ -251,7 +292,11 @@ export class WriteCredits {
   }
 
   /** Keep the next metadata step prepaid in addition to actual native live allocations. */
-  prepareMetadata(bytes: number, signal?: AbortSignal, includesProgress = false): MaybePromise<void> {
+  prepareMetadata(
+    bytes: number,
+    signal?: AbortSignal,
+    includesProgress = false,
+  ): MaybePromise<void> {
     const before = this.#metadataHeadroom;
     // The complete simultaneous workspace, before any of its allocations or waits.
     // Existing reader/cache allocations are temporary ownership, not this step's minimum.
@@ -270,7 +315,9 @@ export class WriteCredits {
     return this.growTo(this.metadata, wanted, signal, includesProgress);
   }
 
-  get metadataReady(): boolean { return this.metadata.held >= this.metadata.allocated + this.#metadataHeadroom; }
+  get metadataReady(): boolean {
+    return this.metadata.held >= this.metadata.allocated + this.#metadataHeadroom;
+  }
 
   reclaimMetadata(): number {
     const released = releaseIdle(
@@ -303,7 +350,12 @@ export class WriteCredits {
 
   /** Fund a next step after its provisional state has unwound. Only actual live
    * bytes and the complete minimum of an already-running step survive the wait. */
-  growTo(grant: Grant, wanted: number, signal?: AbortSignal, includesProgress = false): Promise<void> {
+  growTo(
+    grant: Grant,
+    wanted: number,
+    signal?: AbortSignal,
+    includesProgress = false,
+  ): Promise<void> {
     return this.#growTo(grant, wanted, signal, 0, includesProgress);
   }
 
@@ -314,6 +366,7 @@ export class WriteCredits {
     metadata = 0,
     includesProgress = false,
     funding?: "commit" | "merge",
+    nativeMinimum = false,
   ): Promise<void> {
     const stop =
       signal === undefined ? this.#stop.signal : AbortSignal.any([signal, this.#stop.signal]);
@@ -323,11 +376,15 @@ export class WriteCredits {
     for (;;) {
       this.#check();
       stop.throwIfAborted();
-      if (grant.held >= wanted && this.metadata.held >= metadata) {
+      if (
+        grant.held >= wanted &&
+        this.metadata.held >= metadata &&
+        (!nativeMinimum || this.#nativeReady())
+      ) {
         this.#rememberFundedMetadata(grant, wanted, metadata, funding);
         return;
       }
-      this.#changed?.();
+      this.#changed?.(true);
       const working = this.#workingMinimum();
       const floors = [
         Math.max(this.#rowFloor, working.rows ?? 0),
@@ -338,6 +395,11 @@ export class WriteCredits {
       const desired = accounts.map((account, i) =>
         Math.max(account.allocated + account.loaned, floors[i] ?? 0),
       );
+      if (nativeMinimum) {
+        desired[0] = Math.max(desired[0] ?? 0, this.#rowMinimum);
+        desired[2] = Math.max(desired[2] ?? 0, this.minimum.commits);
+        desired[3] = Math.max(desired[3] ?? 0, this.minimum.merge - (this.#mergeActive?.held ?? 0));
+      }
       desired[target] = Math.max(desired[target] ?? 0, wanted);
       desired[1] = Math.max(desired[1] ?? 0, metadata);
       // Net this owner's idle accounts before requesting anybody else's memory.
@@ -358,11 +420,19 @@ export class WriteCredits {
           if (moved > 0 && source === this.metadata) this.#trimMetadataHeadroom();
         }
       }
-      if (grant.held >= wanted && this.metadata.held >= metadata) {
+      if (
+        grant.held >= wanted &&
+        this.metadata.held >= metadata &&
+        (!nativeMinimum || this.#nativeReady())
+      ) {
         this.#rememberFundedMetadata(grant, wanted, metadata, funding);
         return;
       }
-      if (this.metadata.held >= metadata && grant.tryGrow(Math.max(0, wanted - grant.held))) {
+      if (
+        (!nativeMinimum || this.#nativeReady()) &&
+        this.metadata.held >= metadata &&
+        grant.tryGrow(Math.max(0, wanted - grant.held))
+      ) {
         this.#changed?.(true);
         this.#rememberFundedMetadata(grant, wanted, metadata, funding);
         return;

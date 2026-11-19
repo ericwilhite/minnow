@@ -80,7 +80,8 @@ export class MetadataBudget implements ByteBudget {
     // owner merely to beat their bounded plain/disk fallback, or steal the
     // mandatory buffers that the rest of this same step has not allocated yet.
     const wanted = this.grant.allocated + bytes + reserve;
-    const accepted = wanted <= this.capBytes && wanted <= this.grant.held && this.grant.allocate(bytes);
+    const accepted =
+      wanted <= this.capBytes && wanted <= this.grant.held && this.grant.allocate(bytes);
     if (accepted && bytes) this.changed?.();
     return accepted;
   }
