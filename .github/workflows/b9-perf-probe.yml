@@ -1,0 +1,267 @@
+# SCRATCH BRANCH ONLY. Never merge this workflow into main.
+name: B9 performance probe (branch only)
+on:
+  push:
+    branches: [ci/b9-probe]
+  workflow_dispatch:
+    inputs:
+      parent:
+        description: Fresh main control SHA
+        required: true
+        default: 84d10cff312e5c42dfa9602b3eb83423859db0b0
+      candidate:
+        description: Candidate base SHA (empty uses the control base when a patch exists)
+        required: false
+        default: ""
+      frozen:
+        description: Frozen control SHA (empty skips the additional frozen comparison)
+        required: false
+        default: 5811568dbe5a1c6c3756e3df19789deb75a7ffbf
+      s_scale:
+        description: Commerce scale (333 is S1; smaller values only verify the harness)
+        required: true
+        default: "333"
+      cells:
+        description: Comma-separated cells
+        required: true
+        default: agg_highcard_text,agg_highcard_int,agg_count_distinct,agg_3dims_20aggs,join_fact_fact_int,join_fact_fact_text,join_star_3dims,join_semi_exists,join_anti_not_exists
+      rows:
+        description: Rows (1000000 for W1M; smaller values are harness smoke checks only)
+        required: true
+        default: "1000000"
+permissions:
+  contents: read
+concurrency:
+  group: b9-perf-probe-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  probe:
+    if: github.ref == 'refs/heads/ci/b9-probe'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      UV_THREADPOOL_SIZE: "1"
+      NODE_OPTIONS: --max-old-space-size=4096
+      B9_PARENT: ${{ inputs.parent || '84d10cff312e5c42dfa9602b3eb83423859db0b0' }}
+      B9_CANDIDATE: ${{ inputs.candidate }}
+      B9_FROZEN: ${{ github.event_name == 'push' && '5811568dbe5a1c6c3756e3df19789deb75a7ffbf' || inputs.frozen }}
+      B9_CELLS: ${{ inputs.cells || 'agg_highcard_text,agg_highcard_int,agg_count_distinct,agg_3dims_20aggs,join_fact_fact_int,join_fact_fact_text,join_star_3dims,join_semi_exists,join_anti_not_exists' }}
+      B9_S_SCALE: ${{ inputs.s_scale || '333' }}
+      B9_ROWS: ${{ inputs.rows || '1000000' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "26.12.0"
+      - name: Prepare cache-only directories and record runner
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.cache/b9-probe/tmp" "$HOME/.cache/b9-probe/results"
+          echo "TMPDIR=$HOME/.cache/b9-probe/tmp" >> "$GITHUB_ENV"
+          echo "npm_config_cache=$HOME/.cache/npm" >> "$GITHUB_ENV"
+          node -e 'const fs=require("node:fs"); const m=fs.existsSync("scripts/b9-candidate.json")?JSON.parse(fs.readFileSync("scripts/b9-candidate.json","utf8")):{}; fs.appendFileSync(process.env.GITHUB_ENV,`B9_FULL_GATE=${m.fullGate===true}\n`)'
+          free -h
+          node -e 'if (require("os").totalmem() < 14 * 2**30) throw Error("B9 probe requires the 16 GB runner")'
+          node -p 'JSON.stringify({node:process.version,cpus:require("os").cpus(),memory:require("os").totalmem()})' > "$HOME/.cache/b9-probe/results/runner.json"
+      - name: Install and build harness
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npx tsc -b --pretty false
+          npx tsc --noEmit --pretty false -p scripts
+      - name: Verify branch-only probe policy and fixtures
+        run: npx vitest run --maxWorkers=2 scripts/b9-ndv-probe-policy.test.ts scripts/b9-engine-gates.test.ts scripts/b9-perf-fixtures.test.ts scripts/b9-float-law.test.ts scripts/b9-float-process.test.ts scripts/b9-result-columns.test.ts
+      - name: Build parent and candidate serially
+        shell: bash
+        run: |
+          git worktree add --detach "$HOME/.cache/b9-probe/parent" "$B9_PARENT"
+          candidate_ref="${B9_CANDIDATE:-HEAD}"
+          if [ -f scripts/b9-candidate.patch ]; then candidate_ref="${B9_CANDIDATE:-$B9_PARENT}"; fi
+          git worktree add --detach "$HOME/.cache/b9-probe/candidate" "$candidate_ref"
+          if [ -f scripts/b9-candidate.patch ]; then
+            node --input-type=module - "$HOME/.cache/b9-probe/candidate" "$HOME/.cache/b9-probe/results" <<'NODE'
+          import { readFileSync, copyFileSync } from 'node:fs';
+          import { createHash } from 'node:crypto';
+          import { execFileSync } from 'node:child_process';
+          import { resolve } from 'node:path';
+          const manifest = JSON.parse(readFileSync('scripts/b9-candidate.json', 'utf8'));
+          const patch = resolve(manifest.patch);
+          const digest = createHash('sha256').update(readFileSync(patch)).digest('hex');
+          if (digest !== manifest.sha256) throw new Error('Candidate patch digest mismatch');
+          const candidate = process.argv[2];
+          execFileSync('git', ['-C', candidate, 'apply', '--check', '--index', patch]);
+          execFileSync('git', ['-C', candidate, 'apply', '--index', patch]);
+          copyFileSync('scripts/b9-candidate.json', resolve(process.argv[3], 'candidate-patch.json'));
+          NODE
+          fi
+          for arm in parent candidate; do
+            (cd "$HOME/.cache/b9-probe/$arm" && npm ci --ignore-scripts --no-audit --no-fund && npx tsc -b packages/core --pretty false)
+          done
+          if [ -n "$B9_FROZEN" ]; then
+            git worktree add --detach "$HOME/.cache/b9-probe/frozen" "$B9_FROZEN"
+            (cd "$HOME/.cache/b9-probe/frozen" && npm ci --ignore-scripts --no-audit --no-fund && npx tsc -b packages/core --pretty false)
+          fi
+      - name: Verify both hosted runtimes against the timed prototype
+        shell: bash
+        run: |
+          node --input-type=module - "$HOME/.cache/b9-probe" "$HOME/.cache/b9-probe/results" scripts/b9-candidate.json <<'NODE'
+          import { readFileSync, writeFileSync } from 'node:fs';
+          import { createHash } from 'node:crypto';
+          import { resolve } from 'node:path';
+          const manifest = JSON.parse(readFileSync(process.argv[4], 'utf8'));
+          const files = ['parent', 'candidate'].flatMap(arm =>
+            Object.entries((arm === 'parent' ? manifest.prototypeParentModuleSha256 : manifest.prototypeModuleSha256) ?? {}).map(([file, expected]) => {
+              const actual = createHash('sha256').update(readFileSync(resolve(process.argv[2], arm, 'packages/core/dist', file))).digest('hex');
+              return { arm, file, expected, actual, exact: actual === expected };
+            })
+          );
+          writeFileSync(resolve(process.argv[3], 'compiled-runtime-hashes.json'), JSON.stringify({ files }, null, 2));
+          if (files.some(file => !file.exact)) throw new Error('Hosted runtime differs from timed prototype; inspect the recorded hashes before measuring');
+          NODE
+      - name: Small native W200 publication component, parent and candidate interleaved
+        shell: bash
+        run: |
+          node --v8-pool-size=1 scripts/b9-ndv-write-component.mts --parent "$HOME/.cache/b9-probe/parent/packages/core/dist" --candidate "$HOME/.cache/b9-probe/candidate/packages/core/dist" --rows 4096 --group-rows 1024 --transactions batch --rounds 9 --output "$HOME/.cache/b9-probe/results/ndv-small-component.json"
+      # The harness generates ordinary-writer images in this job. It shares an image
+      # only between identical durable vocabularies; differing formats write separately.
+      - name: Generate W1M fixtures with their builds, then profile paths
+        shell: bash
+        run: |
+          node --v8-pool-size=1 scripts/b9-perf-probe.mts --diagnostics-only --parent "$HOME/.cache/b9-probe/parent" --candidate "$HOME/.cache/b9-probe/candidate" --rows "$B9_ROWS" --cells "$B9_CELLS" --output "$HOME/.cache/b9-probe/results" 2>&1 | tee "$HOME/.cache/b9-probe/results/diagnostics.log"
+      - name: Publish path evidence before timing comparisons
+        uses: actions/upload-artifact@v4
+        with:
+          name: b9-paths-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ~/.cache/b9-probe/results/*.json
+            ~/.cache/b9-probe/results/*.cpuprofile
+            ~/.cache/b9-probe/results/*.log
+          if-no-files-found: error
+          retention-days: 14
+      - name: W1M interleaved current-main and frozen pairs
+        shell: bash
+        run: |
+          args=(--pairs-only --parent "$HOME/.cache/b9-probe/parent" --candidate "$HOME/.cache/b9-probe/candidate" --rows "$B9_ROWS" --cells "$B9_CELLS" --output "$HOME/.cache/b9-probe/results")
+          if [ -n "$B9_FROZEN" ]; then args+=(--frozen "$HOME/.cache/b9-probe/frozen"); fi
+          node --v8-pool-size=1 scripts/b9-perf-probe.mts "${args[@]}" 2>&1 | tee "$HOME/.cache/b9-probe/results/run.log"
+      - name: Generate S1 fixtures with their builds, then profile all commerce paths
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.cache/b9-probe/results/S1"
+          node --v8-pool-size=1 scripts/b9-perf-probe.mts --dataset star --scale "$B9_S_SCALE" --diagnostics-only --parent "$HOME/.cache/b9-probe/parent" --candidate "$HOME/.cache/b9-probe/candidate" --output "$HOME/.cache/b9-probe/results/S1" 2>&1 | tee "$HOME/.cache/b9-probe/results/S1/diagnostics.log"
+      - name: S1 interleaved current-main and frozen pairs
+        shell: bash
+        run: |
+          args=(--dataset star --scale "$B9_S_SCALE" --pairs-only --parent "$HOME/.cache/b9-probe/parent" --candidate "$HOME/.cache/b9-probe/candidate" --output "$HOME/.cache/b9-probe/results/S1")
+          if [ -n "$B9_FROZEN" ]; then args+=(--frozen "$HOME/.cache/b9-probe/frozen"); fi
+          node --v8-pool-size=1 scripts/b9-perf-probe.mts "${args[@]}" 2>&1 | tee "$HOME/.cache/b9-probe/results/S1/run.log"
+      - name: Publish pairs before the optional engine gates
+        if: env.B9_FULL_GATE == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: b9-pairs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ~/.cache/b9-probe/results/*.json
+            ~/.cache/b9-probe/results/*.jsonl
+            ~/.cache/b9-probe/results/S1/*.json
+            ~/.cache/b9-probe/results/S1/*.jsonl
+            ~/.cache/b9-probe/results/S1/*.cpuprofile
+            ~/.cache/b9-probe/results/S1/*.log
+            ~/.cache/b9-probe/results/*.cpuprofile
+            ~/.cache/b9-probe/results/*.log
+          if-no-files-found: error
+          retention-days: 14
+      - name: Full parent and candidate engine gates, serially
+        if: env.B9_FULL_GATE == 'true'
+        shell: bash
+        run: |
+          node scripts/b9-engine-gates.mts --parent "$HOME/.cache/b9-probe/parent" --candidate "$HOME/.cache/b9-probe/candidate" --output "$HOME/.cache/b9-probe/results/gates" 2>&1 | tee "$HOME/.cache/b9-probe/results/gate-driver.log"
+      - name: Upload raw evidence, including incomplete runs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: b9-probe-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ~/.cache/b9-probe/results/*.json
+            ~/.cache/b9-probe/results/*.jsonl
+            ~/.cache/b9-probe/results/S1/*.json
+            ~/.cache/b9-probe/results/S1/*.jsonl
+            ~/.cache/b9-probe/results/S1/*.cpuprofile
+            ~/.cache/b9-probe/results/S1/*.log
+            ~/.cache/b9-probe/results/*.cpuprofile
+            ~/.cache/b9-probe/results/*.log
+            ~/.cache/b9-probe/results/gates/*.json
+            ~/.cache/b9-probe/results/gates/*.jsonl
+            ~/.cache/b9-probe/results/gates/*.log
+          if-no-files-found: error
+          retention-days: 14
+  ndv_write:
+    name: B9 native W1M NDV write impact (branch only)
+    if: github.ref == 'refs/heads/ci/b9-probe'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      UV_THREADPOOL_SIZE: "1"
+      NODE_OPTIONS: --max-old-space-size=4096
+      B9_PARENT: 84d10cff312e5c42dfa9602b3eb83423859db0b0
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "26.12.0"
+      - name: Prepare independent native-write runner and harness
+        run: |
+          mkdir -p "$HOME/.cache/b9-ndv-write/tmp" "$HOME/.cache/b9-ndv-write/results"
+          export TMPDIR="$HOME/.cache/b9-ndv-write/tmp" npm_config_cache="$HOME/.cache/npm"
+          echo "TMPDIR=$HOME/.cache/b9-ndv-write/tmp" >> "$GITHUB_ENV"
+          echo "npm_config_cache=$HOME/.cache/npm" >> "$GITHUB_ENV"
+          node -e 'if(require("os").totalmem()<14*2**30) throw Error("16 GB runner required"); require("fs").writeFileSync(process.env.HOME+"/.cache/b9-ndv-write/results/runner.json",JSON.stringify({node:process.version,cpus:require("os").cpus(),memory:require("os").totalmem()}))'
+          npm ci --ignore-scripts --no-audit --no-fund
+      - name: Build both native-write arms serially
+        run: |
+          git worktree add --detach "$HOME/.cache/b9-ndv-write/parent" "$B9_PARENT"
+          git worktree add --detach "$HOME/.cache/b9-ndv-write/candidate" "$B9_PARENT"
+          node --input-type=module - "$HOME/.cache/b9-ndv-write" <<'NODE'
+          import {readFileSync,writeFileSync} from 'node:fs';
+          import {createHash} from 'node:crypto';
+          import {execFileSync} from 'node:child_process';
+          import {resolve} from 'node:path';
+          const root=process.argv[2],m=JSON.parse(readFileSync('scripts/b9-candidate.json','utf8'));
+          const patch=resolve(m.patch),hash=createHash('sha256').update(readFileSync(patch)).digest('hex');
+          if(hash!==m.sha256) throw Error('Candidate patch digest mismatch');
+          execFileSync('git',['-C',resolve(root,'candidate'),'apply','--check','--index',patch]);
+          execFileSync('git',['-C',resolve(root,'candidate'),'apply','--index',patch]);
+          writeFileSync(resolve(root,'results/candidate-patch.json'),JSON.stringify(m,null,2));
+          NODE
+          for arm in parent candidate; do
+            (cd "$HOME/.cache/b9-ndv-write/$arm" && npm ci --ignore-scripts --no-audit --no-fund && npx tsc -b packages/core --pretty false)
+          done
+      - name: Verify native-write arm emission witnesses
+        run: |
+          node --input-type=module - "$HOME/.cache/b9-ndv-write" <<'NODE'
+          import {readFileSync,writeFileSync} from 'node:fs';
+          import {createHash} from 'node:crypto';
+          import {resolve} from 'node:path';
+          const root=process.argv[2],m=JSON.parse(readFileSync('scripts/b9-candidate.json','utf8'));
+          const files=['parent','candidate'].flatMap(arm=>Object.entries(arm==='parent'?m.prototypeParentModuleSha256:m.prototypeModuleSha256).map(([file,expected])=>{
+            const actual=createHash('sha256').update(readFileSync(resolve(root,arm,'packages/core/dist',file))).digest('hex');
+            return {arm,file,expected,actual,exact:actual===expected};
+          }));
+          writeFileSync(resolve(root,'results/compiled-runtime-hashes.json'),JSON.stringify({files},null,2));
+          if(files.some(f=>!f.exact)) throw Error('Native-write runtime differs from prototype');
+          NODE
+      - name: Native W1M publication and file-write impact, nine interleaved pairs
+        shell: bash
+        run: |
+          node --v8-pool-size=1 scripts/b9-ndv-write-component.mts --parent "$HOME/.cache/b9-ndv-write/parent/packages/core/dist" --candidate "$HOME/.cache/b9-ndv-write/candidate/packages/core/dist" --rows 1000000 --group-rows 8192 --transactions batch --rounds 9 --profile-dir "$HOME/.cache/b9-ndv-write/results" --output "$HOME/.cache/b9-ndv-write/results/ndv-W1M-native-write.json" 2>&1 | tee "$HOME/.cache/b9-ndv-write/results/write.log"
+      - name: Upload native-write raw pairs and runtime witnesses
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: b9-ndv-write-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ~/.cache/b9-ndv-write/results/
+          if-no-files-found: error
+          retention-days: 14

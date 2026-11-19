@@ -11299,3 +11299,38 @@ export const PROJECTION_ARRAY_STEP_REACH = [
   "nondefault bounds",
   "element NULL",
 ] as const;
+
+export const B9_PROBE_FIXTURE_REACH = [
+  "shared",
+  "separate",
+  "one writer per format",
+  "logical datasets isolated",
+  "sizes isolated",
+] as const;
+
+export const B9_FLOAT_PROBE_REACH = [
+  "sum",
+  "avg",
+  "variance",
+  "var_pop",
+  "var_samp",
+  "stddev",
+  "stddev_pop",
+  "stddev_samp",
+  "PG orders",
+  "same-plan bits",
+  "ordered aggregate exact",
+  "NULL",
+  "1e-6 rejected",
+  "native cross-source exact",
+  "keys exact",
+  "counts exact",
+] as const;
+
+export const B9_RESULT_COLUMNS_REACH = [
+  "numeric aliases",
+  "duplicate aliases",
+  "prototype aliases",
+  "UTF8 aliases",
+  "ordinal PG values",
+] as const;

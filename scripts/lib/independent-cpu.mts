@@ -21,6 +21,8 @@ export interface CPUWorkerContext {
 export interface Verification {
   readonly fingerprint: string;
   readonly rows?: number;
+  readonly determinismFingerprint?: string;
+  readonly detail?: unknown;
 }
 export interface BoundaryValue {
   readonly rows?: number;
@@ -287,6 +289,20 @@ export interface IndependentCPUOptions {
   readonly signal?: AbortSignal;
   readonly onEvent?: (event: unknown) => void;
   readonly onSample?: (sample: unknown) => void;
+  /** Probe-specific cross-plan law; absent retains strict fingerprints. */
+  readonly compareVerification?: (
+    left: Verification,
+    right: Verification,
+    workload: string,
+  ) => boolean;
+  readonly onVerification?: (value: {
+    arm: Arm;
+    cohort: number;
+    workload: string;
+    boundary: string;
+    phase: "before" | "after";
+    verification: Verification;
+  }) => void | Promise<void>;
 }
 
 /** One fresh pair per workload/boundary/round; startup and execution both alternate AB/BA.
@@ -340,11 +356,22 @@ export async function runIndependentCPU(options: IndependentCPUOptions) {
                 (!Number.isSafeInteger(checked.rows) || checked.rows < 0))
             )
               throw new Error("Invalid CPU output verification");
+            await options.onVerification?.({
+              arm,
+              cohort,
+              workload,
+              boundary,
+              phase: "before",
+              verification: checked,
+            });
             verification.set(arm, checked);
             const other = verification.get(arm === "control" ? "candidate" : "control");
             if (
               other !== undefined &&
-              (other.fingerprint !== checked.fingerprint || other.rows !== checked.rows)
+              !(
+                options.compareVerification?.(other, checked, workload) ??
+                (other.fingerprint === checked.fingerprint && other.rows === checked.rows)
+              )
             )
               throw new Error(`CPU workload differs: ${workload}`);
             if (settleMs > 0) await new Promise((yes) => setTimeout(yes, settleMs));
@@ -370,7 +397,20 @@ export async function runIndependentCPU(options: IndependentCPUOptions) {
             (arm === "control" ? before : after).push(value.cpuMs);
             options.onSample?.(sample);
             const last = await worker.ask<Verification>({ op: "verify", workload });
-            if (last.fingerprint !== checked.fingerprint || last.rows !== checked.rows)
+            await options.onVerification?.({
+              arm,
+              cohort,
+              workload,
+              boundary,
+              phase: "after",
+              verification: last,
+            });
+            if (
+              last.fingerprint !== checked.fingerprint ||
+              last.rows !== checked.rows ||
+              (last.determinismFingerprint ?? last.fingerprint) !==
+                (checked.determinismFingerprint ?? checked.fingerprint)
+            )
               throw new Error("CPU output changed after measurement");
           } finally {
             await worker.close();
