@@ -34,6 +34,8 @@ import {
 import { MemoryOpfs } from "../testing/opfs-shim.js";
 import { MinnowDatabase } from "./database.js";
 import { allVisibleSegments, heavyTestTimeout } from "./storage-test-helpers.js";
+import { EventLoopWork } from "./event-loop-work.test-support.js";
+import { runSteps } from "../work-slicer.js";
 
 vi.setConfig({ testTimeout: heavyTestTimeout(180_000) });
 
@@ -126,6 +128,61 @@ function jobProgress(jobs: readonly CompactionJobRecord[]): string {
   );
 }
 
+/**
+ * The law is advancing native work, not how quickly this host schedules it. Keep the
+ * 30,000 idle / 120,000 total bounds in counted generator steps, while the original
+ * outer test deadline still detects a stalled await. The real slice runner still runs;
+ * only its clock is driven by work, as in event-loop-stalls.test.ts.
+ */
+async function foldProgress<T>(
+  label: string,
+  operation: (advance: (marker: string) => void) => Promise<T>,
+): Promise<T> {
+  let result: T | undefined;
+  await new EventLoopWork().measure(async () => {
+    result = await withProgressDeadline(label, operation);
+  });
+  return result as T;
+}
+
+it.each(["idle", "total"] as const)(
+  "bounds native fold work without a host-time deadline (%s)",
+  async (kind) => {
+    await expect(
+      foldProgress("counted fold", async (advance) => {
+        advance("start");
+        for (let block = 0; block < 128; block++) {
+          runSteps(
+            (function* () {
+              for (let row = 0; row < 1024; row++) yield;
+            })(),
+          );
+          advance(kind === "idle" ? "start" : String(block));
+        }
+      }),
+    ).rejects.toThrow(kind === "idle" ? "no progress" : "total deadline");
+  },
+);
+
+/** OPFS RPC methods are inherited and read-only; shadow them without retaining mock history. */
+function observeMethod<K extends "createCompactionJob" | "updateCompactionJob">(
+  store: BlockStore,
+  method: K,
+  value: BlockStore[K],
+): () => void {
+  const descriptor = Object.getOwnPropertyDescriptor(store, method);
+  Object.defineProperty(store, method, {
+    configurable: true,
+    writable: true,
+    enumerable: descriptor?.enumerable ?? false,
+    value,
+  });
+  return () => {
+    if (descriptor === undefined) Reflect.deleteProperty(store, method);
+    else Object.defineProperty(store, method, descriptor);
+  };
+}
+
 /** Await foreground fold assistance with native progress diagnostics if it stops advancing. */
 async function firstWrite(
   database: MinnowDatabase,
@@ -134,41 +191,73 @@ async function firstWrite(
 ): Promise<void> {
   const update = store.updateCompactionJob.bind(store);
   let advance: (marker: string) => void = () => undefined;
-  const watched = vi.spyOn(store, "updateCompactionJob").mockImplementation(async (...args) => {
-    const job = await update(...args);
+  // Observe without retaining a vi.fn argument/result history for every native block.
+  const restore = observeMethod(store, "updateCompactionJob", async (id, revision, patch) => {
+    const job = await update(id, revision, patch);
     advance(jobProgress([job]));
     return job;
   });
   try {
-    await withProgressDeadline("first upgraded write", async (report) => {
+    await foldProgress("first upgraded write", async (report) => {
       advance = report;
       await database.execute("INSERT INTO t VALUES (?, ?, ?, ?)", [nextId, nextId, false, "next"]);
     });
   } finally {
-    watched.mockRestore();
+    restore();
   }
 }
 
-/** Observe native cursors; do not compete with active folds by repeatedly scanning their sources. */
+/** Observe native completions instead of repeatedly cloning active jobs' full source plans. */
 async function settle(database: MinnowDatabase, store: BlockStore): Promise<number> {
-  return withProgressDeadline("background folds", async (advance) => {
-    let levelZero: number | null = null;
-    for (;;) {
-      const jobs = await database.listCompactionJobs();
-      const active = jobs.some(
-        (job) => job.state !== "published" && job.state !== "cancelled" && job.state !== "aborted",
-      );
-      advance(JSON.stringify([levelZero, jobProgress(jobs)]));
-      if (!active) {
-        levelZero = await levelZeroCount(database, store);
-        if (levelZero < 48) return levelZero;
-        // Only an idle fragmented table needs a read to schedule its next fold.
-        await database.query("SELECT COUNT(*) AS n FROM t", { memoize: false });
+  const update = store.updateCompactionJob.bind(store);
+  const create = store.createCompactionJob.bind(store);
+  let advance: (marker: string) => void = () => undefined;
+  let wake: () => void = () => undefined;
+  const restores: Array<() => void> = [];
+  try {
+    restores.push(
+      observeMethod(store, "createCompactionJob", async (record) => {
+        await create(record);
+        advance(jobProgress([record]));
+        wake();
+      }),
+    );
+    restores.push(
+      observeMethod(store, "updateCompactionJob", async (id, revision, patch) => {
+        const job = await update(id, revision, patch);
+        advance(jobProgress([job]));
+        if (job.state === "published" || job.state === "cancelled" || job.state === "aborted")
+          wake();
+        return job;
+      }),
+    );
+    return await foldProgress("background folds", async (report) => {
+      advance = report;
+      let levelZero: number | null = null;
+      for (;;) {
+        // Install before reading state: a completion racing that read must not be lost.
+        const changed = new Promise<void>((resolve) => {
+          wake = resolve;
+        });
+        const jobs = await database.listCompactionJobs();
+        const active = jobs.some(
+          (job) =>
+            job.state !== "published" && job.state !== "cancelled" && job.state !== "aborted",
+        );
+        advance(JSON.stringify([levelZero, jobProgress(jobs)]));
+        if (!active) {
+          levelZero = await levelZeroCount(database, store);
+          if (levelZero < 48) return levelZero;
+          // Preserve the original idle read that schedules the next background fold.
+          await database.query("SELECT COUNT(*) AS n FROM t", { memoize: false });
+        }
+        await changed;
       }
-      // Job records include their source plans: observe at most four times a second.
-      await new Promise((resolve) => setTimeout(resolve, 250));
-    }
-  });
+    });
+  } finally {
+    wake();
+    for (const restore of restores.reverse()) restore();
+  }
 }
 
 describe("OPFS: a table 0.15.0 left at the level-zero ceiling", () => {
