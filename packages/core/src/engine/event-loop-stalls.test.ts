@@ -3,10 +3,10 @@
  * for hundreds of milliseconds or minutes: a fold of upserts written in an unrelated order,
  * live aggregates patched after large commits, scans over tables carrying many upserts,
  * secondary-index builds and their first lookups, full-text index builds, and single writes of
- * hundreds of thousands of rows. A watchdog timer records the longest interval it could not run in five cases; the OPFS
- * large-write case counts work between real tasks to avoid host-load noise. The
- * bound is loose enough for a loaded machine and tight enough that a task working through its
- * whole input without yielding fails here. `scripts/stall-survey.mts` measures the real numbers.
+ * hundreds of thousands of rows. Count native work between real MessageChannel tasks,
+ * using the same work clock as the OPFS large-write regression. Host scheduling and GC
+ * pauses cannot consume a slice budget; processing the entire input without yielding
+ * still fails. `scripts/stall-survey.mts` measures wall-clock latency separately.
  */
 import { describe, expect, it, vi } from "vitest";
 import { MemoryBlockStore } from "../storage/index.js";
@@ -15,26 +15,41 @@ import { MemoryOpfs } from "../testing/opfs-shim.js";
 import { MinnowDatabase } from "./database.js";
 import { EventLoopWork } from "./event-loop-work.test-support.js";
 import { heavyTestTimeout } from "./storage-test-helpers.js";
+import { CommittedKeyForwards, keyForwardTestHooks } from "./key-forwards.js";
 
 vi.setConfig({ testTimeout: heavyTestTimeout(120_000) });
 
-const STALL_BOUND_MS = process.env.CI === undefined ? 250 : 750;
+const SLICE_WORK_BOUND = process.env.CI === undefined ? 250 : 750;
 
-/** Runs `work` while a 1 ms watchdog measures the longest stretch it was kept from running. */
-async function longestStall(work: () => Promise<void>): Promise<number> {
-  let longest = 0;
-  let last = performance.now();
-  const watchdog = setInterval(() => {
-    const now = performance.now();
-    longest = Math.max(longest, now - last);
-    last = now;
-  }, 1);
-  try {
-    await work();
-  } finally {
-    clearInterval(watchdog);
-  }
-  return Math.round(longest);
+/** Observe actual copied block bytes without replacing any store or engine operation. */
+function observedStore(work: EventLoopWork): MemoryBlockStore {
+  const store = new MemoryBlockStore();
+  const getBlock = store.getBlock.bind(store);
+  const getBlocks = store.getBlocks.bind(store);
+  const readManifestBlock = store.readManifestBlock.bind(store);
+  store.getBlock = async (id) => {
+    const bytes = await getBlock(id);
+    work.transfer(bytes?.byteLength ?? 0);
+    return bytes;
+  };
+  store.getBlocks = async (ids) => {
+    const blocks = await getBlocks(ids);
+    for (const bytes of blocks) work.transfer(bytes?.byteLength ?? 0);
+    return blocks;
+  };
+  store.readManifestBlock = async (version, id) => {
+    const bytes = await readManifestBlock(version, id);
+    work.transfer(bytes?.byteLength ?? 0);
+    return bytes;
+  };
+  return store;
+}
+
+function assertSlices(measured: Awaited<ReturnType<EventLoopWork["measure"]>>): void {
+  // Preserve the original 250/750 bound in counted work units, independent of host time.
+  expect(measured.largest).toBeLessThan(SLICE_WORK_BOUND);
+  expect(measured.steps + measured.bytes + measured.items).toBeGreaterThan(0);
+  expect(measured.turns).toBeGreaterThan(1);
 }
 
 async function settled(database: MinnowDatabase, table: string): Promise<void> {
@@ -84,7 +99,8 @@ function wideRows(count: number, version: number): Array<Record<string, unknown>
 
 describe("background work never holds the event loop", () => {
   it("folds wide upserts written in an unrelated order in short slices", async () => {
-    const database = new MinnowDatabase(new MemoryBlockStore());
+    const work = new EventLoopWork();
+    const database = new MinnowDatabase(observedStore(work));
     const columns: Array<{ name: string; type: "number" | "datetime" | "string" }> = [
       { name: "id", type: "number" },
     ];
@@ -99,17 +115,23 @@ describe("background work never holds the event loop", () => {
       columns: columns.map((column) => ({ ...column, nullable: column.name !== "id" })),
     });
     await database.insertBatch("t", wideRows(7_000, 0) as never);
-    for (let refresh = 1; refresh <= 4; refresh += 1) {
-      await database.upsertBatch("t", shuffled(wideRows(7_000, refresh), refresh) as never);
-    }
-    const stall = await longestStall(() => settled(database, "t"));
-    expect(stall).toBeLessThan(STALL_BOUND_MS);
+    const measured = await work.measure(async () => {
+      for (let refresh = 1; refresh <= 4; refresh += 1) {
+        await database.upsertBatch(
+          "t",
+          work.rows(shuffled(wideRows(7_000, refresh), refresh)) as never,
+        );
+      }
+      await settled(database, "t");
+    });
+    assertSlices(measured);
     expect((await database.listVisibleSegmentPage("t", { limit: 64 })).records.length).toBe(1);
     await database.close();
   });
 
   it("patches live aggregates and scans upsert-heavy tables in short slices", async () => {
-    const database = new MinnowDatabase(new MemoryBlockStore());
+    const work = new EventLoopWork();
+    const database = new MinnowDatabase(observedStore(work));
     await database.createTable({
       name: "t",
       uniqueKey: "id",
@@ -135,11 +157,13 @@ describe("background work never holds the event loop", () => {
       "SELECT region, COUNT(*) AS n, SUM(amount) AS total FROM t GROUP BY region",
       { onChange: () => undefined },
     );
-    const stall = await longestStall(async () => {
+    const measured = await work.measure(async () => {
       for (let batch = 0; batch < 10; batch += 1) {
         await database.upsertBatch(
           "t",
-          Array.from({ length: 10_000 }, (_, index) => row(batch * 10_000 + index, batch + 1)),
+          work.rows(
+            Array.from({ length: 10_000 }, (_, index) => row(batch * 10_000 + index, batch + 1)),
+          ),
         );
       }
       await database.query("SELECT region, SUM(amount) AS total FROM t GROUP BY region", {
@@ -147,13 +171,14 @@ describe("background work never holds the event loop", () => {
       });
       await settled(database, "t");
     });
-    expect(stall).toBeLessThan(STALL_BOUND_MS);
+    assertSlices(measured);
     live.close();
     await database.close();
   });
 
   it("builds secondary indexes and answers their first lookups in short slices", async () => {
-    const database = new MinnowDatabase(new MemoryBlockStore());
+    const work = new EventLoopWork();
+    const database = new MinnowDatabase(observedStore(work));
     await database.createTable({
       name: "t",
       uniqueKey: "id",
@@ -173,7 +198,7 @@ describe("background work never holds the event loop", () => {
         })),
       );
     }
-    const stall = await longestStall(async () => {
+    const measured = await work.measure(async () => {
       await database.execute("CREATE INDEX t_amount ON t (amount)");
       const byAmount = await database.query("SELECT id FROM t WHERE amount = 1234", {
         memoize: false,
@@ -185,7 +210,7 @@ describe("background work never holds the event loop", () => {
       });
       expect(byLabel.rows).toEqual([{ id: 4321 }]);
     });
-    expect(stall).toBeLessThan(STALL_BOUND_MS);
+    assertSlices(measured);
     await database.close();
   });
 
@@ -219,7 +244,7 @@ describe("background work never holds the event loop", () => {
         await database.upsertBatch("t", upserted);
       });
       // Keep the original 250/750 bound, now in counted work units rather than host milliseconds.
-      expect(measured.largest).toBeLessThan(STALL_BOUND_MS);
+      expect(measured.largest).toBeLessThan(SLICE_WORK_BOUND);
       expect(measured.fields).toBeGreaterThanOrEqual(1_200_000);
       expect(measured.steps).toBeGreaterThan(0);
       expect(measured.bytes).toBeGreaterThan(0);
@@ -237,7 +262,8 @@ describe("background work never holds the event loop", () => {
   });
 
   it("builds a full-text index in short slices", async () => {
-    const database = new MinnowDatabase(new MemoryBlockStore());
+    const work = new EventLoopWork();
+    const database = new MinnowDatabase(observedStore(work));
     await database.createTable({
       name: "docs",
       columns: [
@@ -254,7 +280,7 @@ describe("background work never holds the event loop", () => {
         })),
       );
     }
-    const stall = await longestStall(async () => {
+    const measured = await work.measure(async () => {
       const result = await database.query(
         "SELECT COUNT(*) AS n FROM docs WHERE MATCH(body) AGAINST 'quick fox'",
         { memoize: false },
@@ -263,7 +289,7 @@ describe("background work never holds the event loop", () => {
       // The first full-text query starts the index build in the background; watch it finish.
       await new Promise((resolve) => setTimeout(resolve, 2_000));
     });
-    expect(stall).toBeLessThan(STALL_BOUND_MS);
+    assertSlices(measured);
     await database.close();
   });
 
@@ -271,7 +297,8 @@ describe("background work never holds the event loop", () => {
     const DAY = 24 * 60 * 60 * 1000;
     let current = Date.parse("2026-10-15T12:00:00.000Z");
     const now = (): Date => new Date(current);
-    const store = new MemoryBlockStore();
+    const work = new EventLoopWork();
+    const store = observedStore(work);
     const options = { now, keyForwardRetentionMs: 5 * DAY, autoCollect: false } as const;
     const database = new MinnowDatabase(store, options);
     try {
@@ -283,22 +310,56 @@ describe("background work never holds the event loop", () => {
       await database.execute("UPDATE t SET id = id + 1000000");
       // A connection that opens later reads every forward once, a slice at a time.
       const fresh = new MinnowDatabase(store, options);
-      const loadStall = await longestStall(async () => {
-        expect((await fresh.query("SELECT v FROM t WHERE id = 7")).rows).toEqual([{ v: 7 }]);
-      });
-      expect(loadStall).toBeLessThan(STALL_BOUND_MS);
-      await fresh.close();
-      current += 6 * DAY;
-      let elapsed = 0;
-      const trimStall = await longestStall(async () => {
-        const start = performance.now();
-        await database.collectGarbage();
-        elapsed = performance.now() - start;
-      });
-      expect(trimStall).toBeLessThan(STALL_BOUND_MS);
-      // Each page used to re-read every forward: 50,000 took about ten seconds.
-      expect(elapsed).toBeLessThan(process.env.CI === undefined ? 4_000 : 12_000);
-      expect(await database.resolveKey("t", 7)).toBe(7);
+      let freshClosed = false;
+      // eslint-disable-next-line @typescript-eslint/unbound-method -- Rebound with .call(CommittedKeyForwards, ...) below.
+      const load = CommittedKeyForwards.load;
+      // eslint-disable-next-line @typescript-eslint/unbound-method -- Original iterator is rebound with .call(this) below.
+      const entries = CommittedKeyForwards.prototype.entries;
+      // Count the cold loader's parsed input and the expiry cursor's delivered rows,
+      // without retaining vi.fn call histories or counting cheap internal map copies.
+      CommittedKeyForwards.load = (generation, forwards, clock) =>
+        load.call(
+          CommittedKeyForwards,
+          generation,
+          (function* () {
+            for (const forward of forwards) {
+              work.item();
+              yield forward;
+            }
+          })(),
+          clock,
+        );
+      CommittedKeyForwards.prototype.entries = function* (this: CommittedKeyForwards) {
+        for (const forward of entries.call(this)) {
+          work.item();
+          yield forward;
+        }
+      };
+      try {
+        const loaded = await work.measure(async () => {
+          expect((await fresh.query("SELECT v FROM t WHERE id = 7")).rows).toEqual([{ v: 7 }]);
+        });
+        assertSlices(loaded);
+        expect(loaded.items).toBeGreaterThanOrEqual(50_000);
+        await fresh.close();
+        freshClosed = true;
+        current += 6 * DAY;
+        const beforeReads = keyForwardTestHooks.wholeReads;
+        const trimmed = await work.measure(async () => {
+          await database.collectGarbage();
+        });
+        assertSlices(trimmed);
+        expect(trimmed.turns - loaded.turns).toBeGreaterThan(1);
+        // Each page used to re-read the whole table. Count those reads directly, so
+        // the quadratic implementation fails regardless of this host's throughput.
+        expect(keyForwardTestHooks.wholeReads - beforeReads).toBeLessThanOrEqual(1);
+        expect(trimmed.items - loaded.items).toBeGreaterThanOrEqual(50_000);
+        expect(await database.resolveKey("t", 7)).toBe(7);
+      } finally {
+        CommittedKeyForwards.prototype.entries = entries;
+        CommittedKeyForwards.load = load;
+        if (!freshClosed) await fresh.close();
+      }
     } finally {
       await database.close();
     }

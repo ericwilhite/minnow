@@ -1,7 +1,7 @@
 /**
  * Count work between real MessageChannel tasks, independently of host pauses and GC.
  * One synthetic clock unit is 1,024 source field/descriptor reads, one generator step,
- * or 64 KiB transferred through sync handles. It drives the real shared slice clock;
+ * 16 indexed/delivered native records, or 64 KiB transferred through storage handles. It drives the real shared slice clock;
  * it is not a prediction of wall time. No generator or storage operation is replaced.
  */
 import { vi } from "vitest";
@@ -16,6 +16,7 @@ export class EventLoopWork {
   #steps = 0;
   #bytes = 0;
   #turns = 0;
+  #items = 0;
 
   #add(units: number): void {
     this.#clock += units;
@@ -47,6 +48,13 @@ export class EventLoopWork {
           },
         }),
     );
+  }
+
+  /** A native index insertion or cursor-delivered record, e.g. an immutable key forward. */
+  item(): void {
+    if (!this.#active) return;
+    this.#items++;
+    this.#add(1 / 16);
   }
 
   transfer(bytes: number): void {
@@ -137,6 +145,7 @@ export class EventLoopWork {
         steps: this.#steps,
         bytes: this.#bytes,
         turns: this.#turns,
+        items: this.#items,
       };
     } finally {
       this.#active = false;
