@@ -33,7 +33,9 @@ no stored-format change or migration is required.
 The private 1.0 executor handles short UTF-8 encoder writes, including Node 26's
 exact-capacity tail behavior, without truncating or refusing valid text parameters.
 It keeps the measured byte count separate from reservation bounds and funds one
-temporary encoding slice across sequential parameter slots. Released 0.x behavior
+temporary encoding slice across sequential parameter slots. Result admission separately
+includes frame metadata and construction workspace, so a fitting wide parameter result
+cannot run out of its reserved progress lane under competing memory pressure. Released 0.x behavior
 and stored formats are unchanged; no migration is required.
 
 The private 1.0 devtools binding reads canonical results, detached catalog descriptions and

@@ -11713,3 +11713,16 @@ export const PARAMETER_UTF8_REACH = [
   "short write",
   "zero retained",
 ] as const;
+
+export const PARAMETER_RESULT_PROGRESS_REACH = [
+  "join",
+  "except",
+  "ASCII",
+  "multibyte",
+  "additional scalar columns",
+  "three columns",
+  "five MiB",
+  "occupied credit",
+  "frame progress",
+  "zero retained",
+] as const;

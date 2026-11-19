@@ -2542,6 +2542,10 @@ vary independently. Forced slice yields and short encoder writes check that bind
 resumes by reported progress and preserves each slot's measured byte extent. The
 same cases run on Node 22, 24 and 26; source and reservation bounds are distinct.
 
+The private executor also checks wide parameter results under pinned competing credit.
+Its complete result reservation includes frame construction as well as payload bytes;
+binding-only UTF-8 scratch cannot stand in for result progress.
+
 ### Rebuild directory-cache work counts
 
 The unexported 1.0 executor shares parsed column directories between source sizing and scan
