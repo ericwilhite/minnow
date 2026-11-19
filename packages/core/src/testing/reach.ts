@@ -2909,6 +2909,7 @@ export const WRITE_PRIVATE_MINIMUM_STATES = [
   "complete current snapshot",
   "durable reopen",
   "all credit returned",
+  "declared metadata window after reclaim",
 ] as const;
 
 /** An admitted writer funds one bounded step without taking another execution's minimum. */
@@ -10636,11 +10637,18 @@ export const NATIVE_WRITE_PRESSURE_REACH = [
   "one funded root list through reopen",
   "idle row credit reclaimed",
   "competing reader owns real bytes",
-  "admission after provisional unwind",
+  "admission after provisional settlement",
   "six 1 MiB native commits",
   "exact durable rows",
   "32 MiB peak",
   "zero final charge",
+] as const;
+
+export const NATIVE_WRITE_SETTLEMENT_REACH = [
+  "published settled",
+  "aborted settled",
+  "unsettled rejected",
+  "owned bytes rejected",
 ] as const;
 
 export const NATIVE_WRITE_OPTIONAL_REACH = [
@@ -11298,6 +11306,50 @@ export const PROJECTION_ARRAY_STEP_REACH = [
   "no payload allocation",
   "nondefault bounds",
   "element NULL",
+] as const;
+
+/** Exact signed int8 words survive every native write source and recovery boundary. */
+export const BIGINT_MODIFY_REACH = [
+  "delete before update",
+  "update before delete",
+  "one validity word",
+  "multiple validity words",
+  "parameters",
+  "exact SQL literals",
+  "insert",
+  "update",
+  "delete",
+  "rekey",
+  "non-key predicate",
+  "bigint primary key",
+  "integer primary key",
+  "unique secondary",
+  "unindexed non-key",
+  "resident",
+  "published",
+  "reopened",
+  "WAL replay",
+  "published reopen",
+  "int8 minimum",
+  "int8 maximum",
+  "unsafe positive",
+  "unsafe negative",
+  "adjacent wide words",
+  "generated full range",
+  "nullable value",
+  "RETURNING",
+  "without RETURNING",
+  "zero charge",
+] as const;
+
+/** Caller-owned full-width outputs remain exact when a cached memory handle publishes. */
+export const BIGINT_REPOINT_REACH = [
+  "wide page",
+  "safe page into wide output",
+  "nullable",
+  "all valid",
+  "published memory handle",
+  "zero charge",
 ] as const;
 
 /** PC2/PC4/R15.7: immutable native validation is reused only within its owner. */
