@@ -1,0 +1,111 @@
+# Progress lane: main's 1.0 rebuild (next/) against the published 0.20 engine, nightly.
+#
+# For visibility, not a merge gate. Each dataset job builds both engines' fixtures in one runner
+# and alternates them per round, so the main/0.20 ratio is measured on one machine. The report job
+# writes one table per run to the run summary: per Gate B cell, main, 0.20 and the fixed DuckDB-Wasm
+# target, with the ratios. A timing never fails the run; only a lane that cannot load its fixtures
+# does. Paired acceptance for a change stays with its own hosted probe.
+name: Head-to-head
+
+on:
+  schedule:
+    # 05:00 UTC daily, before the Node and browser performance lanes.
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: "Alternating timed rounds per cell"
+        default: "5"
+      shipped:
+        description: "Published @minnowdb/core version to compare against"
+        default: "0.20.0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: head-to-head
+  cancel-in-progress: false
+
+jobs:
+  measure:
+    name: ${{ matrix.dataset }} main vs ${{ inputs.shipped || '0.20.0' }}
+    runs-on: ubuntu-latest
+    # Measured locally at full size: W1M loads both engines in about five minutes and runs its 29
+    # cells in about half an hour; a hosted runner is slower. S1 is much smaller.
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        dataset: [W1M, S1]
+    env:
+      SHIPPED: ${{ inputs.shipped || '0.20.0' }}
+      ROUNDS: ${{ inputs.rounds || '5' }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: bash scripts/ci-install.sh
+      - run: npx tsc -b packages/core
+      - name: Unpack the published engine
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/shipped"
+          cd "$RUNNER_TEMP/shipped"
+          npm pack "@minnowdb/core@$SHIPPED"
+          npm view "@minnowdb/core@$SHIPPED" dist.integrity > integrity.txt
+          tar xzf "minnowdb-core-$SHIPPED.tgz"
+          node -e 'const p=require("./package/package.json"); if (p.version !== process.env.SHIPPED) throw Error(p.version)'
+      - name: Measure
+        # An explicit Bash shell enables pipefail, so tee cannot hide a failed lane.
+        shell: bash
+        run: >-
+          mkdir -p head-to-head &&
+          node scripts/head-to-head.mts run
+          --dataset ${{ matrix.dataset }}
+          --rounds "$ROUNDS"
+          --shipped "$RUNNER_TEMP/shipped/package"
+          --output head-to-head
+          2> >(tee head-to-head/${{ matrix.dataset }}.log >&2)
+          | tee head-to-head/${{ matrix.dataset }}.md
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: head-to-head-${{ matrix.dataset }}
+          path: head-to-head/
+          retention-days: 90
+
+  report:
+    name: Table
+    needs: measure
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: head-to-head-*
+          path: results
+          merge-multiple: true
+      - name: Write the table
+        shell: bash
+        run: |
+          files=$(ls results/head-to-head-W1M.json results/head-to-head-S1.json 2>/dev/null || true)
+          if [ -z "$files" ]; then
+            echo "No head-to-head results were produced." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          node scripts/head-to-head.mts report $files | tee head-to-head.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the table
+        uses: actions/upload-artifact@v7
+        with:
+          name: head-to-head-table
+          path: head-to-head.md
+          retention-days: 90
