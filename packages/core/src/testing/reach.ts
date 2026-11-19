@@ -11526,3 +11526,15 @@ export const GROUP_AGGREGATE_NATIVE_INT_REACH = [
   ...GROUP_AGGREGATE_NATIVE_REACH,
   "continued writes",
 ] as const;
+
+export const GROUP_AGGREGATE_PACK_CANCEL_REACH = [
+  "multiple-pack demand",
+  "blocked first seal",
+  "cancel during next open",
+  "no new opens",
+  "signal cancellation",
+  "explicit abort",
+  "no new appends",
+  "no partial group",
+  "zero charges",
+] as const;

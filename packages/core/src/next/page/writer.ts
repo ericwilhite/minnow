@@ -1842,7 +1842,13 @@ export class GroupWriter {
           try {
             if (builder !== null && builder.length + encoded.bytes.length + 7 > packBytes)
               await seal();
+            // A full pack's seal may suspend. Drain it, then refuse unstarted work.
+            this.ensureOpen();
+            this.work.signal?.throwIfAborted();
             builder ??= this.extents.open(packBytes);
+            // A synchronous storage callback may cancel while opening the next pack.
+            this.ensureOpen();
+            this.work.signal?.throwIfAborted();
             const [ref] = await appendTo(builder, [encoded.bytes], true);
             if (ref === undefined) throw new Error("Aggregate was not appended");
             pending.push({ index, ref });
