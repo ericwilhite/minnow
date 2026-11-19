@@ -164,7 +164,11 @@ for (const backend of ["memory", "indexeddb"] as const)
               const write = grants.find((g) => g.label === "write path" && g.held > 0);
               if (s.atMerge && options.label.startsWith("merge") && write && pressure) {
                 const growth = governor.capBytes - governor.reserveBytes - governor.usedBytes - 1;
-                if (growth > 0) await pressure(write.held - write.allocated + growth);
+                // Inject an idle forecast, not another row step inside the
+                // suspended merge admission. admit() would preflight a second
+                // publication and move this very credit into its metadata floor.
+                if (growth > 0)
+                  expect(write.tryGrow(growth), "fixture fills free ordinary credit").toBe(true);
               }
               pendingWriteAdmissions++;
               try {

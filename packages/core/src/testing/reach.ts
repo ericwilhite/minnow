@@ -11575,6 +11575,15 @@ export const WRITE_LOAN_NOTIFICATION_REACH = [
   "zero final charge",
 ] as const;
 
+export const WRITE_DELTA_OBSERVER_REACH = [
+  "resident descriptors",
+  "streamed additions",
+  "streamed releases",
+  "mutable cursor descriptors copied",
+  "cursors closed before prepare returns",
+  "snapshot survives source retirement",
+] as const;
+
 export const WRITE_FUNDED_HANDOFF_REACH = [
   "merge first",
   "commit first",
