@@ -145,7 +145,9 @@ async function readGroupRows(
           stored.statistics.nullCount === 0
             ? null
             : new Uint32Array(Math.ceil(positions.length / 32)),
-        data: allocateData(column.type, positions.length, bytes),
+        // A stored page may contain any signed int64 word. Do not assume a safe-number
+        // lane before gathering OLD values for keys, RETURNING and row completion.
+        data: allocateData(column.type, positions.length, bytes, "int64"),
       };
       reader.gather(positions, target, 0);
       target.length = positions.length;

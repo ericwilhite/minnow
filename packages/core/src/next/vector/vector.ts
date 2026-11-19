@@ -182,16 +182,25 @@ export function newDictionaryId(): number {
   return nextDictionaryId++;
 }
 
-function int64Values(capacity: number): Int64Values {
-  return { repr: "safe", values: new Float64Array(capacity) };
+function int64Values(capacity: number, representation: Int64Values["repr"] = "safe"): Int64Values {
+  return representation === "int64"
+    ? { repr: "int64", values: new BigInt64Array(capacity) }
+    : { repr: "safe", values: new Float64Array(capacity) };
 }
 
 /**
  * Allocates the data buffers of a flat vector for `type` at `capacity` slots. Variable-width
  * data starts with `varlenBytes` bytes; builders (varlen.ts) grow it under a grant. The caller
- * charges `dataBytes` to its grant first.
+ * charges `dataBytes` to its grant first. Int64 and interval lanes can request their exact
+ * signed-word representation; it has the same eight bytes per slot as the default safe lane.
+ * Decimal coefficient tiers are independent and retain their builder default.
  */
-export function allocateData(type: PhysicalType, capacity: number, varlenBytes = 0): VectorData {
+export function allocateData(
+  type: PhysicalType,
+  capacity: number,
+  varlenBytes = 0,
+  int64Representation: Int64Values["repr"] = "safe",
+): VectorData {
   const layout: Layout = layoutOf(type);
   switch (layout) {
     case "bool":
@@ -203,7 +212,7 @@ export function allocateData(type: PhysicalType, capacity: number, varlenBytes =
     case "f32":
       return { layout, values: new Float32Array(capacity) };
     case "int64":
-      return { layout, values: int64Values(capacity) };
+      return { layout, values: int64Values(capacity, int64Representation) };
     case "decimal": {
       const declared = type.kind === "decimal" ? type.scale : null;
       return {
@@ -223,7 +232,7 @@ export function allocateData(type: PhysicalType, capacity: number, varlenBytes =
         layout,
         months: new Int32Array(capacity),
         days: new Int32Array(capacity),
-        micros: int64Values(capacity),
+        micros: int64Values(capacity, int64Representation),
       };
   }
 }
