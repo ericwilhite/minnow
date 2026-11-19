@@ -285,6 +285,8 @@ export class NativeCommandRoot {
           },
           scan: {
             reads: scope.execution.reads,
+            visit: (tableId, rowId, columns, signal, visitor) =>
+              prefix.visit(tableId, rowId, columns, signal, visitor),
             prepare: async (_t, n, s) => {
               await this.scope.funding.prepareSource(n, s);
               return this.scope.funding.source;

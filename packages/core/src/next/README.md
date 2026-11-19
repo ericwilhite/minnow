@@ -5081,3 +5081,12 @@ retired per input. Complete setup reserves the largest compiled producer, rather
 sum of producers that never run together. Graph I/O, parameter and sink fences finish before
 that workspace is returned. This changes no write-owner floor: inactive merges keep the
 permanent joint floor, and an active merge still counts once under its existing contract.
+
+### Informational-reference source phases
+
+The native command controller captures informational foreign-key targets through selected
+point reads. It seals every original target identity before running referential writes.
+Only the actual FK operands are decoded; unrelated payloads and hypothetical publication
+buffers are not part of that read. Each point decoder, recipe and payload pin retires before
+funding the next source. Native-owned locator/deletion metadata keeps its existing charge.
+The visitor does not create an extra output image or retain a decoded key after comparison.

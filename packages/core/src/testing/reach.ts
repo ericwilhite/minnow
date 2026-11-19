@@ -11578,3 +11578,14 @@ export const NATIVE_PROGRAM_STEP_REACH = [
   "compiled state retired at each fence",
   "zero ownership",
 ] as const;
+
+export const NATIVE_PREFIX_VISIT_REACH = [
+  "resident",
+  "published",
+  "nullable",
+  "nonnullable",
+  "exact selected operands",
+  "no output image copy",
+  "no source at funding",
+  "zero ownership",
+] as const;

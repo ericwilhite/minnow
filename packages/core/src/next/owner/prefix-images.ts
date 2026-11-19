@@ -16,7 +16,13 @@ import { OutputArena } from "../exec/kernels/vectors.js";
 import type { ChunkReads } from "../exec/scan.js";
 import type { Grant } from "../memory/governor.js";
 import type { ByteCharge } from "../vector/varlen.js";
-import { BATCH_ROWS, type FlatVector, type Vector, type ConstantVector } from "../vector/vector.js";
+import {
+  BATCH_ROWS,
+  type Batch,
+  type FlatVector,
+  type Vector,
+  type ConstantVector,
+} from "../vector/vector.js";
 import { setInt128 } from "../vector/int128.js";
 import type { PhysicalType } from "../types.js";
 import { sourceSlot } from "../write/columns.js";
@@ -239,6 +245,30 @@ export class NativePrefixImages {
     }
   }
   capture(tableId: number, rowId: number, signal: AbortSignal): Promise<RowImageRef> {
+    return this.#read(tableId, rowId, signal, null, async (batch, row) => {
+      const image = await this.scope.images.append(tableId, { batch, row }, null);
+      if (image.spoolId !== this.scope.rootId) invalid();
+      return image;
+    });
+  }
+  /** Internal, synchronous visitor over selected OLD fields. It may not retain vectors,
+   * mutate the statement, or request admission. The source fully retires before return. */
+  visit(
+    tableId: number,
+    rowId: number,
+    columns: readonly number[],
+    signal: AbortSignal,
+    visitor: (batch: Batch, row: number) => boolean,
+  ): Promise<boolean> {
+    return this.#read(tableId, rowId, signal, columns, visitor);
+  }
+  #read<T>(
+    tableId: number,
+    rowId: number,
+    signal: AbortSignal,
+    columns: readonly number[] | null,
+    visitor: (batch: Batch, row: number) => MaybePromise<T>,
+  ): Promise<T> {
     this.#check(signal);
     if (
       this.#pending ||
@@ -325,7 +355,12 @@ export class NativePrefixImages {
             const positions = this.#positions ?? invalid();
             positions[0] = position;
             this.#ids.length = 0;
-            for (const column of table.columns) this.#ids.push(column.id);
+            if (columns === null) for (const column of table.columns) this.#ids.push(column.id);
+            else
+              for (const id of columns) {
+                if (!table.columns.some((column) => column.id === id)) invalid();
+                this.#ids.push(id);
+              }
             if (segment.kind === "memory") {
               // The hint's transient sizing workspace retires before the complete read.
               // A larger step retries from a fresh source boundary, never a reserve loan
@@ -397,15 +432,10 @@ export class NativePrefixImages {
               const row = item.batch.selection?.rows[0] ?? 0;
               await this.#normalize(item.batch, row, stop, pin);
               pin.checkRead();
-              const image = await this.scope.images.append(
-                tableId,
-                { batch: { ...item.batch, columns: this.#columns }, row },
-                null,
-              );
+              const value = await visitor({ ...item.batch, columns: this.#columns }, row);
               this.#check(stop);
               pin.checkRead();
-              if (image.spoolId !== this.scope.rootId) invalid();
-              return image;
+              return value;
             } finally {
               item.transfer?.release();
             }
