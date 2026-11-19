@@ -2670,6 +2670,7 @@ export const WRITE_BATCH_ADMISSION_STATES = [
 
 /** B3 review: transient reader memory must delay metadata publication, never poison it. */
 export const WRITE_METADATA_PRESSURE_STATES = [
+  "idle forecasts donated before reader pressure",
   "memory",
   "indexeddb",
   "reader owns real bytes",
@@ -10659,6 +10660,13 @@ export const NATIVE_WRITE_OPTIONAL_REACH = [
   "cheaper path exact",
   "no grant growth",
   "zero final charge",
+] as const;
+
+export const NATIVE_WRITE_DICTIONARY_PRESSURE_REACH = [
+  ...NATIVE_WRITE_OPTIONAL_REACH,
+  "actual immutable input bounds",
+  "complete plain workspace prepaid",
+  "no dictionary retained by plain fallback",
 ] as const;
 
 export const NATIVE_ROOT_LIST_FUNDING_REACH = [

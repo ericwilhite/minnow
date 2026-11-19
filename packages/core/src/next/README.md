@@ -182,6 +182,10 @@ writer unwind before admission, exact rows, one root charge before/after reopen 
 final charge. `testing/native-root-list-funding.test.ts` pins the identity and pending-state
 handoff guards and the standalone keeper lifetime. Its optional-workspace
 companion pins both cheaper fallbacks under fully occupied ordinary credit.
+The dictionary fixture supplies its immutable row/value bounds and prepays the full plain
+step before its competing reader takes the rest; observers forward the mandatory remainder
+to optional admission. Publication-pressure histories give their reader every idle account
+forecast and observe grouped waits too, so native account netting cannot bypass the pressure.
 Growth first moves idle row, metadata, WAL and merge credit into the next step. Before a
 global wait it returns unused forecasts and admits the complete remaining requirement in
 one group. Live buffers, loans, prepared rows and funded active steps remain owned. Cold
