@@ -223,6 +223,8 @@ export interface OwnerEngine {
 
   /** Native live runtime; absent only on older test engines. */
   readonly live?: LiveRuntime;
+  /** Exclusive replacement barrier: drain live execution and detach the old publication feed. */
+  retireLive?(): Promise<void>;
   readonly snapshots?: OwnerSnapshotOperations | undefined;
   /** Durable database incarnation; owner changes alone do not change it. */
   readonly databaseId: bigint;

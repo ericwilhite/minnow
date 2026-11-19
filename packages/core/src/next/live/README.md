@@ -142,3 +142,21 @@ The page decoder uses the same column grammar as native replay through
 sizing functions and `MemoryAdmissionError` live in `memory-values.ts`, re-exported by the
 governor. The page therefore imports neither a native writer nor governor state. This extraction
 changes no stored encoding, memory admission policy or published export.
+
+## Snapshot import and durable identity
+
+Successful portable import replaces the database incarnation. The replacement barrier closes
+all connection live handles, drains `engine.retireLive()` before import admission/path close,
+and discards the old feed attachment. A new live runtime is lazy and uses the recovered path's
+feed. Even an unacknowledged delivery cannot retain owner live charge across replacement.
+
+The existing `databaseReplaced` message has terminal live-reset semantics.
+`ClientLiveOptions.onReset("databaseReplaced")` runs synchronously before the typed error,
+independently of an outstanding `onResult` promise. Receiving stores must abort decoding and
+clear rows, patches and rekey baselines immediately; they must not present last-good rows from
+the old database as current. The protocol drops old registration/parameter/queued-delivery
+state. Reset-hook failures are isolated. Old calls, live refresh and stale-identity reconnects
+fail with `MINNOW_DATABASE_REPLACED`; explicitly reopen the client to read the replacement.
+No mutation is retried under a new identity. Its first ready snapshot is a full reset with no
+old rekey notices. This terminal reset differs from transparent owner-generation reconnect,
+which keeps the durable database identity and re-subscribes with a fresh read.

@@ -81,6 +81,7 @@
     "next-live-row-backing": [8870, 8871],
     "next-live-row-identity": [8868, 8869],
     "next-live-column-codec": [8902, 8903],
+    "next-live-snapshot-import": [8900, 8901],
     "next-live-row-binary": [8872, 8873]
   }
 }

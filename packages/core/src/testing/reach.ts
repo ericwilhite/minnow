@@ -11326,3 +11326,21 @@ export const LIVE_COLUMN_CODEC_REACH = [
   "same encoded bytes",
   "typed malformed refusal",
 ] as const;
+
+/** Native snapshot import ends the old live baseline and durable identity. */
+export const LIVE_SNAPSHOT_IMPORT_REACH = [
+  "OPFS",
+  "IndexedDB",
+  "outstanding delivery",
+  "acknowledged delivery",
+  "stream import",
+  "array import",
+  "explicit reset before consumer resumes",
+  "zero old live charge",
+  "reset callback isolated",
+  "typed old session refusal",
+  "stale handshake refused",
+  "key reuse has no rekey",
+  "recovered feed delivers commits",
+  "zero owner charge after close",
+] as const;
