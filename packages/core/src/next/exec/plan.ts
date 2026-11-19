@@ -107,6 +107,15 @@ import {
   type StarBound,
 } from "./star-bound.js";
 import { StarDictionaryBooks } from "./star-dictionary.js";
+import { StarLookups } from "./join-star-lookups.js";
+import { starParameterFootprint } from "./join-star-parameters.js";
+
+import {
+  starLookupShape,
+  starLookupBound,
+  type StarLookupShape,
+  type StarLookupBound,
+} from "./join-star-shape.js";
 import { starColumns } from "./star-pipeline.js";
 import type { PartitionBounds } from "./agg/partition-probe.js";
 import {
@@ -597,6 +606,8 @@ export interface CompileOptions {
   readonly aggregateInputPacking?: boolean;
   /** False retains ordinary TEXT producers for star-join diagnostic controls. */
   readonly starDictionary?: boolean;
+  /** False retains all three resident native star joins for diagnostic controls. */
+  readonly starLookups?: boolean;
   /** Diagnostic control for bounded sole rank/row_number windows. */
   readonly windowTopK?: boolean;
   /** Parent control for the resident full numeric columnar sort. */
@@ -723,6 +734,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
   };
   findIds(plan.root);
   const readSources = new Map<number, ReadSource>();
+  const scanRecipes = new Map<number, Recipe>();
   const starPlanners = new Map<
     number,
     { shape: StarDictionaryShape; identity: OperatorIdentity }
@@ -730,7 +742,12 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
   const starCompilers = new Map<number, number>();
   const starChoices = new WeakMap<
     QueryRuntime,
-    { shape: StarDictionaryShape; identity: OperatorIdentity; bound: StarBound }
+    {
+      shape: StarDictionaryShape;
+      identity: OperatorIdentity;
+      bound: StarBound;
+      lookup?: { shape: StarLookupShape; bound: StarLookupBound };
+    }
   >();
   const starBooks = new WeakMap<QueryRuntime, StarDictionaryBooks>();
   const starRel = (runtime: QueryRuntime, rel: Rel): Rel =>
@@ -1398,7 +1415,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                 (filter) => filter.abort(undefined),
               );
         fixed(rel, (cap) => kernelBytes + batchTargetFor(cap, 4) + BATCH_ROWS * 16);
-        return (runtime, downstream, stops, rowsNeeded) => {
+        const scanRecipe: Recipe = (runtime, downstream, stops, rowsNeeded) => {
           if (stops.some((stop) => stop())) return downstream.finish();
           const target = batchTargetFor(runtime.request.governor.capBytes, 4);
           return instantiate(
@@ -1466,6 +1483,8 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
               }),
           );
         };
+        scanRecipes.set(rel.id, scanRecipe);
+        return scanRecipe;
       }
       case "fts": {
         const child = prepare(rel.input),
@@ -2095,7 +2114,13 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
             !terminalStar(plan, rel.id)
               ? null
               : starDictionaryShape(aggregate, plan.volatile);
-          if (star) {
+          // Bound TEXT is new only for the exact three-lookup family. Existing
+          // literal dictionary recipes keep their broader, unchanged eligibility.
+          if (
+            star &&
+            (plan.parameters.length === 0 ||
+              (options.starLookups !== false && starLookupShape(star) !== null))
+          ) {
             const identity: OperatorIdentity = {
               id: nextPhysicalId++,
               op: "project",
@@ -2306,8 +2331,46 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                   !(operator instanceof ExternalAggregateOperator) &&
                   !(operator instanceof HybridAggregateOperator) &&
                   !(operator instanceof RestoredAggregateOperator)
-                )
-                  return child(runtime, operator, []);
+                ) {
+                  const lookup = starChoices.get(runtime)?.lookup;
+                  if (lookup === undefined) return child(runtime, operator, []);
+                  return instantiate(
+                    runtime,
+                    lookup.bound.owner,
+                    [],
+                    lookup.bound.minimum,
+                    1,
+                    (context, grant) => {
+                      const lookups = new StarLookups(
+                        lookup.shape,
+                        lookup.bound,
+                        grant,
+                        runtime.signal,
+                      );
+                      context.ownOperator?.(lookups);
+                      return lookups;
+                    },
+                    (lookups) =>
+                      (async () => {
+                        try {
+                          const c = scanRecipes.get(lookup.shape.c.scan.id),
+                            facts = scanRecipes.get(lookup.shape.fact.id),
+                            a = scanRecipes.get(lookup.shape.a.scan.id),
+                            b = scanRecipes.get(lookup.shape.b.scan.id);
+                          if (!c || !facts || !a || !b) throw new Error("Missing star scan");
+                          // Keep the native source barriers and drain every B prefix before next().
+                          await c(runtime, lookups.dimension(2), []);
+                          await facts(runtime, lookups.fact(), []);
+                          await a(runtime, lookups.dimension(0), []);
+                          await lookups.linkFacts();
+                          await b(runtime, lookups.probe(operator), []);
+                        } finally {
+                          lookups.close();
+                        }
+                      })(),
+                    true,
+                  );
+                }
                 runtime.dispose(() => operator.closed);
                 return (async () => {
                   try {
@@ -3699,9 +3762,19 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           if (
             !active.has(shape.aggregate.id) ||
             !starPrimaryKeys(shape, runtime.view.catalog) ||
-            shape.scans.some((scan) => !starPredicate(scan.filter))
+            shape.scans.some((scan) => !starPredicate(scan.filter, plan.parameters))
           )
             continue;
+          const parameterFootprint = yield* readValue(
+            starParameterFootprint(
+              plan,
+              runtime.request.parameters,
+              runtime.nativeParameters !== null,
+              runtime.signal,
+              runtime.request.governor.capBytes,
+            ),
+          );
+          if (parameterFootprint === null) continue;
           const proofs = new Map<number, PartitionBounds>();
           for (const scan of shape.scans) {
             const read = bounds.get(scan.id);
@@ -3730,7 +3803,13 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
             if (proof === null) break;
             proofs.set(scan.id, proof);
           }
-          const bound = starBound(shape, runtime.view.catalog, proofs, starCompilers);
+          const bound = starBound(
+            shape,
+            runtime.view.catalog,
+            proofs,
+            starCompilers,
+            plan.parameters,
+          );
           if (bound === null) continue;
           const minima = new Map([
             ...bound.joins,
@@ -3747,7 +3826,14 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           });
           const priorStrategy = choices.get(shape.aggregate.id);
           configureChoice(shape.aggregate.id, { kind: "hash", minimum: bound.aggregate, loans: 0 });
-          if (runtime.minimumBytes(entries) > runtime.request.governor.capBytes) {
+          if (
+            runtime.minimumBytes(
+              entries,
+              parameterFootprint.bytes,
+              parameterFootprint.largestSlot,
+              parameterFootprint.slotBytes ?? [],
+            ) > runtime.request.governor.capBytes
+          ) {
             if (priorStrategy) configureChoice(shape.aggregate.id, priorStrategy);
             for (const prior of saved) {
               prior.entry.minimum = prior.minimum;
@@ -3758,7 +3844,19 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           // All probe grants have closed. Only numeric facts survive this complete atomic
           // admission; no source buffer or private partial reservation waits for credit.
           choices.set(shape.aggregate.id, { kind: "hash", minimum: bound.aggregate, loans: 0 });
-          starChoices.set(runtime, { shape, identity, bound });
+          const lookup = options.starLookups === false ? null : starLookupShape(shape),
+            lookupBound =
+              lookup === null
+                ? null
+                : starLookupBound(shape, lookup, bound, proofs, runtime.view.catalog);
+          starChoices.set(runtime, {
+            shape,
+            identity,
+            bound,
+            ...(lookup === null || lookupBound === null
+              ? {}
+              : { lookup: { shape: lookup, bound: lookupBound } }),
+          });
           break;
         }
       choicesReady = true;
