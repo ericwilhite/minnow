@@ -9235,6 +9235,8 @@ export const BOUNDED_RETIREMENT_FAULT_REACH = [
 ] as const;
 
 export const FTS_RETIREMENT_PRESSURE_REACH = [
+  "competitor owns ordinary credit",
+  "allocated peak within prepaid window",
   "owned through publication",
   "released after settlement",
   "shared source refs",
