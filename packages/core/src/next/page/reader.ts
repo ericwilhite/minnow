@@ -167,23 +167,36 @@ export class ReaderClosedError extends Error {
   }
 }
 
-/** Bytes charged for a parsed directory: one entry object (with its statistics) per page. */
+/** Retained parsed directory: descriptors plus owned HLL and byte-statistic copies.
+ * The encoded byte length funds all variable copies before parsing (even invalid
+ * payloads); after validation its unused allowance returns to the holder.
+ */
 export function directoryCharge(directory: ChunkDirectory): number {
-  return 256 + (directory.pages.length + (directory.dictionary === null ? 0 : 1)) * 192;
+  let bytes =
+    256 +
+    (directory.pages.length + (directory.dictionary === null ? 0 : 1)) * 192 +
+    (directory.sketch?.byteLength ?? 0);
+  for (const page of directory.pages) {
+    if (page.min instanceof Uint8Array) bytes += page.min.byteLength;
+    if (page.max instanceof Uint8Array) bytes += page.max.byteLength;
+  }
+  return bytes;
 }
 
 /** The smallest stored page entry (directory.ts): bounds a corrupt header's page count. */
 const MIN_ENTRY_BYTES = 26;
 
 /**
- * `directoryCharge` read from the blob's header, before parsing: the page count (bounded by what
- * the blob could hold) and the dictionary flag. Equal to `directoryCharge` of a valid directory.
+ * Pre-parse upper bound: descriptor count from the fixed header plus every encoded
+ * byte as allowance for copied variable payloads. This needs no payload traversal.
+ * After validation directoryCharge releases the unused allowance; malformed inputs
+ * cannot create an uncharged variable-sized copy before being refused.
  */
 export function directoryChargeOf(bytes: Uint8Array): number {
-  if (bytes.length < 24) return 256;
+  if (bytes.length < 24) return 256 + bytes.byteLength;
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const pages = Math.min(view.getUint32(12, true), Math.floor(bytes.length / MIN_ENTRY_BYTES));
-  return 256 + (pages + ((view.getUint8(6) & 1) !== 0 ? 1 : 0)) * 192;
+  return 256 + (pages + ((view.getUint8(6) & 1) !== 0 ? 1 : 0)) * 192 + bytes.byteLength;
 }
 
 /** `value`, or a `RangeError` (an index the caller just validated). */
@@ -464,6 +477,8 @@ export class ChunkReader {
     const hit = cache?.pin(ref, pinning) ?? null;
     if (cache !== undefined && hit !== null) {
       // Cached and parsed already: charged to this reader while it holds it, unpinned at close.
+      const size = hit.size + DECODE_MEMO_BYTES;
+      let charged = false;
       try {
         check(
           hit.value.tag === chunkTagOf(chunk.type),
@@ -471,32 +486,38 @@ export class ChunkReader {
         );
         // The entry was parsed for whichever chunk read it first (review B2-p2a #1).
         checkDirectoryWithin(hit.value, chunk.data.length);
+        if (!options.budget.allocate(size)) throw new PageBudgetError(size);
+        charged = true;
+        return new ChunkReader(space, chunk, hit.value, options, size, ref);
       } catch (error) {
-        cache.unpin(ref, pinning);
+        try {
+          if (charged) options.budget.free(size);
+        } finally {
+          cache.unpin(ref, pinning);
+        }
         throw error;
       }
-      if (!options.budget.allocate(hit.size + DECODE_MEMO_BYTES)) {
-        cache.unpin(ref, pinning);
-        throw new PageBudgetError(hit.size + DECODE_MEMO_BYTES);
-      }
-      return new ChunkReader(space, chunk, hit.value, options, hit.size + DECODE_MEMO_BYTES, ref);
     }
     const build = (bytes: Uint8Array): ChunkReader => {
       // Charged from the header's page count before the parse builds anything (B2-2 #4).
-      const charge = directoryChargeOf(sized(bytes, ref.length));
+      let charge = directoryChargeOf(sized(bytes, ref.length));
       if (!options.budget.allocate(charge + DECODE_MEMO_BYTES))
         throw new PageBudgetError(charge + DECODE_MEMO_BYTES);
-      let directory: ChunkDirectory;
+      let directory: ChunkDirectory, retained: number;
       try {
         directory = parseDirectory(bytes, chunk.data.length);
         check(
           directory.tag === chunkTagOf(chunk.type),
           "Page directory tag differs from the column type",
         );
+        retained = directoryCharge(directory);
+        if (retained > charge) throw new RangeError("Directory copies exceed their admitted bound");
       } catch (error) {
         options.budget.free(charge + DECODE_MEMO_BYTES);
         throw error;
       }
+      options.budget.free(charge - retained);
+      charge = retained;
       // A one-pass scan uses cached directories but keeps none it parsed (`options.once`).
       if (cache === undefined || options.once === true)
         return new ChunkReader(space, chunk, directory, options, charge + DECODE_MEMO_BYTES, null);

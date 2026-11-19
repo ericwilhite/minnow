@@ -5,7 +5,14 @@ import { MANIFEST_FORMAT_VERSION } from "../durable-format.js";
  * end to end over the in-memory extent space: real chunks, group roots, paged group directories
  * and roots, walked by the real `reachableExtents`.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import fc from "fast-check";
+import { seedsFor } from "../../testing/seeds.js";
+import {
+  createReach,
+  DIRECTORY_CACHE_HIT_BUDGET_REACH,
+  DIRECTORY_CACHE_PAYLOAD_REACH,
+} from "../../testing/reach.js";
 import { BlobCache } from "../format/blob-cache.js";
 import {
   decodeGroupIndex,
@@ -22,7 +29,8 @@ import type { ByteBudget, CacheMemory, ExtentRef } from "../storage/extents.js";
 import type { ChunkDirectory } from "./directory.js";
 import { PageCorruptionError } from "./format.js";
 import { MemoryExtentSpace, UNLIMITED } from "./memory-extents.js";
-import { ChunkReader } from "./reader.js";
+import { ChunkReader, PageBudgetError, DECODE_MEMO_BYTES } from "./reader.js";
+import * as directoryCode from "./directory.js";
 import { defined, readChunk, vectorOf } from "./test-support.js";
 import { GroupWriter } from "./writer.js";
 
@@ -332,3 +340,208 @@ describe("the chunk directory cache (R15.7)", () => {
     expect(memory.charged).toBe(kept.residentBytes); // the hit was unpinned again
   });
 });
+
+for (const seed of seedsFor("next-directory-hit-budget", [0xb505, 0xb506]))
+  it(`returns a failed hit's pin for refused and throwing budgets seed ${String(seed)}`, async () => {
+    const reach = createReach("directory hit funding", DIRECTORY_CACHE_HIT_BUDGET_REACH);
+    await fc.assert(
+      fc.asyncProperty(
+        fc.integer({ min: 64, max: 257 }),
+        fc.boolean(),
+        fc.boolean(),
+        async (rows, once, throws) => {
+          reach.beginHistory();
+          const space = new MemoryExtentSpace(),
+            { roots } = await writeTable(space, 1, rows),
+            chunk = defined(defined(roots[0]).columns[0]),
+            memory = cacheMemory(),
+            directories = new BlobCache<ChunkDirectory>(() => memory),
+            funded = tracked();
+          (await ChunkReader.open(space, chunk, { budget: funded, directories })).close();
+          const failed = new Error("Directory holder funding rejected");
+          let allocations = 0,
+            frees = 0,
+            error: unknown,
+            unexpected: ChunkReader | undefined;
+          const budget: ByteBudget = {
+            allocate() {
+              allocations++;
+              if (throws) throw failed;
+              return false;
+            },
+            free() {
+              frees++;
+            },
+          };
+          try {
+            try {
+              unexpected = await ChunkReader.open(space, chunk, {
+                budget,
+                directories,
+                ...(once ? { once: true } : {}),
+              });
+            } catch (cause) {
+              error = cause;
+            }
+            if (throws) expect(error).toBe(failed);
+            else expect(error).toBeInstanceOf(PageBudgetError);
+            expect(allocations).toBe(1);
+            expect(frees).toBe(0);
+            expect(directories.evictableBytes, "failed cache hit must return its pin").toBe(
+              directories.residentBytes,
+            );
+            expect(memory.charged).toBe(directories.residentBytes);
+            expect(funded.held).toBe(0);
+            reach.reach(throws ? "throwing holder budget" : "refused holder budget");
+            reach.reach(once ? "once pin returned" : "ordinary pin returned");
+            reach.reach("failed hit remains evictable");
+            reach.reach("holder credit unchanged");
+          } finally {
+            unexpected?.close();
+            // Test-owned disposal for the parent/mutant's leaked pin, AFTER the law
+            // assertion. Never repair it before observing the failure.
+            if (directories.evictableBytes < directories.residentBytes)
+              directories.unpin(chunk.directory, once ? { once: true } : {});
+            directories.clear();
+          }
+          expect(memory.charged).toBe(0);
+          expect(space.leased).toBe(0);
+          reach.reach("all fixture credit returned");
+        },
+      ),
+      {
+        seed,
+        numRuns: 40,
+        examples: [
+          [128, false, true],
+          [256, true, true],
+          [64, false, false],
+          [129, true, false],
+        ],
+      },
+    );
+    reach.assertReached();
+  }, 180_000);
+
+for (const seed of seedsFor("next-directory-payload-budget", [0xb507, 0xb508]))
+  it(`funds copied directory payload before parsing and while retained seed ${String(seed)}`, async () => {
+    const reach = createReach("directory payload funding", DIRECTORY_CACHE_PAYLOAD_REACH);
+    await fc.assert(
+      fc.asyncProperty(
+        fc.boolean(),
+        fc.boolean(),
+        fc.constantFrom("retain", "refuse-valid", "refuse-invalid"),
+        fc.integer({ min: 1029, max: 8192 }),
+        async (dense, text, mode, invalidLength) => {
+          reach.beginHistory();
+          const space = new MemoryExtentSpace(),
+            { roots } = await writeTable(space, 1, dense ? 640 : 64),
+            original = defined(defined(roots[0]).columns[text ? 1 : 0]),
+            cold = space.view({ cache: true });
+          const initial = await cold.read([original.directory], { budget: UNLIMITED });
+          initial.release();
+          const encoded = cold.peek(original.directory);
+          if (encoded === null) throw new Error("Missing primed directory bytes");
+          const parsed = directoryCode.parseDirectory(encoded, original.data.length),
+            copied =
+              (parsed.sketch?.byteLength ?? 0) +
+              parsed.pages.reduce(
+                (sum, page) =>
+                  sum +
+                  (page.min instanceof Uint8Array ? page.min.byteLength : 0) +
+                  (page.max instanceof Uint8Array ? page.max.byteLength : 0),
+                0,
+              ),
+            // The descriptor terms are the existing reader contract. Payload copies
+            // are additional bytes, not values inferred from a new engine charge.
+            descriptors = 256 + 192 * (parsed.pages.length + (parsed.dictionary ? 1 : 0));
+          expect(copied).toBeGreaterThan(0);
+          if (!text) reach.reach(parsed.sketch?.[1] === 0 ? "dense sketch" : "sparse sketch");
+          reach.reach(text ? "byte statistics" : "integer statistics");
+          let chunk = original;
+          if (mode === "refuse-invalid") {
+            const bad = new Uint8Array(invalidLength);
+            bad.set([10, 0, 0, 4]); // dense header, but an invalid body length
+            const ref = defined(
+              (
+                await space
+                  .beginWrite("bad sketch funding")
+                  .write([directoryCode.encodeDirectory({ ...parsed, sketch: bad })])
+              ).blobs[0],
+            );
+            const primed = await cold.read([ref], { budget: UNLIMITED });
+            primed.release();
+            chunk = { ...original, directory: ref };
+          }
+          const memory = cacheMemory(),
+            directories = new BlobCache<ChunkDirectory>(() => memory),
+            holder = tracked(),
+            parse = vi.spyOn(directoryCode, "parseDirectory");
+          let reader: ChunkReader | undefined, error: unknown;
+          const budget: ByteBudget =
+            mode === "retain"
+              ? holder
+              : {
+                  allocate(bytes) {
+                    if (holder.held + bytes > descriptors + DECODE_MEMO_BYTES) return false;
+                    return holder.allocate(bytes);
+                  },
+                  free: (bytes) => holder.free(bytes),
+                };
+          try {
+            try {
+              reader = await ChunkReader.open(cold, chunk, { budget, directories });
+            } catch (cause) {
+              error = cause;
+            }
+            if (mode === "retain") {
+              expect(error).toBeUndefined();
+              expect(reader).toBeDefined();
+              reader?.close();
+              reader = undefined;
+              expect(
+                memory.charged,
+                "retained directory must fund copied payload",
+              ).toBeGreaterThanOrEqual(descriptors + copied);
+              reach.reach("retained payload funded");
+            } else {
+              expect(error, "unfunded directory payload must refuse before parse").toBeInstanceOf(
+                PageBudgetError,
+              );
+              expect(parse.mock.calls.length, "no payload parse before funding").toBe(0);
+              expect(directories.entryCount).toBe(0);
+              reach.reach(
+                mode === "refuse-valid"
+                  ? "valid payload refused before parse"
+                  : "invalid payload refused before parse",
+              );
+            }
+          } finally {
+            reader?.close();
+            parse.mockClear();
+            parse.mockRestore();
+            directories.clear();
+          }
+          expect(holder.held).toBe(0);
+          expect(memory.charged).toBe(0);
+          expect(cold.leased).toBe(0);
+          reach.reach("all fixture credit returned");
+        },
+      ),
+      {
+        seed,
+        numRuns: 40,
+        examples: [false, true].flatMap(
+          (
+            dense,
+          ): Array<[boolean, boolean, "retain" | "refuse-valid" | "refuse-invalid", number]> =>
+            [false, true].flatMap((text) => [
+              [dense, text, "retain", 2048],
+              [dense, text, "refuse-valid", 4096],
+              [dense, text, "refuse-invalid", 8192],
+            ]),
+        ),
+      },
+    );
+    reach.assertReached();
+  }, 180_000);

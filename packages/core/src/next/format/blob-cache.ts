@@ -66,6 +66,7 @@ export class BlobCache<T> implements EvictableCacheLike {
   readonly #unpinned = new Map<string, Entry<T>>();
   #evictable = 0;
   #resident = 0;
+  #closed = false;
   hits = 0;
   misses = 0;
 
@@ -180,7 +181,7 @@ export class BlobCache<T> implements EvictableCacheLike {
       }
       return;
     }
-    if (this.#memory.charge(entry.size)) {
+    if (!this.#closed && this.#memory.charge(entry.size)) {
       entry.charged = true;
       if (!listed) {
         entry.usedAt = performance.now();
@@ -197,5 +198,16 @@ export class BlobCache<T> implements EvictableCacheLike {
   /** Drops every unpinned entry and returns its memory. */
   clear(): void {
     this.evict(Number.POSITIVE_INFINITY);
+  }
+
+  /** End an owner's cache lifetime. Pinned values still belong to their holders;
+   * their last unpin drops them instead of retaining bytes in a closed owner.
+   * A late read may finish its already funded parse, but cannot leave idle credit.
+   */
+  close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.clear();
+    this.#memory.unregister?.();
   }
 }
