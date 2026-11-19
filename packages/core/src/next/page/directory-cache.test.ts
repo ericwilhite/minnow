@@ -35,6 +35,8 @@ const MODES = [
   "close while pinned",
   "late read after close",
   "new owner",
+  "pending cold close",
+  "overlapping cold opens",
 ] as const;
 type Mode = (typeof MODES)[number];
 async function store(space: MemoryExtentSpace, bytes: Uint8Array): Promise<BlobRef> {
@@ -71,6 +73,13 @@ function body(count: number, salt: number, dense: boolean): ChunkDirectory {
     sketch: bytes,
   };
 }
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
 it.each(seedsFor("next-directory-cache-identity", [0xb503, 0xb504]))(
   "keeps full identity, hit bounds and charged lifetimes (seed %i)",
   async (seed) => {
@@ -105,9 +114,9 @@ it.each(seedsFor("next-directory-cache-identity", [0xb503, 0xb504]))(
             },
             parse = vi.spyOn(directoryCode, "parseDirectory"),
             readers: ChunkReader[] = [];
-          const open = async (source = chunk, once = false) => {
+          const open = async (source = chunk, once = false, budget = grant) => {
             const reader = await ChunkReader.open(space, source, {
-              budget: grant,
+              budget,
               directories: cache,
               ...(once ? { once: true } : {}),
             });
@@ -115,7 +124,146 @@ it.each(seedsFor("next-directory-cache-identity", [0xb503, 0xb504]))(
             return reader;
           };
           try {
-            if (mode === "once miss") {
+            if (mode === "pending cold close" || mode === "overlapping cold opens") {
+              const gates = Array.from({ length: mode === "pending cold close" ? 1 : 2 }, () => ({
+                entered: deferred(),
+                release: deferred(),
+              }));
+              const other =
+                mode === "overlapping cold opens"
+                  ? await governor.admit({
+                      label: "overlapping directory holder",
+                      minimumBytes: 32768,
+                      spillable: false,
+                    })
+                  : grant;
+              const holders = [grant, other];
+              const read = space.read.bind(space);
+              let started = 0;
+              const pendingRead = vi
+                .spyOn(space, "read")
+                .mockImplementation(async (refs, options) => {
+                  const gate = gates[started++];
+                  if (!gate) throw new Error("Unexpected directory fixture read");
+                  const lease = await read(refs, options);
+                  // Hold a real, already funded IO lease: the open is in flight before close.
+                  gate.entered.resolve();
+                  await gate.release.promise;
+                  return lease;
+                });
+              const pending = gates.map((_, at) => open(chunk, false, holders[at]));
+              try {
+                for (let at = 0; at < gates.length; at++) {
+                  const gate = gates[at],
+                    request = pending[at];
+                  if (!gate || !request) throw new Error("Missing pending open");
+                  const phase = await Promise.race([
+                    gate.entered.promise.then(() => "entered"),
+                    request.then(
+                      () => "completed",
+                      () => "rejected",
+                    ),
+                  ]);
+                  expect(phase, "cold open must enter deferred IO").toBe("entered");
+                }
+                expect(parse.mock.calls.length).toBe(0);
+                expect(cache.entryCount).toBe(0);
+                expect(space.leased).toBe(ref.length * gates.length);
+                expect(grant.allocated).toBe(ref.length);
+                if (gates.length === 2) expect(other.allocated).toBe(ref.length);
+                if (mode === "pending cold close") {
+                  reach.reach("pending read owns funded bytes");
+                  cache.close();
+                  expect(grant.allocated).toBe(ref.length);
+                  expect(space.leased).toBe(ref.length);
+                  gates[0]?.release.resolve();
+                  const completed = await pending[0];
+                  if (!completed) throw new Error("Missing completed cold read");
+                  expect(completed.directory).toEqual(original);
+                  expect(parse.mock.calls.length).toBe(1);
+                  expect(space.leased).toBe(0);
+                  expect(cache.residentBytes).toBeGreaterThan(0);
+                  expect(cache.evictableBytes).toBe(0);
+                  completed.close();
+                  expect(cache.entryCount).toBe(0);
+                  expect(cache.residentBytes).toBe(0);
+                  reach.reach("late unpin does not retain");
+                } else {
+                  reach.reach("overlapping reads own funded bytes");
+                  const reverse = (salt & 1) !== 0,
+                    firstIndex = reverse ? 1 : 0,
+                    lastIndex = reverse ? 0 : 1;
+                  gates[firstIndex]?.release.resolve();
+                  const first = await pending[firstIndex];
+                  if (!first) throw new Error("Missing first completion");
+                  const metadata = holders[firstIndex]?.allocated ?? 0;
+                  expect(holders[lastIndex]?.allocated).toBe(ref.length);
+                  expect(metadata).toBeGreaterThan(cache.residentBytes);
+                  expect(cache.residentBytes).toBeGreaterThan(0);
+                  expect(cache.evictableBytes).toBe(0);
+                  const closesBetween = (salt & 2) !== 0;
+                  if (closesBetween) {
+                    cache.close();
+                    reach.reach("close between completions");
+                  } else reach.reach("open through both completions");
+                  gates[lastIndex]?.release.resolve();
+                  const last = await pending[lastIndex];
+                  if (!last) throw new Error("Missing second completion");
+                  expect(first.directory, "overlapping opens share the admitted directory").toBe(
+                    last.directory,
+                  );
+                  expect(first.directory).toEqual(original);
+                  expect(parse.mock.calls.length).toBe(2);
+                  expect(cache.entryCount).toBe(1);
+                  expect(space.leased).toBe(0);
+                  expect(grant.allocated).toBe(metadata);
+                  expect(other.allocated).toBe(metadata);
+                  reach.reach("shared directory after overlap");
+                  reach.reach(reverse ? "reverse completion" : "forward completion");
+                  const closeFirst = (salt & 4) !== 0 ? last : first,
+                    closeLast = closeFirst === first ? last : first,
+                    closedIndex = closeFirst === first ? firstIndex : lastIndex,
+                    remainingIndex = closedIndex === 0 ? 1 : 0;
+                  closeFirst.close();
+                  expect(holders[closedIndex]?.allocated).toBe(0);
+                  expect(holders[remainingIndex]?.allocated).toBe(metadata);
+                  expect(cache.evictableBytes, "remaining reader owns its cache pin").toBe(0);
+                  expect(cache.evict(Infinity)).toBe(0);
+                  expect(cache.entryCount).toBe(1);
+                  reach.reach("remaining reader keeps pin");
+                  closeLast.close();
+                  expect(grant.allocated).toBe(0);
+                  expect(other.allocated).toBe(0);
+                  if (!closesBetween) {
+                    const retained = cache.residentBytes;
+                    expect(retained).toBeGreaterThan(0);
+                    expect(cache.evictableBytes).toBe(retained);
+                    expect(cache.evict(Infinity)).toBe(retained);
+                    reach.reach("overlap cache eviction returns bytes");
+                  }
+                  expect(cache.entryCount).toBe(0);
+                  expect(cache.residentBytes).toBe(0);
+                }
+              } catch (error) {
+                // Preserve a failed accounting assertion if a deliberately broken pin
+                // design also throws during cleanup of its second holder.
+                for (const gate of gates) gate.release.resolve();
+                await Promise.allSettled(pending);
+                for (const reader of readers) {
+                  try {
+                    reader.close();
+                  } catch {
+                    /* primary failure above owns the evidence */
+                  }
+                }
+                throw error;
+              } finally {
+                for (const gate of gates) gate.release.resolve();
+                await Promise.allSettled(pending);
+                pendingRead.mockRestore();
+                if (other !== grant) other.close();
+              }
+            } else if (mode === "once miss") {
               for (let pass = 0; pass < 3; pass++) {
                 parse.mockClear();
                 (await open(chunk, true)).close();
@@ -269,7 +417,8 @@ it.each(seedsFor("next-directory-cache-identity", [0xb503, 0xb504]))(
       ),
       {
         seed,
-        numRuns: 40,
+        // Examples count toward numRuns: keep the old ten random histories after four new examples.
+        numRuns: 44,
         examples: MODES.flatMap((mode, index): Array<[Mode, number, number, boolean]> => [
           [mode, 7, index, false],
           [mode, 17, index + 31, true],
