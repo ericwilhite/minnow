@@ -3,10 +3,10 @@ import type { IndexCursor, IndexReader, IndexRangePlan } from "../access/key-ind
 import type { ReadBound } from "../page/read-bounds.js";
 import { directoryCacheFor } from "../page/directory-cache.js";
 import type { PhysicalPlan, Rel } from "../ir/ir.js";
-import { BATCH_ROWS, type FlatVector } from "../vector/vector.js";
+import { BATCH_ROWS, dataBytes, type FlatVector } from "../vector/vector.js";
 import { batchTargetFor, OBJECT_OVERHEAD_BYTES } from "../memory/governor.js";
 import { pauseIfDue } from "../task.js";
-import { samePhysicalType, type PhysicalType } from "../types.js";
+import { layoutOf, samePhysicalType, type PhysicalType } from "../types.js";
 import { OutputArena } from "./kernels/vectors.js";
 import { drive, type BatchSource, type Operator, type SourceItem } from "./pipeline.js";
 import { LateFetchOperator, ORDINAL_TYPE } from "./late-fetch.js";
@@ -106,18 +106,44 @@ export interface IndexShape {
   readonly restore: OperatorIdentity;
   readonly descending: boolean;
 }
-export function indexMinimums(shape: IndexShape, cap: number) {
+/** A byte target chooses real read batches; it is never a certificate about a value.
+ * Unknown/underestimated widths still pass through ordinary bounded source sizing,
+ * which includes oversized rows. LIMIT caps cursor output, not physical key positions. */
+export function indexReadTarget(
+  types: readonly PhysicalType[],
+  cap: number,
+  limit: number | null,
+): number {
+  const rows = Math.min(BATCH_ROWS, Math.max(1, limit ?? BATCH_ROWS));
+  let width = 0;
+  for (const type of types)
+    width +=
+      layoutOf(type) !== "varlen"
+        ? dataBytes(type, 1)
+        : type.kind === "text" && type.maxLength !== undefined
+          ? Math.min(65536, 4 * type.maxLength)
+          : 64;
+  return Math.min(batchTargetFor(cap, 4), Math.max(4096, rows * Math.max(1, width)));
+}
+export function indexMinimums(
+  shape: IndexShape,
+  cap: number,
+  targetBytes = batchTargetFor(cap, 4),
+  rows = BATCH_ROWS,
+) {
   return [
-    { rel: shape.source, minimum: BATCH_ROWS * 32 + 4096 },
+    { rel: shape.source, minimum: rows * 32 + 4096 },
     {
       rel: shape.fetch,
       minimum:
-        batchTargetFor(cap, 4) +
+        targetBytes +
         memoryScanBufferBytes(shape.types) +
-        BATCH_ROWS * (80 + 8 * OBJECT_OVERHEAD_BYTES) +
+        rows * (80 + 8 * OBJECT_OVERHEAD_BYTES) +
         OBJECT_OVERHEAD_BYTES * (16 + 2 * shape.types.length),
     },
-    { rel: shape.restore, minimum: sortMinimumBytes([...shape.types, ORDINAL_TYPE]) },
+    ...(rows === 1
+      ? []
+      : [{ rel: shape.restore, minimum: sortMinimumBytes([...shape.types, ORDINAL_TYPE]) }]),
   ];
 }
 
@@ -125,10 +151,13 @@ export interface AdmittedIndexRead {
   readonly plan: IndexRangePlan;
   readonly cursor: OperatorIdentity;
   readonly payload: ReadBound;
+  readonly targetBytes: number;
+  /** Exact SQL bound on cursor output, never a statistics estimate. */
+  readonly rows: number;
 }
 export function admittedIndexMinimums(shape: IndexShape, cap: number, read: AdmittedIndexRead) {
   return [
-    ...indexMinimums(shape, cap).map((entry) => ({
+    ...indexMinimums(shape, cap, read.targetBytes, read.rows).map((entry) => ({
       ...entry,
       minimum: entry.minimum + (entry.rel.id === shape.fetch.id ? read.payload.bytes : 0),
     })),
@@ -160,9 +189,10 @@ export async function runIndexOrder(
         entry.rel,
       ),
     );
-  const [sourceGrant, fetchGrant, restoreGrant] = grants;
+  const [sourceGrant, fetchGrant] = grants;
+  const restoreGrant = admitted?.rows === 1 ? fetchGrant : grants[2];
   if (!sourceGrant || !fetchGrant || !restoreGrant) throw new Error("index admissions");
-  const arena = new OutputArena(sourceGrant, BATCH_ROWS),
+  const arena = new OutputArena(sourceGrant, admitted?.rows ?? BATCH_ROWS),
     fetchArena = new OutputArena(fetchGrant, BATCH_ROWS);
   runtime.dispose(() => arena.close());
   runtime.dispose(() => fetchArena.close());
@@ -190,7 +220,7 @@ export async function runIndexOrder(
       ...(directories === undefined ? {} : { directories }),
       spill: runtime.request.spill,
       queryId: runtime.request.queryId,
-      targetBytes: batchTargetFor(runtime.request.governor.capBytes, 4),
+      targetBytes: admitted?.targetBytes ?? batchTargetFor(runtime.request.governor.capBytes, 4),
       signal: runtime.signal,
       onPipeline: () => runtime.pipeline(),
       orderedShortcut: true,
@@ -200,7 +230,7 @@ export async function runIndexOrder(
   runtime.onAbort((reason) => fetch.abort(reason));
   runtime.dispose(() => fetch.closed);
   runtime.signal.throwIfAborted();
-  const cursorGrant = grants[3];
+  const cursorGrant = admitted ? grants.at(-1) : undefined;
   if (admitted && !cursorGrant) throw new Error("Missing admitted cursor budget");
   const cursor =
     admitted && cursorGrant

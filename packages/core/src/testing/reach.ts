@@ -11605,3 +11605,58 @@ export const DIRECTORY_CACHE_LATE_REACH = [
   "complete PostgreSQL rows",
   "all credit returned",
 ] as const;
+
+export const EXECUTOR_DEMAND_ADMISSION_REACH = [
+  "pinned competitor denies optional growth",
+  "PGlite exact ordered rows",
+  "declared widths",
+  "unknown widths",
+  "descending physical reorder",
+  "ascending physical reorder",
+  "LIMIT zero",
+  "unbounded LIMIT",
+  "bound LIMIT",
+  "oversized row",
+  "nullable input",
+  "minimum versus charged peak",
+  "zero final query credit",
+] as const;
+
+export const READ_DEMAND_COVERAGE_REACH = [
+  "physical prefix is not complete chunk",
+  "whole chunk covers every subinterval",
+  "unused byte target not retained",
+  "one-row hints cover whole source",
+  "zero sizing credits",
+] as const;
+
+export const EXECUTOR_DEMAND_PUBLICATION_REACH = [
+  "resident source retained before publication",
+  "publication after complete admission",
+  "old snapshot exact values after publication",
+  "8MiB query zero final credit",
+] as const;
+
+export const RESIDENT_RANGE_REACH = [
+  "bounded resident minimum",
+  "real delta replacement keeps captured arrays",
+  "publication before open",
+  "cancel before open",
+  "cancel transferred input before next",
+  "cancel pending input keeps charge until settle",
+  "descending exact locators",
+  "ascending exact locators",
+  "pinned optional growth denied",
+  "zero cursor credits",
+] as const;
+
+export const EXECUTOR_LEGACY_DEMAND_REACH = [
+  "optional range capability absent",
+  "complete query fits8MiB",
+  "PGlite exact direct projection",
+  "ascending",
+  "descending",
+  "legacy diagnostic cursor exercised",
+  "operator requests within reserved capacity",
+  "zero final credits",
+] as const;

@@ -370,6 +370,10 @@ export class QueryRuntime {
       table: (id, options) => this.#sourceRecipes.get(id)?.table ?? this.view.table(id, options),
     };
   }
+  /** Exact row count of an explicitly retained source, never a pruning certificate. */
+  residentSourceRows(tableId: number): number | null {
+    return this.#sourceRecipes.get(tableId)?.table.liveRowCount ?? null;
+  }
   retryResidentSources(
     sources: ReadonlyArray<{ readonly tableId: number }>,
   ): MaybePromise<boolean> {

@@ -144,5 +144,21 @@ A caller must include that minimum in its atomic query admission, then call
 `plan.open({ budget, signal })` with a dedicated grant. A plan opens once. The cursor does
 not admit more memory, grow the grant or borrow shared progress credit. Closing it cancels
 pending work and releases its scratch after that work settles; the caller then closes the
-grant. This access-layer API is available now; executor integration and the SQL planner
-route will follow separately. Stored bytes are unchanged.
+grant. Eligible primary-key ordered queries include this cursor in their complete execution
+minimum. Stored bytes are unchanged.
+
+A separate optional resident-range preparation retains one existing native index delta.
+Its arrays remain charged to their original owner through staging or publication; preparation
+allocates no new native buffers or query grant. The caller closes this input lease even when
+the plan never opens. The admitted cursor needs only its bounded heads and key copies. When
+SQL LIMIT is exactly one, the cursor supplies at most one locator, so its query omits the
+physical-order restore sort and sizes locator scratch for one row.
+
+For a small native table, an execution can retain its existing resident chunk while it reads.
+The query still accounts for that input through the write owner, and releases the lease after
+execution. This avoids reserving publication and decoder buffers that the retained read will
+never need. The union of hints covering a complete source bounds every output subinterval; a partial source keeps its
+conservative byte target. LIMIT and column widths choose real bounded read batches, while
+measured oversized values still determine the required progress space. A one-row sort loan
+retries one row before requesting another step. These internal 1.0 paths remain unpublished;
+released 0.x execution behavior is unchanged.
