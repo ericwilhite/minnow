@@ -49,8 +49,9 @@ const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 export interface ByteCharge {
   /** Optional encoding optimizations may decline without requesting async admission. */
   tryAllocate?(bytes: number, reserve?: number): boolean;
-  /** Synchronous preflight for a complete step, before constructing any of its buffers. */
-  preflightAllocation?(bytes: number): void;
+  /** Fund the required step before any buffer. Optional headroom is best effort,
+   * synchronous and never part of a minimum or an asynchronous admission. */
+  preflightAllocation?(bytes: number, optionalBytes?: number): void;
   allocate(bytes: number): boolean;
   free(bytes: number): void;
 }

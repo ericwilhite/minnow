@@ -4648,6 +4648,13 @@ keeper first attempts their complete reservation; a boolean or typed memory refu
 selects the same disk inventory used for larger sources. Other errors propagate.
 The disk route admits its smaller working window before copying or consuming entries.
 
+A group constructor may also prepay at most 1 MiB of optional dictionary headroom from
+currently free credit. It never waits for that spare or includes it in the required minimum.
+Dictionary allocations keep the remaining mandatory workspace reserved; they do not grow
+or reclaim while emitting. If spare credit is unavailable, or its owner returns unused spare,
+the existing plain encoding remains the bounded fallback. Plentiful-memory stored inputs retain dictionary
+pages for certified grouping/percentile routes.
+
 An idle transaction can retain the writer slot while a recycler queues behind it. That queued
 recycler owns no active step: fitting readers can reclaim the dormant writer forecasts before
 the transaction releases its slot. Live allocations, prepared rows, active metadata/WAL work

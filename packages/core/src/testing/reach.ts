@@ -11550,3 +11550,16 @@ export const WRITE_QUEUED_READER_REACH = [
   "64 MiB",
   "zero final charge",
 ] as const;
+
+/** Optional dictionary credit is prepaid before construction, never required for progress. */
+export const WRITE_DICTIONARY_PREFLIGHT_REACH = [
+  "required future workspace retained",
+  "unused optional prepayment reclaimed",
+  "preflight precedes every group buffer",
+  "competing live allocation",
+  "no emit growth or minimum increase",
+  "bounded plain fallback",
+  "plentiful dictionary retained",
+  "exact NULL and UTF8 rows",
+  "zero final charge",
+] as const;

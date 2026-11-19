@@ -39,7 +39,8 @@ migration is required.
 
 The private 1.0 writer prepays all column-group buffers together and sizes TEXT buffers from
 the actual input. Oversized working sets return SQLSTATE `53200` before queueing; optional
-dictionaries leave mandatory workspace available. Serialized directories and distinct sketches
+dictionary headroom is prepaid when free credit is available, with a plain fallback under
+pressure. Serialized directories and distinct sketches
 are charged until storage consumes them. Released 0.x behavior is unchanged; no stored-format
 change or migration is required.
 

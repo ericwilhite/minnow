@@ -58,15 +58,21 @@ export class MetadataBudget implements ByteBudget {
     return this.grant;
   }
 
-  preflightAllocation(bytes: number): void {
+  preflightAllocation(bytes: number, optionalBytes = 0): void {
     const wanted = this.grant.allocated + bytes;
     // Other snapshots can still own resident metadata. Only this complete working
     // minimum is an intrinsic size refusal; its overlap with them is transient.
     if (bytes > this.capBytes) throw new MetadataAllocationTooLargeError(bytes, this.capBytes);
-    if (this.grant.held >= wanted || this.grant.tryGrow(wanted - this.grant.held)) return;
-    this.reclaimWriter();
-    if (this.grant.held >= wanted || this.grant.tryGrow(wanted - this.grant.held)) return;
-    throw new MetadataPressure(bytes, wanted);
+    if (this.grant.held < wanted && !this.grant.tryGrow(wanted - this.grant.held)) {
+      this.reclaimWriter();
+      if (this.grant.held < wanted && !this.grant.tryGrow(wanted - this.grant.held))
+        throw new MetadataPressure(bytes, wanted);
+    }
+    // Optional layouts may take currently free credit before construction. They
+    // never reclaim, wait, or turn their spare allowance into a required minimum.
+    const optional = wanted + optionalBytes;
+    if (optionalBytes > 0 && optional <= this.capBytes && optional > this.grant.held)
+      this.grant.tryGrow(optional - this.grant.held);
   }
 
   tryAllocate(bytes: number, reserve = 0): boolean {

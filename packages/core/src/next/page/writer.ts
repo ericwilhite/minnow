@@ -1534,6 +1534,50 @@ export function groupWriterMinimum(options: Omit<GroupWriterOptions, "writer" | 
   );
 }
 
+/** Best-effort dictionary credit is obtained before the emit step, never by an
+ * optional allocation inside it. A group shares at most a 1 MiB spare window;
+ * an owner can return unused spare and select the existing plain fallback.
+ */
+function groupDictionaryHeadroom(options: Omit<GroupWriterOptions, "writer" | "charge">): number {
+  const rows = options.maxRows ?? MAX_GROUP_ROWS;
+  const entries = Math.min(rows, options.dictionaryEntries ?? 65_536);
+  if (entries < 1) return 0;
+  let slots = 64;
+  while (slots <= entries) slots *= 2;
+  let headroom = 0;
+  for (const column of options.columns) {
+    const kind = column.type.kind;
+    const fixed = kind === "uuid";
+    if (
+      !fixed &&
+      kind !== "text" &&
+      kind !== "bytes" &&
+      kind !== "json" &&
+      kind !== "enum" &&
+      kind !== "array"
+    )
+      continue;
+    const limit = Math.max(
+      0,
+      Math.min(MAX_DICTIONARY_BYTES, options.dictionaryBytes ?? 256 * 1024),
+    );
+    const values = Math.max(
+      0,
+      Math.min(
+        limit,
+        fixed ? rows * 16 : (column.dictionaryValueBytes ?? column.valueBytes ?? limit),
+      ),
+    );
+    let bytes = values === 0 ? 0 : Math.min(limit, 1024);
+    while (bytes < values) bytes = Math.min(limit, bytes * 2);
+    // Old/new hash, offset, slot and byte arrays coexist during growth. This is
+    // optional headroom, not a claim that every possible dictionary must fit it.
+    headroom += 2 * slots * (fixed ? 12 : 16) + 2 * bytes + 4;
+    if (headroom >= 1 << 20) return 1 << 20;
+  }
+  return headroom;
+}
+
 /** Known input bounds eliminate raw-buffer resize overlap on native flushes. */
 function columnBufferBytes(column: WriterColumn, raw: number): number {
   const limit = column.maxValueBytes === undefined ? raw : raw + column.maxValueBytes;
@@ -1576,7 +1620,7 @@ export class GroupWriter {
     };
     this.extents = options.writer;
     const minimum = groupWriterMinimum(options);
-    options.charge?.preflightAllocation?.(minimum);
+    options.charge?.preflightAllocation?.(minimum, groupDictionaryHeadroom(options));
     this.memory = new Charged(options.charge ?? null, minimum);
     this.limbScratch = this.memory.uint32(4);
     this.scratch = new PageScratch((grown, old) => {
