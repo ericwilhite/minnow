@@ -108,6 +108,10 @@ grouping, alternation, character
 classes and ASCII POSIX classes, anchors, and greedy repetition. Pattern backreferences,
 lookaround, inline flags, and non-greedy quantifiers throw; replacement backreferences still work.
 The [SQL limits](/docs/sql) bound pattern size, compilation, matching, and replacement output.
+Capture selection shares the fixed matching-work ceiling. Queries already close to that
+ceiling can now reach it when extracting PostgreSQL-correct groups; simplify the pattern
+or use non-capturing groups when captures are unnecessary. Boolean checks and group-free
+substring/replacement do no capture dissection.
 
 Timestamp text is read as an instant: `2026-10-15 08:00:00`, `2026-10-15T08:00:00.250Z`, and an
 optional zone after the time, `Z` or an offset in PostgreSQL's spellings (`+00`, `-08`, `+0530`,

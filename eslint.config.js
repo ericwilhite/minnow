@@ -132,6 +132,9 @@ export default tseslint.config(
       // Node-only generated-test watchdog; owns/reaps its child and temporary config.
       // No browser entry point imports this fixture.
       "packages/core/src/next/testing/inactive-envelope-deadline.test.fixture.ts",
+      // Full-count regex controls own/reap foreground Node children and os.tmpdir files.
+      // This test-only fixture never enters a browser or package entry point.
+      "packages/core/src/next/testing/regex-work-child.test-support.ts",
       // Exposes the collector through node:v8/node:vm to measure the driver's live heap.
       "packages/core/src/next/exec/pipeline.test.ts",
       // Unexported Node-only operator benchmarks read node:os for per-run host load.

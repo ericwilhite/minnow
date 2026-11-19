@@ -2568,3 +2568,14 @@ change the stored format.
 The private regex byte-input properties compare borrowed UTF-8 and legacy UTF-16
 scalar traversal in both directions, including offset views and Unicode boundaries.
 They qualify the input contract; native SQL regex execution remains separately gated.
+
+The private regex capture-work properties vary lengths to 6,000 repeated characters and
+nesting to 32 captures, using both UTF-16 and borrowed UTF-8 positions. PGlite supplies
+capture values; the frozen released matcher supplies only the work/acceptance baseline.
+Matching and capture-selection steps are counted separately, including valid-path indexing.
+The checks require total new work to stay within three times the released 0.x work for
+inputs that the released matcher accepts, and report the worst ratio. Overlapping groups
+vary nesting depth and input length together; matching and dissection keep polynomial
+work for each fixed pattern, without endpoint-driven prefix rescans. Separate properties
+require exact released work and outcomes for boolean checks and group-free substring/replacement.
+Near-ceiling regressions pin the unchanged 8,388,608-step limit and typed `54000` refusal.

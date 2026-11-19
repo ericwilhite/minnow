@@ -25,8 +25,21 @@ This fixes released 0.x results: `REGEXP_REPLACE('aa', '((a+)+)', '\2')` returns
 and `SUBSTRING('aaa' FROM 'a*(a*)')` returns the empty string. Review code that depended on
 those former capture values. Replacement text also preserves escaped backslashes before a
 digit or ampersand, and keeps `\0` literal instead of changing it to `$0`. Review replacements
-that depended on those former spellings. The supported pattern syntax and bounded work limits are unchanged;
-no stored-format change or migration is required.
+that depended on those former spellings. The supported pattern syntax is unchanged. Capture dissection now caches reachable
+endpoints and reuses a valid match path instead of rescanning a prefix for each possible
+split. The generated length/depth checks require total new work, including capture selection,
+to stay within three times the released 0.x matching work on the same accepted input.
+The worst observed total ratio is 3.000×: 42 steps versus 14 for `((a)+)(b+)` on `ab`.
+For a fixed pattern the bounded VM and dissection do polynomial work; probing another
+endpoint never restarts its prefix walk. The fixed 8,388,608-step ceiling
+still includes both. Capturing queries already within roughly that factor of the ceiling
+can now report `MINNOW_SQL_PATTERN_WORK_LIMIT` (SQLSTATE `54000`, still a `RangeError`)
+where 0.x completed with its former capture selection. For example, `.{8}a(b+)(c+)` on
+929,500 `x` characters followed by `a`, 2,000 `b` characters and 2,000 `c` characters
+used 8,383,439 matching steps before capture selection and now reaches the fixed ceiling.
+Simplify a pattern near this limit, or use non-capturing groups when captures are unnecessary.
+Boolean regex operators and group-free substring/replacement keep their previous work
+and success sets. No stored-format change or data migration is required.
 The capture-fix calibration build measured 1,184,226 raw / 355,431 gzip bytes
 for the main bundle,
 1,596,663 / 462,405 with OPFS, and 1,592,698 / 459,825 for the IndexedDB worker.

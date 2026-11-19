@@ -103,6 +103,15 @@ leftmost-longest selection and PostgreSQL capture ordering. Capture dissection s
 existing state and work ceilings. Both paths charge every transition against the same fixed work
 ceiling. Regex also limits compiled and visited states to 65,536, capture groups to 32, and
 repetition bounds to 1,000.
+Capturing substring and replacement also spend steps selecting PostgreSQL-correct groups.
+The generated length/depth checks require total new work to stay within three times the
+released 0.x work on the same accepted input. Matching already within a factor of three of
+the ceiling can therefore reach the work limit during capture selection. The error has code `MINNOW_SQL_PATTERN_WORK_LIMIT` and SQLSTATE `54000` and
+remains a `RangeError`. For example, `.{8}a(b+)(c+)` on 929,500 `x` characters followed
+by `a`, 2,000 `b` characters and 2,000 `c` characters uses 8,383,439 matching steps and
+reaches the fixed ceiling when extracting groups. Simplify such a pattern or use
+non-capturing groups if groups are unnecessary. Boolean checks and patterns without
+capturing groups do no dissection and keep their previous work and success sets.
 Exceeding any bound throws instead of hanging or returning an approximate answer. Plain selection and cursor streaming do not apply the scalar-result
 limit to an existing stored string. All accepted SQL, pattern, JSON, and full-text strings must also
 be well-formed Unicode; an unpaired UTF-16 surrogate is rejected instead of being silently replaced

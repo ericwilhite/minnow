@@ -4,3 +4,12 @@ export const MAX_SQL_PATTERN_CHARACTERS = 16 * 1024;
 export const MAX_SQL_PATTERN_MATCH_STEPS = 8 * 1024 * 1024;
 /** Released scalar string boundary; native byte input is governed separately. */
 export const MAX_SQL_SCALAR_RESULT_CHARACTERS = 1024 * 1024;
+
+/** Fixed interpreter ceiling; remains a RangeError for existing callers. */
+export class SqlPatternWorkLimitError extends RangeError {
+  readonly code = "MINNOW_SQL_PATTERN_WORK_LIMIT";
+  readonly sqlState = "54000";
+  constructor() {
+    super("SQL pattern match exceeds its work limit");
+  }
+}

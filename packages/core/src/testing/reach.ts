@@ -11649,3 +11649,51 @@ export const REGEX_BYTE_SPANS_REACH = [
   "ordered case flags",
   "longest alternative",
 ] as const;
+
+export const REGEX_CAPTURE_WORK_REACH = [
+  "small length",
+  "hundreds length",
+  "thousands length",
+  "above3000 length",
+  "ASCII atom",
+  "multibyte atom",
+  "astral atom",
+  "prefix",
+  "no prefix",
+  "parent success preserved",
+  "linear counted work",
+  "PG exact values",
+  "byte/span equality",
+] as const;
+
+export const REGEX_ZERO_WORK_REACH = [
+  "separate",
+  "prefix",
+  "nested",
+  "alternative",
+  "bounded",
+  "nullable",
+  "anchored",
+  "repeat",
+  "chain",
+  "overlap-chain",
+  "captured-repeat",
+  "optional-repeat",
+  "star",
+  "zero-body",
+  "zero-prefix",
+  "identical work",
+  "identical outcome",
+  "zero capture work",
+] as const;
+
+export const REGEX_CAPTURE_DEPTH_REACH = ["deep chain", "32 captures"] as const;
+
+/** Overlapping capture languages must grow in length and nesting together. */
+export const REGEX_CAPTURE_OVERLAP_REACH = [
+  "overlapping captures",
+  "coupled length and nesting",
+] as const;
+
+/** Literal and variable-width discarded atoms keep every syntactic capture slot. */
+export const REGEX_CAPTURE_ZERO_REACH = ["literal zero body", "variable zero body"] as const;

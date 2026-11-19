@@ -2,6 +2,7 @@ import { StringRegexInput, type RegexInput } from "./input.js";
 
 import {
   MAX_SQL_NESTING_DEPTH,
+  SqlPatternWorkLimitError,
   MAX_SQL_PATTERN_MATCH_STEPS,
   MAX_SQL_SCALAR_RESULT_CHARACTERS,
 } from "./limits.js";
@@ -11,7 +12,17 @@ import {
   type RegexNode as Node,
   type RegexInstruction as Instruction,
   type RegexNodeRange,
+  type MatchTrace,
 } from "./captures.js";
+
+interface NodeDescription {
+  readonly captures: boolean;
+  readonly width: number | null;
+  readonly minimum: number;
+  readonly firstGroup: number;
+  readonly lastGroup: number;
+  readonly alphabet: (value: string, spend: () => void) => boolean;
+}
 
 function required<T>(value: T | undefined): T {
   if (value === undefined) throw new Error("Invalid SQL regular expression program");
@@ -53,7 +64,7 @@ export class SqlRegex {
 
   /** Every interpreter arrival spends from the fixed per-operation SQL work ceiling. */
   spend(work: { remaining: number }): void {
-    if (--work.remaining < 0) throw new RangeError("SQL pattern match exceeds its work limit");
+    if (--work.remaining < 0) throw new SqlPatternWorkLimitError();
   }
 
   constructor(pattern: string, flags: string) {
@@ -198,7 +209,6 @@ export class SqlRegex {
     const root = alternative(0);
     if (cursor !== pattern.length) fail("unmatched closing parenthesis");
     this.#slots = 2 * (groups + 1);
-    this.#captureRoot = groups ? root : null;
     this.#ranges = groups ? new Map() : null;
     const emit = (instruction: Instruction): number => {
       if (this.#instructions.length >= 65_536)
@@ -206,8 +216,8 @@ export class SqlRegex {
       this.#instructions.push(instruction);
       return this.#instructions.length - 1;
     };
-    const descriptions = new Map<Node, { captures: boolean; width: number | null }>();
-    const describe = (node: Node): { captures: boolean; width: number | null } => {
+    const descriptions = new Map<Node, NodeDescription>();
+    const describe = (node: Node): NodeDescription => {
       const old = descriptions.get(node);
       if (old) return old;
       const descendants =
@@ -233,13 +243,49 @@ export class SqlRegex {
                   ? widths.every((w) => w === widths[0])
                     ? (widths[0] ?? null)
                     : null
-                  : widths[0] === 0
+                  : node.max === 0 || widths[0] === 0
                     ? 0
                     : node.min === node.max && widths[0] !== null && widths[0] !== undefined
                       ? widths[0] * node.min
                       : null;
+      // A witnessed prefix cannot consume a following character outside this
+      // subtree's alphabet. This proves maximality without replaying its VM.
+      const alphabet = (value: string, spend: () => void): boolean => {
+        spend();
+        return node.kind === "character"
+          ? node.matches(value)
+          : node.kind === "repeat" && node.max === 0
+            ? false
+            : values.some((child) => child.alphabet(value, spend));
+      };
+      const minimum =
+        node.kind === "character"
+          ? 1
+          : node.kind === "assert"
+            ? 0
+            : node.kind === "group"
+              ? (values[0]?.minimum ?? 0)
+              : node.kind === "sequence"
+                ? values.reduce((total, child) => total + child.minimum, 0)
+                : node.kind === "alternative"
+                  ? values.reduce((smallest, child) => Math.min(smallest, child.minimum), Infinity)
+                  : (values[0]?.minimum ?? 0) * node.min;
+      const firstGroup =
+        node.kind === "group"
+          ? node.group
+          : (values.find((value) => value.firstGroup > 0)?.firstGroup ?? 0);
+      const lastGroup = values.reduce(
+        (last, value) => Math.max(last, value.lastGroup),
+        node.kind === "group" ? node.group : 0,
+      );
       const value = {
-        captures: node.kind === "group" || values.some((value) => value.captures),
+        minimum,
+        firstGroup,
+        lastGroup,
+        alphabet,
+        captures:
+          node.kind === "group" ||
+          ((node.kind !== "repeat" || node.max !== 0) && values.some((value) => value.captures)),
         width: width !== null && Number.isSafeInteger(width) ? width : null,
       };
       descriptions.set(node, value);
@@ -293,20 +339,29 @@ export class SqlRegex {
       return start;
     };
     this.#start = compile(root, 0);
+    this.#captureRoot = groups && describe(root).captures ? root : null;
   }
 
-  #search(input: RegexInput, from: number, capture: false, work?: { remaining: number }): boolean;
+  #search(
+    input: RegexInput,
+    from: number,
+    capture: false,
+    work?: { remaining: number },
+    trace?: MatchTrace,
+  ): boolean;
   #search(
     input: RegexInput,
     from: number,
     capture?: true,
     work?: { remaining: number },
+    trace?: MatchTrace,
   ): number[] | null;
   #search(
     input: RegexInput,
     from: number,
     capture = true,
     work = { remaining: MAX_SQL_PATTERN_MATCH_STEPS },
+    trace?: MatchTrace,
   ): number[] | null | boolean {
     if (input.length > input.limit)
       throw new RangeError("Regular expression input exceeds scalar size limit");
@@ -315,10 +370,13 @@ export class SqlRegex {
     const visited = new Map<number, number>();
     for (let start = from; start <= input.length;) {
       if (capture) visited.clear();
-      const stack: Array<{ pc: number; position: number }> = [{ pc: this.#start, position: start }];
+      trace?.predecessors.clear();
+      const stack: Array<{ pc: number; position: number; previous: number }> = [
+        { pc: this.#start, position: start, previous: -1 },
+      ];
       let bestEnd = -1;
       while (stack.length) {
-        let { pc, position } = required(stack.pop());
+        let { pc, position, previous } = required(stack.pop());
         for (;;) {
           this.spend(work);
           const key = position * 65536 + pc;
@@ -328,16 +386,21 @@ export class SqlRegex {
           if (visited.size >= 65536)
             throw new RangeError("Regular expression match state limit exceeded");
           visited.set(key, start);
+          trace?.predecessors.set(key, previous);
+          previous = key;
           const instruction = required(this.#instructions[pc]);
           if (instruction.kind === "match") {
             if (!capture) return true;
-            bestEnd = Math.max(bestEnd, position);
+            if (position > bestEnd) {
+              bestEnd = position;
+              if (trace) trace.last = key;
+            }
             break;
           }
           if (instruction.kind === "split") {
             if (stack.length >= 65536)
               throw new RangeError("Regular expression branch limit exceeded");
-            stack.push({ pc: instruction.second, position });
+            stack.push({ pc: instruction.second, position, previous });
             pc = instruction.first;
           } else if (instruction.kind === "save") pc = instruction.next;
           else if (instruction.kind === "assert") {
@@ -364,8 +427,18 @@ export class SqlRegex {
     from = 0,
     work = { remaining: MAX_SQL_PATTERN_MATCH_STEPS },
   ): number[] | null {
-    const whole = this.#search(input, from, true, work);
-    if (whole === null || this.#captureRoot === null || this.#ranges === null) return whole;
+    const trace: MatchTrace | undefined =
+      this.#captureRoot === null ? undefined : { predecessors: new Map(), last: -1 };
+    const whole = this.#search(input, from, true, work, trace);
+    if (whole === null) return null;
+    if (this.#captureRoot === null || this.#ranges === null) {
+      if (this.#slots === 2) return whole;
+      // Syntactic groups inside {0} still occupy result slots, all unmatched.
+      const empty = new Array<number>(this.#slots).fill(-1);
+      empty[0] = required(whole[0]);
+      empty[1] = required(whole[1]);
+      return empty;
+    }
     return captureSpans(
       this.#captureRoot,
       this.#ranges,
@@ -375,6 +448,7 @@ export class SqlRegex {
       required(whole[1]),
       this.#slots,
       () => this.spend(work),
+      trace,
     );
   }
   exec(input: string): RegExpExecArray | null {
