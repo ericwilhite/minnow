@@ -347,7 +347,7 @@ export function currentDirectoryFixture(
         // Only ordinary value/directory pages remain unchanged. The archived one-column
         // roots predate A1's optional reference: materialize fresh CURRENT metadata here,
         // never teach ordinary open to accept an unreleased predecessor's grammar.
-        const table = recipe.tables[0];
+        const table = need(recipe.tables[0]);
         const removed = new Set<number>();
         let groups = table.groups;
         if (table.groupCount !== 0) {
