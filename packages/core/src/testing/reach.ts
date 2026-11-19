@@ -11574,3 +11574,14 @@ export const WRITE_LOAN_NOTIFICATION_REACH = [
   "queued reader progresses",
   "zero final charge",
 ] as const;
+
+export const WRITE_FUNDED_HANDOFF_REACH = [
+  "merge first",
+  "commit first",
+  "finite funding work",
+  "funded handoffs consumed",
+  "compound metadata funded",
+  "idle forecasts returned",
+  "real metadata buffer retained",
+  "zero final charge",
+] as const;

@@ -35,6 +35,7 @@ Fitting queries can reclaim idle write credit, including after UPDATE and inside
 transaction. Active buffers, prepared rows and merge handoffs remain funded; private merge
 I/O uses its prepaid budget. Pressure waits remain cancellable when no idle credit is available.
 Phase settlement preserves outstanding progress loans while waking fitting queued queries.
+Funded commit and merge steps keep their prepayment until their waiting continuations resume.
 Released 0.x behavior is unchanged; no stored-format change or
 migration is required.
 

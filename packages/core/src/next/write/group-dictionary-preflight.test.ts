@@ -58,17 +58,18 @@ for (const seed of seedsFor("next-write-dictionary-preflight", [47239, 47240]))
             firstAllocation = true,
             closing: Promise<void> | undefined;
           const optional = budget.tryAllocate.bind(budget);
-          budget.tryAllocate = (bytes, reserve) => {
-            const accepted = optional(bytes, reserve);
+          budget.tryAllocate = (bytes, reserve?: number) => {
+            const required = reserve ?? 0;
+            const accepted = optional(bytes, required);
             if (accepted) {
               const remaining = grant.held - grant.allocated;
               // Cleanup aid for the reserve-stealing mutant: no new dictionary array
               // exists yet. Refund this rejected charge before its assertion.
-              if (remaining < reserve) budget.free(bytes);
+              if (remaining < required) budget.free(bytes);
               expect(
                 remaining,
                 "optional allocation consumed required future workspace",
-              ).toBeGreaterThanOrEqual(reserve);
+              ).toBeGreaterThanOrEqual(required);
               reach.reach("required future workspace retained");
             }
             return accepted;

@@ -33,6 +33,9 @@ export class WriteCredits {
   #closed = false;
   #mergeActive: Grant | null = null;
   #mergeFloor = 0;
+  #commitFunding = 0;
+  #commitMetadataFunding = 0;
+  #mergeMetadataFunding = 0;
   #metadataHeadroom = 0;
   #rowMinimum: number;
   #rowFloor = 0;
@@ -56,9 +59,9 @@ export class WriteCredits {
     return (
       Math.max(this.minimum.rows, this.rows.allocated + this.rows.loaned, this.#rowFloor) +
       this.metadata.allocated +
-      Math.max(this.metadata.loaned, metadataHeadroom) +
+      Math.max(this.metadata.loaned, metadataHeadroom, this.#commitMetadataFunding - this.metadata.allocated, this.#mergeMetadataFunding - this.metadata.allocated) +
       this.commits.held +
-      Math.max(this.minimum.merge, mergeMinimum, active + this.merge.allocated + this.merge.loaned)
+      Math.max(this.minimum.merge, mergeMinimum, this.#mergeFloor, active + this.merge.allocated + this.merge.loaned)
     );
   }
 
@@ -81,7 +84,7 @@ export class WriteCredits {
     this.reclaimMetadata();
     releaseIdle(
       this.merge,
-      Math.max(0, Math.max(this.minimum.merge, mergeMinimum) - (this.#mergeActive?.held ?? 0)),
+      Math.max(this.#mergeFloor, Math.max(0, Math.max(this.minimum.merge, mergeMinimum) - (this.#mergeActive?.held ?? 0))),
     );
   }
 
@@ -99,14 +102,20 @@ export class WriteCredits {
 
   /** Commit encoding and visibility installation use one atomic prepayment. */
   prepareCommit(signal?: AbortSignal): MaybePromise<void> {
-    return this.commits.held >= this.minimum.commits
-      ? undefined
-      : this.#growTo(
-          this.commits,
-          this.minimum.commits,
-          signal,
-          this.metadata.allocated + this.#metadataHeadroom,
-        );
+    if (this.commits.held >= this.minimum.commits) {
+      // The consumer has resumed. Encoding/append starts synchronously after
+      // this return; its live allocations and the owner's working floor take over.
+      if (this.#commitFunding !== 0) this.#commitFunding = this.#commitMetadataFunding = 0;
+      return undefined;
+    }
+    return this.#growTo(
+      this.commits,
+      this.minimum.commits,
+      signal,
+      this.metadata.allocated + this.#metadataHeadroom,
+      false,
+      "commit",
+    );
   }
 
   private constructor(
@@ -181,8 +190,11 @@ export class WriteCredits {
     this.#metadataHeadroom = 0;
     return (
       releaseIdle(this.rows, Math.max(this.#rowFloor, working.rows ?? 0)) +
-      releaseIdle(this.metadata, working.metadata ?? 0) +
-      releaseIdle(this.commits, working.commits ?? 0) +
+      releaseIdle(
+        this.metadata,
+        Math.max(working.metadata ?? 0, this.#commitMetadataFunding, this.#mergeMetadataFunding),
+      ) +
+      releaseIdle(this.commits, Math.max(working.commits ?? 0, this.#commitFunding)) +
       releaseIdle(this.merge, Math.max(this.#mergeFloor, working.merge ?? 0))
     );
   }
@@ -266,6 +278,8 @@ export class WriteCredits {
       Math.max(
         this.metadata.allocated + this.#metadataHeadroom,
         this.#workingMinimum().metadata ?? 0,
+        this.#commitMetadataFunding,
+        this.#mergeMetadataFunding,
       ),
     );
     if (released) this.#changed?.();
@@ -299,6 +313,7 @@ export class WriteCredits {
     signal?: AbortSignal,
     metadata = 0,
     includesProgress = false,
+    funding?: "commit" | "merge",
   ): Promise<void> {
     const stop =
       signal === undefined ? this.#stop.signal : AbortSignal.any([signal, this.#stop.signal]);
@@ -309,15 +324,15 @@ export class WriteCredits {
       this.#check();
       stop.throwIfAborted();
       if (grant.held >= wanted && this.metadata.held >= metadata) {
-        this.#rememberFundedMetadata(grant, wanted, metadata);
+        this.#rememberFundedMetadata(grant, wanted, metadata, funding);
         return;
       }
       this.#changed?.();
       const working = this.#workingMinimum();
       const floors = [
         Math.max(this.#rowFloor, working.rows ?? 0),
-        working.metadata ?? 0,
-        working.commits ?? 0,
+        Math.max(working.metadata ?? 0, this.#commitMetadataFunding, this.#mergeMetadataFunding),
+        Math.max(working.commits ?? 0, this.#commitFunding),
         Math.max(this.#mergeFloor, working.merge ?? 0),
       ];
       const desired = accounts.map((account, i) =>
@@ -344,12 +359,12 @@ export class WriteCredits {
         }
       }
       if (grant.held >= wanted && this.metadata.held >= metadata) {
-        this.#rememberFundedMetadata(grant, wanted, metadata);
+        this.#rememberFundedMetadata(grant, wanted, metadata, funding);
         return;
       }
       if (this.metadata.held >= metadata && grant.tryGrow(Math.max(0, wanted - grant.held))) {
         this.#changed?.(true);
-        this.#rememberFundedMetadata(grant, wanted, metadata);
+        this.#rememberFundedMetadata(grant, wanted, metadata, funding);
         return;
       }
       this.#changed?.(true);
@@ -382,14 +397,19 @@ export class WriteCredits {
           if (!this.governor.transferCredit(credit, account, Math.min(credit.held, missing)))
             throw new Error("Admitted write credit was not transferred");
         }
-        this.#rememberFundedMetadata(grant, wanted, metadata);
+        this.#rememberFundedMetadata(grant, wanted, metadata, funding);
       } finally {
         for (const credit of credits) credit.close();
       }
     }
   }
 
-  #rememberFundedMetadata(grant: Grant, wanted: number, metadata: number): void {
+  #rememberFundedMetadata(
+    grant: Grant,
+    wanted: number,
+    metadata: number,
+    funding?: "commit" | "merge",
+  ): void {
     const nextMetadata = Math.max(grant === this.metadata ? wanted : 0, metadata);
     const before = this.#metadataHeadroom;
     if (nextMetadata > 0)
@@ -397,7 +417,17 @@ export class WriteCredits {
         this.#metadataHeadroom,
         nextMetadata - this.metadata.allocated,
       );
-    if (before !== this.#metadataHeadroom) this.#changed?.();
+    // These are already funded next steps, not estimates for a later phase. Pin
+    // the handoff before returning a promise (and before closing temporary grants
+    // can reenter admission), so concurrent funding cannot trade it back and forth.
+    if (funding === "commit") {
+      this.#commitFunding = Math.max(this.#commitFunding, wanted);
+      this.#commitMetadataFunding = Math.max(this.#commitMetadataFunding, metadata);
+    } else if (funding === "merge") {
+      this.#mergeFloor = Math.max(this.#mergeFloor, wanted);
+      this.#mergeMetadataFunding = Math.max(this.#mergeMetadataFunding, metadata);
+    }
+    if (before !== this.#metadataHeadroom || funding !== undefined) this.#changed?.();
   }
 
   #trimMetadataHeadroom(): void {
@@ -423,29 +453,38 @@ export class WriteCredits {
     const metadata = this.metadata.allocated + headroom;
     return this.merge.held >= wanted && this.metadata.held >= metadata
       ? undefined
-      : this.#growTo(this.merge, wanted, signal, metadata, complete);
+      : this.#growTo(
+          this.merge,
+          wanted,
+          signal,
+          metadata,
+          complete,
+          complete ? "merge" : undefined,
+        );
   }
 
   async acquireMerge(label: string, bytes: number): Promise<Grant> {
     if (this.#mergeActive || this.#mergeFloor !== 0)
       throw new Error("Merge credit is already in use");
     const headroom = this.#metadataHeadroom;
-    for (;;) {
-      // mergeRuns consumes a ByteBudget: its entire I/O/encoder workspace is
-      // prepaid here and never borrows the shared legacy reserve (rules2/3/5).
-      const ready = this.#prepareMerge(bytes, undefined, true, headroom);
-      if (ready instanceof Promise) await ready;
-      this.#check();
-      // A foreign admission can reclaim idle forecasts while preparation awaits.
-      // Pin only funded credit, synchronously with its last check.
-      if (this.merge.held >= bytes && this.metadata.held >= this.metadata.allocated + headroom)
-        break;
-    }
-    this.#mergeFloor = bytes;
     try {
+      for (;;) {
+        // mergeRuns consumes a ByteBudget: its entire I/O/encoder workspace is
+        // prepaid here and never borrows the shared legacy reserve (rules2/3/5).
+        const ready = this.#prepareMerge(bytes, undefined, true, headroom);
+        if (ready instanceof Promise) await ready;
+        this.#check();
+        // A foreign admission can reclaim idle forecasts while preparation awaits.
+        // Pin only funded credit, synchronously with its last check.
+        if (this.merge.held >= bytes && this.metadata.held >= this.metadata.allocated + headroom)
+          break;
+      }
+      this.#mergeFloor = bytes;
       return await this.#takeMerge(label, bytes);
     } finally {
       this.#mergeFloor = 0;
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- #takeMerge installs the active grant across its await.
+      if (this.#mergeActive === null) this.#mergeMetadataFunding = 0;
     }
   }
 
@@ -493,6 +532,7 @@ export class WriteCredits {
     if (!this.governor.transferCredit(grant, this.merge, grant.held))
       throw new Error("Native merge credit was not returned");
     this.#mergeActive = null;
+    this.#mergeMetadataFunding = 0;
     grant.close();
     // A completed step cannot keep an oversized future forecast while another
     // complete execution waits. The next merge prepares its full step anew.
@@ -501,6 +541,7 @@ export class WriteCredits {
   }
 
   cancel(reason: unknown): void {
+    this.#commitFunding = this.#commitMetadataFunding = this.#mergeMetadataFunding = 0;
     this.#stop.abort(reason);
   }
 

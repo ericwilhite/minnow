@@ -4661,6 +4661,9 @@ the transaction releases its slot. Live allocations, prepared rows, active metad
 and funded merge handoffs remain owned; recycling re-admits its workspace after it gets the slot.
 Phase settlement wakes pending admissions through an account without loan-backed allocations.
 It does not release or repay live loans merely to send a wake; loan repayment supplies its own wake.
+Funded commit and merge handoffs keep their compound prepayment until the waiting consumer
+resumes. Concurrent preparation cannot trade that same credit back and forth. These handoffs
+own admitted next steps; unused estimates still return before any new admission wait.
 
 ### Bounded native writer ownership
 
