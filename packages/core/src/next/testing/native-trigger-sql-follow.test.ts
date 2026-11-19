@@ -1,18 +1,15 @@
 /** Same documented follow identities, now through the funded ordinary SQL owner. */
 import { PGlite } from "@electric-sql/pglite";
 import fc from "fast-check";
-import { afterEach, expect, it, vi } from "vitest";
+import { expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach, NATIVE_TRIGGER_SQL_FOLLOW_REACH } from "../../testing/reach.js";
-import * as gate from "../owner/native-trigger-gate.js";
 import { MinnowDatabaseClient } from "../owner/database-client.js";
 import { publicOwner } from "./public-owner.test.fixture.js";
 import { followScript, followQueries, type Mode } from "./native-trigger-follow.test-support.js";
-afterEach(() => vi.restoreAllMocks());
 const capBytes = (process.env.MINNOW_TRIGGER_CAP_MIB === "32" ? 32 : 64) << 20;
 for (const seed of seedsFor("next-native-trigger-sql-follow", [46978, 46979]))
   it(`qualifies funded SQL follow and nested bodies (${String(seed)})`, async () => {
-    vi.spyOn(gate, "nativeTriggerFiringEnabled").mockReturnValue(true);
     const pg = new PGlite(),
       reach = createReach("funded SQL follow", NATIVE_TRIGGER_SQL_FOLLOW_REACH);
     try {

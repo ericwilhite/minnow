@@ -4061,7 +4061,7 @@ prepay only the reachable live frames. The queue
 encodes `budget + 1` as a nonnegative scalar; scratch packets retain all three states. Image-helper
 count stays one, and copied parameters retire after input spooling, before nested writes. This
 keeps the maximum binding minimum independent of depth. The generated component suite checks
-the depth boundary against the shipped engine; native SQL firing remains disabled.
+the depth boundary against the shipped engine; ordinary-owner qualification is described below.
 
 TriggerBodyRunner controls one prepared body command through an injected TriggerBodyHost.
 The host receives the complete modification plan and frozen body metadata, including explicit
@@ -4080,7 +4080,7 @@ command's nested AFTER frame, then verifies references; the root owns completion
 The generated protocol suite uses real native writers, shared bound row rules and PGlite for
 commit/rollback, generated output, CHECK and generated NOT NULL failures. Its source host is a
 small native-vector fixture, not the compiled provider. B5b's admitted source/registry and B6's
-named-trigger controller remain a separate integration; native SQL firing is still disabled.
+named-trigger controller are integrated by the qualified ordinary owner described below.
 
 ### Named trigger controller component
 
@@ -4103,8 +4103,8 @@ callbacks and all queues before its caller releases the native root or its grant
 The permanent PGlite differential exercises this component with injected scalar source,
 row-image and RI adapters, real prefix-pin lifetimes, nested frames and observed queue
 spills while competing grants hold spare credit. It does not exercise B5b's complete
-compiled source/registry/write driver. SQL firing stays disabled until that joint integration
-passes its end-to-end pressure, rollback, FK-action, cancellation and fault campaign.
+compiled source/registry/write driver. The ordinary-owner qualification below covers their
+joint end-to-end pressure, rollback, FK-action and cancellation paths.
 
 Prepared programs cover every matching trigger on nonnegative-budget routes. The controller
 checks actual catalog routes and refuses a missing program rather than skipping the trigger.
@@ -4256,7 +4256,7 @@ Native statement rule admission follows the shipped trigger budget: root1 and bo
 fire, and their body at -1 may write but cannot fire another matching user trigger.
 Referential actions preserve that signed budget. The static walk includes rules for both
 body levels and distinguishes the same table reached with different budgets; SQL trigger
-firing remains guarded until the joint runtime is installed.
+firing uses the qualified ordinary-owner runtime described below.
 
 ### Root registry scratch primitives (staging)
 
@@ -4931,7 +4931,8 @@ the native writer's governor, without treating temporary pressure as an intrinsi
 refusal. Multi-segment queries prepay the existing mixed-source recipe metadata;
 the single-segment shortcut remains available. Input-only producers do not reserve a second, unused generic modification
 spool. Single complete-key probes use their existing row-ID order; multiple probes
-and composite prefixes keep the bounded locator sort. SQL trigger dispatch remains guarded.
+and composite prefixes keep the bounded locator sort. The qualified ordinary owner supplies
+SQL trigger dispatch.
 
 Serialized-array CASE/COALESCE selectors use the same bounded projection progress as
 text and bytes. Their one-row path borrows the original encoded payload, preserving
@@ -4996,7 +4997,7 @@ Inline bodies remain INSERT/UPDATE/DELETE only. CREATE TRIGGER rejects in-body S
 ROLLBACK with a typed planning error before changing the catalog or executing a body. The
 PostgreSQL comparison checks its own trigger-function execution refusal and statement undo;
 the different grammars do not imply identical refusal stages or diagnostics. Enclosing
-savepoints belong to the caller transaction. SQL firing remains guarded in this consumer stage.
+savepoints belong to the caller transaction. The ordinary owner installs the qualified consumer.
 
 The concrete body campaign compares native and shipped INSERT/UPDATE/DELETE bodies with
 independently compiled PostgreSQL functions. It checks OLD/NEW expressions, ordered
@@ -5006,7 +5007,7 @@ one-further-trigger levels match PG's data. A third matching trigger level follo
 shipped product cap: native and shipped reject and undo the whole statement, while the PG
 function succeeds. The test states that difference explicitly, rather than treating PG's
 successful deeper execution as native parity. This is still component qualification;
-owner SQL dispatch, production admission and firing enablement remain separate.
+the ordinary-owner qualification below supplies production admission and SQL dispatch.
 
 The concrete competing-error campaign checks PGlite's first SQLSTATE in thirteen qualified
 shapes: input/BEFORE/AFTER, generated and CHECK evaluation, later-row errors, root/body
@@ -5050,28 +5051,29 @@ Generated histories cover both existing admission modes, invalidation, competing
 cancellation and cleanup on the real native boundary. This controller alone does not wire
 owner SQL dispatch or enable trigger firing.
 
-### Guarded ordinary SQL trigger qualification
+### Ordinary native SQL row triggers
 
-`owner/native-command.ts` prepares the concrete native graph, rule programs and
-parameter bindings under `NativeRootCredits`, keeping separate source/image and
-row-rule funding. It retires graph I/O and leases before rules and credit. The
-ordinary owner's existing session and commit boundary dispatches to this consumer
-only behind `native-trigger-gate.ts`, which remains false. There is no public
-option to override it and no package or default-engine switch.
+The internal ordinary owner dispatches qualified INSERT/UPDATE/DELETE commands through
+`owner/native-command.ts`, the real graph, writer, governor and spill service. Root/image
+and row-rule funding stay separate. Graph I/O and leases retire before rules and credit.
+There is no public override, package-entry change or default-engine switch.
 
-The qualification suites run at 64 MiB; `MINNOW_TRIGGER_CAP_MIB=32` selects the
-same funded/SQL histories for the final prefix-reservation acceptance run. These
-are `FOR EACH ROW` triggers only. `FOR EACH STATEMENT` and transaction control
-inside bodies remain refused. Generated PostgreSQL comparisons check BEFORE/AFTER
-name order, RI and nested bodies, statement rollback, failed SQL transaction state,
-enclosing savepoint recovery, successful-body undo and exact committed rows.
-The native component suites also cover original-target follow, error precedence,
-cancellation and the shipped one-further-level cascade contract.
+The same funded/SQL histories run at 32 MiB with `MINNOW_TRIGGER_CAP_MIB=32` and at
+64 MiB by default. They compare PostgreSQL BEFORE/AFTER name order, RI and nested bodies,
+statement rollback, failed transaction state, enclosing savepoint recovery, successful-body
+undo and exact committed rows. Shipped-body comparisons pin the product's one-further-level
+cascade rule; a third matching trigger fails with 54001 and undoes the whole statement.
+FOR EACH STATEMENT and transaction control inside bodies remain syntax refusals.
 
-This staged consumer currently refuses RETURNING/conflict/MERGE roots, volatile,
-FTS or init-plan inputs, auto-increment/index domains lacking native preflight,
-and parameterized or growing/structural CHECK/generated-column workspace. These are typed refusals before root
-writes, not uncharged fallbacks. Ordinary SQL firing is not enabled by this unit.
+Informational-FK capture decodes only the actual key operands, through the publication-stable
+point reader. No column payload is borrowed across funding. All original target identities are
+sealed before RI writes begin. Internal RI sort keys use fixed-width IDs within the reserved
+name family, preserving FK allocation order across decimal widths. User names retain UTF8
+ordering around that family; native suffixes are not PostgreSQL OID spellings.
+
+Typed 0A000 refusals remain for RETURNING/conflict/MERGE roots, volatile/FTS/init-plan inputs,
+auto-increment or indexed domains missing native preflight, and parameterized or growing/
+structural CHECK/generated workspace. Raw executor calls do not install this owner controller.
 
 ### Native compiled-input phase memory
 

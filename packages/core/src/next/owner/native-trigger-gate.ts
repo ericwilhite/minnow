@@ -1,5 +1,5 @@
-/** Release qualification gate. Final enablement requires the same histories at 32 MiB.
- * Tests may replace this internal function; no public option bypasses qualification. */
+/** SQL row-trigger firing uses the qualified native command path. Unsupported
+ * roots retain the consumer's explicit typed refusals; there is no public override. */
 export function nativeTriggerFiringEnabled(): boolean {
-  return false;
+  return true;
 }

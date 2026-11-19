@@ -870,6 +870,10 @@ initialize a writable Catalog or encoder. Known semantic fields are required whe
 requiredFeatures is centrally registered, sorted/unique and coherent with nonempty sections.
 Separate pre-fence root minimum-reader/minimum-writer admission belongs to B2, not this codec.
 
-SQL execution guards explicit ON UPDATE modes, ON DELETE SET DEFAULT and informational
-rekeys with0A000 until that bounded RI consumer is installed. Non-key updates, DO NOTHING
-and enforced omitted-update follow remain executable. The guard also covers raw executors.
+The ordinary owner installs the bounded native controller for qualified row triggers, explicit
+ON UPDATE modes, ON DELETE SET DEFAULT and informational rekeys. It preserves original-target
+follow, PostgreSQL RI/user-name order and statement atomicity. RETURNING/conflict/MERGE,
+volatile/FTS/init-plan inputs, auto-increment/index domains without native preflight and growing/
+structural or parameterized row-rule workspaces still refuse with0A000. Raw executor calls
+retain their typed guard rather than bypassing the owner controller. FOR EACH STATEMENT and
+transaction control in bodies remain syntax refusals. No public/default engine switch is made.

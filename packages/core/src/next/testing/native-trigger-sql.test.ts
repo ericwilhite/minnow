@@ -1,16 +1,14 @@
-/** Production owner dispatch under the internal qualification gate. PostgreSQL is authority
+/** Production owner dispatch without a test enablement override. PostgreSQL is authority
  * for row order/statement atomicity; the shipped surface remains FOR EACH ROW only. */
 import { PGlite } from "@electric-sql/pglite";
 import fc from "fast-check";
-import { afterEach, expect, it, vi } from "vitest";
+import { expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach, NATIVE_TRIGGER_SQL_REACH } from "../../testing/reach.js";
-import * as gate from "../owner/native-trigger-gate.js";
 import { MinnowDatabaseClient } from "../owner/database-client.js";
 import { publicOwner } from "./public-owner.test.fixture.js";
 import { orderingScript, orderingTrace } from "./trigger-ordering.test-support.js";
 
-afterEach(() => vi.restoreAllMocks());
 const queries = [
   "SELECT * FROM p ORDER BY id",
   "SELECT * FROM c ORDER BY id",
@@ -32,8 +30,7 @@ async function sqlState(work: () => Promise<unknown>): Promise<string | null> {
   }
 }
 
-it("keeps ordinary SQL firing guarded, and refuses statement-level/transaction-control bodies", async () => {
-  expect(gate.nativeTriggerFiringEnabled()).toBe(false);
+it("enables ordinary row-trigger SQL and refuses statement-level/transaction-control bodies", async () => {
   const owner = await publicOwner({ capBytes });
   const db = new MinnowDatabaseClient(owner.client, { ready: Promise.resolve() });
   try {
@@ -54,11 +51,9 @@ it("keeps ordinary SQL firing guarded, and refuses statement-level/transaction-c
     await db.execute(
       "CREATE TRIGGER r AFTER INSERT ON t FOR EACH ROW BEGIN INSERT INTO audit VALUES(NEW.id); END",
     );
-    await expect(db.execute("INSERT INTO t VALUES(1)")).rejects.toMatchObject({
-      sqlState: "0A000",
-    });
-    expect((await db.query("SELECT * FROM t")).rows()).toEqual([]);
-    expect((await db.query("SELECT * FROM audit")).rows()).toEqual([]);
+    await db.execute("INSERT INTO t VALUES(1)");
+    expect((await db.query("SELECT * FROM t")).rows()).toEqual([{ id: 1 }]);
+    expect((await db.query("SELECT * FROM audit")).rows()).toEqual([{ n: 1 }]);
   } finally {
     await db.close();
     await owner.close();
@@ -81,7 +76,6 @@ for (const seed of seedsFor("next-native-trigger-sql", [46976, 46977])) {
   for (const failure of [false, true])
     for (const childGroup of [false, true])
       it(`qualifies production row-trigger SQL and statement undo ${String(seed)}, failure ${String(failure)}, child ${String(childGroup)}`, async () => {
-        vi.spyOn(gate, "nativeTriggerFiringEnabled").mockReturnValue(true);
         const pg = new PGlite(),
           group = failure ? 1 : 0,
           ledger = ledgers[group];

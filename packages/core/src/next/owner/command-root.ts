@@ -258,7 +258,9 @@ export class NativeCommandRoot {
           signal,
           checkpoint: () => this.#checkpoint(),
           referentialName: (id, kind) =>
-            `RI_ConstraintTrigger_${kind.startsWith("child") ? "c" : "a"}_${String(id)}`,
+            // Fixed-width native IDs preserve allocation order within the reserved
+            // family; raw decimal suffixes would sort FK10 before FK2.
+            `RI_ConstraintTrigger_${kind.startsWith("child") ? "c" : "a"}_${String(id).padStart(16, "0")}`,
         }),
         (v) => v.close(),
       ),

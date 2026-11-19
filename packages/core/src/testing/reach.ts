@@ -11589,3 +11589,30 @@ export const NATIVE_PREFIX_VISIT_REACH = [
   "no source at funding",
   "zero ownership",
 ] as const;
+
+export const NATIVE_TRIGGER_SQL_DEPTH_REACH = [
+  "root trigger only",
+  "one further level",
+  "third matching level rolls back",
+  "BEFORE root",
+  "AFTER root",
+  "published",
+  "resident",
+  "empty source fires nothing",
+  "PG and shipped accepted rows",
+  "zero ownership",
+] as const;
+
+export const NATIVE_TRIGGER_SQL_RI_ORDER_REACH = [
+  "one FK",
+  "several FKs",
+  "IDs cross decimal width",
+  "UPDATE CASCADE",
+  "DELETE CASCADE",
+  "published",
+  "resident",
+  "user names before and after RI",
+  "child BEFORE and deferred AFTER",
+  "exact rows and trace",
+  "zero ownership",
+] as const;

@@ -1,6 +1,6 @@
 /** Real native command consumer. Owns funding/bindings through end and graph retirement;
  * caller retains the writer transaction and alone chooses commit/savepoint recovery.
- * Internal only: compose dispatch remains guarded until end-to-end qualification. */
+ * Internal owner dispatch only; the public package/default engine is unchanged. */
 import { layoutOf } from "../types.js";
 import type { TableDef } from "../access/catalog.js";
 import type { TableRules } from "../access/modify.js";
@@ -141,8 +141,8 @@ function checkPlan(plan: PhysicalPlan): void {
   if (plan.volatile || plan.ftsQueries?.length || plan.initPlans.length)
     refuse("volatile, FTS or init-plan native modification input");
 }
-/** Firing is not enabled by this module: an ordinary owner still uses its typed guard.
- * Returns the root count and invalidation reach; no child-count approximation is made. */
+/** Runs a qualified ordinary-owner modification. Returns the root count and
+ * invalidation reach; no child-count approximation is made. */
 export async function executeNativeCommand(
   request: NativeCommandRequest,
 ): Promise<NativeCommandResult> {

@@ -4,7 +4,6 @@ import fc from "fast-check";
 import { expect, it, vi } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach, NATIVE_TRIGGER_SQL_CANCEL_REACH } from "../../testing/reach.js";
-import * as gate from "../owner/native-trigger-gate.js";
 import * as commands from "../owner/native-command.js";
 import { NativeCommandRoot } from "../owner/command-root.js";
 import { MinnowDatabaseClient } from "../owner/database-client.js";
@@ -51,7 +50,6 @@ for (const seed of seedsFor("next-native-trigger-sql-cancel", [46984, 46985]))
               "accumulator",
             );
             try {
-              vi.spyOn(gate, "nativeTriggerFiringEnabled").mockReturnValue(true);
               for (const sql of [...h.nativeSetup, ...h.seed]) await db.execute(sql);
               await pg.exec("DROP TABLE IF EXISTS c,p,log,audit,trace CASCADE");
               for (const sql of [...h.postgresSetup, ...h.seed]) await pg.exec(sql);
@@ -105,7 +103,7 @@ for (const seed of seedsFor("next-native-trigger-sql-cancel", [46984, 46985]))
                 expect((await db.query(sql)).rows()).toEqual((await pg.query(sql)).rows);
               reach.reach("no committed effects");
               vi.restoreAllMocks();
-              vi.spyOn(gate, "nativeTriggerFiringEnabled").mockReturnValue(true);
+
               expect((await db.execute(h.mutation)).affectedRows).toBe(rows);
               await pg.exec(h.mutation);
               for (const sql of queries)

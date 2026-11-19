@@ -1,4 +1,4 @@
-/** Actual native registry/writer/action/controller assembly. No SQL firing is enabled. */
+/** Actual native registry/writer/action/controller assembly; this fixture has no owner dispatcher. */
 import type { WriteTransaction } from "../access/write-path.js";
 import { NativeBodyHost } from "../owner/body-host.js";
 import { NativeBodyPrograms, nativeBodyProgramMinimumBytes } from "../owner/body-programs.js";

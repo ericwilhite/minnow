@@ -1,12 +1,11 @@
 /** Root INSERT parameters, BEFORE/AFTER and one further body level through the real owner. */
 import { PGlite } from "@electric-sql/pglite";
 import fc from "fast-check";
-import { expect, it, vi } from "vitest";
+import { expect, it } from "vitest";
 import { MinnowDatabase } from "../../engine/database.js";
 import { MemoryBlockStore } from "../../storage/index.js";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach, NATIVE_TRIGGER_SQL_INSERT_REACH } from "../../testing/reach.js";
-import * as gate from "../owner/native-trigger-gate.js";
 import { MinnowDatabaseClient } from "../owner/database-client.js";
 import { publicOwner } from "./public-owner.test.fixture.js";
 const capBytes = (process.env.MINNOW_TRIGGER_CAP_MIB === "32" ? 32 : 64) << 20;
@@ -56,7 +55,6 @@ for (const seed of seedsFor("next-native-trigger-sql-insert", [46986, 46987]))
               },
             ];
             try {
-              vi.spyOn(gate, "nativeTriggerFiringEnabled").mockReturnValue(true);
               await pg.exec("DROP TABLE IF EXISTS src,audit,mirror CASCADE");
               for (const sql of schema) {
                 await db.execute(sql);
@@ -99,7 +97,6 @@ for (const seed of seedsFor("next-native-trigger-sql-insert", [46986, 46987]))
               reach.reach("PG and shipped exact rows");
               reach.reach("root count");
             } finally {
-              vi.restoreAllMocks();
               await old.close();
               await db.close();
               await owner.close();
