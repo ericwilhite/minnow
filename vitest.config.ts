@@ -59,6 +59,8 @@ export default defineConfig({
           exclude: [
             ...configDefaults.exclude,
             maintenanceWorkload,
+            // Wall-clock stalls run unchanged in the isolated one-worker CI project.
+            "packages/core/src/engine/event-loop-latency.test.ts",
             modifyPressureWorkload,
             reachUnions,
           ],

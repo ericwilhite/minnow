@@ -8,6 +8,7 @@ import { vi } from "vitest";
 import * as slices from "../work-slicer.js";
 
 export class EventLoopWork {
+  constructor(readonly clock: "work" | "wall" = "work") {}
   #active = false;
   #clock = 0;
   #turnStart = 0;
@@ -34,6 +35,7 @@ export class EventLoopWork {
   }
 
   rows<T extends object>(rows: readonly T[]): T[] {
+    if (this.clock === "wall") return rows as T[];
     return rows.map(
       (row) =>
         new Proxy(row, {
@@ -82,7 +84,37 @@ export class EventLoopWork {
     return proxy;
   }
 
+  async #measureWall(work: () => Promise<void>) {
+    const start = performance.now();
+    let last = start,
+      largest = 0;
+    const watchdog = setInterval(() => {
+      const now = performance.now();
+      largest = Math.max(largest, now - last);
+      last = now;
+    }, 1);
+    try {
+      await work();
+      const end = performance.now();
+      return {
+        // Preserve the original one-millisecond watchdog statistic.
+        wallLargest: Math.round(largest),
+        wallElapsed: end - start,
+        largest: 0,
+        fields: 0,
+        steps: 0,
+        bytes: 0,
+        turns: 0,
+        items: 0,
+      };
+    } finally {
+      clearInterval(watchdog);
+    }
+  }
   async measure(work: () => Promise<void>) {
+    // The latency lane runs ordinary records, native clocks and native scheduler
+    // methods. Work-count proxies and spies would change what it measures.
+    if (this.clock === "wall") return this.#measureWall(work);
     const run = slices.runSteps,
       sliced = slices.runStepsSliced,
       yieldTurn = slices.yieldToEventLoop;
@@ -140,6 +172,8 @@ export class EventLoopWork {
       await yieldTurn();
       await work();
       return {
+        wallLargest: null,
+        wallElapsed: null,
         largest: this.#largest,
         fields: this.#fields,
         steps: this.#steps,
