@@ -1,0 +1,1485 @@
+{
+  "piece": "J2 bounded byte-key pipeline dispatch on actual flat TEXT representation",
+  "base": "84d10cff312e5c42dfa9602b3eb83423859db0b0",
+  "Law": "Canonical SQL byte equality under deterministic collation; equal keys hash equally, dictionary-local codes never establish cross-dictionary equality. KeyWork contract requires charging all inspected bytes and yielding before publication or match progress. Existing governor admission and allocation remain unchanged.",
+  "RED": {
+    "performance": "Fresh-main hosted44497039678 profiles actual W1M text join flat36 byte keys, key extraction36.7% and table36.0% self-file shares (overlap function subsets). This is a performance reshape, not a parent SQL defect: parent correctness properties are expected to pass. Baseline misses frozen target; new component pairs supply CPU evidence.",
+    "noNewParentSemanticFailureClaimed": true
+  },
+  "GREEN": {
+    "gates": [
+      {
+        "check": "core-build",
+        "exit": 0,
+        "seconds": 0.4164717197418213,
+        "command": [
+          "node",
+          "node_modules/typescript/bin/tsc",
+          "-b",
+          "packages/core",
+          "--pretty",
+          "false"
+        ]
+      },
+      {
+        "check": "lint",
+        "exit": 0,
+        "seconds": 36.43720364570618,
+        "command": [
+          "node",
+          "node_modules/eslint/bin/eslint.js",
+          "packages/core/src/next/exec/join-keys.ts",
+          "packages/core/src/next/exec/join-table.ts",
+          "packages/core/src/next/exec/join-short-key.test.ts",
+          "packages/core/src/next/exec/join-pglite.test.ts",
+          "packages/core/src/testing/reach.ts",
+          "scripts/b9-join-key-component.mjs"
+        ]
+      },
+      {
+        "check": "format",
+        "exit": 0,
+        "seconds": 4.983962535858154,
+        "command": [
+          "node",
+          "node_modules/prettier/bin/prettier.cjs",
+          "--check",
+          "packages/core/src/next/exec/join-keys.ts",
+          "packages/core/src/next/exec/join-table.ts",
+          "packages/core/src/next/exec/join-short-key.test.ts",
+          "packages/core/src/next/exec/join-pglite.test.ts",
+          "packages/core/src/testing/reach.ts",
+          "scripts/b9-join-key-component.mjs",
+          "packages/core/src/next/README.md"
+        ]
+      },
+      {
+        "check": "joins",
+        "exit": 0,
+        "seconds": 108.35775828361511,
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "--maxWorkers=2",
+          "packages/core/src/next/exec/join-append-fence.test.ts",
+          "packages/core/src/next/exec/join-boolean.test.ts",
+          "packages/core/src/next/exec/join-checkpoint.test.ts",
+          "packages/core/src/next/exec/join-filter.test.ts",
+          "packages/core/src/next/exec/join-key-only.test.ts",
+          "packages/core/src/next/exec/join-large-row.test.ts",
+          "packages/core/src/next/exec/join-lifecycle.test.ts",
+          "packages/core/src/next/exec/join-oversized-pair.test.ts",
+          "packages/core/src/next/exec/join-pglite.test.ts",
+          "packages/core/src/next/exec/join-read-fence.test.ts",
+          "packages/core/src/next/exec/join-reserve-boundary.test.ts",
+          "packages/core/src/next/exec/join-short-key.test.ts",
+          "packages/core/src/next/exec/join-staging-clock.test.ts",
+          "packages/core/src/next/exec/join-wide-decimal.test.ts",
+          "packages/core/src/next/exec/join.test.ts",
+          "packages/core/src/next/testing/lower-m3-joins.test.ts",
+          "packages/core/src/next/testing/join-repeated-sql.test.ts",
+          "packages/core/src/next/testing/join-repeated-progress.test.ts",
+          "packages/core/src/testing/seeds.test.ts",
+          "--reporter=verbose",
+          "--reporter=json",
+          "--outputFile.json=/home/eric/.cache/minnow-b9-logs/j2-short-key-broad.json"
+        ]
+      }
+    ],
+    "focusedTests": {
+      "files": 19,
+      "passed": 321,
+      "commandLog": "/home/eric/.cache/minnow-b9-logs/j2-short-key-joins.log"
+    },
+    "restored": 15
+  },
+  "Mutant": [
+    {
+      "name": "wrong-short-hash",
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "--maxWorkers=2",
+        "packages/core/src/next/exec/join-short-key.test.ts",
+        "--reporter=verbose"
+      ],
+      "exit": 1,
+      "seconds": 7.852648496627808,
+      "intendedReject": true,
+      "expected": "to be"
+    },
+    {
+      "name": "skip-comparison-work",
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "--maxWorkers=2",
+        "packages/core/src/next/exec/join-short-key.test.ts",
+        "--reporter=verbose"
+      ],
+      "exit": 1,
+      "seconds": 7.543645620346069,
+      "intendedReject": true,
+      "expected": "to be"
+    },
+    {
+      "name": "ignore-comparison-yield",
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "--maxWorkers=2",
+        "packages/core/src/next/exec/join-short-key.test.ts",
+        "--reporter=verbose"
+      ],
+      "exit": 1,
+      "seconds": 7.6191041469573975,
+      "intendedReject": true,
+      "expected": "ignored spend's yield"
+    },
+    {
+      "name": "miss-final-byte",
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "--maxWorkers=2",
+        "packages/core/src/next/exec/join-short-key.test.ts",
+        "--reporter=verbose"
+      ],
+      "exit": 1,
+      "seconds": 8.311588287353516,
+      "intendedReject": true,
+      "expected": "to deeply equal"
+    },
+    {
+      "name": "ignore-length",
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "--maxWorkers=2",
+        "packages/core/src/next/exec/join-short-key.test.ts",
+        "--reporter=verbose"
+      ],
+      "exit": 1,
+      "seconds": 8.096055030822754,
+      "intendedReject": true,
+      "expected": "to deeply equal"
+    }
+  ],
+  "Reach": {
+    "registry": ["JOIN_SHORT_KEY_REACH", "JOIN_SHORT_SQL_REACH"],
+    "seedsFor": {
+      "extraction": [761713, 761714],
+      "collisions": [761715, 761716],
+      "SQL": [761717, 761718]
+    },
+    "generated": "Each low-level property uses24 runs and2 explicit examples per seed; SQL uses2 histories per seed (ample/minimum grant), all kinds/residual/null-safe and independent dictionary codebooks. Original SQL suite seeds/run counts remain unchanged.",
+    "dimensions": [
+      "empty/1/63/64/65/80 bytes",
+      "UTF8",
+      "flat/dictionary",
+      "row-ID reorder",
+      "same hash different lengths and last byte",
+      "every duplicate head/link",
+      "exact comparison work",
+      "always-due slices",
+      "all seven join kinds",
+      "residual ON",
+      "NULL-safe equality",
+      "minimum-grant spill",
+      "zero final charges"
+    ]
+  },
+  "component": {
+    "clock": "process user+system CPU; natural GC",
+    "scope": "isolated key/table work, no admission waits, scan/decode, payload gather, aggregate, owner or I/O",
+    "results": [
+      {
+        "keyCase": "flat36",
+        "phase": "hash-and-probe",
+        "rows": 32768,
+        "repetitions": 4,
+        "warmups": 3,
+        "rounds": 9,
+        "raw": [
+          {
+            "round": 0,
+            "arm": "parent",
+            "cpuMs": 74.119
+          },
+          {
+            "round": 0,
+            "arm": "candidate",
+            "cpuMs": 46.023
+          },
+          {
+            "round": 1,
+            "arm": "candidate",
+            "cpuMs": 42.626
+          },
+          {
+            "round": 1,
+            "arm": "parent",
+            "cpuMs": 85.114
+          },
+          {
+            "round": 2,
+            "arm": "parent",
+            "cpuMs": 96.092
+          },
+          {
+            "round": 2,
+            "arm": "candidate",
+            "cpuMs": 49.361
+          },
+          {
+            "round": 3,
+            "arm": "candidate",
+            "cpuMs": 52.984
+          },
+          {
+            "round": 3,
+            "arm": "parent",
+            "cpuMs": 120.281
+          },
+          {
+            "round": 4,
+            "arm": "parent",
+            "cpuMs": 96.678
+          },
+          {
+            "round": 4,
+            "arm": "candidate",
+            "cpuMs": 41.929
+          },
+          {
+            "round": 5,
+            "arm": "candidate",
+            "cpuMs": 51.678
+          },
+          {
+            "round": 5,
+            "arm": "parent",
+            "cpuMs": 109.451
+          },
+          {
+            "round": 6,
+            "arm": "parent",
+            "cpuMs": 75.561
+          },
+          {
+            "round": 6,
+            "arm": "candidate",
+            "cpuMs": 43.788
+          },
+          {
+            "round": 7,
+            "arm": "candidate",
+            "cpuMs": 42.658
+          },
+          {
+            "round": 7,
+            "arm": "parent",
+            "cpuMs": 72.188
+          },
+          {
+            "round": 8,
+            "arm": "parent",
+            "cpuMs": 70.533
+          },
+          {
+            "round": 8,
+            "arm": "candidate",
+            "cpuMs": 44.768
+          }
+        ],
+        "comparison": {
+          "pairs": [
+            {
+              "control": 74.119,
+              "candidate": 46.023,
+              "delta": -28.095999999999997
+            },
+            {
+              "control": 85.114,
+              "candidate": 42.626,
+              "delta": -42.48800000000001
+            },
+            {
+              "control": 96.092,
+              "candidate": 49.361,
+              "delta": -46.731
+            },
+            {
+              "control": 120.281,
+              "candidate": 52.984,
+              "delta": -67.297
+            },
+            {
+              "control": 96.678,
+              "candidate": 41.929,
+              "delta": -54.748999999999995
+            },
+            {
+              "control": 109.451,
+              "candidate": 51.678,
+              "delta": -57.772999999999996
+            },
+            {
+              "control": 75.561,
+              "candidate": 43.788,
+              "delta": -31.77300000000001
+            },
+            {
+              "control": 72.188,
+              "candidate": 42.658,
+              "delta": -29.53
+            },
+            {
+              "control": 70.533,
+              "candidate": 44.768,
+              "delta": -25.765
+            }
+          ],
+          "medianDeltaMs": -42.48800000000001,
+          "q1DeltaMs": -54.748999999999995,
+          "q3DeltaMs": -29.53,
+          "iqrDeltaMs": 25.218999999999994,
+          "minDeltaMs": -67.297,
+          "maxDeltaMs": -25.765,
+          "rangeDeltaMs": 41.532,
+          "spreadDeltaMs": 41.532,
+          "favoursCandidate": 9,
+          "favoursControl": 0,
+          "requiredFavourable": 7,
+          "acceptedGain": true,
+          "significantRegression": false,
+          "noRegression": true
+        },
+        "modules": [
+          {
+            "name": "parent",
+            "root": "/home/eric/.cache/minnow-b9-prototypes/ndv-production-84d/parent",
+            "hashes": {
+              "join-keys": "f2064679874bef3c6e64b03b800b9d0e3ec8684af5391508073bb1bd7e0763b2",
+              "join-table": "5624803ff41520894de366f39c40f3ac78ff31f20ff6224dae1ff5b1a119cc9b"
+            },
+            "peak": 3059776
+          },
+          {
+            "name": "candidate",
+            "root": "/home/eric/.cache/minnow-b9-j2-key-pipeline-84d/packages/core/dist",
+            "hashes": {
+              "join-keys": "603d318aa88b8256c71cfe3151030db9f1d0d4579bed301995d3e4b1ec1a7670",
+              "join-table": "6614fa623cd24fd6fea8fa6167b9182d6b6175c709f51521a89560c8eefcb06e"
+            },
+            "peak": 3059776
+          }
+        ]
+      },
+      {
+        "keyCase": "flat36",
+        "phase": "build",
+        "rows": 32768,
+        "repetitions": 4,
+        "warmups": 3,
+        "rounds": 9,
+        "raw": [
+          {
+            "round": 0,
+            "arm": "parent",
+            "cpuMs": 32.164
+          },
+          {
+            "round": 0,
+            "arm": "candidate",
+            "cpuMs": 21.505
+          },
+          {
+            "round": 1,
+            "arm": "candidate",
+            "cpuMs": 19.999
+          },
+          {
+            "round": 1,
+            "arm": "parent",
+            "cpuMs": 31.595
+          },
+          {
+            "round": 2,
+            "arm": "parent",
+            "cpuMs": 28.898
+          },
+          {
+            "round": 2,
+            "arm": "candidate",
+            "cpuMs": 22.962
+          },
+          {
+            "round": 3,
+            "arm": "candidate",
+            "cpuMs": 20.375
+          },
+          {
+            "round": 3,
+            "arm": "parent",
+            "cpuMs": 36.483
+          },
+          {
+            "round": 4,
+            "arm": "parent",
+            "cpuMs": 34.249
+          },
+          {
+            "round": 4,
+            "arm": "candidate",
+            "cpuMs": 20.127
+          },
+          {
+            "round": 5,
+            "arm": "candidate",
+            "cpuMs": 19.379
+          },
+          {
+            "round": 5,
+            "arm": "parent",
+            "cpuMs": 26.077
+          },
+          {
+            "round": 6,
+            "arm": "parent",
+            "cpuMs": 27.332
+          },
+          {
+            "round": 6,
+            "arm": "candidate",
+            "cpuMs": 22.734
+          },
+          {
+            "round": 7,
+            "arm": "candidate",
+            "cpuMs": 20.908
+          },
+          {
+            "round": 7,
+            "arm": "parent",
+            "cpuMs": 30.548
+          },
+          {
+            "round": 8,
+            "arm": "parent",
+            "cpuMs": 26.71
+          },
+          {
+            "round": 8,
+            "arm": "candidate",
+            "cpuMs": 20.305
+          }
+        ],
+        "comparison": {
+          "pairs": [
+            {
+              "control": 32.164,
+              "candidate": 21.505,
+              "delta": -10.659000000000002
+            },
+            {
+              "control": 31.595,
+              "candidate": 19.999,
+              "delta": -11.596
+            },
+            {
+              "control": 28.898,
+              "candidate": 22.962,
+              "delta": -5.936
+            },
+            {
+              "control": 36.483,
+              "candidate": 20.375,
+              "delta": -16.107999999999997
+            },
+            {
+              "control": 34.249,
+              "candidate": 20.127,
+              "delta": -14.122000000000003
+            },
+            {
+              "control": 26.077,
+              "candidate": 19.379,
+              "delta": -6.698
+            },
+            {
+              "control": 27.332,
+              "candidate": 22.734,
+              "delta": -4.597999999999999
+            },
+            {
+              "control": 30.548,
+              "candidate": 20.908,
+              "delta": -9.639999999999997
+            },
+            {
+              "control": 26.71,
+              "candidate": 20.305,
+              "delta": -6.405000000000001
+            }
+          ],
+          "medianDeltaMs": -9.639999999999997,
+          "q1DeltaMs": -11.596,
+          "q3DeltaMs": -6.405000000000001,
+          "iqrDeltaMs": 5.190999999999999,
+          "minDeltaMs": -16.107999999999997,
+          "maxDeltaMs": -4.597999999999999,
+          "rangeDeltaMs": 11.509999999999998,
+          "spreadDeltaMs": 11.509999999999998,
+          "favoursCandidate": 9,
+          "favoursControl": 0,
+          "requiredFavourable": 7,
+          "acceptedGain": true,
+          "significantRegression": false,
+          "noRegression": true
+        },
+        "modules": [
+          {
+            "name": "parent",
+            "root": "/home/eric/.cache/minnow-b9-prototypes/ndv-production-84d/parent",
+            "hashes": {
+              "join-keys": "f2064679874bef3c6e64b03b800b9d0e3ec8684af5391508073bb1bd7e0763b2",
+              "join-table": "5624803ff41520894de366f39c40f3ac78ff31f20ff6224dae1ff5b1a119cc9b"
+            },
+            "peak": 3846208
+          },
+          {
+            "name": "candidate",
+            "root": "/home/eric/.cache/minnow-b9-j2-key-pipeline-84d/packages/core/dist",
+            "hashes": {
+              "join-keys": "603d318aa88b8256c71cfe3151030db9f1d0d4579bed301995d3e4b1ec1a7670",
+              "join-table": "6614fa623cd24fd6fea8fa6167b9182d6b6175c709f51521a89560c8eefcb06e"
+            },
+            "peak": 3846208
+          }
+        ]
+      },
+      {
+        "keyCase": "flat80",
+        "phase": "hash-and-probe",
+        "rows": 32768,
+        "repetitions": 4,
+        "warmups": 3,
+        "rounds": 9,
+        "raw": [
+          {
+            "round": 0,
+            "arm": "parent",
+            "cpuMs": 138.646
+          },
+          {
+            "round": 0,
+            "arm": "candidate",
+            "cpuMs": 147.764
+          },
+          {
+            "round": 1,
+            "arm": "candidate",
+            "cpuMs": 156.764
+          },
+          {
+            "round": 1,
+            "arm": "parent",
+            "cpuMs": 131.876
+          },
+          {
+            "round": 2,
+            "arm": "parent",
+            "cpuMs": 140.155
+          },
+          {
+            "round": 2,
+            "arm": "candidate",
+            "cpuMs": 130.78
+          },
+          {
+            "round": 3,
+            "arm": "candidate",
+            "cpuMs": 121.224
+          },
+          {
+            "round": 3,
+            "arm": "parent",
+            "cpuMs": 132.994
+          },
+          {
+            "round": 4,
+            "arm": "parent",
+            "cpuMs": 125.286
+          },
+          {
+            "round": 4,
+            "arm": "candidate",
+            "cpuMs": 151.506
+          },
+          {
+            "round": 5,
+            "arm": "candidate",
+            "cpuMs": 141.602
+          },
+          {
+            "round": 5,
+            "arm": "parent",
+            "cpuMs": 141.629
+          },
+          {
+            "round": 6,
+            "arm": "parent",
+            "cpuMs": 148.393
+          },
+          {
+            "round": 6,
+            "arm": "candidate",
+            "cpuMs": 161.806
+          },
+          {
+            "round": 7,
+            "arm": "candidate",
+            "cpuMs": 149.514
+          },
+          {
+            "round": 7,
+            "arm": "parent",
+            "cpuMs": 143.743
+          },
+          {
+            "round": 8,
+            "arm": "parent",
+            "cpuMs": 158.409
+          },
+          {
+            "round": 8,
+            "arm": "candidate",
+            "cpuMs": 156.799
+          }
+        ],
+        "comparison": {
+          "pairs": [
+            {
+              "control": 138.646,
+              "candidate": 147.764,
+              "delta": 9.118000000000023
+            },
+            {
+              "control": 131.876,
+              "candidate": 156.764,
+              "delta": 24.888000000000005
+            },
+            {
+              "control": 140.155,
+              "candidate": 130.78,
+              "delta": -9.375
+            },
+            {
+              "control": 132.994,
+              "candidate": 121.224,
+              "delta": -11.769999999999996
+            },
+            {
+              "control": 125.286,
+              "candidate": 151.506,
+              "delta": 26.22
+            },
+            {
+              "control": 141.629,
+              "candidate": 141.602,
+              "delta": -0.026999999999986812
+            },
+            {
+              "control": 148.393,
+              "candidate": 161.806,
+              "delta": 13.413000000000011
+            },
+            {
+              "control": 143.743,
+              "candidate": 149.514,
+              "delta": 5.771000000000015
+            },
+            {
+              "control": 158.409,
+              "candidate": 156.799,
+              "delta": -1.6099999999999852
+            }
+          ],
+          "medianDeltaMs": 5.771000000000015,
+          "q1DeltaMs": -1.6099999999999852,
+          "q3DeltaMs": 13.413000000000011,
+          "iqrDeltaMs": 15.022999999999996,
+          "minDeltaMs": -11.769999999999996,
+          "maxDeltaMs": 26.22,
+          "rangeDeltaMs": 37.989999999999995,
+          "spreadDeltaMs": 37.989999999999995,
+          "favoursCandidate": 4,
+          "favoursControl": 5,
+          "requiredFavourable": 7,
+          "acceptedGain": false,
+          "significantRegression": false,
+          "noRegression": true
+        },
+        "modules": [
+          {
+            "name": "parent",
+            "root": "/home/eric/.cache/minnow-b9-prototypes/ndv-production-84d/parent",
+            "hashes": {
+              "join-keys": "f2064679874bef3c6e64b03b800b9d0e3ec8684af5391508073bb1bd7e0763b2",
+              "join-table": "5624803ff41520894de366f39c40f3ac78ff31f20ff6224dae1ff5b1a119cc9b"
+            },
+            "peak": 5156928
+          },
+          {
+            "name": "candidate",
+            "root": "/home/eric/.cache/minnow-b9-j2-key-pipeline-84d/packages/core/dist",
+            "hashes": {
+              "join-keys": "603d318aa88b8256c71cfe3151030db9f1d0d4579bed301995d3e4b1ec1a7670",
+              "join-table": "6614fa623cd24fd6fea8fa6167b9182d6b6175c709f51521a89560c8eefcb06e"
+            },
+            "peak": 5156928
+          }
+        ]
+      },
+      {
+        "keyCase": "flat80",
+        "phase": "build",
+        "rows": 32768,
+        "repetitions": 4,
+        "warmups": 3,
+        "rounds": 9,
+        "raw": [
+          {
+            "round": 0,
+            "arm": "parent",
+            "cpuMs": 55.198
+          },
+          {
+            "round": 0,
+            "arm": "candidate",
+            "cpuMs": 60.03
+          },
+          {
+            "round": 1,
+            "arm": "candidate",
+            "cpuMs": 57.867
+          },
+          {
+            "round": 1,
+            "arm": "parent",
+            "cpuMs": 64.289
+          },
+          {
+            "round": 2,
+            "arm": "parent",
+            "cpuMs": 70.035
+          },
+          {
+            "round": 2,
+            "arm": "candidate",
+            "cpuMs": 64.808
+          },
+          {
+            "round": 3,
+            "arm": "candidate",
+            "cpuMs": 80.966
+          },
+          {
+            "round": 3,
+            "arm": "parent",
+            "cpuMs": 59.653
+          },
+          {
+            "round": 4,
+            "arm": "parent",
+            "cpuMs": 70.16
+          },
+          {
+            "round": 4,
+            "arm": "candidate",
+            "cpuMs": 55.003
+          },
+          {
+            "round": 5,
+            "arm": "candidate",
+            "cpuMs": 52.591
+          },
+          {
+            "round": 5,
+            "arm": "parent",
+            "cpuMs": 56.017
+          },
+          {
+            "round": 6,
+            "arm": "parent",
+            "cpuMs": 61.937
+          },
+          {
+            "round": 6,
+            "arm": "candidate",
+            "cpuMs": 65.136
+          },
+          {
+            "round": 7,
+            "arm": "candidate",
+            "cpuMs": 75.594
+          },
+          {
+            "round": 7,
+            "arm": "parent",
+            "cpuMs": 56.979
+          },
+          {
+            "round": 8,
+            "arm": "parent",
+            "cpuMs": 50.889
+          },
+          {
+            "round": 8,
+            "arm": "candidate",
+            "cpuMs": 50.941
+          }
+        ],
+        "comparison": {
+          "pairs": [
+            {
+              "control": 55.198,
+              "candidate": 60.03,
+              "delta": 4.832000000000001
+            },
+            {
+              "control": 64.289,
+              "candidate": 57.867,
+              "delta": -6.422000000000004
+            },
+            {
+              "control": 70.035,
+              "candidate": 64.808,
+              "delta": -5.22699999999999
+            },
+            {
+              "control": 59.653,
+              "candidate": 80.966,
+              "delta": 21.312999999999995
+            },
+            {
+              "control": 70.16,
+              "candidate": 55.003,
+              "delta": -15.156999999999996
+            },
+            {
+              "control": 56.017,
+              "candidate": 52.591,
+              "delta": -3.426000000000002
+            },
+            {
+              "control": 61.937,
+              "candidate": 65.136,
+              "delta": 3.198999999999998
+            },
+            {
+              "control": 56.979,
+              "candidate": 75.594,
+              "delta": 18.614999999999995
+            },
+            {
+              "control": 50.889,
+              "candidate": 50.941,
+              "delta": 0.0519999999999996
+            }
+          ],
+          "medianDeltaMs": 0.0519999999999996,
+          "q1DeltaMs": -5.22699999999999,
+          "q3DeltaMs": 4.832000000000001,
+          "iqrDeltaMs": 10.05899999999999,
+          "minDeltaMs": -15.156999999999996,
+          "maxDeltaMs": 21.312999999999995,
+          "rangeDeltaMs": 36.46999999999999,
+          "spreadDeltaMs": 36.46999999999999,
+          "favoursCandidate": 4,
+          "favoursControl": 5,
+          "requiredFavourable": 7,
+          "acceptedGain": false,
+          "significantRegression": false,
+          "noRegression": true
+        },
+        "modules": [
+          {
+            "name": "parent",
+            "root": "/home/eric/.cache/minnow-b9-prototypes/ndv-production-84d/parent",
+            "hashes": {
+              "join-keys": "f2064679874bef3c6e64b03b800b9d0e3ec8684af5391508073bb1bd7e0763b2",
+              "join-table": "5624803ff41520894de366f39c40f3ac78ff31f20ff6224dae1ff5b1a119cc9b"
+            },
+            "peak": 5943360
+          },
+          {
+            "name": "candidate",
+            "root": "/home/eric/.cache/minnow-b9-j2-key-pipeline-84d/packages/core/dist",
+            "hashes": {
+              "join-keys": "603d318aa88b8256c71cfe3151030db9f1d0d4579bed301995d3e4b1ec1a7670",
+              "join-table": "6614fa623cd24fd6fea8fa6167b9182d6b6175c709f51521a89560c8eefcb06e"
+            },
+            "peak": 5943360
+          }
+        ]
+      },
+      {
+        "keyCase": "duplicates36",
+        "phase": "hash-and-probe",
+        "rows": 32768,
+        "repetitions": 4,
+        "warmups": 3,
+        "rounds": 9,
+        "raw": [
+          {
+            "round": 0,
+            "arm": "parent",
+            "cpuMs": 70.798
+          },
+          {
+            "round": 0,
+            "arm": "candidate",
+            "cpuMs": 42.812
+          },
+          {
+            "round": 1,
+            "arm": "candidate",
+            "cpuMs": 38.119
+          },
+          {
+            "round": 1,
+            "arm": "parent",
+            "cpuMs": 78.366
+          },
+          {
+            "round": 2,
+            "arm": "parent",
+            "cpuMs": 65.549
+          },
+          {
+            "round": 2,
+            "arm": "candidate",
+            "cpuMs": 51.167
+          },
+          {
+            "round": 3,
+            "arm": "candidate",
+            "cpuMs": 37.204
+          },
+          {
+            "round": 3,
+            "arm": "parent",
+            "cpuMs": 67.65
+          },
+          {
+            "round": 4,
+            "arm": "parent",
+            "cpuMs": 63.23
+          },
+          {
+            "round": 4,
+            "arm": "candidate",
+            "cpuMs": 34.756
+          },
+          {
+            "round": 5,
+            "arm": "candidate",
+            "cpuMs": 36.155
+          },
+          {
+            "round": 5,
+            "arm": "parent",
+            "cpuMs": 72.923
+          },
+          {
+            "round": 6,
+            "arm": "parent",
+            "cpuMs": 73.82
+          },
+          {
+            "round": 6,
+            "arm": "candidate",
+            "cpuMs": 37.028
+          },
+          {
+            "round": 7,
+            "arm": "candidate",
+            "cpuMs": 38.79
+          },
+          {
+            "round": 7,
+            "arm": "parent",
+            "cpuMs": 76.229
+          },
+          {
+            "round": 8,
+            "arm": "parent",
+            "cpuMs": 97.183
+          },
+          {
+            "round": 8,
+            "arm": "candidate",
+            "cpuMs": 50.093
+          }
+        ],
+        "comparison": {
+          "pairs": [
+            {
+              "control": 70.798,
+              "candidate": 42.812,
+              "delta": -27.986000000000004
+            },
+            {
+              "control": 78.366,
+              "candidate": 38.119,
+              "delta": -40.247
+            },
+            {
+              "control": 65.549,
+              "candidate": 51.167,
+              "delta": -14.382000000000005
+            },
+            {
+              "control": 67.65,
+              "candidate": 37.204,
+              "delta": -30.446000000000005
+            },
+            {
+              "control": 63.23,
+              "candidate": 34.756,
+              "delta": -28.473999999999997
+            },
+            {
+              "control": 72.923,
+              "candidate": 36.155,
+              "delta": -36.768
+            },
+            {
+              "control": 73.82,
+              "candidate": 37.028,
+              "delta": -36.791999999999994
+            },
+            {
+              "control": 76.229,
+              "candidate": 38.79,
+              "delta": -37.439
+            },
+            {
+              "control": 97.183,
+              "candidate": 50.093,
+              "delta": -47.09
+            }
+          ],
+          "medianDeltaMs": -36.768,
+          "q1DeltaMs": -37.439,
+          "q3DeltaMs": -28.473999999999997,
+          "iqrDeltaMs": 8.965000000000003,
+          "minDeltaMs": -47.09,
+          "maxDeltaMs": -14.382000000000005,
+          "rangeDeltaMs": 32.708,
+          "spreadDeltaMs": 32.708,
+          "favoursCandidate": 9,
+          "favoursControl": 0,
+          "requiredFavourable": 7,
+          "acceptedGain": true,
+          "significantRegression": false,
+          "noRegression": true
+        },
+        "modules": [
+          {
+            "name": "parent",
+            "root": "/home/eric/.cache/minnow-b9-prototypes/ndv-production-84d/parent",
+            "hashes": {
+              "join-keys": "f2064679874bef3c6e64b03b800b9d0e3ec8684af5391508073bb1bd7e0763b2",
+              "join-table": "5624803ff41520894de366f39c40f3ac78ff31f20ff6224dae1ff5b1a119cc9b"
+            },
+            "peak": 3190848
+          },
+          {
+            "name": "candidate",
+            "root": "/home/eric/.cache/minnow-b9-j2-key-pipeline-84d/packages/core/dist",
+            "hashes": {
+              "join-keys": "603d318aa88b8256c71cfe3151030db9f1d0d4579bed301995d3e4b1ec1a7670",
+              "join-table": "6614fa623cd24fd6fea8fa6167b9182d6b6175c709f51521a89560c8eefcb06e"
+            },
+            "peak": 3190848
+          }
+        ]
+      },
+      {
+        "keyCase": "duplicates36",
+        "phase": "build",
+        "rows": 32768,
+        "repetitions": 4,
+        "warmups": 3,
+        "rounds": 9,
+        "raw": [
+          {
+            "round": 0,
+            "arm": "parent",
+            "cpuMs": 81.651
+          },
+          {
+            "round": 0,
+            "arm": "candidate",
+            "cpuMs": 53.992
+          },
+          {
+            "round": 1,
+            "arm": "candidate",
+            "cpuMs": 49.992
+          },
+          {
+            "round": 1,
+            "arm": "parent",
+            "cpuMs": 85.503
+          },
+          {
+            "round": 2,
+            "arm": "parent",
+            "cpuMs": 119.038
+          },
+          {
+            "round": 2,
+            "arm": "candidate",
+            "cpuMs": 59.712
+          },
+          {
+            "round": 3,
+            "arm": "candidate",
+            "cpuMs": 38.474
+          },
+          {
+            "round": 3,
+            "arm": "parent",
+            "cpuMs": 79.4
+          },
+          {
+            "round": 4,
+            "arm": "parent",
+            "cpuMs": 106.303
+          },
+          {
+            "round": 4,
+            "arm": "candidate",
+            "cpuMs": 58.991
+          },
+          {
+            "round": 5,
+            "arm": "candidate",
+            "cpuMs": 46.242
+          },
+          {
+            "round": 5,
+            "arm": "parent",
+            "cpuMs": 80.065
+          },
+          {
+            "round": 6,
+            "arm": "parent",
+            "cpuMs": 76.395
+          },
+          {
+            "round": 6,
+            "arm": "candidate",
+            "cpuMs": 37.325
+          },
+          {
+            "round": 7,
+            "arm": "candidate",
+            "cpuMs": 41.458
+          },
+          {
+            "round": 7,
+            "arm": "parent",
+            "cpuMs": 64.722
+          },
+          {
+            "round": 8,
+            "arm": "parent",
+            "cpuMs": 101.897
+          },
+          {
+            "round": 8,
+            "arm": "candidate",
+            "cpuMs": 55.212
+          }
+        ],
+        "comparison": {
+          "pairs": [
+            {
+              "control": 81.651,
+              "candidate": 53.992,
+              "delta": -27.659
+            },
+            {
+              "control": 85.503,
+              "candidate": 49.992,
+              "delta": -35.511
+            },
+            {
+              "control": 119.038,
+              "candidate": 59.712,
+              "delta": -59.32599999999999
+            },
+            {
+              "control": 79.4,
+              "candidate": 38.474,
+              "delta": -40.92600000000001
+            },
+            {
+              "control": 106.303,
+              "candidate": 58.991,
+              "delta": -47.312
+            },
+            {
+              "control": 80.065,
+              "candidate": 46.242,
+              "delta": -33.823
+            },
+            {
+              "control": 76.395,
+              "candidate": 37.325,
+              "delta": -39.06999999999999
+            },
+            {
+              "control": 64.722,
+              "candidate": 41.458,
+              "delta": -23.263999999999996
+            },
+            {
+              "control": 101.897,
+              "candidate": 55.212,
+              "delta": -46.685
+            }
+          ],
+          "medianDeltaMs": -39.06999999999999,
+          "q1DeltaMs": -46.685,
+          "q3DeltaMs": -33.823,
+          "iqrDeltaMs": 12.862000000000002,
+          "minDeltaMs": -59.32599999999999,
+          "maxDeltaMs": -23.263999999999996,
+          "rangeDeltaMs": 36.062,
+          "spreadDeltaMs": 36.062,
+          "favoursCandidate": 9,
+          "favoursControl": 0,
+          "requiredFavourable": 7,
+          "acceptedGain": true,
+          "significantRegression": false,
+          "noRegression": true
+        },
+        "modules": [
+          {
+            "name": "parent",
+            "root": "/home/eric/.cache/minnow-b9-prototypes/ndv-production-84d/parent",
+            "hashes": {
+              "join-keys": "f2064679874bef3c6e64b03b800b9d0e3ec8684af5391508073bb1bd7e0763b2",
+              "join-table": "5624803ff41520894de366f39c40f3ac78ff31f20ff6224dae1ff5b1a119cc9b"
+            },
+            "peak": 4108352
+          },
+          {
+            "name": "candidate",
+            "root": "/home/eric/.cache/minnow-b9-j2-key-pipeline-84d/packages/core/dist",
+            "hashes": {
+              "join-keys": "603d318aa88b8256c71cfe3151030db9f1d0d4579bed301995d3e4b1ec1a7670",
+              "join-table": "6614fa623cd24fd6fea8fa6167b9182d6b6175c709f51521a89560c8eefcb06e"
+            },
+            "peak": 4108352
+          }
+        ]
+      }
+    ]
+  },
+  "emission": {
+    "base": "84d10cff312e5c42dfa9602b3eb83423859db0b0",
+    "workingTree": true,
+    "arms": {
+      "parent": {
+        "root": "/home/eric/.cache/minnow-b9-prototypes/ndv-production-84d/parent",
+        "overlays": {
+          "next/access/changes.js": "90cd8771af7b9187ecf5dae5352acc21ee291958477d4977aa383fbee507a88e",
+          "next/access/key-index.js": "db2b789df909960138815ec2eaf2464111caf38153489afd510fd4f9e8f01c22",
+          "next/access/native-write-step.js": "0e165460efa5f4ca333e123c34aa73f54be22aa4c985ed2a2b7cf6de7d027894",
+          "next/access/snapshot.js": "97fe35adb56ce43d44f070a984f1688f6a7ce810967d5da9cff69ae190aa4e99",
+          "next/access/write-path.js": "51c44f553a2c2bae2d8f8d1e041e2f316f27a7251ef607c2fc733c2a9f96fd53",
+          "next/durable-format.js": "b7ce3109f2fc50ba8150a7f7b10f4d4aa734c2ef5bc09288e282b53735cefc5c",
+          "next/errors.js": "c0a5486f2f7274d2fa166644ccb41bb91b240411b4cb43e5049b75914c025fa7",
+          "next/exec/admission.js": "cd9ea344a4fbae007e2e158e558d927128e058cffb6dc4eed8ec4ee85ffe0ee9",
+          "next/exec/deferred-grant.js": "bb0ed78f608288acc6894d0c10b074e5cc421abd04f5cfb7910917a90936e1ba",
+          "next/exec/executor.js": "db812b5830acebc8ea466941fa107c0941c5712ece257314ff21709487d96dd9",
+          "next/exec/join-keys.js": "f2064679874bef3c6e64b03b800b9d0e3ec8684af5391508073bb1bd7e0763b2",
+          "next/exec/join-table.js": "5624803ff41520894de366f39c40f3ac78ff31f20ff6224dae1ff5b1a119cc9b",
+          "next/exec/plan.js": "1cd57f557336f69eaa24810a8a2708f3f85ad58efc88a636aef800c0b746a606",
+          "next/exec/projection-step.js": "df96f39b61041c79f0fd6327d1e4d0746b3d0b2ed5023d9f6c266229a46d9a66",
+          "next/exec/result-sink.js": "2d75ee95b23c36969fc2160ea6b7057756419c5544bf468d6496c291b2c1155d",
+          "next/exec/result.js": "83370a90f65479c93db9d992b896f137cfc9abcc8c8fea9d897a24523857739b",
+          "next/exec/run.js": "f71ed49158a40a9dae86b0a14b13e459a0e06ebaf0b4343b909042fb10677976",
+          "next/exec/sort-progress.js": "95db26e9109aceb42f39008e2fe0b83c1a0c6b7f2f1ad61c999ceafb133344dc",
+          "next/format/database-identity.js": "8e67421bd539d09d4d4cd1040dbb973180f4b8a5036c0b87d2ebeefb6002facb",
+          "next/format/log-frame.js": "86ccae58c78a5b7b704f902319644bddac090e3ef3cc897daee431b9519c1bbf",
+          "next/format/manifest-codec.js": "f46f2428dbf4d27cdbb3b9d9eedc7ab20a2690013e695777f0c1d6896792d257",
+          "next/format/manifest.js": "fb86945bd8a35d7477ea7b825479a6870b0ad41ae02d3e039d19a8383597328d",
+          "next/format/snapshot.js": "0ec541a419ec5617ae9bf3f88a0f018c360df41c91d4bb8c917534476cdd6f04",
+          "next/hash/xxhash32.js": "77efc74b34833fd0e3bfaf7f5a7cb240ad930ea76519443793ab873251dbc03b",
+          "next/live/constants.js": "cad988863cb005de3c4faffe792d98f9abcfe32ebef4ca210d50c5d58466d1e3",
+          "next/live/errors.js": "37a6f0d701e0b6df27ec66974ec385c2ec5c95383cfe11e11d9deeba9c014c49",
+          "next/live/rows.js": "99e72b2f4597c96db51a5559257be5d4f950337f5ed72d4b4532e796cd0a5b4a",
+          "next/live/runtime.js": "1e91c2d24b7c97666ef2beab66f572b0bbbc66efc2e255891503d360b224e3a2",
+          "next/live/state.js": "437e62f0d928551a160749297352c558048480189cdb3d701235ee61091b1b13",
+          "next/owner/api.js": "4db2b5928fcfb7f717506d7685181738377a552e4f14bde40974c5cc9e9139ba",
+          "next/owner/client.js": "9d5a603bc834825555c6526dcfc0e4196770c6ca649424de9391e4a21f63807c",
+          "next/owner/compose.js": "2bfba0b221bbf1a7b07219be4307ba27852e95c50169dfe636f2a0f77999b51a",
+          "next/owner/connector.js": "edd52509b7c347b6b6f9ee05a22dc288b6b80504874b3a8ea889ec5b6ba35ffc",
+          "next/owner/election.js": "32b7f9f859c4559abe49a2347960fe693b821d679512c519d17c5dded767c1a7",
+          "next/owner/engine.js": "f441cfa4259d8c549b1c2e0620c814e7270b519ac2bf50350e17757151e8f6c0",
+          "next/owner/errors.js": "e372ebcf3aa161887c81bbb1c8b114de50d78f53517a532389becb19cb2ac7f9",
+          "next/owner/host.js": "55b9c9cb03841af2a22583104f61f623d0ef693b29786e81d3fbff361ea07221",
+          "next/owner/native.js": "559a9d77cb95cb2e834001b7b9e6333f8db792aae1515cf4226876c470bee5ac",
+          "next/owner/prefix-images.js": "21090b9e131f555edb89350d14018855743d6ff85235ffdadc69b1d13ccb9560",
+          "next/owner/prefix-images.test-support.js": "2b77572bcc646c818974952a82c624138b118cdb48a2a9ae2b2ce006fa1fc57f",
+          "next/owner/protocol.js": "b09eb2b90d7700a7005b20bb5f011ccccb78238f103883a95b90e2ad5f3afa61",
+          "next/owner/sequence.js": "1fb04c23ac35b47288a3dfc4c70239740868aa3f8f748cd5f06c8b8ccd5c427d",
+          "next/owner/server.js": "5af5174ce320ea05beec9ef1a942b71be5d70b17a32fbc4249dece4446daaaa0",
+          "next/owner/snapshot-api.js": "5af7cf30af8b486c2da67f0c006207ffb2d55e66a0063145931804058203ea4c",
+          "next/owner/snapshot-connection.js": "0d6970c70ee7beb5deb5f5b59e7e3ae312aa243fd7e7759daa186c8fa0179ed2",
+          "next/page/read-bounds.js": "79a6b6238101b3f4d6db730f65d711dec44e46a86c58761b04d20bae3a9cf967",
+          "next/snapshot-errors.js": "00778967279f700877321e1ded4f556dfeb3680547118bbf7fd96de38bd49079",
+          "next/storage/extent-list.js": "c529a5252be239d014ee669f5328c2019c1bbc67aa98c614eacf3be5e8516313",
+          "next/storage/extents.js": "efb7aab77fddd952d4900e2a573a10432b1ba8be7caec2195cb87da657414bb1",
+          "next/storage/idb-bytes.js": "6183e24a54528771f8ad2f799eb9012f37021ed2ee743584f827c27903172da3",
+          "next/storage/native-extent-list.js": "3b31df5a2173209b3466c294b45ea2488468c34fead6ba5488718f4272ba7bf6",
+          "next/storage/select.js": "11dea6b32e873629e2a1daa75ad7bbaf3fe0d731c27e442aa786d82e0c3d085b",
+          "next/storage/space.js": "0a63184a07c26bacb800077291772b062120e0438ad1b0f21584eedd6af65248",
+          "next/store-name.js": "9ebd0cf0614d59096536bec3c66b970fb98f05a94ee1101cd9e03133b58b557e",
+          "next/testing/closed-disk-fixture.test-support.js": "9a88a5e60228ded600422a0aab705b251f3d726a65bcbb5273605d6d4f7c2c6b",
+          "next/testing/durable-inventory.js": "c97fba94ac8d61fcee0ac805b0100247172e4cb7db6b366ac5c48007fe2c43eb",
+          "next/testing/live-runtime.test-support.js": "c7e61697a9c0c4400798b3fc54cbde9097f3a16572041eb38b5c78454bdfc036",
+          "next/testing/mutation-owner.test-support.js": "37773c5220f7764e6f1a66c3193a16996ee8d72dec433e75d5d2bea4f671a09f",
+          "next/testing/owner-harness.js": "18faff226c573b301433feb8ca91f10e45fb4df96e3c986f7b8b93ec09a246ae",
+          "next/testing/owner-standins.js": "35fc97e652bb54bccec71a387501748f94137703b7172da2643fea259851bc59",
+          "next/testing/snapshot-owner-support.js": "e812c4067fd187a95a8d8817ce9052e55733705a908456769a69b2b2fdfc11b8",
+          "next/write/budget.js": "dcbcce6640c6eb35b4e4a4bc6a9b368b7bae071994c303bb57bcc4fd94787cff",
+          "next/write/credits.js": "7303d775d89bccb85867181c8c402840e502489b8c10de1893a6c6f172ebad7a",
+          "next/write/directory-current.test-support.js": "6fa95cdef9c7746f953ac4387dcd9d9bf71a12f06a0535846f7331e41f8878ff",
+          "next/write/engine.js": "0ffc8c8f79ff6cc0fe731c87946700aeebe98f8a68dade66fcce6f8349038272",
+          "next/write/live-rekeys.js": "acb88a917c31aa430c639e66090f88c8460a7385515cd87e4bf243e0cded0da7",
+          "next/write/memtable.js": "1eacf962086cf4e46f2c6ac1cd048e78930646571b6e8981ac70def2a77ac866",
+          "next/write/native-step.js": "f83b5037db0b4677eeadbd96a464c0679fec14bff304a25ffd141fa0d2ed1042",
+          "next/write/snapshot-export.js": "d83dea5197fdac3982360b5237a24291da89089cfaadf973a76889e860ddf97e",
+          "next/write/snapshot-load.js": "d878716ab7b6321c6d4cac569265f9ed498bae67905286d4ba97ae22c52de8ee",
+          "next/write/snapshot-source.js": "9407012812dd866c74759fe450c1e9656589be3d0ce07fc55e9d4d48bfea9484",
+          "next/write/state.js": "b65bb862ab94b6a7b15c43bd40546cc876e2011985fc527383e519a70d916857",
+          "next/write/transaction.js": "34bc70e7570bd44cf17bec8cc5bfa1de6a7fed53cde5b885bdfcc000d421f56b",
+          "next/write/view.js": "2b817bf22d4375343008894fa91e63e13214bc4a4178a8bed321b55d1c2b0e58",
+          "testing/reach.js": "6ffcbb06490c052b33d1dccfaa9127cac87a24e6890de61429d019483d0e1487"
+        }
+      },
+      "candidate": {
+        "root": "/home/eric/.cache/minnow-b9-prototypes/j2-short-byte-final-84d/candidate",
+        "overlays": {
+          "next/access/changes.js": "90cd8771af7b9187ecf5dae5352acc21ee291958477d4977aa383fbee507a88e",
+          "next/access/key-index.js": "db2b789df909960138815ec2eaf2464111caf38153489afd510fd4f9e8f01c22",
+          "next/access/native-write-step.js": "0e165460efa5f4ca333e123c34aa73f54be22aa4c985ed2a2b7cf6de7d027894",
+          "next/access/snapshot.js": "97fe35adb56ce43d44f070a984f1688f6a7ce810967d5da9cff69ae190aa4e99",
+          "next/access/write-path.js": "51c44f553a2c2bae2d8f8d1e041e2f316f27a7251ef607c2fc733c2a9f96fd53",
+          "next/durable-format.js": "b7ce3109f2fc50ba8150a7f7b10f4d4aa734c2ef5bc09288e282b53735cefc5c",
+          "next/errors.js": "c0a5486f2f7274d2fa166644ccb41bb91b240411b4cb43e5049b75914c025fa7",
+          "next/exec/admission.js": "cd9ea344a4fbae007e2e158e558d927128e058cffb6dc4eed8ec4ee85ffe0ee9",
+          "next/exec/deferred-grant.js": "bb0ed78f608288acc6894d0c10b074e5cc421abd04f5cfb7910917a90936e1ba",
+          "next/exec/executor.js": "db812b5830acebc8ea466941fa107c0941c5712ece257314ff21709487d96dd9",
+          "next/exec/join-keys.js": "603d318aa88b8256c71cfe3151030db9f1d0d4579bed301995d3e4b1ec1a7670",
+          "next/exec/join-table.js": "6614fa623cd24fd6fea8fa6167b9182d6b6175c709f51521a89560c8eefcb06e",
+          "next/exec/plan.js": "1cd57f557336f69eaa24810a8a2708f3f85ad58efc88a636aef800c0b746a606",
+          "next/exec/projection-step.js": "df96f39b61041c79f0fd6327d1e4d0746b3d0b2ed5023d9f6c266229a46d9a66",
+          "next/exec/result-sink.js": "2d75ee95b23c36969fc2160ea6b7057756419c5544bf468d6496c291b2c1155d",
+          "next/exec/result.js": "83370a90f65479c93db9d992b896f137cfc9abcc8c8fea9d897a24523857739b",
+          "next/exec/run.js": "f71ed49158a40a9dae86b0a14b13e459a0e06ebaf0b4343b909042fb10677976",
+          "next/exec/sort-progress.js": "95db26e9109aceb42f39008e2fe0b83c1a0c6b7f2f1ad61c999ceafb133344dc",
+          "next/format/database-identity.js": "8e67421bd539d09d4d4cd1040dbb973180f4b8a5036c0b87d2ebeefb6002facb",
+          "next/format/log-frame.js": "86ccae58c78a5b7b704f902319644bddac090e3ef3cc897daee431b9519c1bbf",
+          "next/format/manifest-codec.js": "f46f2428dbf4d27cdbb3b9d9eedc7ab20a2690013e695777f0c1d6896792d257",
+          "next/format/manifest.js": "fb86945bd8a35d7477ea7b825479a6870b0ad41ae02d3e039d19a8383597328d",
+          "next/format/snapshot.js": "0ec541a419ec5617ae9bf3f88a0f018c360df41c91d4bb8c917534476cdd6f04",
+          "next/hash/xxhash32.js": "77efc74b34833fd0e3bfaf7f5a7cb240ad930ea76519443793ab873251dbc03b",
+          "next/live/constants.js": "cad988863cb005de3c4faffe792d98f9abcfe32ebef4ca210d50c5d58466d1e3",
+          "next/live/errors.js": "37a6f0d701e0b6df27ec66974ec385c2ec5c95383cfe11e11d9deeba9c014c49",
+          "next/live/rows.js": "99e72b2f4597c96db51a5559257be5d4f950337f5ed72d4b4532e796cd0a5b4a",
+          "next/live/runtime.js": "1e91c2d24b7c97666ef2beab66f572b0bbbc66efc2e255891503d360b224e3a2",
+          "next/live/state.js": "437e62f0d928551a160749297352c558048480189cdb3d701235ee61091b1b13",
+          "next/owner/api.js": "4db2b5928fcfb7f717506d7685181738377a552e4f14bde40974c5cc9e9139ba",
+          "next/owner/client.js": "9d5a603bc834825555c6526dcfc0e4196770c6ca649424de9391e4a21f63807c",
+          "next/owner/compose.js": "2bfba0b221bbf1a7b07219be4307ba27852e95c50169dfe636f2a0f77999b51a",
+          "next/owner/connector.js": "edd52509b7c347b6b6f9ee05a22dc288b6b80504874b3a8ea889ec5b6ba35ffc",
+          "next/owner/election.js": "32b7f9f859c4559abe49a2347960fe693b821d679512c519d17c5dded767c1a7",
+          "next/owner/engine.js": "f441cfa4259d8c549b1c2e0620c814e7270b519ac2bf50350e17757151e8f6c0",
+          "next/owner/errors.js": "e372ebcf3aa161887c81bbb1c8b114de50d78f53517a532389becb19cb2ac7f9",
+          "next/owner/host.js": "55b9c9cb03841af2a22583104f61f623d0ef693b29786e81d3fbff361ea07221",
+          "next/owner/native.js": "559a9d77cb95cb2e834001b7b9e6333f8db792aae1515cf4226876c470bee5ac",
+          "next/owner/prefix-images.js": "21090b9e131f555edb89350d14018855743d6ff85235ffdadc69b1d13ccb9560",
+          "next/owner/prefix-images.test-support.js": "2b77572bcc646c818974952a82c624138b118cdb48a2a9ae2b2ce006fa1fc57f",
+          "next/owner/protocol.js": "b09eb2b90d7700a7005b20bb5f011ccccb78238f103883a95b90e2ad5f3afa61",
+          "next/owner/sequence.js": "1fb04c23ac35b47288a3dfc4c70239740868aa3f8f748cd5f06c8b8ccd5c427d",
+          "next/owner/server.js": "5af5174ce320ea05beec9ef1a942b71be5d70b17a32fbc4249dece4446daaaa0",
+          "next/owner/snapshot-api.js": "5af7cf30af8b486c2da67f0c006207ffb2d55e66a0063145931804058203ea4c",
+          "next/owner/snapshot-connection.js": "0d6970c70ee7beb5deb5f5b59e7e3ae312aa243fd7e7759daa186c8fa0179ed2",
+          "next/page/read-bounds.js": "79a6b6238101b3f4d6db730f65d711dec44e46a86c58761b04d20bae3a9cf967",
+          "next/snapshot-errors.js": "00778967279f700877321e1ded4f556dfeb3680547118bbf7fd96de38bd49079",
+          "next/storage/extent-list.js": "c529a5252be239d014ee669f5328c2019c1bbc67aa98c614eacf3be5e8516313",
+          "next/storage/extents.js": "efb7aab77fddd952d4900e2a573a10432b1ba8be7caec2195cb87da657414bb1",
+          "next/storage/idb-bytes.js": "6183e24a54528771f8ad2f799eb9012f37021ed2ee743584f827c27903172da3",
+          "next/storage/native-extent-list.js": "3b31df5a2173209b3466c294b45ea2488468c34fead6ba5488718f4272ba7bf6",
+          "next/storage/select.js": "11dea6b32e873629e2a1daa75ad7bbaf3fe0d731c27e442aa786d82e0c3d085b",
+          "next/storage/space.js": "0a63184a07c26bacb800077291772b062120e0438ad1b0f21584eedd6af65248",
+          "next/store-name.js": "9ebd0cf0614d59096536bec3c66b970fb98f05a94ee1101cd9e03133b58b557e",
+          "next/testing/closed-disk-fixture.test-support.js": "9a88a5e60228ded600422a0aab705b251f3d726a65bcbb5273605d6d4f7c2c6b",
+          "next/testing/durable-inventory.js": "c97fba94ac8d61fcee0ac805b0100247172e4cb7db6b366ac5c48007fe2c43eb",
+          "next/testing/live-runtime.test-support.js": "c7e61697a9c0c4400798b3fc54cbde9097f3a16572041eb38b5c78454bdfc036",
+          "next/testing/mutation-owner.test-support.js": "37773c5220f7764e6f1a66c3193a16996ee8d72dec433e75d5d2bea4f671a09f",
+          "next/testing/owner-harness.js": "18faff226c573b301433feb8ca91f10e45fb4df96e3c986f7b8b93ec09a246ae",
+          "next/testing/owner-standins.js": "35fc97e652bb54bccec71a387501748f94137703b7172da2643fea259851bc59",
+          "next/testing/snapshot-owner-support.js": "e812c4067fd187a95a8d8817ce9052e55733705a908456769a69b2b2fdfc11b8",
+          "next/write/budget.js": "dcbcce6640c6eb35b4e4a4bc6a9b368b7bae071994c303bb57bcc4fd94787cff",
+          "next/write/credits.js": "7303d775d89bccb85867181c8c402840e502489b8c10de1893a6c6f172ebad7a",
+          "next/write/directory-current.test-support.js": "6fa95cdef9c7746f953ac4387dcd9d9bf71a12f06a0535846f7331e41f8878ff",
+          "next/write/engine.js": "0ffc8c8f79ff6cc0fe731c87946700aeebe98f8a68dade66fcce6f8349038272",
+          "next/write/live-rekeys.js": "acb88a917c31aa430c639e66090f88c8460a7385515cd87e4bf243e0cded0da7",
+          "next/write/memtable.js": "1eacf962086cf4e46f2c6ac1cd048e78930646571b6e8981ac70def2a77ac866",
+          "next/write/native-step.js": "f83b5037db0b4677eeadbd96a464c0679fec14bff304a25ffd141fa0d2ed1042",
+          "next/write/snapshot-export.js": "d83dea5197fdac3982360b5237a24291da89089cfaadf973a76889e860ddf97e",
+          "next/write/snapshot-load.js": "d878716ab7b6321c6d4cac569265f9ed498bae67905286d4ba97ae22c52de8ee",
+          "next/write/snapshot-source.js": "9407012812dd866c74759fe450c1e9656589be3d0ce07fc55e9d4d48bfea9484",
+          "next/write/state.js": "b65bb862ab94b6a7b15c43bd40546cc876e2011985fc527383e519a70d916857",
+          "next/write/transaction.js": "34bc70e7570bd44cf17bec8cc5bfa1de6a7fed53cde5b885bdfcc000d421f56b",
+          "next/write/view.js": "2b817bf22d4375343008894fa91e63e13214bc4a4178a8bed321b55d1c2b0e58",
+          "testing/reach.js": "4b919e6779bc8c64046bb001337b8acf88b98224ce3328b03be1aafd95e70449"
+        }
+      }
+    },
+    "ordinaryEmission": true,
+    "measuredRuntimeExact": true
+  },
+  "profileShare": {
+    "run": 44497039678,
+    "cell": "join_fact_fact_text",
+    "representation": "flat raw36-byte TEXT; no page dictionary",
+    "keyFileSelfPercent": 36.7,
+    "tableFileSelfPercent": 36.0,
+    "limits": "Diagnostic sample shares are not additive with their function subsets and do not establish CPU causality."
+  },
+  "Limits": [
+    "Whole W1M/S1 current/frozen measurements and complete seven-gate qualification are HOSTED pending. No engine commit until full gates pass.",
+    "Local component measures process user+system CPU,9 AB/BA rounds after3warmups, natural GC; excludes scan/decode, payload gather, aggregate, owner, I/O and admission waits.",
+    "Four36-byte component gains meet paired median>IQR and7/9 direction rule;80-byte fallback controls inconclusive with no accepted reverse, not equivalence proof.",
+    "This piece only removes bounded nested generator dispatch; it does not claim complete J2, a new row-ID sink, star fusion or dictionary translation.",
+    "Exact whole-cell results and same-plan repeat bits remain required. No new buffers, state format, weakened comparison or changed demand barrier."
+  ]
+}
