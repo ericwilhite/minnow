@@ -19,7 +19,7 @@ import {
   texts,
   tableInput,
   rowsOf,
-} from "./test-support.js";
+} from "../write/test-support.js";
 
 type Coverage = Reach<(typeof ROOT_DROP_ABORT_CRASH_REACH)[number]>;
 interface Shape {

@@ -176,7 +176,7 @@ for (const seed of seedsFor("next-root-selection-drop", [704, 705]))
                   }
                   old.release();
                   old = null;
-                  // Interrupted-process cases: root-drop-abort-crash.test.ts.
+                  // Interrupted-process cases: ../testing/root-drop-abort-crash.test.ts.
                   path = await harness.reopen();
                   expect(path.catalog.table(target)).toBeUndefined();
                   const view = path.pin();
