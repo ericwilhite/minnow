@@ -1,8 +1,12 @@
 /** Governor rules 4/5/7: page and retirement work survives reclaim of idle row credit. */
 import fc from "fast-check";
 import { expect, it, onTestFinished, vi } from "vitest";
-import { createReach, NATIVE_WRITE_PRESSURE_REACH } from "../../testing/reach.js";
-import type { ExtentWriter } from "../storage/extents.js";
+import {
+  createReach,
+  NATIVE_WRITE_PRESSURE_REACH,
+  NATIVE_WRITE_SETTLEMENT_REACH,
+} from "../../testing/reach.js";
+import type { ExtentWriter, WriterState } from "../storage/extents.js";
 import { seedsFor } from "../../testing/seeds.js";
 import { Governor, type Grant } from "../memory/governor.js";
 import * as writers from "../page/writer.js";
@@ -12,6 +16,75 @@ import { WriteCredits } from "../write/credits.js";
 import { autocommit, batch, rowsOf, texts } from "../write/test-support.js";
 import { StorageCore } from "./storage-core.js";
 import { oracleRows } from "./differential-adapter.js";
+
+/** ExtentWriter's lifecycle contract and governor rules4/5/7 require settlement,
+ * not a failed attempt. Successful publication also retires provisional ownership. */
+function assertSettled(
+  state: WriterState | undefined,
+  writerBytes: number,
+  releasingBytes: number,
+) {
+  expect(["aborted", "published"]).toContain(state);
+  expect(writerBytes).toBe(0);
+  expect(releasingBytes).toBe(0);
+}
+
+for (const seed of seedsFor("next-native-write-settlement", [47249, 47250]))
+  it(`rejects unsettled or still-owned writer work before growth (seed ${String(seed)})`, () => {
+    const reach = createReach("native writer settlement", NATIVE_WRITE_SETTLEMENT_REACH);
+    fc.assert(
+      fc.property(
+        fc.constantFrom<WriterState | undefined>(
+          "open",
+          "publishing",
+          "published",
+          "aborted",
+          "indeterminate",
+          undefined,
+        ),
+        fc.integer({ min: 0, max: 4096 }),
+        fc.integer({ min: 0, max: 4096 }),
+        (state, writerBytes, releasingBytes) => {
+          reach.beginHistory();
+          const valid =
+            (state === "aborted" || state === "published") &&
+            writerBytes === 0 &&
+            releasingBytes === 0;
+          const check = () => assertSettled(state, writerBytes, releasingBytes);
+          if (valid) {
+            expect(check).not.toThrow();
+            reach.reach(state === "published" ? "published settled" : "aborted settled");
+          } else {
+            expect(check).toThrow();
+            reach.reach(
+              state === "open" ||
+                state === "publishing" ||
+                state === "indeterminate" ||
+                state === undefined
+                ? "unsettled rejected"
+                : "owned bytes rejected",
+            );
+          }
+        },
+      ),
+      {
+        seed,
+        numRuns: 48,
+        examples: [
+          ["published", 0, 0],
+          ["aborted", 0, 0],
+          ["open", 0, 0],
+          ["publishing", 0, 0],
+          ["indeterminate", 0, 0],
+          [undefined, 0, 0],
+          ["published", 4096, 0],
+          ["aborted", 0, 4096],
+        ],
+        endOnFailure: true,
+      },
+    );
+    reach.assertReached();
+  });
 
 const population = Array.from({ length: 12 }, (_, i) => 8814 + i);
 const seeds = seedsFor("next-native-write-pressure", population);
@@ -83,8 +156,9 @@ for (const boundary of ["retirement", "group"] as const) {
             expect(writer.retainedBytes).toBeGreaterThan(0);
             return writer;
           });
-          // Only safe outer retry may admit more metadata. No provisional writer/lock
-          // may survive to this boundary. Release the competitor on the next real task.
+          // A funded attempt may have published rather than aborted. Both retire
+          // provisional ownership; open/publishing/indeterminate work may not wait
+          // for more credit. Release the competitor on the next real task.
           // eslint-disable-next-line @typescript-eslint/unbound-method -- Rebound below.
           const grow = WriteCredits.prototype.growTo;
           const growth = vi.spyOn(WriteCredits.prototype, "growTo").mockImplementation(function (
@@ -94,14 +168,18 @@ for (const boundary of ["retirement", "group"] as const) {
             signal,
           ) {
             if (held !== undefined && grant === this.metadata && wanted > grant.held) {
-              expect(borrowed?.state).toBe("aborted");
-              reach.reach("admission after provisional unwind");
+              const stats = core.harness.space.stats;
+              assertSettled(borrowed?.state, stats.writerBytes, stats.releasingBytes);
+              reach.reach("admission after provisional settlement");
               timer ??= setTimeout(releaseReader, 5);
             }
             return grow.call(this, grant, wanted, signal);
           });
           let closed = false;
+          let restored = false;
           const restore = () => {
+            if (restored) return;
+            restored = true;
             opened.mockRestore();
             keeper.mockRestore();
             group.mockRestore();
