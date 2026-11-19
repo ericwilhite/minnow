@@ -129,6 +129,30 @@ export class WriteCredits {
   }
 
   #workingMinimum: () => Partial<WriteMinimum> = () => ({});
+  #relief: (() => MaybePromise<void>) | null = null;
+
+  /** The owner's spill/unwind of dependent live state (rows it could write out or rebuild).
+   * Growth calls it before it would wait, so a waiting owner never keeps live state another
+   * owner's complete step needs. Whatever stays allocated afterwards is a required input and
+   * counts toward the waiting step's complete minimum. */
+  bindLiveRelief(relieve: (() => MaybePromise<void>) | null): void {
+    this.#relief = relieve;
+  }
+
+  /** Live bytes this owner keeps across a growth wait: allocations, loans and an active merge. */
+  get retainedBytes(): number {
+    return (
+      this.rows.allocated +
+      this.rows.loaned +
+      this.metadata.allocated +
+      this.metadata.loaned +
+      this.commits.allocated +
+      this.commits.loaned +
+      this.merge.allocated +
+      this.merge.loaned +
+      (this.#mergeActive?.held ?? 0)
+    );
+  }
 
   /** Actual suspended native steps, not forecasts for a later phase. */
   bindWorkingMinimum(work: () => Partial<WriteMinimum>): void {
@@ -315,6 +339,11 @@ export class WriteCredits {
     return this.growTo(this.metadata, wanted, signal, includesProgress);
   }
 
+  /** The prepaid next metadata step beyond live allocations (observation only). */
+  get metadataHeadroom(): number {
+    return this.#metadataHeadroom;
+  }
+
   get metadataReady(): boolean {
     return this.metadata.held >= this.metadata.allocated + this.#metadataHeadroom;
   }
@@ -373,6 +402,7 @@ export class WriteCredits {
     const accounts = [this.rows, this.metadata, this.commits, this.merge];
     const target = accounts.indexOf(grant);
     if (target < 0) throw new Error("Growth must belong to the native write owner");
+    let relieved = false;
     for (;;) {
       this.#check();
       stop.throwIfAborted();
@@ -447,6 +477,32 @@ export class WriteCredits {
         }
       }
       this.#changed?.(true);
+      // Before any wait, spill or unwind dependent live state, then re-evaluate:
+      // relief may fund the step at once, change the floors, or abort the owner.
+      if (!relieved && this.#relief !== null && this.retainedBytes > 0) {
+        relieved = true;
+        const relief = this.#relief();
+        if (relief instanceof Promise) await relief;
+        continue;
+      }
+      // The complete simultaneous minimum is every byte held through the wait plus the
+      // deficit: retained inputs, protected floors and the active merge are not free for
+      // this step. Above capacity the wait could never be served; refuse it (53200).
+      // Loan-backed bytes come from the shared reserve, as in the governor's own room check.
+      const complete =
+        desired.reduce((sum, bytes) => sum + bytes, 0) + (this.#mergeActive?.held ?? 0);
+      const loaned =
+        accounts.reduce((sum, account) => sum + account.loaned, 0) +
+        (this.#mergeActive?.loaned ?? 0);
+      const ordinary = this.governor.capBytes - this.governor.reserveBytes;
+      if (complete > this.governor.capBytes)
+        throw new MemoryAdmissionError(
+          `complete grow ${grant.label}`,
+          complete,
+          this.governor.capBytes,
+        );
+      if (!includesProgress && complete - loaned > ordinary)
+        throw new MemoryAdmissionError(`complete grow ${grant.label}`, complete - loaned, ordinary);
       // Dormant row, WAL, metadata and merge forecasts are all revocable. Admit
       // the next phase together instead of waiting for a deficit while holding
       // another owner's progress hostage. A live step's prepaid buffers stay owned.

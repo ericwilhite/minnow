@@ -59,7 +59,16 @@ bytes stay with their owner. Storage can take retained buffers from these native
 there is no second allocation counter that can become stale after a takeover.
 
 Additional growth first transfers idle row estimates, then requests ordinary admission
-with cancellation. Closing the writer cancels pending growth before releasing its inputs.
+with cancellation. Before it would wait, the owner's bound relief spills or unwinds dependent
+live state (the engine releases its pooled arenas), and idle forecasts are returned. Every byte
+still held through the wait (live allocations, loans, protected floors and an active merge)
+belongs to the step's complete minimum together with the deficit. When that complete minimum
+exceeds the cap (or ordinary capacity, net of loans, for a step without private progress),
+growth refuses at once with the typed 53200 `MemoryAdmissionError`; it never queues a request
+that could only be served by freeing its own inputs. A background merge refused this way is
+retried once and then left unmerged, without failing the write path.
+`live-growth.test.ts` and `testing/write-retained-merge.test.ts` generate owners with
+substantial live rows and merges beside retained readers. Closing the writer cancels pending growth before releasing its inputs.
 Metadata allocation distinguishes an individual object larger than the whole cap from
 transient pressure: only the former is a typed size refusal. A metadata parse still has
 to fit as one step; this does not add a new stored format or a streaming manifest parser.

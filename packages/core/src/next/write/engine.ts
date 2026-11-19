@@ -889,6 +889,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
         : credits.reclaimRows();
     };
     grant.onReclaimRequest(reclaimWriter);
+    // Before any growth wait: pooled arenas are live but dependent (rebuilt on demand), so
+    // they are released rather than kept through the wait. Memtable rows, cached run
+    // readers and in-flight buffers remain required inputs counted in the complete minimum.
+    credits.bindLiveRelief(() => {
+      if (engine !== null) engine.#arenaPool.clear();
+    });
     metadataGrant.onReclaimRequest(() => {
       const retire = () =>
         engine !== null && engine.#canRetireIdleForecasts()

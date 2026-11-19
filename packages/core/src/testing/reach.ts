@@ -11535,6 +11535,41 @@ export const WRITE_DONATED_METADATA_REACH = [
   "zero final charge",
 ] as const;
 
+export const WRITE_LIVE_GROWTH_REACH = [
+  "each step fits alone",
+  "steps cannot fit with peers' retained rows",
+  "every owner keeps rows",
+  "some owners keep rows",
+  "live rows spilled before waiting",
+  "growth waited",
+  "growth funded at once",
+  "two owners",
+  "three owners",
+  "four owners",
+  "all owners complete",
+  "zero final charge",
+] as const;
+
+export const WRITE_RETAINED_MERGE_REACH = [
+  "required metadata retained",
+  "merge alone fills the cap",
+  "merge alone fits",
+  "exact whole cap",
+  "below whole cap",
+  "zero final charge",
+] as const;
+
+export const WRITE_RETAINED_MERGE_ENGINE_REACH = [
+  "merge readers retained at admission",
+  "oversized merge refused with 53200",
+  "fitting merge completes",
+  "exact rows after maintenance",
+  "cap 32 MiB",
+  "cap 64 MiB",
+  "cap 128 MiB",
+  "zero final charge",
+] as const;
+
 export const WRITE_PRIVATE_MERGE_REACH = [
   "complete step exceeds ordinary capacity",
   "whole cap admitted without loan",
