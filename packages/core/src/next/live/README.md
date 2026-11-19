@@ -106,8 +106,8 @@ That native minimum interaction is not claimed fixed here.
 
 The first runtime re-executes affected SELECTs. It does not promise 0.x incremental-maintenance
 performance or merge adapter result transforms. Native table-level proofs are conservative;
-column/key-range exclusion requires additional planner and accepted-effect proof. B6's window
-helper must validate top-level ORDER BY and apply LIMIT/OFFSET before registration; ordinary
+column/key-range exclusion requires additional planner and accepted-effect proof. The private Kysely
+window helper validates top-level ORDER BY and applies LIMIT/OFFSET before registration; ordinary
 SQL LIMIT/OFFSET executes natively and `LiveRows.maxRows` rejects oversized decoded windows.
 Trigger/RI writers enter the same surviving undo stream. Full trigger firing qualification
 remains with the tracks enabling it; the FTS test here qualifies the native scan/fallback path.
@@ -160,3 +160,61 @@ fail with `MINNOW_DATABASE_REPLACED`; explicitly reopen the client to read the r
 No mutation is retried under a new identity. Its first ready snapshot is a full reset with no
 old rekey notices. This terminal reset differs from transparent owner-generation reconnect,
 which keeps the durable database identity and re-subscribes with a fresh read.
+
+## Private receiving bindings
+
+`owner/live-store.ts` connects canonical `Result` decoding to `NativeLiveState` and `LiveRows`.
+`MinnowDatabaseClient.liveQuery` owns store shutdown; the private React helper supplies this
+store to the existing structural hooks, and Kysely compiles SELECTs and applies configured
+native decoding and the supplied database's result plugins. No package exports are switched.
+The selected key must preserve the source primary-key value for table-qualified scalar rekeys;
+composite identities reset when they cannot be paired with a scalar result key.
+
+Stores share a finite 64 MiB receiving account per ProtocolClient; memoryBytes can impose a
+stricter local cap. Source capture and diagnostics are prepaid. Result decode/copies and retained
+rows/diffs are admitted before ownership. Adapter-private allocations and caller-retained
+snapshots are caller-owned. One active decoder and coalesced protocol replacement bound pending
+work, including reconnect and unsubscribe/re-subscribe. Close cancels then drains before freeing
+credit. Async iteration has one latest dirty state and one pending next; concurrent next rejects.
+
+Native final-update seeds8894/8895 pass in the current stack above84d10cff with their original
+64MiB caps and final-update assertions. The earlier bare8c8385b8 admission-stall evidence remains
+recorded with the B7 writer/retention and B9 sizing owners; no general native-admission fix is
+claimed here. The bindings do not poll or alter admission.
+
+Each receiving iterator establishes its own full-snapshot baseline. If unread states
+coalesce, its next ready value is an explicit reset with no stale changes/rekey notices.
+Only baseline/gap flags and one pending next are retained, never a row-history queue.
+React renders use full rows because batching can skip source publications.
+
+The receiving source captures wire parameter arrays once, with admitted scalar/Date/
+array/typed-buffer copies. Intrinsic backing capacity includes caller-shadowed views.
+Key/table metadata is charged. Keyed no-op publications clear prior differences while
+retaining a fresh raw canonical Result independently of adapter rows.
+
+Receiving bindings attach the terminal reset hook: they abort the active decoder, retire
+rows/patches/rekey baselines, and publish a stable `MINNOW_DATABASE_REPLACED` error with
+empty rows and no old version. Late decoding cannot reinstall the old baseline. A fresh
+store on an explicitly reopened client begins with a full snapshot. Decoder credit remains
+charged until cancellation drains; `close()` fences that cleanup before returning.
+
+Row sizing and binary equality read intrinsic backing capacity, offsets and lengths. A decoder
+can shadow `.buffer` or a buffer's `.byteLength`; those fields cannot hide owned clone capacity
+or make changed binary contents compare equal. Copies of supported binary values, including
+previous rows retained by a diff, remain admitted before ownership.
+
+Canonical result headers are part of the receiving admission even for zero-row results.
+Column labels and SQL type metadata cannot bypass a store's cap through an empty payload.
+
+Decoded row graphs use enumerable data properties with SQL scalars, Dates, binary values,
+arrays and plain records. Accessor properties and custom host/class objects are rejected
+before cloning; a getter cannot substitute a larger value after sizing. Materialize custom
+models in the adapter transform. Its private allocations remain caller-owned.
+
+Adapter decoding receives a separate admitted copy of metadata and frame buffers. Mutating
+a plugin row or binary value cannot change the independently retained canonical `Result`.
+The raw result keeps native labels, types and exact values; adapted rows use their own baseline.
+
+Binary receiver data uses non-shared ArrayBuffers. `structuredClone` aliases shared storage,
+so SharedArrayBuffer views are rejected before copying; materialize them with
+`Uint8Array.from(view)` in the decoder when needed. Ordinary SQL wire buffers are non-shared.

@@ -53,11 +53,23 @@ export class NativeLiveState<R> {
     if (this.#closed || this.#snapshot.status === "loading") return;
     this.#publish(Object.freeze({ status: "loading", rows: this.#snapshot.rows }));
   }
-  ready(rows: readonly R[], version: number, reset: boolean): void {
+  ready(rows: readonly R[], version: number, reset: boolean, resultChanged = false): void {
     if (this.#closed) return;
-    if (this.#snapshot.status === "ready" && this.#snapshot.rows === rows && !reset) return;
+    if (
+      this.#snapshot.status === "ready" &&
+      this.#snapshot.rows === rows &&
+      !reset &&
+      !resultChanged
+    )
+      return;
     this.#version = version;
     this.#publish(Object.freeze({ status: "ready", rows, version, reset }));
+  }
+  /** A database incarnation change retires every row and the prior version. */
+  reset(error: unknown): void {
+    if (this.#closed) return;
+    this.#version = null;
+    this.#publish(Object.freeze({ status: "error", rows: LOADING.rows, version: null, error }));
   }
   error(error: unknown): void {
     if (this.#closed) return;

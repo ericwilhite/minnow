@@ -3,6 +3,7 @@ import { dateMilliseconds } from "../../date-value.js";
  * result decoder. Explicit resets never invent identity continuity across a missing history.
  */
 import type { ByteBudget } from "../storage/extents.js";
+import { liveBinaryCapacity, liveBinaryView } from "./binary.js";
 import { MemoryAdmissionError, bigintBytes, stringBytes } from "../memory-values.js";
 
 export type LiveKey = string | number | boolean | bigint | Date;
@@ -78,15 +79,9 @@ export function sameLiveValue(left: unknown, right: unknown): boolean {
   const rightBytes = right instanceof ArrayBuffer || ArrayBuffer.isView(right) ? right : null;
   if (leftBytes !== null || rightBytes !== null) {
     if (leftBytes === null || rightBytes === null) return false;
-    if (leftBytes.byteLength !== rightBytes.byteLength) return false;
-    const a =
-      leftBytes instanceof ArrayBuffer
-        ? new Uint8Array(leftBytes)
-        : new Uint8Array(leftBytes.buffer, leftBytes.byteOffset, leftBytes.byteLength);
-    const b =
-      rightBytes instanceof ArrayBuffer
-        ? new Uint8Array(rightBytes)
-        : new Uint8Array(rightBytes.buffer, rightBytes.byteOffset, rightBytes.byteLength);
+    const a = liveBinaryView(leftBytes),
+      b = liveBinaryView(rightBytes);
+    if (a.byteLength !== b.byteLength) return false;
     return a.every((value, i) => value === b[i]);
   }
 
@@ -103,14 +98,26 @@ function bytesOf(value: unknown): number {
   if (typeof value === "string") return stringBytes(value);
   if (typeof value === "bigint") return bigintBytes(value);
   if (value === null || typeof value !== "object") return 16;
-  if (value instanceof ArrayBuffer) return 128 + value.byteLength;
-  // structuredClone retains the whole backing store, even for a one-byte view.
-  if (ArrayBuffer.isView(value)) return 128 + value.buffer.byteLength;
+  // structuredClone retains intrinsic backing capacity, including shadowed properties.
+  if (value instanceof ArrayBuffer || ArrayBuffer.isView(value))
+    return 128 + liveBinaryCapacity(value);
+  if (value instanceof Date) {
+    dateMilliseconds(value);
+    return 128;
+  }
+  const prototype = Object.getPrototypeOf(value) as object | null;
+  if (!Array.isArray(value) && prototype !== Object.prototype && prototype !== null)
+    throw new TypeError("Live rows need plain records for object values");
   let bytes = 128;
-  for (const key of Object.keys(value))
-    bytes += stringBytes(key) + bytesOf(Reflect.get(value, key));
+  for (const key of Object.keys(value)) {
+    const field = Object.getOwnPropertyDescriptor(value, key);
+    if (field === undefined || !Object.hasOwn(field, "value"))
+      throw new TypeError("Live rows need data properties");
+    bytes += stringBytes(key) + bytesOf(field.value);
+  }
   return bytes;
 }
+export { bytesOf as liveValueBytes };
 
 /** A charged retained key index and snapshot; no delivery queue. On refusal, the old baseline
  * remains intact. The caller owns any snapshots it retains after replacement or close(). */

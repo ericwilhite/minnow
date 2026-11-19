@@ -121,8 +121,15 @@ for (const seed of seedsFor("next-native-kysely", [46956, 46957]))
               await decoded.destroy();
             }
             reach.reach("explicit decoding");
-            expect(() => nativeLiveQuery()).toThrow("not yet bound");
-            reach.reach("live unbound");
+            const live = nativeLiveQuery({ driver: native, db });
+            const window = live.window(db.selectFrom("t").selectAll().orderBy("id"), {
+              key: "id",
+              limit: 2,
+            });
+            await window.refresh();
+            expect(window.getSnapshot().rows).toEqual(expected.slice(0, 2));
+            await live.close();
+            reach.reach("live bound");
           } finally {
             await db.destroy();
             await native.close();

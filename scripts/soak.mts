@@ -28,6 +28,36 @@ interface Suite {
 /** Every suite whose corpus is generated from a seed. A suite with a fixed corpus gains nothing here. */
 const SUITES: Suite[] = [
   {
+    name: "next-live-store-canonical",
+    file: "packages/core/src/next/testing/live-store-canonical.test.ts",
+  },
+  { name: "next-live-store-data", file: "packages/core/src/next/testing/live-store-data.test.ts" },
+  {
+    name: "next-live-store-metadata",
+    file: "packages/core/src/next/testing/live-store-metadata.test.ts",
+  },
+  {
+    name: "next-live-store-reset",
+    file: "packages/core/src/next/testing/live-store-reset.test.ts",
+  },
+  {
+    name: "next-live-store-account",
+    file: "packages/core/src/next/testing/live-store-binding.test.ts",
+  },
+  {
+    name: "next-live-store-capture",
+    file: "packages/core/src/next/testing/live-store-binding.test.ts",
+  },
+  { name: "next-native-kysely-live", file: "packages/kysely/next/src/live.test.ts" },
+  {
+    name: "next-live-store-binding",
+    file: "packages/core/src/next/testing/live-store-binding.test.ts",
+  },
+  {
+    name: "next-live-store-disposal",
+    file: "packages/core/src/next/testing/live-store-binding.test.ts",
+  },
+  {
     name: "next-live-snapshot-import",
     file: "packages/core/src/next/testing/live-snapshot-import.test.ts",
   },

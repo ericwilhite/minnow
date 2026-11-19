@@ -1,4 +1,9 @@
-/** Internal cutover entry: the structural hooks are unchanged; B8 live creation is not bound. */
+/** Internal cutover entry. Published exports remain held. */
+import type { Param, Row } from "../../../core/dist/next/owner/api.js";
+import type {
+  NativeLiveDriver,
+  NativeLiveOptions,
+} from "../../../core/dist/next/owner/live-store.js";
 export { useLiveQuery, useLiveSelector, useSuspenseLiveQuery } from "../../dist/index.js";
 export type {
   LiveExternalStore,
@@ -8,7 +13,12 @@ export type {
   SettledLiveSnapshot,
 } from "../../dist/index.js";
 
-/** The eventual finite-credit live-store bridge belongs here, never a polling substitute. */
-export function nativeLiveStore(): never {
-  throw new Error("Native React live stores are not yet bound");
+/** The existing hooks consume the native store directly, including Suspense refresh sharing. */
+export function nativeLiveStore<R extends object = Row>(
+  driver: NativeLiveDriver,
+  sql: string,
+  params: readonly Param[] = [],
+  options: NativeLiveOptions<R> = {},
+) {
+  return driver.liveQuery<R>(sql, params, options);
 }
