@@ -4961,6 +4961,11 @@ cancellation; an intrinsic compound minimum above the selected capacity fails wi
 Ordinary funding preserves the governor reserve. Only an already-proven complete private
 progress step may use the existing whole-cap mode.
 
+Immediate growth can preserve warm WAL and merge windows when free credit funds the step.
+Before any queued admission, growth nets all unused forecasts and surrenders dormant
+working floors; a warm window never pins credit while waiting. This also lets keyed FTS
+invalidations append without waiting for an unrelated held root publication.
+
 Idle readers can retire every unused account forecast. The next native producer re-admits
 its row, publication, WAL and merge companion minima in one request before publishing a
 witness; it never reports donated credit as still owned. Completed recovery scan credit is

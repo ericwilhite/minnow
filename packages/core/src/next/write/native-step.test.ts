@@ -1,7 +1,7 @@
 /** NativeWriteStepBoundary/WriteCredits contract: account the actual joint owner once,
  * preserve prepaid primary progress, and reject a stale witness before root allocation. */
 import fc from "fast-check";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach, NATIVE_WRITE_STEP_CREDIT_REACH } from "../../testing/reach.js";
 import { Governor } from "../memory/governor.js";
@@ -141,7 +141,16 @@ for (const seed of seedsFor("next-native-write-owner-credit", [0xb715, 0xb716]))
             });
             boundary.check();
             expect(boundary.protectedWriteBytes).toBe(expected + newer - headroom);
-            await credits.growTo(credits.rows, credits.rows.held + units * 64, stop.signal);
+            // Keep the native metadata step live and inject a non-waiting growth
+            // refusal, forcing an unchanged-floor WAL transfer on the cold pass.
+            credits.bindWorkingMinimum(() => ({ metadata: credits.metadata.held }));
+            const immediate = vi.spyOn(credits.rows, "tryGrow").mockReturnValue(false);
+            try {
+              await credits.growTo(credits.rows, credits.rows.held + units * 64, stop.signal);
+            } finally {
+              immediate.mockRestore();
+              credits.bindWorkingMinimum(() => ({}));
+            }
             expect(
               boundary.invalidated.aborted,
               "transferred credit invalidates even an unchanged protected floor",

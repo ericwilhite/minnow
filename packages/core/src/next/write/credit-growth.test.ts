@@ -2,7 +2,11 @@
 import fc from "fast-check";
 import { expect, it, vi } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
-import { createReach, NATIVE_WRITE_GROWTH_REACH } from "../../testing/reach.js";
+import {
+  createReach,
+  NATIVE_WRITE_GROWTH_REACH,
+  WRITE_WARM_CREDIT_REACH,
+} from "../../testing/reach.js";
 import { Governor, type Grant } from "../memory/governor.js";
 import { yieldTask } from "../task.js";
 import { WriteCredits } from "./credits.js";
@@ -173,3 +177,80 @@ for (const seed of seedsFor("next-native-write-growth", [0xb7a5, 0xb7a6]))
       reach.assertReached();
     },
   );
+
+// Warm forecasts may survive a non-waiting admission, but never a queued one.
+for (const seed of seedsFor("next-write-warm-credit", [47253, 47254]))
+  it(`preserves warm windows only while immediate credit fits (seed ${String(seed)})`, async () => {
+    const reach = createReach("warm native credit", WRITE_WARM_CREDIT_REACH);
+    await fc.assert(
+      fc.asyncProperty(
+        fc.constantFrom("rows" as const, "metadata" as const),
+        fc.integer({ min: 1, max: 4 }),
+        async (kind, units) => {
+          reach.beginHistory();
+          const governor = new Governor(32 * MiB);
+          const credits = await WriteCredits.open(governor, {
+            rows: MiB,
+            metadata: MiB / 4,
+            commits: 6 * MiB,
+            merge: MiB,
+          });
+          const target = credits[kind];
+          let holder: Grant | undefined;
+          let buffer: Uint8Array | undefined, competing: Uint8Array | undefined;
+          const queue = vi.spyOn(governor, "admitGroup");
+          try {
+            await credits.growTo(target, 3 * MiB + units * 1024);
+            expect(credits.commits.held, "warm WAL credit survives immediate growth").toBe(6 * MiB);
+            expect(credits.merge.held).toBe(MiB);
+            expect(queue).not.toHaveBeenCalled();
+            reach.reach("warm WAL and merge preserved");
+            const live = target.held;
+            expect(target.allocate(live)).toBe(true);
+            buffer = new Uint8Array(live).fill(73);
+            holder = await governor.admit({
+              label: "real warm-credit competitor",
+              minimumBytes: 0,
+              spillable: true,
+            });
+            const spare = governor.capBytes - governor.reserveBytes - governor.usedBytes;
+            expect(holder.tryGrow(spare)).toBe(true);
+            expect(holder.allocate(spare)).toBe(true);
+            competing = new Uint8Array(spare).fill(41);
+            await credits.growTo(target, live + units * 65536);
+            expect(
+              credits.commits.held,
+              "cold transfer donates dormant WAL before any wait",
+            ).toBeLessThan(6 * MiB);
+            expect(queue).not.toHaveBeenCalled();
+            expect(buffer.at(-1)).toBe(73);
+            expect(competing.at(-1)).toBe(41);
+            expect(governor.peakBytes).toBeLessThanOrEqual(governor.capBytes);
+            reach.reach("cold forecasts transferred before wait");
+            reach.reach("real buffers retained");
+            reach.reach(kind);
+          } finally {
+            queue.mockRestore();
+            // eslint-disable-next-line no-useless-assignment -- drop buffers before refunding ownership
+            buffer = competing = undefined;
+            holder?.free(holder.allocated);
+            holder?.close();
+            target.free(target.allocated);
+            credits.close();
+          }
+          expect(governor.usedBytes).toBe(0);
+          reach.reach("zero final charge");
+        },
+      ),
+      {
+        seed,
+        numRuns: 8,
+        examples: [
+          ["rows", 1],
+          ["metadata", 4],
+        ],
+        endOnFailure: true,
+      },
+    );
+    reach.assertReached();
+  });

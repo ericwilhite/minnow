@@ -11614,3 +11614,13 @@ export const WRITE_MEMTABLE_OWNERSHIP_ORACLE_REACH = [
   "actual ownership accepted",
   "unfunded ownership rejected despite spare credit",
 ] as const;
+
+/** Non-waiting warm credit never becomes a hold-and-wait dependency. */
+export const WRITE_WARM_CREDIT_REACH = [
+  "warm WAL and merge preserved",
+  "cold forecasts transferred before wait",
+  "real buffers retained",
+  "rows",
+  "metadata",
+  "zero final charge",
+] as const;

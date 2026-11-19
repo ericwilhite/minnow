@@ -402,40 +402,46 @@ export class WriteCredits {
       }
       desired[target] = Math.max(desired[target] ?? 0, wanted);
       desired[1] = Math.max(desired[1] ?? 0, metadata);
-      // Net this owner's idle accounts before requesting anybody else's memory.
-      // Unused row estimates go first; keep the bounded WAL/merge progress
-      // windows warm until this actual step needs their credit.
-      for (let i = 0; i < accounts.length; i++) {
-        const targetAccount = accounts[i];
-        if (!targetAccount) continue;
-        for (const j of [0, 2, 3, 1]) {
-          const source = accounts[j];
-          if (!source || i === j) continue;
-          const missing = Math.max(0, (desired[i] ?? 0) - targetAccount.held);
-          if (missing === 0) break;
-          const spare = Math.max(0, source.held - (desired[j] ?? 0));
-          const moved = Math.min(missing, spare);
-          if (moved > 0 && !this.governor.transferCredit(source, targetAccount, moved))
-            throw new Error("Idle native phase credit was not transferred");
-          if (moved > 0 && source === this.metadata) this.#trimMetadataHeadroom();
+      // First preserve warm WAL/merge windows when immediate credit can fund
+      // this step. Before ANY wait, retry with every unused forecast available;
+      // retaining a warm window must never turn into hold-and-wait.
+      for (let pass = 0; pass < 2; pass++) {
+        for (let i = 0; i < accounts.length; i++) {
+          const targetAccount = accounts[i];
+          if (!targetAccount) continue;
+          for (const j of [0, 2, 3, 1]) {
+            const source = accounts[j];
+            if (!source || i === j) continue;
+            const missing = Math.max(0, (desired[i] ?? 0) - targetAccount.held);
+            if (missing === 0) break;
+            let retained = desired[j] ?? 0;
+            if (pass === 0 && j === 2) retained = Math.max(retained, this.minimum.commits);
+            if (pass === 0 && j === 3)
+              retained = Math.max(retained, this.minimum.merge - (this.#mergeActive?.held ?? 0));
+            const spare = Math.max(0, source.held - retained);
+            const moved = Math.min(missing, spare);
+            if (moved > 0 && !this.governor.transferCredit(source, targetAccount, moved))
+              throw new Error("Idle native phase credit was not transferred");
+            if (moved > 0 && source === this.metadata) this.#trimMetadataHeadroom();
+          }
         }
-      }
-      if (
-        grant.held >= wanted &&
-        this.metadata.held >= metadata &&
-        (!nativeMinimum || this.#nativeReady())
-      ) {
-        this.#rememberFundedMetadata(grant, wanted, metadata, funding);
-        return;
-      }
-      if (
-        (!nativeMinimum || this.#nativeReady()) &&
-        this.metadata.held >= metadata &&
-        grant.tryGrow(Math.max(0, wanted - grant.held))
-      ) {
-        this.#changed?.(true);
-        this.#rememberFundedMetadata(grant, wanted, metadata, funding);
-        return;
+        if (
+          grant.held >= wanted &&
+          this.metadata.held >= metadata &&
+          (!nativeMinimum || this.#nativeReady())
+        ) {
+          this.#rememberFundedMetadata(grant, wanted, metadata, funding);
+          return;
+        }
+        if (
+          (!nativeMinimum || this.#nativeReady()) &&
+          this.metadata.held >= metadata &&
+          grant.tryGrow(Math.max(0, wanted - grant.held))
+        ) {
+          this.#changed?.(true);
+          this.#rememberFundedMetadata(grant, wanted, metadata, funding);
+          return;
+        }
       }
       this.#changed?.(true);
       // Dormant row, WAL, metadata and merge forecasts are all revocable. Admit
