@@ -131,6 +131,21 @@ larger than the entire cap gets the typed `MetadataAllocationTooLargeError` size
 Reclaim preserves both allocated bytes and outstanding loans; it never frees a reader's live buffers.
 `write/metadata-pressure.test.ts` generates reader-held memory through flush, staging, merges
 and durable reopen on memory and simulated IndexedDB.
+The admitted metadata step includes the keeper's complete decoded/output list-page
+window (`256 * LIST_PAGE_EXTENTS`, 1 MiB at the native page size), alongside the run
+encoder, root and directory buffers it overlaps. Reclaim returns only credit above that
+minimum. Maintenance therefore does not depend on a preceding flush's unused high-water
+credit after a competing execution takes the free capacity.
+At the next admission boundary, an attempt may have published successfully or aborted.
+Both are settled under `ExtentWriter`'s lifecycle contract. Pressure tests require no
+unpublished writer bytes or releases still in flight; they reject open, publishing and
+indeterminate attempts. Publication does not excuse fresh admission while retaining
+provisional ownership. The original six-insert pressure histories still reach actual growth
+with real competing buffers, exact durable rows, and a zero final charge.
+`write/low-cap-minimum.test.ts` generates both warm and native-reclaimed metadata routes,
+keeps all 40 original generated scenarios per seed, and checks exact current/reopened rows over memory
+and IndexedDB. Its explicit examples include the coverage regression and its reduction.
+
 Extent-list preparation and `GroupWriter` page buffers use that metadata budget too:
 reclaimed idle row credit is never mistaken for prepaid publication workspace. Only the
 keeper's internal metadata-pressure request can reach the outer retry; genuine external

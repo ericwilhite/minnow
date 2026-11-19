@@ -1,3 +1,4 @@
+import { LIST_PAGE_EXTENTS } from "../storage/extent-list.js";
 import { WRITER_OWNERSHIP_STEP_BYTES } from "../storage/writer-inventory.js";
 /** Bounds one publication from its actual schema, directories and pending inputs (governor rule 3). */
 import { FTS_PUBLICATION_MINIMUM_BYTES } from "./fts-minimum.js";
@@ -91,6 +92,8 @@ export function writeStepMinimum(
           ? FTS_PUBLICATION_MINIMUM_BYTES
           : 0,
         WRITER_OWNERSHIP_STEP_BYTES +
+          // The keeper's decoded/output list-page window overlaps run/root buffers.
+          256 * LIST_PAGE_EXTENTS +
           RUN_ENCODER_MINIMUM +
           (keyBytes > 2048 ? 8 * keyBytes : 0) +
           4096 +

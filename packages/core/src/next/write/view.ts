@@ -626,12 +626,21 @@ function decodeInto(
     stored.type.kind === "array"
       ? reader.varlenBytes(from, to)
       : 0;
+  const output = out.flat.data;
+  const integerRepresentation =
+    output.layout === "int64"
+      ? output.values.repr
+      : output.layout === "interval"
+        ? output.micros.repr
+        : "safe";
   const temp: FlatVector = {
     form: "flat",
     type: stored.type,
     length: 0,
     validity: stored.statistics.nullCount === 0 ? null : new Uint32Array(Math.ceil(count / 32)),
-    data: allocateData(stored.type, count, varlenBytes),
+    // Preserve the caller's admitted lane, including a full-width destination for safe
+    // pages. copyFlat requires matching representations and never narrows integer words.
+    data: allocateData(stored.type, count, varlenBytes, integerRepresentation),
   };
   reader.decodeRange(from, to, temp, 0);
   temp.length = count;
@@ -680,8 +689,11 @@ function copyFlat(source: FlatVector, target: FlatVector, count: number): void {
       break;
     case "int64": {
       const tv = (t as typeof s).values;
-      if (tv.repr !== s.values.repr) throw new TypeError("Output int64 representation differs");
-      (tv.values as Float64Array).set(s.values.values.subarray(0, count) as Float64Array);
+      if (tv.repr === "safe" && s.values.repr === "safe")
+        tv.values.set(s.values.values.subarray(0, count));
+      else if (tv.repr === "int64" && s.values.repr === "int64")
+        tv.values.set(s.values.values.subarray(0, count));
+      else throw new TypeError("Output int64 representation differs");
       break;
     }
     default:

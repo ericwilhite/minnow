@@ -12,6 +12,19 @@ compatibility policy and release process.
 
 The unexported 1.0 rebuild reserves wide sort merge workspace independently of source batch size, including encoded keys and the `WITH TIES` boundary row when a competing query forces a smaller source recipe.
 
+The private 1.0 writer preserves exact BIGINT values when updating or deleting persisted
+rows, including primary and unique keys and RETURNING results. Cached memory readers keep
+the caller's full-width integer buffers after publication. Values across the signed 64-bit
+range survive WAL replay and reopen. Released 0.x behavior is unchanged; no stored-format
+change or migration is required.
+
+The private 1.0 writer now reserves the complete extent-list page workspace before native
+maintenance. A competing execution can keep its admitted memory after unused metadata credit
+is reclaimed, without forcing maintenance to ask for more. Released 0.x behavior is unchanged;
+no stored-format change or migration is required.
+The writer may finish a prepaid publication before waiting for the next phase's memory;
+published state keeps its owning charge, and provisional work must be fully settled first.
+
 The private 1.0 storage writer keeps space statistics exact while aborting a write,
 including when releasing part of its reserved space fails. Idle maintenance can read
 those statistics without a reservation error. Released 0.x behavior is unchanged;
