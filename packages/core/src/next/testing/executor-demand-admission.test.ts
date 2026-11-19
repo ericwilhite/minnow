@@ -18,6 +18,8 @@ import { oracleRows } from "./differential-adapter.js";
 import { ints, texts } from "../write/test-support.js";
 import type { FlatVector } from "../vector/vector.js";
 import { StorageCore } from "./storage-core.js";
+import { allocationAudit } from "./allocation-audit.js";
+import { OutputArena } from "../exec/kernels/vectors.js";
 
 /** Observe charged allocations separately from unused admitted credit. */
 function measure(governor: Governor) {
@@ -29,25 +31,29 @@ function measure(governor: Governor) {
     for (const grant of active) used += grant.allocated;
     peak = Math.max(peak, used);
   };
+  const prototypes = new WeakSet(),
+    retire: Array<() => void> = [];
   const meter = (grant: Grant | null): Grant | null => {
     if (grant === null || active.has(grant) || grant.label === "demand competitor") return grant;
     active.add(grant);
-    const allocate = grant.allocate.bind(grant),
-      free = grant.free.bind(grant),
-      close = grant.close.bind(grant);
-    grant.allocate = (bytes) => {
-      const accepted = allocate(bytes);
-      observe();
-      return accepted;
-    };
-    grant.free = (bytes) => {
-      free(bytes);
-      observe();
-    };
-    grant.close = () => {
-      close();
-      observe();
-    };
+    const prototype = Object.getPrototypeOf(grant) as object;
+    if (!prototypes.has(prototype)) {
+      prototypes.add(prototype);
+      for (const name of ["allocate", "free", "close"] as const) {
+        const descriptor = Object.getOwnPropertyDescriptor(prototype, name);
+        if (!descriptor || typeof descriptor.value !== "function") throw Error(`Missing ${name}`);
+        const original = descriptor.value as (...args: unknown[]) => unknown;
+        Object.defineProperty(prototype, name, {
+          ...descriptor,
+          value: function (this: Grant, ...args: unknown[]) {
+            const result = Reflect.apply(original, this, args);
+            observe();
+            return result;
+          },
+        });
+        retire.push(() => Object.defineProperty(prototype, name, descriptor));
+      }
+    }
     return grant;
   };
   const admit = governor.tryAdmit.bind(governor);
@@ -70,6 +76,11 @@ function measure(governor: Governor) {
     get minimum() {
       return minimum;
     },
+    get covered() {
+      let held = 0;
+      for (const grant of active) held += grant.held;
+      return Math.max(minimum, held);
+    },
     get peak() {
       observe();
       return peak;
@@ -77,9 +88,38 @@ function measure(governor: Governor) {
     close: () => {
       spy.mockRestore();
       groups.mockRestore();
+      for (const restore of retire.reverse()) restore();
     },
   };
 }
+
+it("independent backing census rejects allocation without its charge", async () => {
+  const governor = new Governor(8 << 20);
+  const grant = await governor.admit({
+    label: "audit calibration",
+    minimumBytes: 1 << 20,
+    spillable: false,
+  });
+  const audit = allocationAudit(() => grant.held);
+  try {
+    const good = new OutputArena(grant, 16);
+    good.flat({ kind: "int32", bits: 32 });
+    good.close();
+    expect(audit.observedBytes).toBe(68);
+    const take = vi.spyOn(OutputArena.prototype, "take").mockImplementation(() => undefined);
+    const unpaid = new OutputArena(grant, 16);
+    try {
+      expect(() => unpaid.flat({ kind: "int32", bits: 32 })).toThrow("Uncharged backing");
+    } finally {
+      take.mockRestore();
+      unpaid.close();
+    }
+  } finally {
+    audit.close();
+    grant.close();
+  }
+  expect(governor.usedBytes).toBe(0);
+});
 
 it("peak meter excludes unused loan credit and counts its allocated buffers once", async () => {
   const governor = new Governor(8 << 20),
@@ -239,6 +279,7 @@ it.each(seedsFor("next-demand-admission", [0xb9e01, 0xb9e02]))(
               return work instanceof Promise ? work.then(pin) : pin();
             });
             Object.assign(core.harness, { governor });
+            const buffers = allocationAudit(() => observed.covered);
             try {
               const actual = await core.execute(sql, [limit]);
               if (!("batches" in actual)) throw Error("expected rows");
@@ -246,6 +287,7 @@ it.each(seedsFor("next-demand-admission", [0xb9e01, 0xb9e02]))(
               if (limit !== 0) {
                 expect(observed.minimum).toBeGreaterThan(0);
                 expect(observed.peak).toBeGreaterThan(0);
+                expect(buffers.observedBytes).toBeGreaterThan(0);
                 expect(observed.minimum).toBeLessThanOrEqual(4 * observed.peak + (1 << 20));
               }
               expect(governor.peakBytes).toBeLessThanOrEqual(governor.capBytes);
@@ -259,6 +301,8 @@ it.each(seedsFor("next-demand-admission", [0xb9e01, 0xb9e02]))(
                 nulls,
                 minimumBytes: observed.minimum,
                 chargedPeakBytes: observed.peak,
+                observedBackingBytes: buffers.observedBytes,
+                allocationFactories: buffers.summary(),
                 capBytes: governor.capBytes,
               });
               reach.reach("pinned competitor denies optional growth");
@@ -274,6 +318,7 @@ it.each(seedsFor("next-demand-admission", [0xb9e01, 0xb9e02]))(
               if (nulls) reach.reach("nullable input");
               reach.reach("minimum versus charged peak");
             } finally {
+              buffers.close();
               mock.mockRestore();
               competitor.grant?.close();
               observed.close();

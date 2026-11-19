@@ -1203,5 +1203,15 @@
     "All25 current/frozen W1M/S1 and all7 engine gates pending hosted; no mergeable engine commit/global no-regression claim.",
     "00396 data retained separately. B7 scalar/array progress and B5b protected funding retained; read-bound merge preserves complete-source union plus partial-source floor.",
     "Sizing unit initially confused logical valueBytes with source union; corrected from ReadBound contract and independent widths, all40 replayed; failed diagnostic logs retained."
-  ]
+  ],
+  "reviewP2": {
+    "evidence": "scripts/bench-evidence/b9-admission-review-84d-2026-11-19.json",
+    "testOnly": true,
+    "independentBackingHistories": 108,
+    "registeredChecks": 21,
+    "droppedChargeMutantRejected": true,
+    "hostedRun": 44497039678,
+    "hostedCurrentMainNoRegressionCells": 25,
+    "fullGates": "pending hosted; no full-gate claim"
+  }
 }

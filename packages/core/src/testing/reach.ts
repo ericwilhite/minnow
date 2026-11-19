@@ -11660,3 +11660,31 @@ export const EXECUTOR_LEGACY_DEMAND_REACH = [
   "operator requests within reserved capacity",
   "zero final credits",
 ] as const;
+
+/** Independent factory allocations across input/output batch and variable width boundaries. */
+export const EXECUTOR_DEMAND_BOUNDARIES_REACH = [
+  "BYTEA",
+  "JSON",
+  "JSONB",
+  "native",
+  "ties",
+  "distinct",
+  "sql-distinct",
+  "2047",
+  "2048",
+  "2049",
+  "4097",
+  "8193",
+  "DISTINCT returns rows beyond offset",
+  "wide payload",
+  "variable NUMERIC coefficients",
+  "safe coefficient source",
+  "int64 coefficient source",
+  "int128 coefficient source",
+  "LIMIT above batch",
+  "OFFSET crosses batch",
+  "independent backing credit",
+  "pinned pressure",
+  "PGlite exact rows",
+  "zero final credit",
+] as const;
