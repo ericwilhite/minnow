@@ -217,7 +217,17 @@ for (const seed of seedsFor("next-write-warm-credit", [47253, 47254]))
             expect(holder.tryGrow(spare)).toBe(true);
             expect(holder.allocate(spare)).toBe(true);
             competing = new Uint8Array(spare).fill(41);
-            await credits.growTo(target, live + units * 65536);
+            const coldGrowth = vi.spyOn(target, "tryGrow");
+            try {
+              await credits.growTo(target, live + units * 65536);
+              expect(
+                coldGrowth,
+                "internal credit precedes a denied global attempt",
+              ).not.toHaveBeenCalled();
+            } finally {
+              coldGrowth.mockRestore();
+            }
+            reach.reach("no denied growth before internal transfer");
             expect(
               credits.commits.held,
               "cold transfer donates dormant WAL before any wait",

@@ -11619,6 +11619,7 @@ export const WRITE_MEMTABLE_OWNERSHIP_ORACLE_REACH = [
 export const WRITE_WARM_CREDIT_REACH = [
   "warm WAL and merge preserved",
   "cold forecasts transferred before wait",
+  "no denied growth before internal transfer",
   "real buffers retained",
   "rows",
   "metadata",

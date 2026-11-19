@@ -436,6 +436,9 @@ export class WriteCredits {
         if (
           (!nativeMinimum || this.#nativeReady()) &&
           this.metadata.held >= metadata &&
+          (pass === 1 ||
+            wanted - grant.held <=
+              this.governor.capBytes - this.governor.reserveBytes - this.governor.usedBytes) &&
           grant.tryGrow(Math.max(0, wanted - grant.held))
         ) {
           this.#changed?.(true);
