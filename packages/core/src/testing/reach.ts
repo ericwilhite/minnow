@@ -11614,3 +11614,19 @@ export const DIRECTORY_CACHE_LATE_REACH = [
   "complete PostgreSQL rows",
   "all credit returned",
 ] as const;
+
+export const REGEX_INPUT_REACH = [
+  "empty",
+  "one byte",
+  "two bytes",
+  "three bytes",
+  "four bytes",
+  "newline",
+  "offset view",
+  "lone surrogate replacement",
+  "BOM is data",
+  "combining scalar",
+  "long input",
+  "forward and backward",
+  "borrowed buffer",
+] as const;

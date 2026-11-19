@@ -2564,3 +2564,7 @@ The separate `scripts/directory-cache-cpu.mts` benchmark measures native source 
 independent CPU pairs and a same-build control. It verifies full stored rows outside the clock;
 whole-query measurements remain separate. These checks do not publish performance results or
 change the stored format.
+
+The private regex byte-input properties compare borrowed UTF-8 and legacy UTF-16
+scalar traversal in both directions, including offset views and Unicode boundaries.
+They qualify the input contract; native SQL regex execution remains separately gated.
