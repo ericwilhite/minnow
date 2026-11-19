@@ -11521,3 +11521,8 @@ export const GROUP_AGGREGATE_REBASE_REACH = [
   "count record",
   "zero charges",
 ] as const;
+
+export const GROUP_AGGREGATE_NATIVE_INT_REACH = [
+  ...GROUP_AGGREGATE_NATIVE_REACH,
+  "continued writes",
+] as const;
