@@ -3764,6 +3764,7 @@ export const SORT_PROGRESS_PRESSURE_REACH = [
   "with ties boundary row",
   "peer rows across runs",
   "both complete",
+  "queued WITH TIES completes",
   "cancel waiting sort",
   "later admitted sort",
   "zero resources",
@@ -7682,6 +7683,8 @@ export const WRITE_MERGE_RETIREMENT_REACH = [
 ] as const;
 
 export const MODIFY_PROGRESS_REACH = [
+  "first seeded history",
+  "second seeded history",
   "finished merge credit retired",
   "healthy merge completion",
   "64 MiB",
@@ -10151,6 +10154,8 @@ export const NATIVE_RI_COMPOSITE_REACH = [
 ] as const;
 
 export const NATIVE_RI_PRESSURE_REACH = [
+  "commit while competitor retains bytes",
+  "no future merge at commit",
   "rekey",
   "delete",
   "published",
@@ -10275,6 +10280,9 @@ export const NATIVE_INPUT_REACH = [
   "parameters retired before apply",
   "no writes",
   "zero ownership",
+  "no unused modification spool",
+  "multiple probe sort",
+  "single probe already ordered",
 ] as const;
 
 export const NATIVE_BODY_HOST_REACH = [
@@ -11102,4 +11110,192 @@ export const ROOT_SELECTION_DROP_REACH = [
   "exact native inventory",
   "reopen and keep writing",
   "zero final charge",
+] as const;
+
+export const NATIVE_WRITE_STEP_REACH = [
+  "statement requires witness retirement",
+  "true compound size refusal",
+  "temporary pressure waits",
+  "native metadata invalidates funding",
+  "cancellable wait",
+  "owner close cancels funding",
+  "image cannot consume rule workspace",
+  "whole-cap private progress",
+  "ordinary capacity",
+  "32 MiB",
+  "64 MiB",
+  "all ownership retired",
+  "native footprint equals protected holdings",
+  "private native metadata progresses",
+  "ordinary native metadata waits",
+  "optional metadata invalidates funding",
+] as const;
+
+export const NATIVE_WRITE_STEP_BORROW_REACH = [
+  "foreign native chunk waits",
+  "cancel with borrower still live",
+  "borrow release sufficient before snapshot close",
+  "32 MiB",
+  "64 MiB",
+  "all ownership retired",
+  "own locator pin is not foreign pressure",
+  "foreign query pin before owner",
+  "foreign query pin after owner",
+] as const;
+
+export const NATIVE_WRITE_STEP_CREDIT_REACH = [
+  "control charged before retention",
+  "primary floor survives reclaim",
+  "metadata and commit buffers once",
+  "active merge once",
+  "future merge forecast reclaimed",
+  "stale witness rejected before allocation",
+  "fresh boundary after invalidation",
+  "zero ownership",
+  "decrease invalidates for reclaim",
+  "handoff changes restabilized",
+] as const;
+
+export const MUTATION_CANCEL_REACH = [
+  "cancellation awaits owner terminal",
+  "cancelled input never posted",
+  "options signal",
+  "attached signal",
+  "signal",
+  "wire",
+  "wire cancellation identity",
+  "direct",
+  "channel",
+  "before-send",
+  "end",
+  "commit",
+  "after",
+  "committed",
+  "rolled back",
+  "RETURNING",
+  "no RETURNING",
+  "Error reason",
+  "primitive reason",
+  "zero native charge",
+  "RETURNING withheld before commit",
+  "listener retired",
+] as const;
+
+export const MUTATION_OUTCOMES_REACH = [
+  "explicit committed replay",
+  "explicit expiry",
+  "RETURNING split before terminal",
+  "input retained after unknown",
+  "input retired after collection",
+  "cancel intent resent",
+  "read retains reachability error",
+  "typed COMMIT",
+  "SQL COMMIT",
+  "prepared COMMIT",
+  "explicit direct commit",
+  "explicit channel commit",
+  "provisional RETURNING",
+  "direct",
+  "channel",
+  "unknown before commit",
+  "unknown after commit call",
+  "unknown result not decoded",
+  "late cancel ignored",
+  "late cancel rolls back",
+  "late terminal collected",
+  "never sent none",
+  "expired unknown",
+  "committed without result",
+  "committed replay counts",
+  "RETURNING",
+  "no RETURNING",
+  "zero native charge",
+] as const;
+
+export const MUTATION_ERRORS_REACH = [
+  "direct",
+  "channel",
+  "owner prototype protected",
+  "CHECK",
+  "NOT NULL",
+  "registry configuration copied",
+  "Error cause",
+  "DOMException cause",
+  "cause depth bounded",
+  "unicode cause",
+  "zero native charge",
+] as const;
+
+export const NATIVE_PREFIX_MINIMUM_REACH = [
+  "published",
+  "resident",
+  "payload",
+  "empty payload",
+  "protected compound minimum at 32MiB",
+  "no pin across funding",
+  "exact PostgreSQL payload",
+  "zero ownership",
+] as const;
+
+export const NATIVE_PREFIX_MINIMUM_LIFETIME_REACH = [
+  "logical mutation rejected",
+  "cancelled funding",
+  "publication retry preserves prefix",
+  "wider funding boundary",
+  "initial funding boundary",
+  "zero ownership",
+] as const;
+
+export const NATIVE_PREFIX_POINT_RECIPE_REACH = [
+  "owner-charged publication retention",
+  "published",
+  "resident",
+  "second chunk",
+  "third chunk",
+  "exact selected row",
+  "zero ownership",
+] as const;
+
+export const NATIVE_PREFIX_OUTPUT_BOUND_REACH = [
+  "retained",
+  "publication-stable hint",
+  "one row",
+  "several rows",
+  "oversized row",
+  "short source below target",
+  "all shifted prefixes covered",
+  "zero ownership",
+] as const;
+
+export const NATIVE_QUERY_SOURCE_PRESSURE_REACH = [
+  "published",
+  "resident",
+  "one row",
+  "several rows",
+  "compound minimum before admission",
+  "exact PostgreSQL rows",
+  "zero ownership",
+  "indexed order",
+  "plain order",
+  "resident indexed order",
+  "mixed source",
+] as const;
+
+export const NATIVE_INPUT_PROBE_ORDER_REACH = [
+  "single complete key",
+  "multiple probes",
+  "composite prefix",
+  "non-key insertion order",
+  "zero ownership",
+] as const;
+
+export const PROJECTION_ARRAY_STEP_REACH = [
+  "CASE",
+  "COALESCE",
+  "dense",
+  "sparse",
+  "exact encoding",
+  "no payload allocation",
+  "nondefault bounds",
+  "element NULL",
 ] as const;

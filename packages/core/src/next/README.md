@@ -157,6 +157,12 @@ between pieces of the same call; uniqueness, foreign keys and rollback still spa
 statement. `write/batch-admission.test.ts` generates these calls with another real working
 buffer occupying ordinary capacity, over memory and the IndexedDB fake, through durable reopen.
 
+`testing/modify-progress.test.ts` keeps two generated 20,000-row UPDATE/DELETE histories
+per seed at 64 MiB. Each original RNG position has its own 120-second test budget;
+the UPDATE still has its 30-second assertion. The campaign checks both histories,
+their unchanged generated inputs, and the union of producer-retirement, merge-credit,
+row-result and cleanup reach. This partitions the test budget, not the native workload.
+
 `write/low-cap.test.ts` generates loads under 32/48/64 MiB caps over memory and the IndexedDB
 adapter on its fake. It exercises idle estimates, allocated working buffers, active loans,
 merges, metadata growth, exact rows and durable reopen, with declared reach. Its stored rows
@@ -2461,7 +2467,10 @@ shipped-engine or stored-format change.
   The wide complete boundary-row step fits alone at 176 MiB (128 MiB for plain
   sort). `testing/sort-progress-pressure.test.ts` runs the five-TEXT SQL shape, including WITH
   TIES peers across runs, through real lowering/execution at 128 MiB under resident pressure
-  and queued cancellation.
+  and queued cancellation. Native scalar sort admission also measures each physical
+  payload column and encoded key separately: shrinking a source to one-row batches
+  cannot remove merge output or the retained WITH TIES boundary row from its minimum.
+  These widths size workspace without evaluating expressions or borrowing row images.
   Concurrent executions share one immutable snapshot so their physical input and read minimum
   stay the same. A later snapshot may require a different complete minimum. These are liveness
   and correctness checks, not performance acceptance or exhaustive I/O failure injection.
@@ -2643,6 +2652,35 @@ The internal owner client is `ProtocolClient` (`owner/client.ts`). Its explicit 
 API is `exportStream(sql, params?, { session?, windowBytes? })`. It is not a published package API.
 It accepts queries, including queries in a session, and rejects modifying/control statements.
 `query()` and the existing cursor retain their current lifetimes and 1 MiB source target.
+
+Buffered `query`, `send`, prepared `execute` and transaction-control calls accept an
+optional `signal`. Facade-owned call options also identify mutation intent; an
+explicit transaction's statement result remains provisional. An abort before posting
+sends nothing. Once posted, cancellation waits for the owner's terminal reply.
+Only confirmed `MINNOW_CANCELLED` maps back to the original signal reason; a
+successful commit or a different failure keeps its actual outcome. The owner's
+call to `commit()` is the boundary. Cancellation listeners end with the request,
+and cancellation intent survives a resend of its original identity. Manual wire
+cancellation retains `CancelledError`, code `MINNOW_CANCELLED` and SQLSTATE57014.
+No published facade or export map changes here.
+`attachSignal(seq, signal)` binds an already-issued facade task to the same pending
+state; callers combine scope and call signals before binding. The task returned by
+`send` has a separate `retired` promise: keep copied input leases charged until it
+resolves, since a caller Unknown may precede a retry. Retirement means this client
+will not resend that input; it does not prove commitment. `cancel(seq)` records
+intent, so reconnect resends cancellation with the original identity. Typed writes
+and COMMIT (including known SQL/prepared COMMIT) identify mutation intent directly;
+other SQL effect classification belongs to the facade, not a SQL-text guess here.
+A sent classified mutation that becomes unreachable rejects with `OutcomeUnknownError`
+and keeps its wire sequence unresolved for late terminal collection. Late result
+frames return credit without being decoded or retained. A mutation rejected after
+ledger expiry gets `OutcomeUnknownError` with the original typed expiry cause.
+A committed replay with requested RETURNING rows gets `CommittedWithoutResultError`
+and original counts, rather than an empty result or a cancellation reason.
+Never-sent requests retain proven no effect; low-level reads keep their existing
+reachability errors. `ProtocolClientOptions.errorRegistry` copies client-side domain
+prototypes once, with owner builtins protected. Wire code, SQLSTATE, identity fields
+and bounded causes survive rehydration without importing the executor into client.
 
 ```ts
 const stream = client.exportStream("SELECT * FROM t");
@@ -4843,3 +4881,49 @@ awaits, even though the flush holds the publication lock. A checkpoint which omi
 abandons the provisional writer and releases all fresh output. An older coherent checkpoint
 which still contains the table may publish; WAL replay carries the later DROP. Older read
 pins retain their values in both histories. This changes no stored bytes or format selector.
+
+### Native write-owner funding boundary
+
+`StatementImpl.prepareNativeStep(rootBytes, signal, { includesProgress? })` stabilizes
+native storage before the caller funds its next complete root step. The invalidatable
+boundary reports protected row credit, metadata/publication headroom, commit buffers,
+active/permanent merge credit and non-evictable extent storage once. It returns idle
+forecasts and stages eligible rows first. Temporary reader/result pressure waits with
+cancellation; an intrinsic compound minimum above the selected capacity fails with 53200.
+Ordinary funding preserves the governor reserve. Only an already-proven complete private
+progress step may use the existing whole-cap mode.
+
+Keep no image, producer borrow or progress loan across preparation or fresh admission.
+Include retained preparation/rules/parameters and all simultaneous next-step maxima in
+`rootBytes`; exclude the native floor already reported by the boundary. Protect rule and
+image workspace separately. Combine `invalidated` with cancellation only while funding,
+check before admission and allocation, and retire provisional funding before retrying a
+changed boundary. Never replay SQL. Release the boundary before execution/statement end;
+use the command's cancellation signal for execution. This internal API does not enable SQL
+triggers or change the released API or stored format.
+
+Native OLD-image capture starts with descriptor and point-recipe metadata, not a
+publication-worst-case decoder. `TableSnapshot.prepareRead({budget, locator})` retains
+only the selected existing owner-charged memory chunk after funding; an already
+published source uses its group reader. Exact decode growth retries only after the
+recipe, decoder, pin and unused source credit retire. A metadata-only statement phase
+fence prevents fresh funding from rereading a logically changed prefix. Generated
+32MiB compound-owner tests cover exact payloads, cancellation, publication and phase
+invalidation. Memory-source output bounds use the smaller measured logical input,
+with each oversized row still covered in full; shifted-prefix generators check that
+refinement against native hints. Source alternatives also account for a query sharing
+the native writer's governor, without treating temporary pressure as an intrinsic
+refusal. Multi-segment queries prepay the existing mixed-source recipe metadata;
+the single-segment shortcut remains available. Input-only producers do not reserve a second, unused generic modification
+spool. Single complete-key probes use their existing row-ID order; multiple probes
+and composite prefixes keep the bounded locator sort. SQL trigger dispatch remains guarded.
+
+Serialized-array CASE/COALESCE selectors use the same bounded projection progress as
+text and bytes. Their one-row path borrows the original encoded payload, preserving
+shape, bounds and element representation without parsing or an output copy. Array
+casts are certified only when their complete physical element types agree.
+
+Native command statements retain their memory policy across end and commit. Ending
+the command scope must not reintroduce a future background-merge estimate into the
+commit step while another admitted execution retains its workspace. The next live
+statement selects its own policy; actual merge acquisition still funds its full step.

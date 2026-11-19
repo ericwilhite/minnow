@@ -254,7 +254,11 @@ export function boundSource(
             );
             const budget = new SizingBudget(grant, capacity);
             let retry = false,
-              required = capacity;
+              required = capacity,
+              totalOutput = 0,
+              largestOutput = 0,
+              resident = 0,
+              scratch = 0;
             try {
               for (let first = 0; first < rows; first += BATCH_ROWS) {
                 const end = Math.min(BATCH_ROWS, rows - first);
@@ -277,24 +281,15 @@ export function boundSource(
                     hint.rowCount > end - start
                   )
                     throw new RangeError("Memory sizing hint made no bounded progress");
-                  // Every ordinary prefix fits target. A row larger than target forms its
-                  // own prefix and is therefore visited by this pass. Any later sub-prefix
-                  // is bounded by max(target, largest observed oversized row), even when
-                  // a LIMIT or sparse selection changes its start. Native output shapes
-                  // remain valid across publication. Include old/new output overlap and
-                  // conservative descriptor/view/buffer headers in the source minimum.
-                  const output = Math.max(target, hint.outputBytes);
-                  maximum = Math.max(
-                    maximum,
-                    source.stagingBytes +
-                      hint.residentBytes +
-                      hint.scratchBytes +
-                      2 * output +
-                      8192 +
-                      source.columns.length * 4096,
-                  );
+                  // A later prefix cannot exceed the total output measured over this
+                  // logical segment. Clamp that total at target to avoid accumulating
+                  // unused rows or overflowing safe accounting units. Oversized rows
+                  // still form their own prefix and retain their full measured bound.
+                  totalOutput += Math.min(hint.outputBytes, Math.max(0, target - totalOutput));
+                  largestOutput = Math.max(largestOutput, hint.outputBytes);
+                  resident = Math.max(resident, hint.residentBytes);
+                  scratch = Math.max(scratch, hint.scratchBytes);
                   io = Math.max(io, hint.ioBytes);
-                  largestValue = Math.max(largestValue, output);
                   valueBytes = Math.max(valueBytes, hint.outputBytes);
                   start += hint.rowCount;
                   const pause = pauseIfDue(task);
@@ -313,7 +308,20 @@ export function boundSource(
             } finally {
               grant.close();
             }
-            if (!retry) break;
+            if (!retry) {
+              const output = Math.max(totalOutput, largestOutput);
+              maximum = Math.max(
+                maximum,
+                source.stagingBytes +
+                  resident +
+                  scratch +
+                  2 * output +
+                  8192 +
+                  source.columns.length * 4096,
+              );
+              largestValue = Math.max(largestValue, output);
+              break;
+            }
             if (capacity === governor.capBytes)
               throw new MemoryAdmissionError(
                 "read-step/memory-sizing",

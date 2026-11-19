@@ -2,13 +2,20 @@
 import fc from "fast-check";
 import { afterEach, expect, it, vi } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
-import { createReach, PROJECTION_SPLIT_REACH } from "../../testing/reach.js";
+import {
+  createReach,
+  PROJECTION_SPLIT_REACH,
+  PROJECTION_ARRAY_STEP_REACH,
+} from "../../testing/reach.js";
 import { Governor } from "../memory/governor.js";
 import type { ScalarExpr } from "../ir/ir.js";
 import type { Batch } from "../vector/vector.js";
 import * as compiler from "./kernels/compile.js";
-import { OutputArena } from "./kernels/vectors.js";
+import { encodeArrayValue } from "../vector/array-value.js";
+import type { FlatVector } from "../vector/vector.js";
+import { OutputArena, flatOf, slotIndex, isValidSlot } from "./kernels/vectors.js";
 import { BOOL, TEXT, col, texts, numbers, valueAt } from "./kernels/test-support.js";
+import { projectionStep } from "./projection-step.js";
 import { ProjectOperator } from "./filter.js";
 import { DivisionByZeroError } from "./errors.js";
 import type { Operator } from "./pipeline.js";
@@ -218,6 +225,198 @@ it.each(seedsFor("projection-split", [0xb7b3, 0xb7b4]))(
           [80000, false, true, false, false],
           [80000, true, false, true, false],
           [80000, false, false, false, true],
+        ],
+      },
+    );
+    reach.assertReached();
+  },
+  60000,
+);
+
+/** Selectors copy opaque array encodings; they never parse or normalize their elements. */
+it.each(seedsFor("projection-array-step", [47117, 47118]))(
+  "borrows serialized array selectors under competing credit seed%i",
+  async (seed) => {
+    const reach = createReach("projection array step", PROJECTION_ARRAY_STEP_REACH);
+    await fc.assert(
+      fc.asyncProperty(
+        fc.integer({ min: 1, max: 80000 }),
+        fc.boolean(),
+        fc.boolean(),
+        fc.integer({ min: -8, max: 8 }),
+        async (width, sparse, coalesce, lower) => {
+          reach.beginHistory();
+          const type = { kind: "array", element: TEXT } as const;
+          const encoded = (tag: string) =>
+            encodeArrayValue(TEXT, {
+              dimensions: [2],
+              lowerBounds: [lower],
+              elements: [new TextEncoder().encode(tag + "x".repeat(width)), null],
+            });
+          const left = [encoded("a"), null, encoded("c"), null];
+          const right = [encoded("w"), encoded("x"), encoded("y"), encoded("z")];
+          const vector = (values: ReadonlyArray<Uint8Array | null>): FlatVector => {
+            const offsets = new Int32Array(5);
+            let size = 0;
+            for (let i = 0; i < values.length; i++) {
+              offsets[i] = size;
+              size += values[i]?.length ?? 0;
+            }
+            offsets[4] = size;
+            const bytes = new Uint8Array(size),
+              validity = new Uint32Array(1);
+            for (let i = 0; i < values.length; i++) {
+              const value = values[i];
+              if (value) {
+                bytes.set(value, offsets[i]);
+                validity[0] = (validity[0] ?? 0) | (1 << i);
+              }
+            }
+            return {
+              form: "flat",
+              type,
+              length: 4,
+              validity,
+              data: { layout: "varlen", bytes, offsets },
+            };
+          };
+          const batch: Batch = {
+            length: 4,
+            columns: [numbers(BOOL, [1, 0, 1, 0]), vector(left), vector(right)],
+            selection: sparse ? { rows: Uint16Array.of(1, 3), count: 2 } : null,
+          };
+          const expr: ScalarExpr = coalesce
+            ? { op: "call", fn: "coalesce", type, args: [col(1, type), col(2, type)] }
+            : {
+                op: "case",
+                type,
+                branches: [{ when: col(0, BOOL), then: col(1, type) }],
+                otherwise: col(2, type),
+              };
+          // Array casts may change encoded element widths. A same-kind cast is
+          // not a byte-preserving selector unless its full physical type agrees.
+          const cast: ScalarExpr = {
+            op: "cast",
+            type: { kind: "array", element: { kind: "bytes" } },
+            input: col(1, type),
+          };
+          expect(
+            projectionStep(
+              [{ type: cast.type, op: "call", fn: "coalesce", args: [cast, col(2, cast.type)] }],
+              { slots: [] },
+            ),
+          ).toBeNull();
+          expect(
+            projectionStep(
+              [
+                {
+                  op: "case",
+                  type,
+                  branches: [
+                    {
+                      when: {
+                        op: "compare",
+                        cmp: "=",
+                        collation: null,
+                        type: BOOL,
+                        left: col(1, type),
+                        right: col(2, type),
+                      },
+                      then: col(1, type),
+                    },
+                  ],
+                  otherwise: col(2, type),
+                },
+              ],
+              { slots: [] },
+            ),
+          ).toBeNull();
+          const governor = new Governor(16 << 20);
+          const grant = await governor.admit({
+            label: "array selector",
+            minimumBytes: 0,
+            spillable: true,
+          });
+          const competitor = await governor.admit({
+            label: "retained competitor",
+            minimumBytes: 0,
+            spillable: true,
+          });
+          const arena = new OutputArena(grant, 16);
+          let operator: ProjectOperator | undefined,
+            released = 0;
+          const actual: Array<Uint8Array | null> = [];
+          try {
+            operator = new ProjectOperator(
+              [expr],
+              { arena, params: { slots: [] }, input: [BOOL, type, type] },
+              {
+                push: (output) => {
+                  const v = output.columns[0];
+                  if (!v) throw new Error("Missing selected array");
+                  expect(output.selection?.count ?? output.length).toBe(1);
+                  const row = output.selection?.rows[0] ?? 0;
+                  const flat = flatOf(v),
+                    slot = slotIndex(v, row);
+                  if (flat.data.layout !== "varlen") throw new Error("Missing array encoding");
+                  actual.push(
+                    isValidSlot(v, row)
+                      ? flat.data.bytes.slice(flat.data.offsets[slot], flat.data.offsets[slot + 1])
+                      : null,
+                  );
+                  return "ready";
+                },
+                ready: () => Promise.resolve(),
+                finish: () => undefined,
+                abort: () => undefined,
+              },
+              { available: () => 0, signal: new AbortController().signal },
+            );
+            grant.release(grant.held - grant.allocated);
+            const fixed = grant.allocated;
+            expect(
+              competitor.allocate(governor.capBytes - governor.reserveBytes - governor.usedBytes),
+            ).toBe(true);
+            expect(operator.push(batch, { release: () => released++ })).toBe("blocked");
+            await operator.ready();
+            const rows = sparse ? [1, 3] : [0, 1, 2, 3];
+            const expected = rows.map((row) => left[row] ?? right[row]);
+            expect(actual.length).toBe(expected.length);
+            expect(
+              actual.every((value, i) => {
+                const wanted = expected[i];
+                return (
+                  value !== null &&
+                  value.length === wanted?.length &&
+                  value.every((byte, k) => byte === wanted[k])
+                );
+              }),
+            ).toBe(true);
+            expect(released).toBe(1);
+            expect(grant.allocated).toBe(fixed);
+            reach.reach(coalesce ? "COALESCE" : "CASE");
+            reach.reach(sparse ? "sparse" : "dense");
+            reach.reach("exact encoding");
+            reach.reach("no payload allocation");
+            if (lower !== 1) reach.reach("nondefault bounds");
+            reach.reach("element NULL");
+          } finally {
+            operator?.abort(new Error("array step cleanup"));
+            await operator?.closed;
+            arena.close();
+            grant.close();
+            competitor.close();
+            expect(governor.usedBytes).toBe(0);
+          }
+        },
+      ),
+      {
+        seed,
+        numRuns: 12,
+        endOnFailure: true,
+        examples: [
+          [80000, false, false, -1],
+          [80000, true, true, 2],
         ],
       },
     );

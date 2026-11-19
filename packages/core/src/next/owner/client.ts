@@ -29,8 +29,9 @@ import {
  *
  * ## Giving up (connector.ts "unresponsive")
  * `giveUp(detail)`: no owner was reachable for `DEFAULT_UNRESPONSIVE_AFTER_MS`. Every waiting
- * request fails with `OwnerUnreachableError`: effect `none` if it was never sent on any
- * connection, `unknown` if it was sent and never answered. A sent BEGIN or unknown statement
+ * sent classified mutation fails with `OutcomeUnknownError` and keeps its wire seq for late
+ * terminal collection. Other requests use `OwnerUnreachableError`: effect `none` if never sent,
+ * `unknown` if sent and unanswered. Unknown mutation results are discarded, not buffered. A sent BEGIN or unknown statement
  * leaves its session lost, as on a reconnect. New requests fail at once (`none`) until the next
  * connection.
  *
@@ -59,9 +60,13 @@ import {
   CancelledError,
   ConnectionRefusedError,
   OwnerUnreachableError,
+  OutcomeUnknownError,
+  OwnerUnresponsiveError,
+  RequestExpiredError,
   fromWireError,
   ownerErrorRegistry,
 } from "./errors.js";
+import type { ErrorRegistry } from "../../worker-protocol/index.js";
 import {
   StreamDictionaries,
   payloadBytes,
@@ -71,6 +76,7 @@ import {
 } from "./frame.js";
 import {
   DEFAULT_RESULT_WINDOW_BYTES,
+  DEFAULT_UNRESPONSIVE_AFTER_MS,
   RELEASE_DELAY_MS,
   LEASE_RELEASE_FAILURE_CONTEXT,
   PROTOCOL_VERSION,
@@ -134,6 +140,25 @@ export interface ProtocolClientOptions {
   readonly build?: string;
   readonly livenessLock?: string;
   readonly now?: () => number;
+  /** Client-only domain prototypes; copied once. Owner error identities cannot be overridden. */
+  readonly errorRegistry?: ErrorRegistry;
+}
+
+/** Facade-owned effect classification; a statement in an explicit transaction is still
+ * provisional. Cancellation is acknowledged by the owner's terminal reply, never locally. */
+export interface ProtocolCallOptions {
+  readonly signal?: AbortSignal;
+  readonly mutation?: boolean;
+}
+
+/** Caller outcome and retained-input lifetime differ after OutcomeUnknown. */
+export interface ProtocolTask {
+  readonly seq: number;
+  readonly promise: Promise<ClientResult>;
+  /** This client will never resend the input again. Release input leases here, not on
+   * caller rejection. Also resolves on proven never-sent refusal and irreversible close;
+   * retirement alone is NOT proof of commitment. */
+  readonly retired: Promise<void>;
 }
 
 /** Internal bridge for B6's lossless decoder/external store. Delivery is backpressured until
@@ -220,8 +245,15 @@ interface Pending {
   /** The generation of the connection it was last posted on (0: never posted). */
   sentOn: number;
   readonly cursor: CursorQueue | null;
+  signal: AbortSignal | undefined;
+  readonly mutation: boolean;
+  cancelCleanup: (() => void) | null;
+  cancelRequested: boolean;
+  /** Caller got unknown; retain the wire identity, but no longer retain result payloads. */
+  abandoned: boolean;
   readonly resolve: (result: ClientResult) => void;
-  readonly reject: (error: Error) => void;
+  readonly reject: (error: unknown) => void;
+  readonly retire: () => void;
 }
 
 /** Frames waiting for a cursor consumer. Metadata can arrive before a result ends. */
@@ -334,6 +366,7 @@ export class ProtocolClient {
    */
   livenessLock: string;
   readonly #now: () => number;
+  readonly #errors: ErrorRegistry;
   readonly protocol: number;
   readonly #sequencer = new RequestSequencer();
   /** Each session's transaction state, from replies: a non-idle session pins a snapshot. */
@@ -386,6 +419,9 @@ export class ProtocolClient {
     this.livenessLock = options.livenessLock ?? `client:${this.clientId}`;
     this.#now = options.now ?? Date.now;
     this.protocol = options.protocol ?? PROTOCOL_VERSION;
+    const errors = new Map(options.errorRegistry);
+    for (const [name, constructor] of ownerErrorRegistry) errors.set(name, constructor);
+    this.#errors = errors;
   }
 
   /** Requests sent and not yet answered. */
@@ -548,11 +584,14 @@ export class ProtocolClient {
 
   /**
    * No owner was reachable for the unresponsive deadline (connector.ts): every waiting request
-   * fails with `OwnerUnreachableError`, effect `none` if never sent, `unknown` if sent and never
-   * answered. A sent BEGIN or unknown statement leaves its session lost (a cause at its place, as
+   * sent classified mutation fails with `OutcomeUnknownError` without settling its sequence.
+   * Other requests retain `OwnerUnreachableError`, effect `none` if never sent, `unknown` if sent. A sent BEGIN or unknown statement leaves its session lost (a cause at its place, as
    * on a reconnect). New requests fail at once until the next connection.
    */
-  giveUp(detail: string): void {
+  giveUp(
+    detail: string,
+    cause: Error = new OwnerUnresponsiveError(DEFAULT_UNRESPONSIVE_AFTER_MS),
+  ): void {
     if (this.#closed) return;
     this.#unreachable = detail;
     for (const pending of [...this.#pending.values()].sort((a, b) => a.seq - b.seq)) {
@@ -563,7 +602,38 @@ export class ProtocolClient {
         (pending.kind === "begin" || pending.kind === "unknown")
       )
         this.#addCause(pending.session, pending.seq);
-      this.#fail(pending, new OwnerUnreachableError(detail, { sequence: pending.seq, effect }));
+      if (pending.sent && pending.mutation) {
+        if (!pending.abandoned) {
+          pending.abandoned = true;
+          pending.frames.length = 0; // Buffered frames already returned their owner credit.
+          pending.columns = null;
+          pending.dictionaries = new StreamDictionaries();
+          const error = new OutcomeUnknownError("unresponsive", { cause });
+          if (pending.cursor !== null) {
+            if (pending.cursor instanceof ExportQueue) {
+              const window =
+                "result" in pending.body
+                  ? pending.body.result.windowBytes
+                  : DEFAULT_RESULT_WINDOW_BYTES;
+              this.#discardExport(
+                pending.cursor,
+                pending.seq,
+                window,
+                pending.sentOn === this.#generation,
+              );
+              pending.cursor.rejectColumns(error);
+            } else {
+              this.#releaseFrames(pending, pending.cursor.frames);
+              pending.cursor.frames.length = 0;
+            }
+            pending.cursor.error = error;
+            pending.cursor.wake?.();
+          }
+          pending.reject(error);
+          queueMicrotask(() => this.onActivity?.());
+        }
+      } else
+        this.#fail(pending, new OwnerUnreachableError(detail, { sequence: pending.seq, effect }));
     }
   }
 
@@ -799,41 +869,57 @@ export class ProtocolClient {
       readonly session?: number;
       readonly windowBytes?: number;
       readonly wantRows?: boolean;
+      readonly signal?: AbortSignal;
+      readonly mutation?: boolean;
     } = {},
   ): Promise<ClientResult> {
-    return this.#request({
-      t: "statement",
-      session: options.session ?? 0,
-      text: sql,
-      prepared: null,
-      knownColumnsVersion: -1,
-      params,
-      result: {
-        windowBytes: options.windowBytes ?? DEFAULT_RESULT_WINDOW_BYTES,
-        frameRows: null,
-        wantRows: options.wantRows ?? true,
+    return this.#request(
+      {
+        t: "statement",
+        session: options.session ?? 0,
+        text: sql,
+        prepared: null,
+        knownColumnsVersion: -1,
+        params,
+        result: {
+          windowBytes: options.windowBytes ?? DEFAULT_RESULT_WINDOW_BYTES,
+          frameRows: null,
+          wantRows: options.wantRows ?? true,
+        },
       },
-    }).promise;
+      null,
+      options,
+    ).promise;
   }
 
-  prepare(sql: string): Promise<PreparedInfo> {
-    return this.prepareTask(sql).promise;
+  prepare(sql: string, options: ProtocolCallOptions = {}): Promise<PreparedInfo> {
+    return this.prepareTask(sql, undefined, options).promise;
   }
 
-  /** Same opaque request, with its sequence available for terminal-aware cancellation. */
+  /** Same opaque request, with scoped metadata and terminal-aware cancellation. */
   prepareTask(
     sql: string,
     session?: number,
-  ): { readonly seq: number; readonly promise: Promise<PreparedInfo> } {
+    options: ProtocolCallOptions = {},
+  ): {
+    readonly seq: number;
+    readonly promise: Promise<PreparedInfo>;
+    readonly retired: Promise<void>;
+  } {
     const id = ++this.#prepared;
-    const task = this.#request({
-      t: "prepare",
-      id,
-      text: sql,
-      ...(session === undefined ? {} : { session }),
-    });
+    const task = this.#request(
+      {
+        t: "prepare",
+        id,
+        text: sql,
+        ...(session === undefined ? {} : { session }),
+      },
+      null,
+      options,
+    );
     return {
       seq: task.seq,
+      retired: task.retired,
       promise: task.promise.then((result) => ({
         id,
         columns: result.columns,
@@ -854,28 +940,37 @@ export class ProtocolClient {
     params: readonly WireValue[] = [],
     session = 0,
     knownColumnsVersion = -1,
+    options: ProtocolCallOptions = {},
   ): Promise<ClientResult> {
-    return this.#request({
-      t: "statement",
-      session,
-      text: null,
-      prepared: id,
-      knownColumnsVersion,
-      params,
-      result: { windowBytes: DEFAULT_RESULT_WINDOW_BYTES, frameRows: null, wantRows: true },
-    }).promise;
+    return this.#request(
+      {
+        t: "statement",
+        session,
+        text: null,
+        prepared: id,
+        knownColumnsVersion,
+        params,
+        result: { windowBytes: DEFAULT_RESULT_WINDOW_BYTES, frameRows: null, wantRows: true },
+      },
+      null,
+      options,
+    ).promise;
   }
 
-  begin(session: number, readOnly = false): Promise<ClientResult> {
-    return this.#request({ t: "begin", session, readOnly }).promise;
+  begin(
+    session: number,
+    readOnly = false,
+    options: ProtocolCallOptions = {},
+  ): Promise<ClientResult> {
+    return this.#request({ t: "begin", session, readOnly }, null, options).promise;
   }
 
-  commit(session: number): Promise<ClientResult> {
-    return this.#request({ t: "commit", session }).promise;
+  commit(session: number, options: ProtocolCallOptions = {}): Promise<ClientResult> {
+    return this.#request({ t: "commit", session }, null, { ...options, mutation: true }).promise;
   }
 
-  rollback(session: number): Promise<ClientResult> {
-    return this.#request({ t: "rollback", session }).promise;
+  rollback(session: number, options: ProtocolCallOptions = {}): Promise<ClientResult> {
+    return this.#request({ t: "rollback", session }, null, options).promise;
   }
 
   /** An ended callback never reuses its positive session id. Forget local recovery state
@@ -935,8 +1030,8 @@ export class ProtocolClient {
   }
 
   /** Sends a request and returns its seq with its promise (for cancellation and retries in tests). */
-  send(body: Body): { readonly seq: number; readonly promise: Promise<ClientResult> } {
-    return this.#request(body);
+  send(body: Body, options: ProtocolCallOptions = {}): ProtocolTask {
+    return this.#request(body, null, options);
   }
 
   /** A cursor: frames released as they are taken. */
@@ -1021,6 +1116,7 @@ export class ProtocolClient {
   cancel(seq: number, close = false): void {
     if (seq < 0) return; // Refused before a sequence was allocated.
     const pending = this.#pending.get(seq);
+    if (pending && !close) pending.cancelRequested = true;
     if (pending !== undefined && !pending.sent) {
       if (!close) this.#fail(pending, new CancelledError());
       else {
@@ -1045,6 +1141,25 @@ export class ProtocolClient {
       return;
     }
     this.#port?.postMessage({ t: "cancel", target: seq, close });
+  }
+
+  /** Facade adapter for an already-issued task. The SAME pending request owns its listener. */
+  attachSignal(seq: number, signal: AbortSignal): void {
+    const pending = this.#pending.get(seq);
+    if (pending) this.#bindSignal(pending, signal);
+  }
+
+  #bindSignal(pending: Pending, signal: AbortSignal): void {
+    if (pending.signal && pending.signal !== signal)
+      throw new TypeError("A request already has a different cancellation signal");
+    if (pending.cancelCleanup) return;
+    pending.signal = signal;
+    const abort = () => {
+      if (this.#pending.has(pending.seq)) this.cancel(pending.seq);
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    pending.cancelCleanup = () => signal.removeEventListener("abort", abort);
+    if (signal.aborted) abort();
   }
 
   /** Explicit columnar streaming export. Credits return on handout, buffers only on release. */
@@ -1194,7 +1309,10 @@ export class ProtocolClient {
   #request(
     body: Body,
     cursor: CursorQueue | null = null,
-  ): { readonly seq: number; readonly promise: Promise<ClientResult> } {
+    options: ProtocolCallOptions = {},
+  ): ProtocolTask {
+    if (options.signal?.aborted)
+      return this.#refuse(new CancelledError(), cursor, options.signal.reason);
     if (this.#replaced !== null) return this.#refuse(this.#replaced, cursor);
     if (this.#closed) return this.#refuse(new ClientClosedError(), cursor);
     if (this.#unreachable !== null) {
@@ -1222,10 +1340,14 @@ export class ProtocolClient {
     // connection: it is never resendable, so a new owner refuses it rather than running it.
     const resendable = !control && isResendable(body, this.#session0);
     let resolve: (result: ClientResult) => void = () => undefined;
-    let reject: (error: Error) => void = () => undefined;
+    let reject: (error: unknown) => void = () => undefined;
     const promise = new Promise<ClientResult>((res, rej) => {
       resolve = res;
       reject = rej;
+    });
+    let retire: () => void = () => undefined;
+    const retired = new Promise<void>((resolve) => {
+      retire = resolve;
     });
     const pending: Pending = {
       seq,
@@ -1243,8 +1365,19 @@ export class ProtocolClient {
       sent: false,
       sentOn: 0,
       cursor,
+      signal: undefined,
+      mutation:
+        body.t === "write" ||
+        kind === "commit" ||
+        (body.t === "statement" &&
+          options.mutation === true &&
+          (kind === "other" || kind === "unknown")),
+      cancelCleanup: null,
+      cancelRequested: false,
+      abandoned: false,
       resolve,
       reject,
+      retire,
     };
     if (control && session === 0) this.#session0.unresolvedControl++;
     // Silence is counted from when requests came into flight, not from an idle stretch before.
@@ -1259,9 +1392,10 @@ export class ProtocolClient {
       };
       promise.then(closeCursor, closeCursor);
     }
-    this.#send(pending, false);
+    if (options.signal) this.#bindSignal(pending, options.signal);
+    if (this.#pending.has(seq)) this.#send(pending, false);
     this.onActivity?.();
-    return { seq, promise };
+    return { seq, promise, retired };
   }
 
   #send(pending: Pending, retry: boolean): void {
@@ -1283,6 +1417,8 @@ export class ProtocolClient {
       retry,
       generation: pending.generation,
     });
+    if ((pending.cancelRequested || pending.signal?.aborted) && this.#pending.has(pending.seq))
+      this.cancel(pending.seq);
   }
 
   // ---- releases (ruling R22.2) ----
@@ -1328,25 +1464,58 @@ export class ProtocolClient {
     const pending = this.#pending.get(seq);
     if (pending === undefined) return;
     this.#pending.delete(seq);
+    pending.cancelCleanup?.();
+    pending.cancelCleanup = null;
     this.#sequencer.resolve(seq);
     if (pending.control && pending.session === 0) this.#session0.unresolvedControl--;
+    pending.retire();
     queueMicrotask(() => this.onActivity?.());
+  }
+
+  /** No frame payload or dictionary survives a caller's unknown outcome. */
+  #releaseFrames(pending: Pending, frames: readonly FramePayload[]): void {
+    const last = frames.at(-1);
+    if (!last) return;
+    let bytes = 0;
+    for (const frame of frames) bytes += payloadBytes(frame);
+    const window =
+      "result" in pending.body ? pending.body.result.windowBytes : DEFAULT_RESULT_WINDOW_BYTES;
+    this.#queueRelease(pending.seq, last.sequence, bytes, window);
+  }
+
+  #acceptSummary(pending: Pending, summary: StatementSummary): void {
+    // Only an authoritative terminal boundary discharges earlier lost-session causes.
+    if (
+      pending.session !== null &&
+      (pending.kind === "commit" || pending.kind === "rollback") &&
+      summary.transaction === "idle"
+    )
+      this.#discharge(pending.session, pending.seq);
+    if (pending.session === 0) this.#session0.transaction = summary.transaction;
+    if (pending.session !== null) {
+      if (
+        (pending.body.t === "commit" || pending.body.t === "rollback") &&
+        pending.body.retire === true &&
+        summary.transaction === "idle"
+      )
+        this.#sessions.delete(pending.session);
+      else this.#sessions.set(pending.session, summary.transaction);
+    }
   }
 
   /**
    * A request refused before it was issued (closed, a lost session, a full window): its promise
    * rejects, and so does a cursor's queue, which its consumer waits on.
    */
-  #refuse(
-    error: Error,
-    cursor: CursorQueue | null,
-  ): { readonly seq: number; readonly promise: Promise<ClientResult> } {
+  #refuse(error: Error, cursor: CursorQueue | null, reason: unknown = error): ProtocolTask {
     if (cursor !== null) {
       cursor.error = error;
       cursor.rejectColumns(error);
       cursor.wake?.();
     }
-    return { seq: -1, promise: Promise.reject(error) };
+    // AbortSignal.reason may be any value; preserve it as the cancellation contract requires.
+    // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors
+    return { seq: -1, promise: Promise.reject(reason), retired: Promise.resolve() };
   }
 
   /**
@@ -1355,7 +1524,12 @@ export class ProtocolClient {
    * reply, a broken frame, a reconnect, `close()`.
    */
   #fail(pending: Pending, error: Error): void {
+    const reason: unknown =
+      pending.signal?.aborted && "code" in error && error.code === "MINNOW_CANCELLED"
+        ? pending.signal.reason
+        : error;
     this.#settle(pending.seq);
+    if (pending.abandoned) return; // The caller's original unknown outcome stays terminal.
     if (pending.cursor !== null) {
       if (pending.cursor instanceof ExportQueue) {
         const window =
@@ -1371,7 +1545,7 @@ export class ProtocolClient {
       pending.cursor.error = error;
       pending.cursor.wake?.();
     }
-    pending.reject(error);
+    pending.reject(reason);
   }
 
   // ---- incoming ----
@@ -1477,6 +1651,14 @@ export class ProtocolClient {
       case "done": {
         const pending = this.#pending.get(message.seq);
         if (pending === undefined) return;
+        if (pending.abandoned) {
+          this.#releaseFrames(pending, message.frames);
+          if (message.t === "done") {
+            this.#acceptSummary(pending, message.summary);
+            this.#settle(message.seq);
+          }
+          return;
+        }
         if (message.columns !== null) pending.columns = message.columns;
         try {
           if (pending.cursor instanceof ExportQueue) {
@@ -1535,22 +1717,7 @@ export class ProtocolClient {
           // The owner confirmed this boundary left the session idle (a COMMIT answered from the
           // ledger, a ROLLBACK that succeeded): the loss causes before it are discharged, not the
           // ones after it. Never on send.
-          if (
-            pending.session !== null &&
-            (pending.kind === "commit" || pending.kind === "rollback") &&
-            message.summary.transaction === "idle"
-          )
-            this.#discharge(pending.session, pending.seq);
-          if (pending.session === 0) this.#session0.transaction = message.summary.transaction;
-          if (pending.session !== null) {
-            if (
-              (pending.body.t === "commit" || pending.body.t === "rollback") &&
-              pending.body.retire === true &&
-              message.summary.transaction === "idle"
-            )
-              this.#sessions.delete(pending.session);
-            else this.#sessions.set(pending.session, message.summary.transaction);
-          }
+          this.#acceptSummary(pending, message.summary);
           this.#settle(message.seq);
           const result = makeResult(
             pending.columns ?? [],
@@ -1618,9 +1785,15 @@ export class ProtocolClient {
         const pending = this.#pending.get(message.seq);
         if (pending === undefined) return;
         if (message.t === "error") {
-          const error = fromWireError(message.error, ownerErrorRegistry);
+          const error = fromWireError(message.error, this.#errors);
           if (error instanceof DatabaseReplacedError) this.#markDatabaseReplaced();
-          else this.#fail(pending, error);
+          else
+            this.#fail(
+              pending,
+              pending.mutation && pending.sent && error instanceof RequestExpiredError
+                ? new OutcomeUnknownError("expired", { cause: error })
+                : error,
+            );
           return;
         }
         this.#settle(message.seq);
@@ -1635,7 +1808,7 @@ export class ProtocolClient {
         this.onSessionAborted?.(message.session);
         return;
       case "diagnostic": {
-        const error = fromWireError(message.error, ownerErrorRegistry);
+        const error = fromWireError(message.error, this.#errors);
         if (
           message.context === LEASE_RELEASE_FAILURE_CONTEXT &&
           error instanceof SessionLostError

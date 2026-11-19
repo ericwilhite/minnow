@@ -243,6 +243,7 @@ for (const seed of seedsFor("next-sort-progress-pressure", [0xb731, 0xb742]))
                   "PGlite-exact second sorted output",
                 ).toBe(true);
                 reach.reach("both complete");
+                if (withTies && rows > 1) reach.reach("queued WITH TIES completes");
               } else {
                 const c = start(103);
                 const resultC = await consume(c, prepared);
@@ -280,6 +281,7 @@ for (const seed of seedsFor("next-sort-progress-pressure", [0xb731, 0xb742]))
           numRuns: 3,
           examples: [
             [{ rows: 1, chars: 360000, desc: false, nullTail: false, withTies: false }],
+            [{ rows: 2, chars: 352615, desc: false, nullTail: false, withTies: true }],
             [{ rows: 3, chars: 360000, desc: false, nullTail: true, withTies: true }],
           ],
         },

@@ -88,6 +88,10 @@ import {
 import { need, MemtableMemoryError, byteString } from "./bytes.js";
 import type { PreparedWriteCredit } from "./credits.js";
 import { NativePrimaryAdapter, type NativePrimaryScope } from "./primary-command.js";
+import type {
+  NativeWriteStepBoundary,
+  NativeWriteStepOptions,
+} from "../access/native-write-step.js";
 
 /** Everything committed and pending (constraint checks see the whole transaction). */
 export const ALL = PENDING_BASE + MAX_STATEMENTS;
@@ -97,6 +101,14 @@ const FTS_ROW_UNDO_BYTES = 32;
 /** What transactions need from the write path. */
 export interface EngineHooks {
   readonly liveRekeys?: boolean;
+  prepareNativeStep?(
+    statement: StatementImpl,
+    bytes: number,
+    signal: AbortSignal,
+    options?: NativeWriteStepOptions,
+  ): Promise<NativeWriteStepBoundary>;
+  checkNativeStepReady?(statement: StatementImpl): void;
+  closeNativeStep?(statement: StatementImpl): Promise<void>;
   readonly shared: Shared;
   /** The one key batch writers encode into (one writer at a time; consumed before reuse). */
   readonly keys: KeyBatch;
@@ -273,6 +285,9 @@ export class TransactionImpl implements WriteTransaction {
   ftsSeal: FtsClaimSeal | null = null;
   #ordinal = 0;
   #open: StatementImpl | null = null;
+  // Statement.end retires the command scope before commit. Keep its funding policy
+  // across that boundary; commit does not execute a future background merge.
+  #lastNativeCommands = false;
   #savepointMap: Map<number, number> | null = null;
 
   get #savepoints(): Map<number, number> {
@@ -303,7 +318,19 @@ export class TransactionImpl implements WriteTransaction {
 
   /** @internal */
   ended(statement: StatementImpl): void {
-    if (this.#open === statement) this.#open = null;
+    if (this.#open === statement) {
+      this.#lastNativeCommands = statement.nativeCommandMode;
+      this.#open = null;
+    }
+  }
+
+  get nativeCommands(): boolean {
+    return this.#open?.nativeCommandMode ?? this.#lastNativeCommands;
+  }
+
+  checkCurrentStatement(statement: StatementImpl): void {
+    this.#requireOpen();
+    if (this.#open !== statement) throw new TransactionStateError("Foreign statement");
   }
 
   /** Owner close fences command callbacks before synchronous native rollback. */
@@ -880,8 +907,45 @@ export class StatementImpl implements Statement {
       throw new TransactionStateError("Foreign native command primary capability");
   }
 
-  closeNativeCommands(): Promise<void> {
-    return this.#commands?.close() ?? RESOLVED;
+  async closeNativeCommands(): Promise<void> {
+    const results = await Promise.allSettled([
+      this.#commands?.close() ?? RESOLVED,
+      this.tx.hooks.closeNativeStep?.(this) ?? RESOLVED,
+    ]);
+    const errors = results.flatMap((r) => (r.status === "rejected" ? [r.reason as unknown] : []));
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) throw new AggregateError(errors, "Native statement close failed");
+  }
+
+  get nativeCommandMode(): boolean {
+    return this.#commandMode;
+  }
+
+  checkNativeFunding(): void {
+    this.#checkOpen();
+    this.tx.checkCurrentStatement(this);
+  }
+
+  /** No image, source borrow or loan may span this funding boundary. A source's
+   * caller releases the witness before running SQL with its admitted workspace. */
+  prepareNativeStep(
+    bytes: number,
+    signal: AbortSignal,
+    options?: NativeWriteStepOptions,
+  ): Promise<NativeWriteStepBoundary> {
+    this.checkNativeFunding();
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- Explicit owner in call below.
+    const prepare = this.tx.hooks.prepareNativeStep;
+    if (!prepare) throw new TransactionStateError("Native write funding is unavailable");
+    return prepare.call(this.tx.hooks, this, bytes, signal, options);
+  }
+
+  /** Every active view owned by this statement, irrespective of query pin order. */
+  get nativeReaderCount(): number {
+    let count = this.#view && !this.#view.released ? 1 : 0;
+    if (this.#current && this.#current !== this.#view && !this.#current.released) count++;
+    if (this.#ownReads) for (const view of this.#ownReads) if (!view.released) count++;
+    return count;
   }
 
   /** Runs `work`; any error fails the statement (its only valid call is then `rollback`). */
@@ -915,18 +979,24 @@ export class StatementImpl implements Statement {
     if (this.#ownReads !== null) this.#mutation++;
   }
 
-  readOwn(): SnapshotImpl {
+  /** Metadata-only data-phase fence. Unlike a pin it retains no native reader or
+   * source; callers use it while unwinding and re-funding a representation retry. */
+  readOwnCheck(): () => void {
     this.#checkOpen();
+    this.#ownReads ??= new Set();
     const mutation = this.#mutation;
-    const view = this.#fresh(
-      () => this.#ownReads?.delete(view),
-      () => {
-        if (mutation !== this.#mutation)
-          throw new TransactionStateError(
-            "A current-prefix pin is locator-only after mutation begins",
-          );
-      },
-    );
+    return () => {
+      this.#checkOpen();
+      if (mutation !== this.#mutation)
+        throw new TransactionStateError(
+          "A current-prefix pin is locator-only after mutation begins",
+        );
+    };
+  }
+
+  readOwn(): SnapshotImpl {
+    const checkRead = this.readOwnCheck();
+    const view = this.#fresh(() => this.#ownReads?.delete(view), checkRead);
     (this.#ownReads ??= new Set()).add(view);
     (this.#ownOrigins ??= new WeakSet()).add(view);
     return view;
@@ -1113,12 +1183,14 @@ export class StatementImpl implements Statement {
   }
 
   end(signal?: AbortSignal): Promise<void> {
+    this.tx.hooks.checkNativeStepReady?.(this);
     this.#signal =
       signal && this.#signal && signal !== this.#signal
         ? AbortSignal.any([this.#signal, signal])
         : (signal ?? this.#signal);
     const finish = (): MaybePromise<void> =>
       this.guard(() => {
+        this.tx.hooks.checkNativeStepReady?.(this);
         this.#releaseViews();
         return settle(this.#needsFtsPreparation(this.#start), (keyed) =>
           settle(keyed ? this.tx.hooks.prepareFtsMutation?.(this.#signal) : undefined, () => {
@@ -1353,6 +1425,7 @@ export class StatementImpl implements Statement {
   rollback(): void {
     if (this.#state === "ended") return;
     this.#commands?.checkRollbackReady();
+    this.tx.hooks.checkNativeStepReady?.(this);
     this.tx.undoTo(this.#start);
     this.#state = "ended";
     this.#releaseViews();

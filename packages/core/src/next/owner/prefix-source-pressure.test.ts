@@ -23,6 +23,18 @@ for (const seed of seedsFor("next-native-prefix-fixed-step", [0xb643, 0xb644]))
               spillable: false,
             });
           expect(competing.allocate(competing.held)).toBe(true);
+          let preparations = 0;
+          const readers = f.statement.tx.hooks.shared.readers,
+            baseReaders = readers.count;
+          f.setPrepare(async () => {
+            preparations++;
+            expect(readers.count).toBe(baseReaders);
+            expect(f.source.allocated).toBe(0);
+            expect(f.source.loaned).toBe(0);
+            // A larger actual decoder step may wait on temporary foreign credit.
+            // Release that holder only after the old source is fully retired.
+            if (preparations > 1) competing.close();
+          });
           try {
             const id = f.ids[row];
             if (id === undefined) throw new Error("Missing native source row");

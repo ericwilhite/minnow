@@ -53,7 +53,7 @@ import { Slice, runSliced, type SlicedJob } from "./slices.js";
 import type { MaybePromise } from "../access/key-index.js";
 import type { PhysicalPlan, Rel, ScalarExpr, SortKey } from "../ir/ir.js";
 import { ResultSink, resultRowStepBytes } from "./result-sink.js";
-import { aggregateProgressLayout } from "./agg/parameter-copies.js";
+import { aggregateProgressLayout, simpleAggregateType } from "./agg/parameter-copies.js";
 import { packAggregateInputs } from "./agg/input-layout.js";
 import { outputCopyLayout, checkpointDeliveryCopies } from "./output-copies.js";
 import {
@@ -142,6 +142,7 @@ import { LateFetchOperator, ORDINAL_TYPE } from "./late-fetch.js";
 import { OBJECT_OVERHEAD_BYTES } from "../memory/governor.js";
 import { SortOperator, sortMinimumBytes } from "./sort.js";
 import { sortMode } from "./sort-keys.js";
+import { sortRowProgressBytes } from "./sort-progress.js";
 import type { SortColumn } from "./sort-keys.js";
 import {
   windowInputLayout,
@@ -666,6 +667,17 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
   }> = [];
   const compoundColumns = new Map<number, number>();
   const compoundCopies = new Map<number, number>();
+  const optionalIndexSorts = new Map<number, (runtime: QueryRuntime) => boolean>();
+  const sortRows = new Map<
+    number,
+    {
+      input: Rel;
+      exprs: readonly ScalarExpr[];
+      types: readonly PhysicalType[];
+      keys: readonly SortColumn[];
+      held: boolean;
+    }
+  >();
   const keyedInputs = new Map<
     number,
     ReadonlyArray<{
@@ -1210,8 +1222,19 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           rel.op === "keyLookup"
             ? { id: nextPhysicalId++, op: "sort" as const, profileAs: rel }
             : null;
+        // One complete-key probe is already in row-id/locator order, including
+        // non-unique matches. Multiple probes and composite-key prefixes still
+        // need the bounded merge/dedup sort before a modification consumes them.
+        const needsSort = (runtime: QueryRuntime) =>
+          rel.op === "keyLookup" &&
+          (rel.keys.length !== 1 ||
+            rel.keys[0]?.length !==
+              runtime.view.index(rel.tableId, rel.indexId).def.columnIds.length);
         const sortMinimum = sortMinimumBytes([{ kind: "float64" }]);
-        if (sort) fixed(sort, sortMinimum, rel.id);
+        if (sort) {
+          fixed(sort, sortMinimum, rel.id);
+          optionalIndexSorts.set(sort.id, needsSort);
+        }
         return (runtime, downstream, stops) =>
           stops.some((stop) => stop())
             ? downstream.finish()
@@ -1220,7 +1243,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                 rel,
                 counted(runtime, rel, downstream),
                 minimum(runtime.request.governor.capBytes, runtime),
-                sort,
+                needsSort(runtime) ? sort : null,
                 sortMinimum,
               );
       }
@@ -2407,6 +2430,18 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           rel.op === "sort" || options.windowInputDeduplication !== false,
         );
         const sortKeys = rel.op === "sort" ? order(rel.keys, keys.indexes.map(physical.index)) : [];
+        if (
+          rel.op === "sort" &&
+          physical.types.every(simpleAggregateType) &&
+          sortMode(physical.types, sortKeys) === "keys"
+        )
+          sortRows.set(rel.id, {
+            input: rel.input,
+            exprs: physical.exprs,
+            types: physical.types,
+            keys: sortKeys,
+            held: rel.withTies,
+          });
         const outputExprs = input.map((type, c): ScalarExpr => ({
           op: "column",
           index: physical.index(c),
@@ -3064,7 +3099,25 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
     }
     for (const [id, columns] of compoundColumns)
       if (active.has(id)) runtime.operatorParameterColumns(id, columns, compoundCopies.get(id));
-    const modificationSources = new Map<number, Set<number>>();
+    const singleValueSources = new Map<number, Set<number>>();
+    // Source recipes may shrink to one row under pressure. Sort merge progress
+    // still includes its encoded keys and retained WITH TIES boundary row.
+    for (const [id, sort] of sortRows) {
+      if (!active.has(id)) continue;
+      for (const expr of sort.exprs)
+        expressionInputBytes(expr, sort.input, {
+          parameter: () => 0,
+          source(source, column) {
+            const columns = joinKeySources.get(source) ?? new Set<number>();
+            columns.add(column);
+            joinKeySources.set(source, columns);
+            const single = singleValueSources.get(source) ?? new Set<number>();
+            single.add(column);
+            singleValueSources.set(source, single);
+            return 0;
+          },
+        });
+    }
     const modification = plan.root;
     if (modification.op === "modify" && modification.deferGenerated && runtime.request.rowRules) {
       const rules = runtime.request.rowRules;
@@ -3075,9 +3128,9 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
             const columns = joinKeySources.get(source) ?? new Set<number>();
             columns.add(column);
             joinKeySources.set(source, columns);
-            const modificationColumns = modificationSources.get(source) ?? new Set<number>();
+            const modificationColumns = singleValueSources.get(source) ?? new Set<number>();
             modificationColumns.add(column);
-            modificationSources.set(source, modificationColumns);
+            singleValueSources.set(source, modificationColumns);
             return 0;
           },
         });
@@ -3171,6 +3224,17 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
       kind === "json" ? 48 : kind === "array" ? 64 : 0;
     let opaqueConsumerStep = 0;
     runtime.groupKeyProgress((id, loanSlot, slots, largest, minimum, ordinary) => {
+      const sort = sortRows.get(id);
+      if (sort && loanSlot === undefined && minimum > 0 && active.has(id)) {
+        const widths = sort.exprs.map((expr) =>
+          expressionInputBytes(expr, sort.input, {
+            parameter: (slot) => slots[slot] ?? largest,
+            source: (source, column) => joinKeyColumnBytes.get(source)?.get(column) ?? null,
+          }),
+        );
+        const merge = sortRowProgressBytes(sort.types, sort.keys, widths, sort.held);
+        if (merge !== null) return { complete: Math.max(ordinary, merge) };
+      }
       // Internal JSON sorts release their shared semantic pair before yielding to
       // a group boundary. Only the host lane funds that workspace, once.
       // Most plans/borrowers have no semantic grouping workspace. Avoid walking all
@@ -3367,7 +3431,10 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
         runtime.progressEnvelope(inline, inputMultiplicity, sourceMultiplicity);
     }
     const entries = admissions
-      .filter((entry) => active.has(entry.owner))
+      .filter(
+        (entry) =>
+          active.has(entry.owner) && (optionalIndexSorts.get(entry.rel.id)?.(runtime) ?? true),
+      )
       .map((entry) => ({
         rel: entry.rel,
         owner: entry.owner,
@@ -3978,7 +4045,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                   runtime.sourceView(),
                   {
                     ...source,
-                    ...(modificationSources.get(source.id)?.has(index)
+                    ...(singleValueSources.get(source.id)?.has(index)
                       ? { singleValueBound: true, batchRows: 1 as const }
                       : {}),
                     columns: [column],
@@ -4101,13 +4168,14 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
         // happens once on the ordinary path; only a sizing retry repeats it.
         if (needsChoices) yield* readValue(chooseAggregates());
         const minimum = runtime.minimumBytes(entries);
-        // The native write owner is already admitted and may retain committed rows.
-        // Shrink optional read windows before queuing behind that persistent owner.
-        // A temporary competitor can still be awaited after all fitting alternatives.
-        const producerRoom =
-          plan.root.op === "modify"
-            ? Math.max(0, runtime.request.governor.capBytes - runtime.request.governor.usedBytes)
-            : runtime.request.governor.capBytes;
+        // A query can share its governor with the native write owner too. Try
+        // smaller optional source recipes before queuing behind retained storage.
+        // This pressure bound selects alternatives only: admission still waits
+        // cancellably for temporary holders, and refusal uses the whole cap.
+        const producerRoom = Math.max(
+          0,
+          runtime.request.governor.capBytes - runtime.request.governor.usedBytes,
+        );
         const overCap = minimum > Math.min(runtime.request.governor.capBytes, producerRoom);
         if (windows && overCap && [...bounds.values()].some((bound) => bound.windowBytes > 0)) {
           // Coalesced export windows are optional. All sizing holds have ended: retry the

@@ -34,8 +34,10 @@ export async function prefixFixture(
   nullable: boolean,
   extraTable = false,
   capBytes = 256 * 1024 * 1024,
+  nativeFunding = false,
+  memtableRows = 256,
 ) {
-  const h = new Harness("strict", "memory", 256);
+  const h = new Harness("strict", "memory", memtableRows);
   Object.defineProperty(h, "governor", { value: new Governor(capBytes) });
   const path = await h.open(),
     type = decimal(38, 0);
@@ -71,9 +73,9 @@ export async function prefixFixture(
   const coefficients = Array.from({ length: rows }, (_, i) =>
     i % 3 === 0 ? BigInt(i + 1) : i % 3 === 1 ? 2n ** 56n + BigInt(i) : 10n ** 30n + BigInt(i),
   );
-  const valid = new Uint32Array(1);
+  const valid = new Uint32Array(Math.ceil(rows / 32));
   for (let i = 0; i < rows; i++)
-    if (!nullable || i % 3 !== 2) valid[0] = (valid[0] ?? 0) | (1 << i);
+    if (!nullable || i % 3 !== 2) valid[i >>> 5] = (valid[i >>> 5] ?? 0) | (1 << (i & 31));
   const n: FlatVector = {
     form: "flat",
     type,
@@ -111,7 +113,7 @@ export async function prefixFixture(
     }),
     source = await h.governor.admit({
       label: "prefix image source",
-      minimumBytes: nativePrefixSourceBytes(table),
+      minimumBytes: nativeFunding ? 0 : nativePrefixSourceBytes(table),
       spillable: false,
     }),
     stop = new AbortController(),
@@ -150,6 +152,25 @@ export async function prefixFixture(
       signal.throwIfAborted();
       expect(source.allocated).toBe(0);
       expect(source.loaned).toBe(0);
+      if (nativeFunding) {
+        source.release(source.held);
+        for (;;) {
+          const boundary = await statement.prepareNativeStep(root.held + minimum, signal, {
+            includesProgress: true,
+          });
+          try {
+            expect(
+              await source.makeRoom?.(minimum, AbortSignal.any([signal, boundary.invalidated])),
+            ).toBe(true);
+            boundary.check();
+            return source;
+          } catch (error) {
+            if (!boundary.invalidated.aborted || signal.aborted) throw error;
+          } finally {
+            boundary.release();
+          }
+        }
+      }
       if (minimum > source.held) expect(await source.makeRoom?.(minimum, signal)).toBe(true);
       expect(minimum).toBeLessThanOrEqual(source.held);
       return source;

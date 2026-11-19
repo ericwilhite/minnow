@@ -8,6 +8,7 @@ import {
   type MemorySegment,
   type MemoryReadHint,
   type MemoryChunkStep,
+  type TableReadRecipe,
 } from "../access/snapshot.js";
 import { selectedSegment } from "../exec/late-fetch.js";
 import { TableScan, memoryScanBufferBytes } from "../exec/table-scan.js";
@@ -20,9 +21,9 @@ import { setInt128 } from "../vector/int128.js";
 import type { PhysicalType } from "../types.js";
 import { sourceSlot } from "../write/columns.js";
 import type { StatementImpl } from "../write/transaction.js";
-import { MAX_READ_BYTES } from "../access/space.js";
-import { scratchBytes as predicateScratchBytes } from "../page/select.js";
-import { MEMORY_READ_HINT_BYTES, MEMORY_READ_RESIDENT_BYTES } from "../write/memory-read.js";
+import { ReadDeniedError, type ByteBudget } from "../access/space.js";
+import { PageBudgetError } from "../page/reader.js";
+import { ParseBudgetError } from "../format/manifest-codec.js";
 import type { RegistryImages } from "./registry-images.js";
 
 export interface NativePrefixImageScope {
@@ -48,17 +49,17 @@ export function nativePrefixImageBytes(columns: number): number {
   if (!Number.isSafeInteger(bytes)) invalid();
   return bytes;
 }
-/** Fixed native decode/IO starts in ordinary admission. Wider row steps are funded
- * at a fresh boundary after publication-stable hints or persisted decode sizing. */
-const MEMORY_STEP_BYTES =
-  MEMORY_READ_HINT_BYTES +
-  MEMORY_READ_RESIDENT_BYTES +
-  MAX_READ_BYTES +
-  65536 * 8 +
-  predicateScratchBytes(4096);
+/** Only descriptors, a point recipe and retained-memory hint scratch precede source
+ * inspection. Actual page/decoder/output growth is funded after full teardown. */
+function hintBytes(columns: number): number {
+  return 8192 + columns * 256;
+}
 export function nativePrefixSourceBytes(table: TableDef): number {
   return (
-    MEMORY_STEP_BYTES +
+    hintBytes(table.columns.length) +
+    8192 +
+    1024 +
+    table.columns.length * 16 +
     memoryScanBufferBytes(table.columns.map((column) => column.type)) +
     6 * BATCH_ROWS * Uint16Array.BYTES_PER_ELEMENT +
     2048 * table.columns.length +
@@ -247,6 +248,9 @@ export class NativePrefixImages {
       rowId < 0
     )
       invalid();
+    // This fence has no native pin or payload. A fresh pin after a funding wait
+    // may revalidate physical representation, never a logically changed prefix.
+    const checkPhase = this.scope.statement.readOwnCheck();
     // No root-dependent composite history per captured row. All operation listeners
     // retire with its one pending slot, even when an un-aborted root lives a long time.
     const operation = new AbortController(),
@@ -279,16 +283,35 @@ export class NativePrefixImages {
           baseMinimum = nativePrefixSourceBytes(table);
         let minimum = baseMinimum;
         for (;;) {
+          checkPhase();
           const budget = await this.scope.prepareSource(table, minimum, stop);
           this.#check(stop);
+          checkPhase();
           sourceBoundary(budget);
           if (budget.held < minimum) invalid();
+          let refused = 0;
+          const sourceBudget: ByteBudget & { optionalAllocate(bytes: number): boolean } = {
+            allocate: (bytes) => {
+              const needed = budget.allocated + bytes;
+              if (!Number.isSafeInteger(needed) || bytes < 0) invalid();
+              if (needed <= budget.held && budget.allocate(bytes)) return true;
+              refused = Math.max(refused, needed);
+              return false;
+            },
+            // A declined optional cached representation must not raise the minimum.
+            optionalAllocate: (bytes) =>
+              bytes <= budget.held - budget.allocated && budget.allocate(bytes),
+            free: (bytes) => budget.free(bytes),
+          };
           const pin = this.scope.statement.readOwn();
           let arena: OutputArena | null = null;
+          let recipe: TableReadRecipe | null = null;
           let nextMinimum: number;
           try {
-            const source = pin.internalTable(tableId),
-              locator = source.locator(rowId),
+            const locator = pin.internalTable(tableId).locator(rowId),
+              read = pin.table(tableId, { budget: sourceBudget });
+            recipe = read.prepareRead({ budget: sourceBudget, locator });
+            const source = recipe?.table ?? read,
               segment = source.segments[Math.floor(locator / 65536)],
               position = locator % 65536;
             if (
@@ -315,25 +338,25 @@ export class NativePrefixImages {
                   maxRows: 1,
                   targetBytes: 1,
                 },
-                { budget, pages: pin.pages, signal: stop },
+                { budget: sourceBudget, pages: pin.pages, signal: stop },
               );
               this.#check(stop);
               pin.checkRead();
               const complete = Math.max(
                 minimum,
                 baseMinimum -
-                  MEMORY_STEP_BYTES +
+                  hintBytes(table.columns.length) +
                   hint.residentBytes +
                   hint.scratchBytes +
                   hint.ioBytes +
                   hint.outputBytes,
               );
               if (!Number.isSafeInteger(complete)) invalid();
-              if (complete > budget.held - budget.allocated) throw new PrefixStep(complete);
+              if (complete > budget.held) throw new PrefixStep(complete);
               this.#check(stop);
               pin.checkRead();
             }
-            arena = new OutputArena(budget, 1);
+            arena = new OutputArena(sourceBudget, 1);
             const scan = new TableScan({
               table: {
                 tableId,
@@ -351,7 +374,7 @@ export class NativePrefixImages {
               emitLocator: false,
               pages: pin.pages,
               reads: this.scope.reads,
-              budget,
+              budget: sourceBudget,
               context: { arena, params: { slots: [] }, input: [] },
               boundedMemory: true,
               rowsNeeded: () => 1,
@@ -387,14 +410,23 @@ export class NativePrefixImages {
               item.transfer?.release();
             }
           } catch (error) {
-            if (!(error instanceof PrefixStep)) throw error;
-            if (error.bytes <= minimum) invalid();
-            nextMinimum = error.bytes;
+            if (error instanceof PrefixStep) nextMinimum = error.bytes;
+            else if (
+              error instanceof PageBudgetError ||
+              error instanceof ParseBudgetError ||
+              error instanceof ReadDeniedError
+            ) {
+              // Capture the refused high-water before readers unwind their charges.
+              if (refused <= minimum) throw error;
+              nextMinimum = refused;
+            } else throw error;
+            if (nextMinimum <= minimum) invalid();
           } finally {
             this.#scan?.abort();
             this.#scan = null;
             this.#columns.length = this.#ids.length = 0;
             arena?.close();
+            recipe?.close();
             pin.release();
           }
           this.#check(stop);

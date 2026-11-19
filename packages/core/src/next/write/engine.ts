@@ -103,6 +103,7 @@ import { FROZEN_MEMTABLE_CAP_BYTES, MAX_LSN } from "../access/snapshot.js";
 import type { Space, SpacePin, ByteBudget } from "../access/space.js";
 import {
   WritePathClosedError,
+  TransactionStateError,
   type BeginOptions,
   type ColumnSummary,
   type CommitReceipt,
@@ -142,9 +143,20 @@ import {
 import { Replayer, type Effect } from "../format/replay.js";
 import { walkReachable, type ManifestReader } from "../format/reachable.js";
 import { encodeKeyBatch, KeyBatch } from "../keys/key-encoding.js";
-import { OBJECT_OVERHEAD_BYTES, type Grant, type Loan } from "../memory/governor.js";
+import {
+  OBJECT_OVERHEAD_BYTES,
+  MemoryAdmissionError,
+  type Grant,
+  type Loan,
+} from "../memory/governor.js";
 import { CommandMaintenance, waitCommandMaintenance } from "./command-wait.js";
 import { WriteCredits, WRITE_ROW_STEP_BYTES, type PreparedWriteCredit } from "./credits.js";
+import { NativeWriteSteps } from "./native-step.js";
+import { FIXED_CACHE_BYTES } from "../storage/page-cache.js";
+import type {
+  NativeWriteStepBoundary,
+  NativeWriteStepOptions,
+} from "../access/native-write-step.js";
 import { RunSink } from "./run-output.js";
 import { writeStepMinimum, type WriteStepMinimum } from "./minimum.js";
 import { MetadataBudget, MetadataPressure, releaseIdle } from "./budget.js";
@@ -224,6 +236,7 @@ import {
 import {
   hexId,
   TransactionImpl,
+  StatementImpl,
   jsonBound,
   type EngineHooks,
   type PublishedRows,
@@ -512,6 +525,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
   readonly #session: StoreSession;
   readonly #space: Space;
   readonly #credits: WriteCredits;
+  readonly #nativeSteps: NativeWriteSteps;
+  readonly #nativeProgress = (growth = false) => this.#nativeSteps.changed(growth);
   readonly #grant: Grant;
   readonly #arenaPool: ArenaPool;
   readonly #now: () => number;
@@ -719,6 +734,15 @@ export class WritePathImpl implements WritePath, EngineHooks {
     // contract). Prepay its record in the owner account, rather than add Promise cleanup to
     // every chunk. This is allocated scratch, not just held admission headroom.
     charged(grant, OBJECT_OVERHEAD_BYTES);
+    this.#nativeSteps = new NativeWriteSteps({
+      charge: grant,
+      governor: input.governor,
+      check: (owner) => this.#checkNativeStep(owner),
+      protectedBytes: () => this.#protectedNativeBytes(),
+      stabilize: (owner, bytes, capacity, signal) =>
+        this.#stabilizeNativeStep(owner, bytes, capacity, signal),
+    });
+    credits.onNativeStepChange(this.#nativeProgress);
     this.#arenaPool = new ArenaPool(
       grant,
       Math.min(8 * 1024 * 1024, Math.floor(input.governor.capBytes / 32)),
@@ -796,7 +820,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       governor: input.governor,
       space,
       budget: grant,
-      readers: new ReaderRegistry(),
+      readers: new ReaderRegistry(this.#nativeProgress),
       pinState: (state, label) => this.#pinState(state, label),
       runReader: (ref) => this.#runReader(ref),
       groupRoot: (ref, budget) => this.#metadata.groupRoot(ref, budget),
@@ -840,6 +864,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
       reclaimWriter,
       input.governor.capBytes,
       (wanted) => credits.growTo(metadataGrant, wanted),
+      () => {
+        if (engine) engine.#nativeProgress();
+      },
     );
     let commitBuffers: CommitBuffers | null = null;
     try {
@@ -1573,6 +1600,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
         this.#grant,
         this.#memtableRows,
         this.#arenaPool,
+        false,
+        this.#nativeProgress,
       );
       memtable.rowCount = ref.rowCount;
       memtable.storedRows = ref.rowCount;
@@ -1779,6 +1808,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#memtableRows,
       this.#arenaPool,
       definition !== undefined && def.columns !== this.#def(tableId).columns,
+      this.#nativeProgress,
     );
     this.#setView(state, { ...state.view, memtables: [...memtables, memtable] });
     if (frozen !== null && !this.#recovering) this.#scheduleFlush();
@@ -1818,6 +1848,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#memtableRows,
       this.#arenaPool,
       definition !== undefined && def.columns !== this.#def(state.tableId).columns,
+      this.#nativeProgress,
     );
     this.#setView(state, { ...state.view, memtables: [...memtables, memtable] });
     return memtable;
@@ -1938,14 +1969,40 @@ export class WritePathImpl implements WritePath, EngineHooks {
   #minimumCatalog: Catalog | null = null;
   #minimumMetadata = 0;
   #minimumMerge = 0;
+  #minimumReaders = 0;
 
   // This cached check is deliberately closure-free: single-row writes take it repeatedly.
   #prepareMinimum(
     catalog = this.#holder?.catalog ?? this.#catalog,
     signal?: AbortSignal,
+    includesProgress = false,
   ): MaybePromise<void> {
-    if (this.#minimumState !== this.#state || this.#minimumCatalog !== catalog)
-      return this.#recalculateMinimum(catalog, signal);
+    if (this.#minimumState !== this.#state || this.#minimumCatalog !== catalog) {
+      const refreshed = this.#recalculateMinimum(catalog, signal);
+      if (refreshed instanceof Promise)
+        return this.#trackMinimum(
+          refreshed.then(() => this.#prepareMinimum(catalog, signal, includesProgress)),
+        );
+    }
+    const native = this.#nativeSteps.funding || this.#holder?.nativeCommands;
+    // Native producer/rule steps do not run a future background merge. Its real
+    // acquireMerge prepares the exact step again; active merge credit stays protected.
+    if (native) this.#credits.reclaimNativeStep();
+    const metadata = this.#credits.prepareMetadata(
+      this.#metadataHeadroom(catalog),
+      signal,
+      !!native && includesProgress,
+    );
+    if (metadata instanceof Promise) return this.#finishMinimumGrowth(metadata, signal, !!native);
+    if (native) {
+      this.#credits.reclaimNativeStep();
+      return;
+    }
+    const merge = this.#credits.prepareMerge(this.#minimumMerge, signal);
+    return merge instanceof Promise ? this.#trackMinimum(merge) : undefined;
+  }
+
+  #metadataHeadroom(catalog: Catalog): number {
     // Commit installs these records synchronously after logging. Keep their credit private
     // alongside the next publication step, so DROP/CREATE churn cannot consume that minimum.
     let newBuilds = 0;
@@ -1955,7 +2012,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         for (const index of table.indexes)
           if (!committed?.indexes.some((existing) => existing.id === index.id)) newBuilds++;
       }
-    const metadata = this.#credits.prepareMetadata(
+    return (
       Math.max(
         this.#minimumMetadata,
         this.#holder?.ftsMutationPrepared === true ||
@@ -1963,33 +2020,38 @@ export class WritePathImpl implements WritePath, EngineHooks {
           ? FTS_PUBLICATION_MINIMUM_BYTES
           : 0,
       ) +
-        newBuilds * PENDING_INDEX_BYTES,
-      signal,
+      newBuilds * PENDING_INDEX_BYTES
     );
-    if (metadata instanceof Promise) return this.#finishMinimumGrowth(metadata, signal);
-    const merge = this.#credits.prepareMerge(this.#minimumMerge, signal);
-    return merge instanceof Promise ? this.#trackMinimum(merge) : undefined;
   }
 
-  #finishMinimumGrowth(metadata: Promise<void>, signal?: AbortSignal): Promise<void> {
+  #finishMinimumGrowth(
+    metadata: Promise<void>,
+    signal?: AbortSignal,
+    native = false,
+  ): Promise<void> {
     return this.#trackMinimum(
-      metadata.then(() => this.#credits.prepareMerge(this.#minimumMerge, signal)),
+      metadata.then(() => {
+        if (native) this.#credits.reclaimNativeStep();
+        else return this.#credits.prepareMerge(this.#minimumMerge, signal);
+      }),
     );
   }
 
   #recalculateMinimum(catalog: Catalog, signal?: AbortSignal): MaybePromise<void> {
     const state = this.#state;
+    const readers = this.#minimumReaders;
     // Calculation may yield; reuse the state's existing pin so publication cannot release
     // its directory buffers until navigation has finished. This takes no new space pin.
     const pin = this.#pinState(state, "write minimum");
     const install = (minimum: WriteStepMinimum): MaybePromise<void> => {
       pin.release();
-      if (state !== this.#state) return this.#prepareMinimum(catalog, signal);
+      if (state !== this.#state || readers !== this.#minimumReaders)
+        return this.#recalculateMinimum(catalog, signal);
       this.#minimumMetadata = minimum.metadata;
       this.#minimumMerge = minimum.merge;
       this.#minimumState = state;
       this.#minimumCatalog = catalog;
-      return this.#prepareMinimum(catalog, signal);
+      return;
     };
     let minimum: MaybePromise<WriteStepMinimum>;
     try {
@@ -2025,8 +2087,148 @@ export class WritePathImpl implements WritePath, EngineHooks {
 
   #trackMinimum(run: Promise<void>): Promise<void> {
     this.#minimumRuns.add(run);
-    void run.finally(() => this.#minimumRuns.delete(run)).catch(() => undefined);
+    void run
+      .finally(() => {
+        this.#minimumRuns.delete(run);
+        this.#nativeProgress();
+      })
+      .catch(() => undefined);
     return run;
+  }
+
+  /** Non-evictable storage accounts are part of the same compound native owner.
+   * Cached pages/foreign read leases remain temporary governor pressure, not this floor. */
+  #protectedNativeBytes(): number {
+    return this.#credits.protectedBytes() + FIXED_CACHE_BYTES + this.#space.stats.retainedBytes;
+  }
+
+  #checkNativeStep(owner: object): asserts owner is StatementImpl {
+    this.#check();
+    if (!(owner instanceof StatementImpl) || this.#holder !== owner.tx)
+      throw new TransactionStateError("Foreign native funding statement");
+    owner.checkNativeFunding();
+  }
+
+  prepareNativeStep(
+    owner: StatementImpl,
+    bytes: number,
+    signal: AbortSignal,
+    options?: NativeWriteStepOptions,
+  ): Promise<NativeWriteStepBoundary> {
+    return this.#nativeSteps.prepare(owner, bytes, signal, options);
+  }
+
+  checkNativeStepReady(owner: StatementImpl): void {
+    this.#nativeSteps.checkReady(owner);
+  }
+
+  closeNativeStep(owner: StatementImpl): Promise<void> {
+    return this.#nativeSteps.closeOwner(owner, new TransactionStateError("Native funding closed"));
+  }
+
+  /** Only a root whose data/producer leases have retired calls this operation. Relief
+   * changes representation, not accepted effects; staging keeps the shared undo exact. */
+  async #stabilizeNativeStep(
+    owner: object,
+    rootBytes: number,
+    capacity: number,
+    signal: AbortSignal,
+  ): Promise<void> {
+    for (;;) {
+      this.#checkNativeStep(owner);
+      signal.throwIfAborted();
+      this.#arenaPool.clear();
+      const catalog = owner.catalog;
+      if (this.#minimumState !== this.#state || this.#minimumCatalog !== catalog)
+        await this.#recalculateMinimum(catalog, signal);
+      this.#checkNativeStep(owner);
+      signal.throwIfAborted();
+      const headroom = this.#metadataHeadroom(catalog),
+        needed =
+          this.#credits.protectedBytes(this.#credits.minimum.merge, headroom) +
+          FIXED_CACHE_BYTES +
+          this.#space.stats.retainedBytes,
+        mandatory =
+          FIXED_CACHE_BYTES +
+          this.#credits.minimum.rows +
+          this.#credits.commits.held +
+          this.#credits.minimum.merge +
+          headroom;
+      if (
+        mandatory + rootBytes > capacity &&
+        !this.#credits.hasActiveMerge &&
+        !this.#credits.hasLoans
+      )
+        throw new MemoryAdmissionError("native root and writer", mandatory + rootBytes, capacity);
+      if (needed + rootBytes <= capacity && !this.#credits.hasLoans) {
+        // This route proved the entire root +native compound step fits the same
+        // selected capacity. Replenishing its own metadata is part of that step.
+        await this.#prepareMinimum(catalog, signal, capacity === this.#credits.governor.capBytes);
+        this.#credits.reclaimNativeStep();
+        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- Native commit/maintenance can acquire a loan across the metadata await.
+        if (!this.#credits.metadataReady || this.#credits.hasLoans) continue;
+        if (this.#minimumState !== this.#state || this.#minimumCatalog !== owner.catalog) continue;
+        if (this.#protectedNativeBytes() + rootBytes <= capacity) return;
+        continue;
+      }
+      // A single relief pass freezes/stages eligible data and drains committed flush
+      // work. Zero requests no spare row arena and never admits the root a second time.
+      const state = this.#state,
+        rows = this.#grant.allocated;
+      await this.#relieve(0, undefined, signal);
+      this.#checkNativeStep(owner);
+      signal.throwIfAborted();
+      this.#arenaPool.clear();
+      this.#credits.reclaimNativeStep();
+      if (state !== this.#state || this.#grant.allocated < rows) continue;
+
+      const observedState = this.#state,
+        borrower = await this.#nativeBorrowed(signal);
+      // Inspection pins can notify metadata pressure themselves. Capture the wake
+      // generation AFTER retiring that pin, and recheck the observed borrower
+      // synchronously so a release during the scan cannot lose its only wakeup.
+      if (observedState !== this.#state || borrower?.borrowedBytes === 0) continue;
+      if (this.#protectedNativeBytes() + rootBytes <= capacity && !this.#credits.hasLoans) continue;
+      const version = this.#nativeSteps.version;
+      if (
+        borrower ||
+        this.shared.readers.count > owner.nativeReaderCount ||
+        this.#credits.hasActiveMerge ||
+        this.#credits.hasLoans ||
+        this.#flushing.size > 0 ||
+        this.#stagingRuns.size > 0
+      ) {
+        await this.#nativeSteps.wait(version, signal);
+        continue;
+      }
+      throw new MemoryAdmissionError(
+        "native root and writer",
+        this.#protectedNativeBytes() + rootBytes,
+        capacity,
+      );
+    }
+  }
+
+  async #nativeBorrowed(signal: AbortSignal): Promise<Memtable | null> {
+    const state = this.#state,
+      pin = this.#pinState(state, "native funding borrows");
+    let checked = 0;
+    try {
+      for (const view of state.tables.values())
+        for (const memtable of view.memtables) {
+          signal.throwIfAborted();
+          if (memtable.borrowedBytes > 0) return memtable;
+          if ((++checked & 255) === 0 && taskClock.due()) await yieldTask();
+        }
+      for (const memtable of this.#published) {
+        signal.throwIfAborted();
+        if (memtable.borrowedBytes > 0) return memtable;
+        if ((++checked & 255) === 0 && taskClock.due()) await yieldTask();
+      }
+      return null;
+    } finally {
+      pin.release();
+    }
   }
 
   /** Admit the proposed schema before DDL mutates synchronous state/pins. */
@@ -2864,7 +3066,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
       throw error;
     });
     this.#commitRuns.add(settled);
-    void settled.finally(() => this.#commitRuns.delete(settled)).catch(() => undefined);
+    void settled
+      .finally(() => {
+        this.#commitRuns.delete(settled);
+        this.#nativeProgress();
+      })
+      .catch(() => undefined);
     return settled;
   }
 
@@ -3234,6 +3441,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
   async #closeNow(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
+    this.#nativeSteps.cancel(new WritePathClosedError());
     this.#credits.cancel(new WritePathClosedError());
     this.#commitAbort.abort(new WritePathClosedError());
     let commandFailure: { reason: unknown } | null = null;
@@ -3294,6 +3502,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#ftsRenderer = null;
       this.#chargeMetadata(-this.#ftsMetadataBytes);
       this.#ftsMetadataBytes = 0;
+      await this.#nativeSteps.close();
       this.#metadataGrant.close();
       this.#columns.close();
       this.#body.close();
@@ -3341,6 +3550,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#ftsRenderer = null;
     this.#chargeMetadata(-this.#ftsMetadataBytes);
     this.#ftsMetadataBytes = 0;
+    await this.#nativeSteps.close();
     this.#metadataGrant.close();
     this.#columns.close();
     this.#body.close();
@@ -3375,7 +3585,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const key = blobKey(ref.entries);
     const cached = this.#runReaders.get(key);
     if (cached !== undefined) {
-      if (!(cached instanceof Promise)) this.#runsByRef.set(ref, cached);
+      if (!(cached instanceof Promise)) this.#rememberReader(ref, cached);
       return cached;
     }
     // Its resident parts are charged to the metadata grant before they are built (runs.ts).
@@ -3385,8 +3595,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
     if (opened instanceof Promise) {
       const pending = opened.then((reader) => {
         // A drop while it opened took the entry away: give the charge back.
-        if (this.#runReaders.get(key) === pending) this.#runReaders.set(key, reader);
-        else this.#chargeMetadata(-reader.bytes);
+        if (this.#runReaders.get(key) === pending) {
+          this.#runReaders.set(key, reader);
+          this.#rememberReader(ref, reader);
+        } else this.#chargeMetadata(-reader.bytes);
         return reader;
       });
       this.#runReaders.set(key, pending);
@@ -3394,7 +3606,16 @@ export class WritePathImpl implements WritePath, EngineHooks {
       return pending;
     }
     this.#runReaders.set(key, opened);
+    this.#rememberReader(ref, opened);
     return opened;
+  }
+
+  #rememberReader(ref: RunRef, reader: RunReader): void {
+    if (this.#runsByRef.has(ref)) return;
+    this.#runsByRef.set(ref, reader);
+    this.#minimumReaders++;
+    this.#minimumState = null;
+    this.#nativeProgress(true);
   }
 
   #bitmap(ref: BlobRef, rowCount: number): Uint32Array | Promise<Uint32Array> {
@@ -3476,6 +3697,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#flushing.set(state, flush);
     const done = () => {
       if (this.#flushing.get(state) === flush) this.#flushing.delete(state);
+      this.#nativeProgress();
     };
     void flush.then(done, done);
     return flush;
@@ -4010,7 +4232,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
 
   #trackStaging<T>(run: Promise<T>): Promise<T> {
     this.#stagingRuns.add(run);
-    void run.finally(() => this.#stagingRuns.delete(run)).catch(() => undefined);
+    void run
+      .finally(() => {
+        this.#stagingRuns.delete(run);
+        this.#nativeProgress();
+      })
+      .catch(() => undefined);
     return run;
   }
 
@@ -5182,6 +5409,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       unlock?.();
       output?.release();
       if (!mergeCreditReleased) this.#credits.releaseMerge(grant);
+      this.#nativeProgress();
     }
   }
 

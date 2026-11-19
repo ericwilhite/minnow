@@ -194,6 +194,13 @@ export interface TableReadRecipe {
   close(): void;
 }
 
+export interface TableReadRecipeOptions {
+  readonly budget: ByteBudget;
+  /** Only this locator's memory chunk needs publication-stable retention. Other
+   * chunks keep their ordinary read contract; no payload escapes the recipe. */
+  readonly locator?: number;
+}
+
 export interface TableSnapshot {
   readonly tableId: number;
   /** The schema version this view reads the table under. */
@@ -210,7 +217,7 @@ export interface TableSnapshot {
   /** Optional admission retry. Existing owner-charged storage may stay resident through
    * publication. It never changes visibility, and close releases the retention.
    * Multiple small native tails require a prepaid budget for recipe metadata. */
-  prepareRead?(options?: { readonly budget: ByteBudget }): TableReadRecipe | null;
+  prepareRead?(options?: TableReadRecipeOptions): TableReadRecipe | null;
 }
 
 export type Segment = GroupSegment | MemorySegment;

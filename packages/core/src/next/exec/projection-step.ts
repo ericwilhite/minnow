@@ -1,5 +1,5 @@
 /** Pure sizing: never evaluates a predicate or function. Unknown producers are not certified. */
-import { layoutOf } from "../types.js";
+import { layoutOf, samePhysicalType } from "../types.js";
 import type { ScalarExpr } from "../ir/ir.js";
 import type { Batch, Vector } from "../vector/vector.js";
 import type { ParameterSlots } from "./kernels/compile.js";
@@ -7,7 +7,10 @@ import { isValidSlot, flatOf, slotIndex } from "./kernels/vectors.js";
 
 type Bound = (batch: Batch, start: number, count: number) => number;
 const zero: Bound = () => 0;
-const variable = (e: ScalarExpr) => e.type.kind === "text" || e.type.kind === "bytes";
+// Array selectors copy their serialized bytes just like text; element casts are
+// certified separately and require exact physical identity. No array parsing here.
+const variable = (e: ScalarExpr) =>
+  e.type.kind === "text" || e.type.kind === "bytes" || e.type.kind === "array";
 function width(vector: Vector, batch: Batch, start: number, count: number): number {
   let max = 0;
   for (let k = start; k < start + count; k++) {
@@ -131,6 +134,14 @@ export function projectionStep(exprs: readonly ScalarExpr[], params: ParameterSl
         children = [e.arg, ...e.list];
         break;
     }
+    // This certificate covers opaque copying, not array comparison/parsing or
+    // conversion workspace. Only validity tests and exact identity casts are free.
+    if (
+      children.some((child) => child.type.kind === "array") &&
+      e.op !== "isNull" &&
+      !(e.op === "cast" && samePhysicalType(e.type, e.input.type))
+    )
+      return null;
     const bounds: Bound[] = [];
     for (const child of children) {
       const bound = visit(child);
@@ -138,7 +149,7 @@ export function projectionStep(exprs: readonly ScalarExpr[], params: ParameterSl
       bounds.push(bound);
     }
     if (!variable(e)) return zero;
-    if (e.op === "cast") return e.type.kind === e.input.type.kind ? (bounds[0] ?? zero) : null;
+    if (e.op === "cast") return samePhysicalType(e.type, e.input.type) ? (bounds[0] ?? zero) : null;
     if (e.op !== "call" || e.fn !== "nullif") return null;
     return selector(e, bounds.slice(0, 1));
   };
