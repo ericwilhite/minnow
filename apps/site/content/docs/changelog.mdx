@@ -12,6 +12,10 @@ compatibility policy and release process.
 
 The unexported 1.0 rebuild reserves wide sort merge workspace independently of source batch size, including encoded keys and the `WITH TIES` boundary row when a competing query forces a smaller source recipe.
 
+Shared byte-span regex preparation measures 1,031,398 packed bytes. The core tarball cap
+rises once by 1,000 bytes; download and package-isolation limits stay unchanged. Native
+SQL regex execution remains guarded while its admitted execution path is prepared.
+
 Regex substring and replacement now follow PostgreSQL's ARE capture ordering. Earlier greedy
 parts take priority over later captures; positive repetitions report the final atom after a
 greedy prefix, and an optional group absent from that atom does not reuse an earlier capture.

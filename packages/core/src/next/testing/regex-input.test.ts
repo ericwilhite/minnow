@@ -1,9 +1,10 @@
 /** Representation-native positions walk the same Unicode scalars without decoding/copying input. */
 import fc from "fast-check";
 import { expect, it } from "vitest";
-import { seedsFor } from "../testing/seeds.js";
-import { createReach, REGEX_INPUT_REACH } from "../testing/reach.js";
-import { StringRegexInput, Utf8RegexInput } from "./input.js";
+import { seedsFor } from "../../testing/seeds.js";
+import { createReach, REGEX_INPUT_REACH } from "../../testing/reach.js";
+import { StringRegexInput } from "../../pattern/input.js";
+import { Utf8RegexInput } from "../vector/regex-input.js";
 
 const history = fc.record({
   atom: fc.oneof(

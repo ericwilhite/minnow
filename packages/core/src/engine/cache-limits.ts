@@ -8,7 +8,7 @@ export const MAX_CACHEABLE_TEXT_CHARACTERS = 16 * 1024;
  */
 export const MAX_SQL_TEXT_CHARACTERS = 1024 * 1024;
 export const MAX_SQL_TOKENS = 16_384;
-export const MAX_SQL_NESTING_DEPTH = 128;
+export { MAX_SQL_NESTING_DEPTH } from "../pattern/limits.js";
 export const MAX_SQL_PARAMETERS = 4_096;
 
 /**
@@ -16,14 +16,14 @@ export const MAX_SQL_PARAMETERS = 4_096;
  * query memory accounting can observe it. Plain projection does not use this limit: a stored wide
  * value can still be selected or streamed without asking a scalar function to expand it.
  */
-export const MAX_SQL_SCALAR_RESULT_CHARACTERS = 1024 * 1024;
+export { MAX_SQL_SCALAR_RESULT_CHARACTERS } from "../pattern/limits.js";
 
 /** Bounds object/array walks performed before an execution memory context exists. */
 export const MAX_SQL_STRUCTURED_VALUE_ITEMS = 65_536;
 export const MAX_SQL_STRUCTURED_VALUE_DEPTH = 128;
 
 /** SQL patterns compile outside the execution memory budget and may be retained in small caches. */
-export const MAX_SQL_PATTERN_CHARACTERS = 16 * 1024;
+export { MAX_SQL_PATTERN_CHARACTERS } from "../pattern/limits.js";
 /** Pattern matching step limit. */
-export const MAX_SQL_PATTERN_MATCH_STEPS = 8 * 1024 * 1024;
+export { MAX_SQL_PATTERN_MATCH_STEPS } from "../pattern/limits.js";
 export const MAX_SQL_NUMERIC_DIGITS = 100_000;

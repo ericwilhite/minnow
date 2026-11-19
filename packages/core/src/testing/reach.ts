@@ -11630,3 +11630,22 @@ export const REGEX_INPUT_REACH = [
   "forward and backward",
   "borrowed buffer",
 ] as const;
+
+export const REGEX_BYTE_SPANS_REACH = [
+  "nested",
+  "optional",
+  "noncapturing",
+  "star",
+  "alternative",
+  "prefix",
+  "bounded",
+  "anchored",
+  "empty",
+  "no match",
+  "empty match",
+  "nonparticipating group",
+  "astral bytes",
+  "newline mode",
+  "ordered case flags",
+  "longest alternative",
+] as const;
