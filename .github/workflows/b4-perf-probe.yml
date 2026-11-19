@@ -1,0 +1,71 @@
+# BRANCH ONLY. Never merge this diagnostic or its two scripts into main.
+name: B4 fresh-parent and cache counts (branch only)
+on:
+  push:
+    branches: [ci/b4-probe]
+    paths:
+      - .github/workflows/b4-perf-probe.yml
+      - scripts/b4-perf-probe.mts
+      - scripts/b4-perf-worker.mts
+permissions:
+  contents: read
+concurrency:
+  group: b4-perf-probe-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  probe:
+    if: github.ref == 'refs/heads/ci/b4-probe'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - arm: parent
+            revision: 84d10cff312e5c42dfa9602b3eb83423859db0b0
+          - arm: cache
+            revision: 35814378581cec75b8da6e62cdb23aa173a863a4
+    env:
+      NODE_OPTIONS: --max-old-space-size=4096
+      UV_THREADPOOL_SIZE: "1"
+      B4_MAIN: ${{ matrix.revision }}
+      B4_ARM: ${{ matrix.arm }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "26.12.0"
+      - name: Cache-only scratch and runner identity
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.cache/b4-probe/tmp" "$HOME/.cache/b4-probe/results"
+          echo "TMPDIR=$HOME/.cache/b4-probe/tmp" >> "$GITHUB_ENV"
+          echo "npm_config_cache=$HOME/.cache/npm" >> "$GITHUB_ENV"
+          node -p 'JSON.stringify({node:process.version,cpus:require("os").cpus(),memory:require("os").totalmem()})' > "$HOME/.cache/b4-probe/results/runner.json"
+          node -e 'if (require("os").totalmem() < 14 * 2**30) throw Error("B4 diagnostic requires the 16 GB runner")'
+      - name: Build harness and the pinned arm serially
+        shell: bash
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npx tsc -b --pretty false
+          npx tsc --noEmit --pretty false -p scripts
+          git worktree add --detach "$HOME/.cache/b4-probe/main" "$B4_MAIN"
+          (cd "$HOME/.cache/b4-probe/main" && npm ci --ignore-scripts --no-audit --no-fund && npx tsc -b packages/core --pretty false)
+      - name: Ten complete queries under precise call counts (UNTIMED)
+        shell: bash
+        run: |
+          set -o pipefail
+          node --v8-pool-size=1 scripts/b4-perf-probe.mts --runtime "$HOME/.cache/b4-probe/main" --arm "$B4_ARM" --output "$HOME/.cache/b4-probe/results" 2>&1 | tee "$HOME/.cache/b4-probe/results/run.log"
+      - name: Upload complete or failed diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: b4-directory-after-counts-${{ matrix.arm }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ~/.cache/b4-probe/results/*.json
+            ~/.cache/b4-probe/results/*.log
+          if-no-files-found: error
+          retention-days: 30
