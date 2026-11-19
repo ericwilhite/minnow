@@ -231,6 +231,7 @@ export class Harness {
   /** Abandons the write path without closing it (no final header), then opens again. */
   async crash(): Promise<WritePathImpl> {
     await this.path.flush();
+    WritePathImpl.abandonForCrash(this.path);
     await this.#release?.();
     if (this.backend instanceof SimBackend) this.backend.restart();
     return this.open();

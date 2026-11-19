@@ -161,6 +161,7 @@ import { RunSink } from "./run-output.js";
 import { writeStepMinimum, type WriteStepMinimum } from "./minimum.js";
 import { MetadataBudget, MetadataPressure, releaseIdle } from "./budget.js";
 import { nativeGroupOptions } from "./group-options.js";
+import { claimWriteOwner } from "./owner-claim.js";
 import { GroupWriter } from "../page/writer.js";
 import type { StoreSession } from "../storage/contract.js";
 import { ExtentListKeeper, type ExtentList } from "../storage/extent-list.js";
@@ -844,7 +845,25 @@ export class WritePathImpl implements WritePath, EngineHooks {
 
   // ── Open and recovery ────────────────────────────────────────────────────────────────────
 
+  /** Simulated crash (test support): the abandoned engine never closes, as when its worker
+   * dies with its governor; a new engine may then claim the same governor. */
+  static abandonForCrash(path: WritePathImpl): void {
+    path.#ownerClaim?.release();
+  }
+
+  #ownerClaim: { release(): void } | null = null;
+
   static async open(input: EngineInput): Promise<WritePathImpl> {
+    const claim = claimWriteOwner(input.governor);
+    try {
+      return await WritePathImpl.#open(input, claim);
+    } catch (error) {
+      claim.release();
+      throw error;
+    }
+  }
+
+  static async #open(input: EngineInput, claim: { release(): void }): Promise<WritePathImpl> {
     const raw = input.space.root?.byteLength ?? 512;
     const credits = await WriteCredits.open(
       input.governor,
@@ -1033,6 +1052,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         rootCharge,
         lists,
       });
+      engine.#ownerClaim = claim;
       await engine.#load();
       await engine.#prepareMinimum();
       await engine.#recover();
@@ -3560,7 +3580,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
   }
 
   close(): Promise<void> {
-    return (this.#closing ??= this.#closeNow());
+    // A closed engine never waits for growth: even a failed close frees the governor for
+    // recovery's new engine (owner/native.ts reopens after an indeterminate import).
+    return (this.#closing ??= this.#closeNow().finally(() => this.#ownerClaim?.release()));
   }
 
   async #closeNow(): Promise<void> {
@@ -3645,6 +3667,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
       });
       releaseIdle(this.#grant);
       this.#credits.close({ keepRowsForReaders: true });
+      // Readers keep the closed engine's rows; a new engine may take the governor.
+      this.#ownerClaim?.release();
       this.shared.readers.holdUntilOlderClose(() => {
         for (const state of this.#tables.values())
           for (const memtable of state.view.memtables) memtable.releaseAll();
@@ -3685,6 +3709,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#grant.free(OBJECT_OVERHEAD_BYTES);
     this.#grant.close();
     this.#credits.close();
+    this.#ownerClaim?.release();
   }
 
   // ── Shared caches ────────────────────────────────────────────────────────────────────────

@@ -68,7 +68,15 @@ growth refuses at once with the typed 53200 `MemoryAdmissionError`; it never que
 that could only be served by freeing its own inputs. A background merge refused this way is
 retried once and then left unmerged, without failing the write path.
 `live-growth.test.ts` and `testing/write-retained-merge.test.ts` generate owners with
-substantial live rows and merges beside retained readers. Closing the writer cancels pending growth before releasing its inputs.
+substantial live rows and merges beside retained readers.
+
+Limit: memtable rows leave memory only through a metadata publication, so the engine counts
+them as required inputs instead of spilling them. That is deadlock-free only while one governor
+serves one write engine; two engines on one governor could each keep rows the other's step
+needs. `write/owner-claim.ts` enforces the invariant production already follows (one governor
+and one write engine per owner, `owner/native-boot.ts`): attaching a second engine fails with
+`WriteOwnerConflictError`, and closing (or a simulated crash in test support) frees the
+governor. `write/owner-claim.test.ts` pins it. There is no memtable eviction path. Closing the writer cancels pending growth before releasing its inputs.
 Metadata allocation distinguishes an individual object larger than the whole cap from
 transient pressure: only the former is a typed size refusal. A metadata parse still has
 to fit as one step; this does not add a new stored format or a streaming manifest parser.
