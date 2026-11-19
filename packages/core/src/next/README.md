@@ -4648,6 +4648,11 @@ keeper first attempts their complete reservation; a boolean or typed memory refu
 selects the same disk inventory used for larger sources. Other errors propagate.
 The disk route admits its smaller working window before copying or consuming entries.
 
+An idle transaction can retain the writer slot while a recycler queues behind it. That queued
+recycler owns no active step: fitting readers can reclaim the dormant writer forecasts before
+the transaction releases its slot. Live allocations, prepared rows, active metadata/WAL work
+and funded merge handoffs remain owned; recycling re-admits its workspace after it gets the slot.
+
 ### Bounded native writer ownership
 
 Abort detaches each builder before consuming its reservation. Its remaining disk bytes move

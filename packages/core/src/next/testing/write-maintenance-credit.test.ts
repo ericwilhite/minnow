@@ -2,11 +2,24 @@
 import fc from "fast-check";
 import { expect, it, onTestFinished, vi } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
-import { createReach, WRITE_MAINTENANCE_CREDIT_REACH } from "../../testing/reach.js";
+import {
+  createReach,
+  WRITE_MAINTENANCE_CREDIT_REACH,
+  WRITE_QUEUED_READER_REACH,
+} from "../../testing/reach.js";
 import { Governor, type Grant } from "../memory/governor.js";
 import { yieldTask } from "../task.js";
 import { WriteCredits } from "../write/credits.js";
-import { Harness, autocommit, column, INT, tableInput } from "../write/test-support.js";
+import {
+  Harness,
+  autocommit,
+  batch,
+  column,
+  INT,
+  ints,
+  rowsOf,
+  tableInput,
+} from "../write/test-support.js";
 
 for (const seed of seedsFor("next-write-maintenance-credit", [47217, 47218]))
   it(`grows while maintenance waits for the current transaction (seed ${String(seed)})`, async () => {
@@ -131,6 +144,143 @@ for (const seed of seedsFor("next-write-maintenance-credit", [47217, 47218]))
         reach.reach("zero final charge");
       }),
       { seed, numRuns: 8, endOnFailure: true },
+    );
+    reach.assertReached();
+  });
+
+for (const seed of seedsFor("next-write-queued-reader", [47237, 47238]))
+  it(`reclaims idle forecasts while recycling waits for a transaction (seed ${String(seed)})`, async () => {
+    const reach = createReach("reader behind queued recycling", WRITE_QUEUED_READER_REACH);
+    await fc.assert(
+      fc.asyncProperty(
+        fc.constantFrom(32, 48, 64),
+        fc.integer({ min: 1, max: 3 }),
+        fc.integer({ min: 1, max: 4 }),
+        async (cap, headroom, count) => {
+          reach.beginHistory();
+          const h = new Harness("strict", "memory", 128, undefined, { merges: { mode: "off" } });
+          Object.defineProperty(h, "governor", { value: new Governor(cap * (1 << 20)) });
+          const stop = new AbortController();
+          let credits: WriteCredits | undefined,
+            tx: Awaited<ReturnType<Harness["path"]["begin"]>> | undefined,
+            maintenance: Promise<void> | undefined,
+            pending: Promise<void> | undefined,
+            reader: Grant | undefined,
+            output: Uint8Array | undefined,
+            closing: Promise<void> | undefined;
+          const state: { settled: boolean; error: unknown } = { settled: false, error: null };
+          const open = WriteCredits.open.bind(WriteCredits);
+          const captured = vi
+            .spyOn(WriteCredits, "open")
+            .mockImplementation(async (...args) => (credits = await open(...args)));
+          const release = () => {
+            if (output) expect(output.at(-1)).toBe(53);
+            output = undefined;
+            reader?.free(reader.allocated);
+            reader?.close();
+            reader = undefined;
+          };
+          const close = () =>
+            (closing ??= (async () => {
+              stop.abort(new Error("queued reader cleanup"));
+              if (pending) await pending;
+              release();
+              tx?.rollback();
+              tx = undefined;
+              if (maintenance) await maintenance;
+              captured.mockRestore();
+              await h.close();
+            })());
+          onTestFinished(close);
+          try {
+            const path = await h.open();
+            await autocommit(path, (s) =>
+              s.changeCatalog({
+                kind: "createTable",
+                table: tableInput("queued_reader", [column("id", INT)], { primaryKey: null }),
+              }),
+            );
+            const values = Array.from({ length: count }, (_, i) => i);
+            await autocommit(path, (s) => s.table(1).insert(batch(ints(values)), null));
+            await path.quiesce();
+            tx = await path.begin();
+            maintenance = path.recycleLog();
+            void maintenance.catch(() => undefined);
+            await yieldTask();
+            expect(path.maintenanceState.recycling).toBe(true);
+            reach.reach("recycling waits behind idle transaction");
+            if (!credits) throw new Error("Missing native credits");
+            await credits.prepareMetadata(headroom * (1 << 20));
+            expect(credits.metadata.held - credits.metadata.allocated).toBeGreaterThanOrEqual(
+              headroom * (1 << 20),
+            );
+            reach.reach("future workspace has no live allocation");
+            pending = h.governor
+              .admitGroup({
+                label: "reader behind queued recycling",
+                includesProgress: true,
+                grants: [
+                  {
+                    label: "complete reader",
+                    minimumBytes: (cap - 6) * (1 << 20),
+                    spillable: false,
+                  },
+                ],
+                signal: stop.signal,
+              })
+              .then(
+                (grants) => {
+                  reader = grants[0];
+                  state.settled = true;
+                },
+                (error: unknown) => {
+                  state.error = error;
+                  state.settled = true;
+                },
+              );
+            for (let turn = 0; turn < 16 && !state.settled; turn++) await yieldTask();
+            const blocked = !state.settled;
+            // Cleanup aid only: preserve the bounded progress assertion on the parent/mutant.
+            if (blocked) credits.reclaimIdleForecasts();
+            await pending;
+            expect(blocked, "queued maintenance cannot pin dormant writer credit").toBe(false);
+            expect(state.error).toBeNull();
+            expect(path.maintenanceState.recycling).toBe(true);
+            reach.reach("fitting reader progresses before transaction releases slot");
+            expect(reader?.allocate(65536)).toBe(true);
+            output = new Uint8Array(65536).fill(53);
+            release();
+            tx.rollback();
+            tx = undefined;
+            await maintenance;
+            reach.reach("recycling completes after reader and transaction");
+            await autocommit(path, (s) => s.table(1).insert(batch(ints([count])), null));
+            const pin = path.pin();
+            try {
+              expect(await rowsOf(pin, 1)).toEqual([...values, count].map((value) => [value]));
+            } finally {
+              pin.release();
+            }
+            reach.reach("exact rows and continued writes");
+            reach.reach(cap === 32 ? "32 MiB" : cap === 48 ? "48 MiB" : "64 MiB");
+          } finally {
+            await close();
+          }
+          expect(h.governor.usedBytes).toBe(0);
+          reach.reach("zero final charge");
+        },
+      ),
+      {
+        seed,
+        // Three fixed cap boundaries plus eight random histories per seed.
+        numRuns: 11,
+        examples: [
+          [32, 1, 1],
+          [48, 2, 2],
+          [64, 3, 4],
+        ],
+        endOnFailure: true,
+      },
     );
     reach.assertReached();
   });

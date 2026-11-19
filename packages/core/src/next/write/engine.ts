@@ -2003,7 +2003,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
       !this.#flushScheduled &&
       !this.#mergeScheduled &&
       !this.#merging &&
-      this.#recycling === null &&
+      // A holder excludes maintenance from the single writer slot. A recycler
+      // queued behind that holder owns no step and cannot pin future credit.
+      (this.#recycling === null || this.#holder !== null) &&
       this.#idleRun === null &&
       this.#runReadersPending === 0
     );

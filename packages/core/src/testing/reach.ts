@@ -11537,3 +11537,16 @@ export const WRITE_RECLAIM_PROGRESS_REACH = [
   "64 MiB",
   "zero final charge",
 ] as const;
+
+/** Queued recycling owns no slot or workspace and cannot obstruct a fitting reader. */
+export const WRITE_QUEUED_READER_REACH = [
+  "recycling waits behind idle transaction",
+  "future workspace has no live allocation",
+  "fitting reader progresses before transaction releases slot",
+  "recycling completes after reader and transaction",
+  "exact rows and continued writes",
+  "32 MiB",
+  "48 MiB",
+  "64 MiB",
+  "zero final charge",
+] as const;
