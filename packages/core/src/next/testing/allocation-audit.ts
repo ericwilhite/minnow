@@ -9,6 +9,8 @@ import * as varlen from "../vector/varlen.js";
 import * as pools from "../exec/spill-pool.js";
 import * as sorts from "../exec/sort.js";
 import * as results from "../exec/result-buffer.js";
+import * as scans from "../exec/table-scan.js";
+import { MemoryOutputs } from "../exec/memory-output.js";
 import type { ByteCharge } from "../vector/varlen.js";
 
 interface Step {
@@ -158,6 +160,24 @@ export function allocationAudit(covered: () => number) {
     return call("OutputArena.validity", this.charge, () => validity.call(this));
   });
   restore.push(() => validitySpy.mockRestore());
+  const Scan = scans.TableScan;
+  const scanSpy = vi.spyOn(scans, "TableScan").mockImplementation(function (
+    ...args: ConstructorParameters<typeof Scan>
+  ) {
+    return call("TableScan.constructor", args[0].budget, () => new Scan(...args));
+  });
+  restore.push(() => scanSpy.mockRestore());
+  // Native output replacements are synchronous and retain their old charge until
+  // installation. Every new backing must follow the replacement's fresh charge.
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- Rebound below.
+  const prepareOutputs = MemoryOutputs.prototype.prepare;
+  const outputsSpy = vi.spyOn(MemoryOutputs.prototype, "prepare").mockImplementation(function (
+    this: MemoryOutputs,
+    ...args: Parameters<typeof prepareOutputs>
+  ) {
+    return call("MemoryOutputs.prepare", this.budget, () => prepareOutputs.apply(this, args));
+  });
+  restore.push(() => outputsSpy.mockRestore());
   const storeCharges = new WeakMap<stores.ColumnStore, ByteCharge>();
   const Pool = pools.Pool;
   const poolSpy = vi.spyOn(pools, "Pool").mockImplementation(function (

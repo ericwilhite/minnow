@@ -11688,3 +11688,22 @@ export const EXECUTOR_DEMAND_BOUNDARIES_REACH = [
   "PGlite exact rows",
   "zero final credit",
 ] as const;
+
+/** One-locator admission must retain full physical-position workspace. */
+export const EXECUTOR_KEY_ORDER_DEMAND_REACH = [
+  "2",
+  "257",
+  "2049",
+  "int",
+  "text",
+  "numeric",
+  "resident",
+  "stored",
+  "ASC",
+  "DESC",
+  "OFFSET",
+  "no OFFSET",
+  "PG exact",
+  "independent backing",
+  "released",
+] as const;

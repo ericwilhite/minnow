@@ -152,7 +152,9 @@ Its arrays remain charged to their original owner through staging or publication
 allocates no new native buffers or query grant. The caller closes this input lease even when
 the plan never opens. The admitted cursor needs only its bounded heads and key copies. When
 SQL LIMIT is exactly one, the cursor supplies at most one locator, so its query omits the
-physical-order restore sort and sizes locator scratch for one row.
+physical-order restore sort and sizes locator scratch for one row. The fetched row can
+occupy any physical slot in a batch, so its ordinal vector and scan position lists
+retain their full batch capacities in the admitted minimum.
 
 For a small native table, an execution can retain its existing resident chunk while it reads.
 The query still accounts for that input through the write owner, and releases the lease after

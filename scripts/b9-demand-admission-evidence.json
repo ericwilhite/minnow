@@ -1213,5 +1213,13 @@
     "hostedRun": 44497039678,
     "hostedCurrentMainNoRegressionCells": 25,
     "fullGates": "pending hosted; no full-gate claim"
+  },
+  "hostedFailureRepair": {
+    "evidence": "scripts/bench-evidence/b9-admission-hosted-repair-84d-2026-11-19.json",
+    "priorRun": 44497039678,
+    "priorGate": "FAILED candidate shards1/3; parentall4 passed",
+    "runtimeChange": "Fund full-batch ordinal/scan position workspace beside one locator; charge scan boolean placeholder",
+    "currentQualification": "107 unique affected checks +4 intended mutants +scoped TS/lint/format PASS; new full hosted gate and W1M/S1 comparison required",
+    "priorMeasurements": "Historical above, not qualification of this repair"
   }
 }

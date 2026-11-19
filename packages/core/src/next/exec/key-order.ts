@@ -138,6 +138,12 @@ export function indexMinimums(
       minimum:
         targetBytes +
         memoryScanBufferBytes(shape.types) +
+        // LIMIT bounds locators, not physical slots in a sparse payload scan. The
+        // ordinal vector and five position/selection lists still hold a full batch.
+        dataBytes(ORDINAL_TYPE, BATCH_ROWS) +
+        4 * Math.ceil(BATCH_ROWS / 32) +
+        5 * BATCH_ROWS * Uint16Array.BYTES_PER_ELEMENT +
+        1 +
         rows * (80 + 8 * OBJECT_OVERHEAD_BYTES) +
         OBJECT_OVERHEAD_BYTES * (16 + 2 * shape.types.length),
     },
