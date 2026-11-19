@@ -10579,6 +10579,7 @@ export const FOLLOW_NESTED_AFTER_REACH = [
 ] as const;
 
 export const FOLLOW_NESTED_PRESSURE_REACH = [
+  "prepaid writer progresses with competitor retained",
   "published",
   "resident",
   "64MiB competing credit",
