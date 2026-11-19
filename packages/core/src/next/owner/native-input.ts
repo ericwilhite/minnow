@@ -103,7 +103,8 @@ export class NativeInputProgram {
     let program = this.#program,
       compiledBytes = 0;
     if (this.transient) {
-      const bytes = nativeInputProgramBytes(this.plan);
+      // The retained handle is already part of the legacy program envelope.
+      const bytes = nativeInputProgramBytes(this.plan) - NATIVE_INPUT_HANDLE_BYTES;
       if (!charge.allocate(bytes)) throw new RangeError("Transient input program must be admitted");
       try {
         program = compileModificationInput(this.plan);

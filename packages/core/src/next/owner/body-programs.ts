@@ -28,7 +28,7 @@ export function nativeBodyProgramMinimumBytes(plans: readonly NativeBodyPlan[]):
       1024 +
       256 * (plan.root.op === "modify" ? plan.root.input.output.length : 0) +
       NATIVE_INPUT_HANDLE_BYTES;
-    working = Math.max(working, nativeInputProgramBytes(plan));
+    working = Math.max(working, nativeInputProgramBytes(plan) - NATIVE_INPUT_HANDLE_BYTES);
   }
   bytes += working;
   if (!Number.isSafeInteger(bytes)) throw new RangeError("Native body programs too large");

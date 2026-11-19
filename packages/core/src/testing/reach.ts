@@ -11570,6 +11570,7 @@ export const NATIVE_TRIGGER_SQL_INSERT_REACH = [
 ] as const;
 
 export const NATIVE_PROGRAM_STEP_REACH = [
+  "fitting legacy minimum never rises",
   "one immutable plan",
   "many immutable plans",
   "successful producer",

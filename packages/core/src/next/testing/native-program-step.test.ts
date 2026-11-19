@@ -5,7 +5,7 @@ import { expect, it, vi } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach, NATIVE_PROGRAM_STEP_REACH } from "../../testing/reach.js";
 import { NativeBodyPrograms, nativeBodyProgramMinimumBytes } from "../owner/body-programs.js";
-import { NATIVE_INPUT_CAPTURE_BYTES } from "../owner/native-input.js";
+import { NATIVE_INPUT_CAPTURE_BYTES, nativeInputProgramBytes } from "../owner/native-input.js";
 import { PrepaidQueryGovernor, PREPAID_QUERY_BYTES } from "../owner/prepaid-query.js";
 import { nativeParameterMinimumBytes } from "../exec/native-parameters.js";
 import * as compiler from "../exec/plan.js";
@@ -32,6 +32,21 @@ for (const seed of seedsFor("next-native-program-step", [49537, 49538]))
             body: null,
             plan: { ...lowered.plan },
           }));
+          const legacy =
+            4096 +
+            entries.reduce(
+              (sum, { plan }) =>
+                sum +
+                1024 +
+                256 * (plan.root.op === "modify" ? plan.root.input.output.length : 0) +
+                nativeInputProgramBytes(plan),
+              0,
+            );
+          expect(
+            nativeBodyProgramMinimumBytes(entries),
+            "a fitting legacy minimum never rises",
+          ).toBeLessThanOrEqual(legacy);
+          reach.reach("fitting legacy minimum never rises");
           const bytes =
             nativeBodyProgramMinimumBytes(entries) +
             NATIVE_INPUT_CAPTURE_BYTES +
