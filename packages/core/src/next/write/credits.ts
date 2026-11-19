@@ -190,7 +190,16 @@ export class WriteCredits {
   /** Phase settlement may expose idle credit without freeing a live buffer. Wake
    * already queued admissions so they can ask our cooperative reclaimer again. */
   notifyReclaimable(): void {
-    this.rows.release(0);
+    // A live loan can back allocations above an account's ordinary holdings.
+    // Even release(0) is forbidden there: notify through a non-loan-backed
+    // account without moving ownership. If every account is loan-backed, its
+    // eventual repayment will itself wake the governor.
+    for (const account of [this.rows, this.metadata, this.commits, this.merge]) {
+      if (account.held >= account.allocated + account.loaned) {
+        account.release(0);
+        return;
+      }
+    }
   }
 
   /** Protect already admitted writer progress BEFORE opening the root's image lease.

@@ -11563,3 +11563,14 @@ export const WRITE_DICTIONARY_PREFLIGHT_REACH = [
   "exact NULL and UTF8 rows",
   "zero final charge",
 ] as const;
+
+export const WRITE_LOAN_NOTIFICATION_REACH = [
+  "row loan",
+  "metadata loan",
+  "commit loan",
+  "merge loan",
+  "reader queued during phase",
+  "loan and real buffer retained",
+  "queued reader progresses",
+  "zero final charge",
+] as const;

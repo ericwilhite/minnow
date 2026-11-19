@@ -4659,6 +4659,8 @@ An idle transaction can retain the writer slot while a recycler queues behind it
 recycler owns no active step: fitting readers can reclaim the dormant writer forecasts before
 the transaction releases its slot. Live allocations, prepared rows, active metadata/WAL work
 and funded merge handoffs remain owned; recycling re-admits its workspace after it gets the slot.
+Phase settlement wakes pending admissions through an account without loan-backed allocations.
+It does not release or repay live loans merely to send a wake; loan repayment supplies its own wake.
 
 ### Bounded native writer ownership
 

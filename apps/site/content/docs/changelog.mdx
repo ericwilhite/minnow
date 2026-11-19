@@ -34,6 +34,7 @@ The private 1.0 writer admits complete phase requirements after returning unused
 Fitting queries can reclaim idle write credit, including after UPDATE and inside an existing
 transaction. Active buffers, prepared rows and merge handoffs remain funded; private merge
 I/O uses its prepaid budget. Pressure waits remain cancellable when no idle credit is available.
+Phase settlement preserves outstanding progress loans while waking fitting queued queries.
 Released 0.x behavior is unchanged; no stored-format change or
 migration is required.
 
