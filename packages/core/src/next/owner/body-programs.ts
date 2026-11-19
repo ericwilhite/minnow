@@ -4,7 +4,11 @@ import type { CatalogView } from "../access/catalog.js";
 import type { TriggerBody } from "../access/trigger-def.js";
 import type { PhysicalPlan } from "../ir/ir.js";
 import type { ByteCharge } from "../vector/varlen.js";
-import { NativeInputProgram, nativeInputProgramBytes } from "./native-input.js";
+import {
+  NativeInputProgram,
+  nativeInputProgramBytes,
+  NATIVE_INPUT_HANDLE_BYTES,
+} from "./native-input.js";
 import type { RegistryImageTable } from "./registry-images.js";
 export interface NativeBodyPlan {
   readonly body: TriggerBody | null;
@@ -15,16 +19,18 @@ export interface NativeBodyProgram extends NativeBodyPlan {
   readonly input: NativeInputProgram;
 }
 export function nativeBodyProgramMinimumBytes(plans: readonly NativeBodyPlan[]): number {
-  const bytes =
-    4096 +
-    plans.reduce(
-      (n, { plan }) =>
-        n +
-        1024 +
-        256 * (plan.root.op === "modify" ? plan.root.input.output.length : 0) +
-        nativeInputProgramBytes(plan),
-      0,
-    );
+  // Inputs are fully spooled and retired before any row/body/RI writer runs.
+  // Only one compiled producer overlaps the retained immutable plans and schemas.
+  let bytes = 4096,
+    working = 0;
+  for (const { plan } of plans) {
+    bytes +=
+      1024 +
+      256 * (plan.root.op === "modify" ? plan.root.input.output.length : 0) +
+      NATIVE_INPUT_HANDLE_BYTES;
+    working = Math.max(working, nativeInputProgramBytes(plan));
+  }
+  bytes += working;
   if (!Number.isSafeInteger(bytes)) throw new RangeError("Native body programs too large");
   return bytes;
 }
@@ -75,7 +81,7 @@ export class NativeBodyPrograms {
           schemaVersion: 0,
           columns: root.input.output.map((c, i) => ({ id: i + 1, type: c.type })),
         };
-        const input = new NativeInputProgram(entry.plan, charge);
+        const input = new NativeInputProgram(entry.plan, charge, true);
         this.#programs.push({ ...entry, schema, input });
       }
     } catch (error) {

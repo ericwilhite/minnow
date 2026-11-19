@@ -11568,3 +11568,13 @@ export const NATIVE_TRIGGER_SQL_INSERT_REACH = [
   "root count",
   "zero ownership",
 ] as const;
+
+export const NATIVE_PROGRAM_STEP_REACH = [
+  "one immutable plan",
+  "many immutable plans",
+  "successful producer",
+  "terminal error prefix",
+  "repeated invocations",
+  "compiled state retired at each fence",
+  "zero ownership",
+] as const;

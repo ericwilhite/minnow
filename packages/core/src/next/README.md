@@ -5072,3 +5072,12 @@ This staged consumer currently refuses RETURNING/conflict/MERGE roots, volatile,
 FTS or init-plan inputs, auto-increment/index domains lacking native preflight,
 and parameterized or growing/structural CHECK/generated-column workspace. These are typed refusals before root
 writes, not uncharged fallbacks. Ordinary SQL firing is not enabled by this unit.
+
+### Native compiled-input phase memory
+
+Native root and body inputs are fully sealed before their row effects run. Their immutable
+plans, schemas and small handles stay retained; compiled producer state is admitted and
+retired per input. Complete setup reserves the largest compiled producer, rather than the
+sum of producers that never run together. Graph I/O, parameter and sink fences finish before
+that workspace is returned. This changes no write-owner floor: inactive merges keep the
+permanent joint floor, and an active merge still counts once under its existing contract.

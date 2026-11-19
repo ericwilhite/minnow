@@ -39,8 +39,11 @@ import {
 } from "./referential-mutations.js";
 import { NativeCommandExecution, nativeCommandExecutionBytes } from "./command-execution.js";
 import { NativeFollowUnique, nativeFollowUniqueBytes } from "./follow-unique.js";
-import { nativeInputProgramBytes } from "./native-input.js";
-import { NativeBodyPrograms, type NativeBodyPlan } from "./body-programs.js";
+import {
+  nativeBodyProgramMinimumBytes,
+  NativeBodyPrograms,
+  type NativeBodyPlan,
+} from "./body-programs.js";
 import { NativeBodyHost, nativeBodyHostBytes, type NativeBodyHostScope } from "./body-host.js";
 export interface NativeRootFunding {
   readonly metadata: Grant;
@@ -103,15 +106,7 @@ export function nativeCommandRootSetupBytes(scope: NativeRootPreparation): numbe
     ids = scope.tableIds;
   let columns = 0;
   for (const table of catalog.tables) columns = Math.max(columns, table.columns.length);
-  let programBytes = 4096;
-  const add = (plan: NativeBodyPlan["plan"]) => {
-    programBytes +=
-      1024 +
-      256 * (plan.root.op === "modify" ? plan.root.input.output.length : 0) +
-      nativeInputProgramBytes(plan);
-  };
-  add(scope.root);
-  for (const trigger of scope.triggers) for (const body of trigger.bodies) add(body.plan);
+  const programBytes = nativeBodyProgramMinimumBytes(plans(scope));
   const bytes =
     baseBytes(scope) +
     REGISTRY_DIRECTORY_BYTES +
