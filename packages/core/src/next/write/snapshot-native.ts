@@ -374,6 +374,7 @@ export class SnapshotNativeBuilder {
             type: column.column.type,
             statistics: { nullCount: nulls, min: null, max: null, dictionarySize: null },
             distinctSketch: null,
+            aggregateSummary: null,
           });
         } finally {
           source.close();

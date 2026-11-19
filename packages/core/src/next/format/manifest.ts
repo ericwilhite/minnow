@@ -247,6 +247,8 @@ export interface ColumnChunk {
   readonly statistics: ColumnStatistics;
   /** Mergeable distinct-count sketch (approximate; planning only), or null. */
   readonly distinctSketch: BlobRef | null;
+  /** Exact A1 numeric facts for these immutable source refs; absence means ordinary scan. */
+  readonly aggregateSummary: BlobRef | null;
 }
 
 export const PageEncoding = DURABLE_CODECS.page;
