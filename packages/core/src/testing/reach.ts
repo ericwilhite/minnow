@@ -7470,6 +7470,7 @@ export const FTS_STATEMENT_CLOCK_REACH = [
 
 /** End-of-statement FTS admission observes its own signal before another holder releases credit. */
 export const FTS_ADMISSION_CANCEL_REACH = [
+  "native forecasts own real buffers during wait",
   "options",
   "end",
   "actual admission wait",
