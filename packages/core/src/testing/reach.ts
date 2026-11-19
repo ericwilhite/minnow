@@ -11606,3 +11606,11 @@ export const WRITE_FUNDED_HANDOFF_REACH = [
   "real metadata buffer retained",
   "zero final charge",
 ] as const;
+
+export const WRITE_MEMTABLE_OWNERSHIP_ORACLE_REACH = [
+  "live",
+  "borrowed",
+  "both",
+  "actual ownership accepted",
+  "unfunded ownership rejected despite spare credit",
+] as const;
