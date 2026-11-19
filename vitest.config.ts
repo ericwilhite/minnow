@@ -134,6 +134,7 @@ export default defineConfig({
         "packages/core/src/next/write/directory-publication-compat.test-support.ts",
         "packages/core/src/next/testing/prototype-runs.test-support.ts",
         "packages/core/src/engine/event-loop-work.test-support.ts",
+        "packages/core/src/engine/event-loop-stalls.test-support.ts",
         "packages/core/src/engine/sql-regex-parent.test-support.ts",
         "packages/core/src/testing/reach-union.ts",
         "packages/core/src/testing/reach-unions.ts",
