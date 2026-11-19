@@ -1,6 +1,15 @@
+import { MODIFY_TARGET_SET_BYTES } from "./modify-target-set.js";
 import { NativeTargetGuard } from "./native-target-guard.js";
 import { statementRuleReach } from "./statement-reach.js";
-import { cursorMinimum, runIndexAccess, indexExpressions, indexMetadata } from "./index-access.js";
+import {
+  cursorMinimum,
+  runIndexAccess,
+  indexTuples,
+  indexMetadata,
+  indexFetchTarget,
+  INDEX_KEY_FIXED_SLACK,
+  SMALL_INDEX_IN_KEYS,
+} from "./index-access.js";
 import {
   UpsertWriter,
   UpsertExpressions,
@@ -667,6 +676,32 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
   }> = [];
   const compoundColumns = new Map<number, number>();
   const compoundCopies = new Map<number, number>();
+  const indexFetchOwners = new Set<number>();
+  interface IndexWorkspace {
+    identity: OperatorIdentity;
+    members: Array<{
+      owner: number;
+      rel: Extract<Rel, { op: "keyLookup" | "indexRange" }>;
+      minimum: (cap: number, runtime: QueryRuntime) => number;
+    }>;
+    grants: WeakMap<QueryRuntime, MaybePromise<Grant>>;
+  }
+  const indexKeyPlans = new Map<number, IndexWorkspace>();
+  const indexActive = new WeakMap<QueryRuntime, ReadonlySet<number>>();
+  // These producers are serial: join builds its right input before probing its
+  // left, and every wrapper completes its child before another producer starts.
+  // Replay, recursion, windows and volatile plans retain independent workspaces.
+  const serialIndexes = (rel: Rel): boolean => {
+    if (["scan", "values", "keyLookup", "indexRange"].includes(rel.op)) return true;
+    if (rel.op === "join") return serialIndexes(rel.left) && serialIndexes(rel.right);
+    if (rel.op === "setOp")
+      return rel.kind === "except" && rel.inputs.length === 2 && rel.inputs.every(serialIndexes);
+    if (["filter", "project", "sort", "limit", "modify"].includes(rel.op) && "input" in rel)
+      return serialIndexes(rel.input);
+    return false;
+  };
+  const shareIndexes = !plan.volatile && serialIndexes(plan.root);
+  let sharedIndexWorkspace: IndexWorkspace | null = null;
   const optionalIndexSorts = new Map<number, (runtime: QueryRuntime) => boolean>();
   const sortRows = new Map<
     number,
@@ -892,17 +927,6 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
     terminalInput.exprs.every((expr, k) => expr.op === "column" && expr.index === k)
   )
     terminalInput = terminalInput.input;
-  // Only the single source path of a modification input has the reviewed cursor
-  // recipe. Crossing a join/set branch requires a separate complete-minimum proof.
-  let modifyIndexInput: number | null = null;
-  if (plan.root.op === "modify") {
-    let input = plan.root.input;
-    for (;;) {
-      if (input.op === "keyLookup" || input.op === "indexRange") modifyIndexInput = input.id;
-      if (!("input" in input)) break;
-      input = input.input;
-    }
-  }
   const prepare = (rel: Rel): Recipe => {
     if (rel.op === "sort" && !rel.withTies && windowSuppliesOrder(rel.input, rel.keys))
       rel = { ...rel, op: "limit" };
@@ -1158,16 +1182,9 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
       }
       case "keyLookup":
       case "indexRange": {
-        // A cursor on the direct single-source modify input path joins the admitted
-        // producer. Query roots and cursors under branching inputs remain diagnostic;
-        // neither a MODIFY ancestor nor LIMIT zero grants an unreviewed minimum.
-        if (modifyIndexInput !== rel.id && options.keyOrder !== true)
-          throw new UnsupportedPlanError(
-            `${rel.op} requires diagnostic opt-in outside admitted modification input`,
-            {
-              construct: rel.op,
-            },
-          );
+        // Native index sources join the same whole-query reservation as scans. Key
+        // materialisation/cursor and row-fetch loans are distinct: a live encoded
+        // bound must never own the fetch borrower's only progress slot.
         if (
           options.keyOrder === true &&
           rel.op === "indexRange" &&
@@ -1196,16 +1213,73 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
             );
         }
         const input = types(rel).slice(0, rel.columns.length);
-        const compiler = measureCompilerBuffers(
-          compilation,
-          [],
-          BATCH_ROWS,
-          (context) => indexExpressions(rel, context),
-          () => undefined,
-        );
-        const extra = indexMetadata(rel) + compiler + BATCH_ROWS * 32 + 32768;
+        let compiler = 0;
+        for (const tuple of indexTuples(rel))
+          compiler = Math.max(
+            compiler,
+            measureCompilerBuffers(
+              compilation,
+              [],
+              1,
+              (context) => tuple.map((expr) => compileExpr(expr, context)),
+              () => undefined,
+            ),
+          );
+        const keyMinimum = (_cap: number, runtime: QueryRuntime) =>
+          indexMetadata(rel) + compiler + 16384 + cursorMinimum(runtime, rel);
+        let workspace = shareIndexes ? sharedIndexWorkspace : null;
+        if (workspace === null) {
+          workspace = {
+            identity: { id: nextPhysicalId++, op: rel.op, profileAs: rel },
+            members: [],
+            grants: new WeakMap(),
+          };
+          const group = workspace;
+          indexKeyPlans.set(group.identity.id, group);
+          if (shareIndexes) sharedIndexWorkspace = group;
+          fixed(
+            group.identity,
+            (cap, runtime) => {
+              const live = indexActive.get(runtime);
+              let bytes = 0;
+              for (const member of group.members)
+                if (live?.has(member.owner) !== false)
+                  bytes = Math.max(bytes, member.minimum(cap, runtime));
+              return bytes;
+            },
+            shareIndexes ? plan.root.id : rel.id,
+          );
+        }
+        const group = workspace,
+          keyIdentity = group.identity;
+        group.members.push({ owner: rel.id, rel, minimum: keyMinimum });
+        const keyBudget = (runtime: QueryRuntime): MaybePromise<Grant> => {
+          const previous = group.grants.get(runtime);
+          if (previous) return previous;
+          const grant = runtime.admit(
+            `${keyIdentity.op}#${String(keyIdentity.id)}`,
+            keyMinimum(runtime.request.governor.capBytes, runtime),
+            true,
+            keyIdentity,
+          );
+          group.grants.set(runtime, grant);
+          return grant;
+        };
+        indexFetchOwners.add(rel.id);
+        const fullKeys = (runtime: QueryRuntime) => {
+          const width = runtime.view.index(rel.tableId, rel.indexId).def.columnIds.length;
+          return rel.op === "keyLookup" && rel.keys.every((tuple) => tuple.length === width);
+        };
+        const trackLocators = (runtime: QueryRuntime) =>
+          plan.root.op !== "modify" &&
+          rel.op === "keyLookup" &&
+          rel.keys.length > SMALL_INDEX_IN_KEYS &&
+          fullKeys(runtime);
         const minimum = (cap: number, runtime: QueryRuntime) =>
-          extra + batchTargetFor(cap, 4) + cursorMinimum(runtime, rel);
+          BATCH_ROWS * 32 +
+          32768 +
+          indexFetchTarget(cap) +
+          (trackLocators(runtime) ? MODIFY_TARGET_SET_BYTES : 0);
         readSources.set(rel.id, {
           id: rel.id,
           tableId: rel.tableId,
@@ -1214,10 +1288,10 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           stagingBytes: memoryScanBufferBytes(input),
           windowBytes: 0,
           rows: null,
+          batchRows: 1,
+          selectedRow: true,
         });
-        fixed(rel, minimum, rel.id, 1);
-        compoundColumns.set(rel.id, variableColumns(input));
-        compoundCopies.set(rel.id, 8);
+        fixed(rel, minimum, rel.id);
         const sort =
           rel.op === "keyLookup"
             ? { id: nextPhysicalId++, op: "sort" as const, profileAs: rel }
@@ -1225,11 +1299,12 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
         // One complete-key probe is already in row-id/locator order, including
         // non-unique matches. Multiple probes and composite-key prefixes still
         // need the bounded merge/dedup sort before a modification consumes them.
-        const needsSort = (runtime: QueryRuntime) =>
-          rel.op === "keyLookup" &&
-          (rel.keys.length !== 1 ||
-            rel.keys[0]?.length !==
-              runtime.view.index(rel.tableId, rel.indexId).def.columnIds.length);
+        const needsSort = (runtime: QueryRuntime) => {
+          if (rel.op !== "keyLookup") return false;
+          const width = runtime.view.index(rel.tableId, rel.indexId).def.columnIds.length;
+          if (rel.keys.length === 1 && rel.keys[0]?.length === width) return false;
+          return plan.root.op === "modify" || !fullKeys(runtime);
+        };
         const sortMinimum = sortMinimumBytes([{ kind: "float64" }]);
         if (sort) {
           fixed(sort, sortMinimum, rel.id);
@@ -1243,8 +1318,13 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                 rel,
                 counted(runtime, rel, downstream),
                 minimum(runtime.request.governor.capBytes, runtime),
+                keyIdentity,
+                keyMinimum(runtime.request.governor.capBytes, runtime),
+                () => keyBudget(runtime),
+                trackLocators(runtime),
                 needsSort(runtime) ? sort : null,
                 sortMinimum,
+                () => stops.some((stop) => stop()),
               );
       }
       case "recursive": {
@@ -2981,7 +3061,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
   // One document may feed several output columns in the same copied result row.
   const jsonProgressColumns = Math.max(1, plan.columns.length);
   // SQL may use the exact PK order only with a complete caller-admitted cursor.
-  // Explicit indexRange and legacy cursors retain their separate diagnostic opt-in.
+  // Explicit native index sources use their complete general query recipe below.
   const ordered = options.keyOrder !== false ? orderedSort(plan) : null;
   const cursorIdentity: OperatorIdentity = {
     id: nextPhysicalId++,
@@ -3023,6 +3103,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
       } else if ("input" in rel) visit(rel.input);
     };
     visit(plan.root);
+    indexActive.set(runtime, active);
     // Query-local scalar key bounds. They are populated by complete sizing passes,
     // before any execution grant exists; no native vectors/grants are retained here.
     const joinKeySources = new Map<number, Set<number>>();
@@ -3097,6 +3178,12 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
         return maximum;
       });
     }
+    for (const [id, group] of indexKeyPlans)
+      for (const member of group.members)
+        if (active.has(member.owner)) {
+          runtime.operatorStepOwner(id);
+          runtime.operatorStepOwner(member.owner);
+        }
     for (const [id, columns] of compoundColumns)
       if (active.has(id)) runtime.operatorParameterColumns(id, columns, compoundCopies.get(id));
     const singleValueSources = new Map<number, Set<number>>();
@@ -3224,6 +3311,41 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
       kind === "json" ? 48 : kind === "array" ? 64 : 0;
     let opaqueConsumerStep = 0;
     runtime.groupKeyProgress((id, loanSlot, slots, largest, minimum, ordinary) => {
+      if (indexFetchOwners.has(id))
+        return {
+          complete: Math.max(
+            0,
+            (bounds.get(id)?.progress ?? 0) - indexFetchTarget(runtime.request.governor.capBytes),
+          ),
+        };
+      const indexKeys = indexKeyPlans.get(id);
+      if (indexKeys?.members.some((member) => active.has(member.owner))) {
+        let bytes = 0;
+        for (const member of indexKeys.members) {
+          if (!active.has(member.owner)) continue;
+          for (const tuple of indexTuples(member.rel)) {
+            let width = 0;
+            for (const expr of tuple) {
+              const sizeOf = (key: ScalarExpr): number | null => {
+                const size = expressionInputBytes(key, member.rel, {
+                  parameter: (slot) => slots[slot] ?? largest,
+                  source: () => null,
+                });
+                if (key.op !== "cast") return size;
+                const input = sizeOf(key.input);
+                return size === null || input === null ? null : Math.max(size, input);
+              };
+              const size = sizeOf(expr);
+              if (size === null) return { complete: ordinary };
+              width += size + 32;
+            }
+            bytes = Math.max(bytes, width);
+          }
+        }
+        // Two range bounds, UTF-8 escaping and geometric growth overlap. The
+        // cursor keeps these buffers immutable while fetch owns another loan.
+        return { complete: Math.max(0, 16 * bytes - INDEX_KEY_FIXED_SLACK) };
+      }
       const sort = sortRows.get(id);
       if (sort && loanSlot === undefined && minimum > 0 && active.has(id)) {
         const widths = sort.exprs.map((expr) =>
@@ -3975,7 +4097,9 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
               },
               runtime.request.governor,
               runtime.signal,
-              batchTargetFor(runtime.request.governor.capBytes, 4),
+              indexFetchOwners.has(source.id)
+                ? indexFetchTarget(runtime.request.governor.capBytes)
+                : batchTargetFor(runtime.request.governor.capBytes, 4),
               BATCH_ROWS,
               runtime.metadataCaches(
                 source.retain !== false &&

@@ -1,5 +1,4 @@
-/** The general cursor/fetch recipe is funded by DML's complete producer minimum.
- * Query roots retain the diagnostic opt-in; LIMIT zero cannot bypass prepare-time refusal. */
+/** Queries and DML share complete native cursor/fetch admission, including branching inputs. */
 import { PGlite } from "@electric-sql/pglite";
 import fc from "fast-check";
 import { expect, it } from "vitest";
@@ -8,7 +7,6 @@ import { seedsFor } from "../../testing/seeds.js";
 import { currentEngine } from "../../testing/differential-current.js";
 import type { PhysicalPlan, Rel } from "../ir/ir.js";
 import { createExecutor } from "../exec/create.js";
-import { UnsupportedPlanError } from "../errors.js";
 import { StorageCore } from "./storage-core.js";
 import { oracleRows } from "./differential-adapter.js";
 function findIndex(rel: Rel): Extract<Rel, { op: "keyLookup" | "indexRange" }> | null {
@@ -23,8 +21,8 @@ function findIndex(rel: Rel): Extract<Rel, { op: "keyLookup" | "indexRange" }> |
   return null;
 }
 for (const seed of seedsFor("next-modify-index-gate", [0xb609, 0xb60a]))
-  it(`keeps query index admission diagnostic while executing DML inputs seed ${String(seed)}`, async () => {
-    const reach = createReach("DML-only index admission", MODIFY_INDEX_GATE_REACH),
+  it(`admits query and DML index inputs with the same typed semantics seed ${String(seed)}`, async () => {
+    const reach = createReach("general index admission", MODIFY_INDEX_GATE_REACH),
       core = await new StorageCore(8).open(),
       pg = new PGlite(),
       shipped = await currentEngine("memory");
@@ -92,19 +90,10 @@ for (const seed of seedsFor("next-modify-index-gate", [0xb609, 0xb60a]))
               };
             for (const options of [{}, { keyOrder: false }] as const) {
               const executor = createExecutor(options);
-              let refused = false;
-              try {
-                executor.prepare(select);
-              } catch (error) {
-                expect(error).toBeInstanceOf(UnsupportedPlanError);
-                expect((error as UnsupportedPlanError).construct).toBe(route);
-                refused = true;
-              }
-              expect(refused, "SELECT index cursor must remain diagnostic-only").toBe(true);
+              expect(() => executor.prepare(select)).not.toThrow();
               expect(() => executor.prepare(lowered.plan)).not.toThrow();
             }
-            // Branching input needs its own simultaneous-source admission proof. A
-            // MODIFY ancestor alone cannot authorize the cursor under a join/set input.
+            // Every branch joins the same atomic input/cursor/result reservation.
             const empty: Rel = {
               id: 1000001,
               op: "values",
@@ -143,18 +132,12 @@ for (const seed of seedsFor("next-modify-index-gate", [0xb609, 0xb60a]))
                 root: { ...lowered.plan.root, input: branch },
               };
               for (const keyOrder of [undefined, false]) {
-                let refused = false;
-                try {
-                  createExecutor(keyOrder === undefined ? {} : { keyOrder }).prepare(nested);
-                } catch (error) {
-                  expect(error).toBeInstanceOf(UnsupportedPlanError);
-                  expect((error as UnsupportedPlanError).construct).toBe(route);
-                  refused = true;
-                }
-                expect(refused, "nested branch index must remain diagnostic-only").toBe(true);
+                expect(() =>
+                  createExecutor(keyOrder === undefined ? {} : { keyOrder }).prepare(nested),
+                ).not.toThrow();
               }
               expect(() => createExecutor({ keyOrder: true }).prepare(nested)).not.toThrow();
-              reach.reach(branch.op === "join" ? "nested join refused" : "nested set refused");
+              reach.reach(branch.op === "join" ? "nested join admitted" : "nested set admitted");
             }
             expect(() => createExecutor({ keyOrder: true }).prepare(select)).not.toThrow();
             const actual = await core.execute(sql),
@@ -176,8 +159,8 @@ for (const seed of seedsFor("next-modify-index-gate", [0xb609, 0xb60a]))
             reach.reach(form);
             reach.reach(route);
             reach.reach(zero ? "zero SELECT limit" : "positive SELECT limit");
-            reach.reach("query unset refused");
-            reach.reach("query false refused");
+            reach.reach("query unset admitted");
+            reach.reach("query false admitted");
             reach.reach("query opt-in prepared");
             reach.reach("DML unset admitted");
             reach.reach("DML false admitted");
