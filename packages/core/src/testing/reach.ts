@@ -11522,6 +11522,7 @@ export const WRITE_IDLE_NOTIFICATION_REACH = [
 
 /** Reused credit cannot also remain promised as an old metadata forecast. */
 export const WRITE_DONATED_METADATA_REACH = [
+  "live metadata survives forecast donation",
   "metadata forecast funded",
   "metadata credit donated to row step",
   "merge retains only still funded metadata",

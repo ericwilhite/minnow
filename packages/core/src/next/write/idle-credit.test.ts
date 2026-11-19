@@ -178,15 +178,20 @@ for (const seed of seedsFor("next-write-donated-metadata", [47231, 47232]))
         const minimum = { rows: 1 << 20, metadata: 1 << 20, commits: 1 << 20, merge: 1 << 20 };
         const credits = await WriteCredits.open(governor, minimum);
         const kept = units * 1024;
+        let liveMetadata: Uint8Array | undefined;
         try {
           await credits.prepareMetadata(minimum.metadata);
+          expect(credits.metadata.allocate(kept)).toBe(true);
+          liveMetadata = new Uint8Array(kept).fill(73);
+          reach.reach("live metadata survives forecast donation");
           reach.reach("metadata forecast funded");
           const total =
             credits.rows.held + credits.metadata.held + credits.commits.held + credits.merge.held;
           await credits.growTo(credits.rows, total - kept);
           expect(credits.metadata.held).toBe(kept);
           reach.reach("metadata credit donated to row step");
-          await credits.prepareMerge(minimum.merge);
+          await credits.prepareMerge(2 * minimum.merge);
+          expect(liveMetadata.at(-1)).toBe(73);
           expect(
             credits.metadata.held,
             "a later phase cannot restore an unfunded old forecast",
@@ -196,6 +201,9 @@ for (const seed of seedsFor("next-write-donated-metadata", [47231, 47232]))
           expect(credits.metadata.held).toBeGreaterThanOrEqual(kept + 4096);
           reach.reach("real later metadata step readmitted");
         } finally {
+          // eslint-disable-next-line no-useless-assignment -- release the real buffer before refund
+          liveMetadata = undefined;
+          credits.metadata.free(credits.metadata.allocated);
           credits.close();
         }
         expect(governor.usedBytes).toBe(0);

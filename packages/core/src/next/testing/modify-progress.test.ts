@@ -53,20 +53,46 @@ for (const path of historyPaths)
         const verifyStop = new AbortController();
         // eslint-disable-next-line @typescript-eslint/unbound-method -- Invoked with the same native owner.
         const originalMetadata = WriteCredits.prototype.prepareMetadata;
+        const checkMerge = () => {
+          if (verifying && core.harness.path.stats().levelZeroRuns === 0) {
+            if (grants.some((g) => g.label.startsWith("merge t") && g.held > 0)) {
+              protocolFailure = new Error(
+                "Completed merge retained working credit across future metadata admission",
+              );
+              verifyStop.abort(protocolFailure);
+              throw protocolFailure;
+            }
+            reach.reach("finished merge credit retired");
+          }
+        };
         const metadata = vi
           .spyOn(WriteCredits.prototype, "prepareMetadata")
-          .mockImplementation(function (this: WriteCredits, bytes, signal) {
-            if (verifying && core.harness.path.stats().levelZeroRuns === 0) {
-              if (grants.some((g) => g.label.startsWith("merge t") && g.held > 0)) {
-                protocolFailure = new Error(
-                  "Completed merge retained working credit across future metadata admission",
-                );
-                verifyStop.abort(protocolFailure);
-                throw protocolFailure;
-              }
-              reach.reach("finished merge credit retired");
-            }
-            return originalMetadata.call(this, bytes, signal);
+          .mockImplementation(function (this: WriteCredits, bytes, signal, includesProgress) {
+            checkMerge();
+            return originalMetadata.call(this, bytes, signal, includesProgress);
+          });
+        // eslint-disable-next-line @typescript-eslint/unbound-method -- Invoked with the same native owner.
+        const originalNative = WriteCredits.prototype.prepareNativeMinimum;
+        const native = vi
+          .spyOn(WriteCredits.prototype, "prepareNativeMinimum")
+          .mockImplementation(function (this: WriteCredits, bytes, signal, includesProgress) {
+            checkMerge();
+            return originalNative.call(this, bytes, signal, includesProgress);
+          });
+        // Completion is the ownership boundary even when an already-funded
+        // verification query needs no later metadata preparation at all.
+        // eslint-disable-next-line @typescript-eslint/unbound-method -- Invoked with the same native owner.
+        const originalRelease = WriteCredits.prototype.releaseMerge;
+        const release = vi
+          .spyOn(WriteCredits.prototype, "releaseMerge")
+          .mockImplementation(function (this: WriteCredits, grant) {
+            originalRelease.call(this, grant);
+            if (grant.held !== 0 || grant.allocated !== 0 || grant.loaned !== 0) {
+              // Record a background protocol failure without throwing into maintenance;
+              // the verification query and final check report it on the test's own stack.
+              protocolFailure = new Error("Completed merge did not return all working credit");
+              verifyStop.abort(protocolFailure);
+            } else reach.reach("finished merge credit retired");
           });
         // eslint-disable-next-line @typescript-eslint/unbound-method -- Rebound with call in the spy.
         const originalUpdate = TableWriterImpl.prototype.update;
@@ -156,11 +182,14 @@ for (const path of historyPaths)
           reach.reach("bounded spill workspace");
         } finally {
           metadata.mockRestore();
+          native.mockRestore();
+          release.mockRestore();
           update.mockRestore();
           remove.mockRestore();
           end.mockRestore();
           await core.close();
         }
+        if (protocolFailure) throw protocolFailure;
         expect(core.harness.governor.usedBytes).toBe(0);
         expect(
           core.harness.path.maintenance.lastMergeFailure,
