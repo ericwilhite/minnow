@@ -56,13 +56,12 @@ export const resultFrameMetadataBytes = (columns: number): number =>
  * #make(1) uses targetBytes=0, so each field's arena is exact, overlapping only
  * its initial 64 bytes while resizing. Producer buffers are charged elsewhere;
  * the ordinary frame window funds bounded small/multi-row attempts. */
+export const resultRowOverheadBytes = (columns: number): number =>
+  64 + 4096 + 2 * OBJECT_OVERHEAD_BYTES + 288 * columns;
 export function resultRowStepBytes(widths: readonly number[]): number {
-  return (
-    widths.reduce((n, width) => n + Math.max(64, width), 0) +
-    64 +
-    4096 +
-    2 * OBJECT_OVERHEAD_BYTES +
-    288 * widths.length
+  return widths.reduce(
+    (n, width) => n + Math.max(64, width),
+    resultRowOverheadBytes(widths.length),
   );
 }
 
