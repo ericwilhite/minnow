@@ -1651,6 +1651,19 @@ export const KEY_ORDER_WINDOW_REACH = [
   "PG exact",
 ] as const;
 
+/** Point and range lookups sized over only the groups their keys name. */
+export const KEY_LOOKUP_SIZING_REACH = [
+  "point",
+  "missing key",
+  "duplicate IN probes",
+  "range",
+  "range over the bound",
+  "parameter",
+  "work bound",
+  "fallback",
+  "PG exact",
+] as const;
+
 /** SQL windows run through durable storage and the actual executor, not a plan interpreter. */
 export const LOWER_M3_WINDOWS_REACH = [
   "literal window amounts",

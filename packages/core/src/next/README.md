@@ -1775,6 +1775,17 @@ requires ORDER BY. Existing TEXT-to-integer cast-kernel refusals are independent
 path selection; integer inputs accept supported explicit numeric casts. Composite-prefix
 queries retain scans unless every indexed column is proven non-null by its schema or a
 strict predicate: native indexes omit tuples containing any NULL component.
+
+The selected-row fetch is sized over only the groups the lookup's keys name. Before admission,
+sizing binds the parameters and encodes the same keys on its own scratch grant
+(`index-lookup/sizing`: twice the key minimum plus 8 bytes per locator), probes the same pinned
+view, and charges the distinct segment list (`index-lookup/segments`, 4 bytes per locator). The
+scratch is released before sizing continues. While the list is held, sizing only tries its
+admissions; if one would wait, the list is released and the whole source is sized normally. More
+than 2048 locators, a scratch the cap cannot hold, or keys that fail to bind or encode all size
+the whole source: execution raises any key error in its usual order, and nothing is refused below
+the cap. A sized lookup opens a sizing cursor per probed key before its execution cursors; each
+closes at once on cancellation and settles before its memory is released.
 Ordinary SQL selects the admitted index recipe for a direct, complete
 primary-key ORDER BY with LIMIT or OFFSET, including OFFSET without LIMIT. The pinned
 catalog must certify the same unique key columns, byte collation and direction. Direct

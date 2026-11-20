@@ -4,6 +4,8 @@ import { statementRuleReach } from "./statement-reach.js";
 import {
   cursorMinimum,
   runIndexAccess,
+  lookupSegments,
+  type IndexRel,
   indexTuples,
   indexMetadata,
   indexFetchTarget,
@@ -776,6 +778,11 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
   const compoundColumns = new Map<number, number>();
   const compoundCopies = new Map<number, number>();
   const indexFetchOwners = new Set<number>();
+  /** Point and range lookups whose fetch is sized over only the segments their keys name. */
+  const lookupSizing = new Map<
+    number,
+    { rel: IndexRel; keyMinimum: (runtime: QueryRuntime) => number }
+  >();
   interface IndexWorkspace {
     identity: OperatorIdentity;
     members: Array<{
@@ -1365,6 +1372,10 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           return grant;
         };
         indexFetchOwners.add(rel.id);
+        lookupSizing.set(rel.id, {
+          rel,
+          keyMinimum: (runtime) => keyMinimum(runtime.request.governor.capBytes, runtime),
+        });
         const fullKeys = (runtime: QueryRuntime) => {
           const width = runtime.view.index(rel.tableId, rel.indexId).def.columnIds.length;
           return rel.op === "keyLookup" && rel.keys.every((tuple) => tuple.length === width);
@@ -4307,7 +4318,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
         let ftsSourceBytes = fts.declared;
         bounds.clear();
         for (const source of sources) {
-          const bound = yield* readValue(
+          const sizeMain = (segments?: Uint32Array) =>
             boundSource(
               runtime.sourceView(),
               {
@@ -4318,6 +4329,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                   ? { retain: false }
                   : {}),
                 rows: demand.get(source.id) ?? null,
+                ...(segments === undefined ? {} : { segments, noWait: true as const }),
               },
               runtime.request.governor,
               runtime.signal,
@@ -4332,8 +4344,26 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                   !(runtime.request.outputBuffers && source.windowBytes > 0),
                 sources,
               ),
-            ),
-          );
+            );
+          // A lookup's keys name its segments (read while holding nothing). While that list is
+          // held, sizing never waits: a refusal releases it and the whole source is sized.
+          let bound: ReadBound | null = null;
+          const lookup = lookupSizing.get(source.id);
+          const found =
+            lookup === undefined
+              ? null
+              : yield* readValue(
+                  lookupSegments(runtime, plan, lookup.rel, lookup.keyMinimum(runtime)),
+                );
+          if (found !== null)
+            try {
+              bound = yield* readValue(sizeMain(found.segments));
+            } catch (error) {
+              if (!(error instanceof SizingWouldWait)) throw error;
+            } finally {
+              found.release();
+            }
+          bound ??= yield* readValue(sizeMain());
           bounds.set(source.id, bound);
           if (bound.batchRows === 1) {
             if (boundedColumns === null) {
