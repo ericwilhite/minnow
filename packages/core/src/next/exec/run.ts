@@ -556,10 +556,11 @@ export class QueryRuntime {
         this.#expressionProgress +
         4 * inputs * this.#expressionMultiplicity
       : Math.max(readProgress, largestInput);
+    // Fixed frame construction costs are funded once per step, whichever payload
+    // envelope (a retired producer's saved step or the current one) dominates.
     return Math.max(
       MAX_BLOB_BYTES,
-      savedCopies * this.#savedProgressBytes,
-      copies * current + fixedBytes,
+      Math.max(savedCopies * this.#savedProgressBytes, copies * current) + fixedBytes,
     );
   }
   #operatorStepBytes(
