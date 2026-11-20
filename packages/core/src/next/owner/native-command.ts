@@ -38,6 +38,7 @@ import { NativeRootCredits, NATIVE_ROOT_CREDIT_BYTES } from "./native-root-credi
 import { NATIVE_INPUT_CAPTURE_BYTES } from "./native-input.js";
 import { PREPAID_QUERY_BYTES } from "./prepaid-query.js";
 import { retainedBytes } from "./rule-cache.js";
+import { OBJECT_OVERHEAD_BYTES } from "../memory/governor.js";
 import type { StatementPlanner, PlannerContext } from "./planner.js";
 
 export interface NativeCommandRequest {
@@ -141,6 +142,39 @@ function checkPlan(plan: PhysicalPlan): void {
   if (plan.volatile || plan.ftsQueries?.length || plan.initPlans.length)
     refuse("volatile, FTS or init-plan native modification input");
 }
+/** One admitted preparation step. `build` is a single planning step (lowering one stored
+ * statement or rule set), the same transient work as planning a root statement; its retained
+ * result is charged to `metadata` before it is returned, so the next step and every wait run
+ * with all earlier results already charged. When held credit cannot cover the result, it is
+ * dropped first (it never leaves `attempt`), credit grows by a cancellable admitted wait, and
+ * the step is planned again from the same immutable catalog inputs: no uncharged plan is ever
+ * held across a wait, and at most one step's planning is in flight uncharged. */
+export async function preparedStep<T>(
+  credits: Pick<NativeRootCredits, "metadata" | "prepareMetadata">,
+  build: () => T,
+  measure: (value: T) => number,
+  signal: AbortSignal,
+): Promise<{ readonly value: T; readonly bytes: number }> {
+  let want = 0;
+  for (;;) {
+    signal.throwIfAborted();
+    const outcome = attempt(credits.metadata, build, measure);
+    if (typeof outcome !== "number") return outcome;
+    // Re-planning is deterministic for one catalog; never ask for less than already seen.
+    want = Math.max(want, outcome);
+    await credits.prepareMetadata(want, signal);
+  }
+}
+function attempt<T>(
+  metadata: NativeRootCredits["metadata"],
+  build: () => T,
+  measure: (value: T) => number,
+): { readonly value: T; readonly bytes: number } | number {
+  const value = build(),
+    bytes = measure(value);
+  if (!Number.isSafeInteger(bytes) || bytes < 0) throw new RangeError("Invalid preparation size");
+  return metadata.allocate(bytes) ? { value, bytes } : bytes;
+}
 /** Runs a qualified ordinary-owner modification. Returns the root count and
  * invalidation reach; no child-count approximation is made. */
 export async function executeNativeCommand(
@@ -189,11 +223,31 @@ export async function executeNativeCommand(
       defaults: Array<NativeRootPreparation["defaults"][number]> = [];
     let ruleBytes = 0,
       prelude =
-        NATIVE_INPUT_CAPTURE_BYTES + PREPAID_QUERY_BYTES + nativeParameterMinimumBytes(plan);
-    // Lower immutable programs only. No default/sequence/generated expression is evaluated
-    // to size a workspace, and no source row or image is retained by this preparation.
+        NATIVE_INPUT_CAPTURE_BYTES + PREPAID_QUERY_BYTES + nativeParameterMinimumBytes(plan),
+      preparationBytes = 0;
+    // Preparation is a sequence of admitted planning steps (see preparedStep): every retained
+    // program, plan and container is charged to the root's metadata before the next step
+    // starts or any wait begins. Lower immutable programs only. No default/sequence/generated
+    // expression is evaluated to size a workspace, and no source row or image is retained.
+    const charge = async <T>(build: () => T, measure: (value: T) => number): Promise<T> => {
+      const { value, bytes } = await preparedStep(paid, build, measure, signal);
+      retained += bytes;
+      preparationBytes += bytes;
+      return value;
+    };
+    const tableCount = reach.tables.length,
+      triggerCount = reach.triggers.length;
+    let bodyCount = 0;
+    for (const definition of reach.triggers) bodyCount += definition.statements.length;
+    const clock = await charge(
+      () => clockParameter({ kind: "timestamp", zoned: true }, request.execution.statementTime),
+      (clock) =>
+        retainedBytes(clock) +
+        // Preparation object, its arrays, one binding/trigger entry each, and array slots.
+        OBJECT_OVERHEAD_BYTES * (8 + 2 * tableCount + 2 * triggerCount) +
+        8 * (tableCount + triggerCount + bodyCount),
+    );
     for (const id of reach.tables) {
-      signal.throwIfAborted();
       const table = catalog.table(id);
       if (!table) throw new TypeError("Missing native command table");
       if (table.columns.some((c) => c.autoIncrement === true))
@@ -207,45 +261,59 @@ export async function executeNativeCommand(
           })
         )
           refuse("native trigger indexed-domain preflight");
-      const expr = request.planner.lowerTableRules(table, catalog),
-        program = compileTableRules(table, catalog.version, expr),
-        entry: Binding = { table, program, minimum: 0, rules: null };
-      qualify(program);
-      const bytes = minimum(entry);
-      bindings.push({ ...entry, minimum: bytes });
-      ruleBytes += bytes;
-      for (const column of table.columns)
-        if (column.generatedSql === null)
-          defaults.push({
-            tableId: table.id,
-            columnId: column.id,
-            expr: expr.defaults?.find((d) => d.columnId === column.id)?.expr ?? null,
-          });
+      const step = await charge(
+        () => {
+          const expr = request.planner.lowerTableRules(table, catalog),
+            program = compileTableRules(table, catalog.version, expr);
+          qualify(program);
+          const rows: Array<NativeRootPreparation["defaults"][number]> = [];
+          for (const column of table.columns)
+            if (column.generatedSql === null)
+              rows.push({
+                tableId: table.id,
+                columnId: column.id,
+                expr: expr.defaults?.find((d) => d.columnId === column.id)?.expr ?? null,
+              });
+          return { expr, program, defaults: rows, minimum: minimum({ table, program }) };
+        },
+        (step) => retainedBytes(step),
+      );
+      bindings.push({ table, program: step.program, minimum: step.minimum, rules: null });
+      ruleBytes += step.minimum;
+      defaults.push(...step.defaults);
     }
     for (const definition of reach.triggers) {
       const table = catalog.table(definition.tableId);
       if (!table) throw new TypeError("Missing native trigger table");
       const bodies: TriggerBodyRunner[] = [];
       for (const body of definition.statements) {
-        signal.throwIfAborted();
-        const lowered = request.planner.lower(body.sql, {
-          ...request.context,
-          parameterTypes: body.bindings.map((binding) => binding.type),
-        });
-        if (lowered.kind !== "modify") refuse("non-modifying native trigger body");
-        checkPlan(lowered.plan);
-        bodies.push(new TriggerBodyRunner(table, body, lowered.plan));
+        const runner = await charge(
+          () => {
+            const lowered = request.planner.lower(body.sql, {
+              ...request.context,
+              parameterTypes: body.bindings.map((binding) => binding.type),
+            });
+            if (lowered.kind !== "modify") refuse("non-modifying native trigger body");
+            checkPlan(lowered.plan);
+            return new TriggerBodyRunner(table, body, lowered.plan);
+          },
+          // The runner's own plan copy shares the lowered graph; its binding program is
+          // sized by the binding descriptors it is compiled from.
+          (runner) =>
+            OBJECT_OVERHEAD_BYTES +
+            retainedBytes({ plan: runner.plan, bindings: body.bindings, minimum: 0 }),
+        );
+        bodies.push(runner);
         prelude = Math.max(
           prelude,
           NATIVE_INPUT_CAPTURE_BYTES +
             PREPAID_QUERY_BYTES +
-            nativeParameterMinimumBytes(lowered.plan),
+            nativeParameterMinimumBytes(runner.plan),
         );
       }
       triggers.push({ definition, bodies });
     }
-    // Reach already supplies the UTF8 name/ID order. Preparation/header arrays and rule IR
-    // have their own retained charge in addition to the assembler's mutable objects.
+    // Reach already supplies the UTF8 name/ID order.
     const preparation: NativeRootPreparation = {
       rootId: request.rootId,
       catalog,
@@ -255,20 +323,8 @@ export async function executeNativeCommand(
       triggers,
       tableIds: reach.tables,
       defaults,
-      clock: clockParameter({ kind: "timestamp", zoned: true }, request.execution.statementTime),
+      clock,
     };
-    const preparationBytes = retainedBytes({
-      bindings: bindings.map((binding) => ({
-        tableId: binding.table.id,
-        minimum: binding.minimum,
-      })),
-      triggers: triggers.map((trigger) => ({
-        id: trigger.definition.id,
-        bodies: trigger.bodies.map((body) => body.plan),
-      })),
-      defaults,
-      clock: preparation.clock,
-    });
     const fixedMetadata =
       NATIVE_ROOT_CREDIT_BYTES +
       nativeCommandReachBytes(catalog) +
@@ -283,9 +339,6 @@ export async function executeNativeCommand(
       },
       signal,
     );
-    if (!paid.metadata.allocate(preparationBytes))
-      throw new Error("Native preparation was not funded");
-    retained = preparationBytes;
     const parameters = await prepareParameters(
       plan,
       request.parameters,

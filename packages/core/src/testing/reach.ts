@@ -11495,6 +11495,20 @@ export const NATIVE_ROOT_CREDITS_REACH = [
   "zero root ownership",
 ] as const;
 
+/** Native trigger preparation charges each planning step before the next step or any wait. */
+export const NATIVE_COMMAND_PREPARATION_REACH = [
+  "no competing credit",
+  "granted after release",
+  "cancelled while waiting",
+  "waited before retaining",
+  "replanned after wait",
+  "exact PG rows",
+  "large body",
+  "several triggers",
+  "wide default rules",
+  "zero retained ownership",
+] as const;
+
 export const NATIVE_COMMAND_FUNDED_REACH = [
   "pressure cancellation",
   "pressure release",
