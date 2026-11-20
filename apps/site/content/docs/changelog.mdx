@@ -10,6 +10,8 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The unexported 1.0 rebuild again sizes ordinary scans of small retained tables from their row count, as page-consuming scans already did, after a merge lost the change for ordinary scans. Results are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.
+
 The unexported 1.0 rebuild bounds the work of its short-key join dispatch and hashes short TEXT keys through an extraction-local view over the buffers it already holds. Results are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.
 
 The unexported 1.0 rebuild's streaming star join keeps each source's native read demand: it passes each prefix of the last dimension's matches through the ordinary aggregate before reading more input, so errors keep their PostgreSQL order. Results and errors are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.
