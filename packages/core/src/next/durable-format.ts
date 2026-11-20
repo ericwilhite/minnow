@@ -16,14 +16,14 @@
  * The native vocabulary/profile guard below catches an unassigned vocabulary extension.
  * The independent native writer ledger also guards read-optional fields before acquisition.
  */
-/** Shared reference-table envelope; the manifest also carries its logical format version14. */
+/** Shared reference-table envelope; the manifest also carries its logical format version15. */
 export const METADATA_ENVELOPE_VERSION = 1;
 /** Root reader capability; incompatible nested bytes advance this or the exact manifest barrier. */
-export const DURABLE_READER_VERSION = 11;
-export const MANIFEST_FORMAT_VERSION = 14;
+export const DURABLE_READER_VERSION = 12;
+export const MANIFEST_FORMAT_VERSION = 15;
 export const ROOT_SLOT_HEADER_BYTES = 16;
 /** Profile8 escape: two independently checked u32 capability selectors precede the manifest. */
-export const DURABLE_WRITER_VERSION = 11;
+export const DURABLE_WRITER_VERSION = 12;
 export const ROOT_SLOT_CAPABILITY_BYTES = 8;
 export const ROOT_SLOT_EXTENSION_TAG = 7;
 export const ROOT_SLOT_PAYLOAD_OFFSET = ROOT_SLOT_HEADER_BYTES + ROOT_SLOT_CAPABILITY_BYTES;
@@ -106,6 +106,21 @@ const inherited = (parent: string, decoder: string, fields: readonly FormatField
   }) as const satisfies Format;
 
 export const DURABLE_CODECS = {
+  groupAggregate: {
+    class: { int16: 1, int32: 2, int64: 3, decimal: 4 },
+    capability: { count: 1, sum: 2 },
+    headerBytes: 108,
+    sourceScaleMode: { mixed: 0, fixed: 1 },
+    maximumSourcePrecision: 65535,
+    minimumSourceScale: -32768,
+    maximumSourceScale: 32767,
+    payloadBytes: 4096,
+    maxRows: 65536,
+    minimumCoefficientScale: -32768,
+    maximumScale: 16383,
+    coefficient: "minimal-signed-le",
+    specialCountOrder: ["NaN", "Infinity", "-Infinity"],
+  },
   ftsNode: { leaf: 0, branch: 1 },
   ftsState: { building: 0, ready: 1, invalid: 2 },
   catalogFieldFlags: { required: 1, knownMask: 1 },
@@ -598,6 +613,32 @@ export const CATALOG_CHANGE_FIELDS = {
 } as const;
 
 export const DURABLE_FORMATS = {
+  groupAggregate: {
+    magic: 0x5347414d, // MAGS
+    version: 1,
+    versionIn: "header",
+    fields: [
+      magic(0x5347414d),
+      version(4, 2),
+      zero(6, 2),
+      { name: "column id high", offset: 12, width: 4, mask: 0x1fffff },
+      { name: "class", offset: 24, width: 1, values: [1, 2, 3, 4] },
+      { name: "capabilities", offset: 25, width: 1, values: [1, 3], mask: 3 },
+      { name: "result scale", offset: 28, width: 2, mask: 0x3fff },
+      zero(34, 2),
+      { name: "source scale mode", offset: 100, width: 1, values: [0, 1] },
+      zero(101, 1),
+      zero(106, 2),
+      ...[40, 48, 56, 72, 80, 88, 96].map((offset) => ({
+        name: "source safe integer high",
+        offset,
+        width: 4 as const,
+        mask: 0x1fffff,
+      })),
+    ],
+    decoder: "decodeGroupAggregateRecord/decodeGroupAggregate",
+    state: "implemented",
+  },
   ftsJournal: {
     ...envelope(0x4a54464d, "readFtsJournal"), // MFTJ
     fields: [
@@ -1075,6 +1116,7 @@ export const NATIVE_READER_PROFILES: Readonly<
   9: Object.freeze({ manifest: 12, vocabulary: 131312130 }),
   10: Object.freeze({ manifest: 13, vocabulary: 3997453788 }),
   11: Object.freeze({ manifest: 14, vocabulary: 3266998012 }),
+  12: Object.freeze({ manifest: 15, vocabulary: 1157799046 }),
 });
 
 /** Required rewrite capability includes even fields that are optional for reading.
@@ -1084,6 +1126,7 @@ export const NATIVE_WRITER_PROFILES: typeof NATIVE_READER_PROFILES = Object.free
   9: Object.freeze({ manifest: 12, vocabulary: 131312130 }),
   10: Object.freeze({ manifest: 13, vocabulary: 3997453788 }),
   11: Object.freeze({ manifest: 14, vocabulary: 3266998012 }),
+  12: Object.freeze({ manifest: 15, vocabulary: 1157799046 }),
 });
 
 function canonicalVocabulary(value: unknown): string {

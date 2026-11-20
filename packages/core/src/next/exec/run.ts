@@ -36,7 +36,7 @@ import {
 } from "./parameters.js";
 import { RESULT_FRAME_TARGET_BYTES, RESULT_WINDOW_BYTES, ResultChannel } from "./result.js";
 import type { ResultAllocator } from "./result-buffer.js";
-import { ResultSink, resultFrameMetadataBytes } from "./result-sink.js";
+import { ResultSink, resultFrameMetadataBytes, resultRowOverheadBytes } from "./result-sink.js";
 import type { ParameterSlots, CallResolver } from "./kernels/compile.js";
 import { ReservedGrant } from "./admission.js";
 import { DeferredGrant } from "./deferred-grant.js";
@@ -308,6 +308,11 @@ export class QueryRuntime {
           ),
           this.#resultCopies,
           this.#resultCopySourceProgress ?? this.#progressBytes,
+          this.#resultCopies,
+          // Payload bounds exclude the binding-only UTF16 slice. Delivery must
+          // independently fund frame metadata, fixed arrays, arena overlap and
+          // promotions, including each field's minimum 64-byte arena.
+          resultRowOverheadBytes(this.plan.columns.length) + 64 * this.plan.columns.length,
         )
       : // A JSON checkpoint bounds its complete serialized row, including repeated aliases.
         // Only an input/source envelope needs the separate logical copy multiplier.
@@ -545,6 +550,7 @@ export class QueryRuntime {
     copies = 1,
     readProgress = this.#progressBytes,
     savedCopies = copies,
+    fixedBytes = 0,
   ): number {
     // ReadBound.progress already covers a complete source prefix, not one cell.
     // Add newly materialized inline/literal/owned-parameter columns; multiply only
@@ -554,7 +560,12 @@ export class QueryRuntime {
         this.#expressionProgress +
         4 * inputs * this.#expressionMultiplicity
       : Math.max(readProgress, largestInput);
-    return Math.max(MAX_BLOB_BYTES, savedCopies * this.#savedProgressBytes, copies * current);
+    // Fixed frame construction costs are funded once per step, whichever payload
+    // envelope (a retired producer's saved step or the current one) dominates.
+    return Math.max(
+      MAX_BLOB_BYTES,
+      Math.max(savedCopies * this.#savedProgressBytes, copies * current) + fixedBytes,
+    );
   }
   #operatorStepBytes(
     rel: OperatorIdentity,

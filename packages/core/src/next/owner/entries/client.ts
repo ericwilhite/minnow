@@ -16,3 +16,5 @@ export type {
 } from "../api.js";
 
 export { AmbiguousResultColumnError } from "../result.js";
+
+export type { CatalogDescription, ExplainDescription } from "../inspection.js";

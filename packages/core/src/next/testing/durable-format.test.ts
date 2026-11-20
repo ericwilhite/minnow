@@ -1,3 +1,8 @@
+import {
+  tryEncodeGroupAggregate,
+  decodeGroupAggregate,
+  decodeGroupAggregateRecord,
+} from "../format/group-aggregate.js";
 import { readDatabaseIdentity } from "../format/database-identity.js";
 import { encodeFtsJournal, decodeFtsJournal } from "../format/fts-journal.js";
 import { encodeFts, decodeFts, type FtsValues } from "../format/fts-codec.js";
@@ -157,6 +162,7 @@ const root: GroupRoot = {
       directory: blob,
       statistics: { nullCount: 0, min: 3, max: 9, dictionarySize: null },
       distinctSketch: null,
+      aggregateSummary: null,
     },
   ],
 };
@@ -563,7 +569,37 @@ function adapters(): Record<Exclude<DurableFormatName, "indexedDb">, Adapter> {
     sequence = encodedSequence.bytes.slice();
   encodedSequence.close();
   expect(sequenceBudget.held).toBe(0);
+  const aggregateFunding = budget();
+  const aggregateSource = root.columns[0];
+  if (aggregateSource === undefined) throw new Error("Missing aggregate registry source");
+  const aggregate = tryEncodeGroupAggregate(
+    {
+      nonNullCount: 2,
+      sum: {
+        coefficient: 12n,
+        coefficientScale: 0,
+        resultScale: 0,
+        nanCount: 0,
+        positiveInfinityCount: 0,
+        negativeInfinityCount: 0,
+      },
+    },
+    root.rowCount,
+    aggregateSource,
+    aggregateFunding,
+  );
+  if (aggregate === null) throw new Error("Missing aggregate registry bytes");
+  const aggregateBytes = aggregate.bytes.slice();
+  aggregateFunding.free(aggregate.charge);
+  expect(aggregateFunding.held).toBe(0);
   return {
+    groupAggregate: {
+      bytes: aggregateBytes,
+      decode: parsed((bytes, b) => decodeGroupAggregate(bytes, root.rowCount, aggregateSource, b)),
+      also: [
+        parsed((bytes, b) => decodeGroupAggregateRecord(bytes, root.rowCount, aggregateSource, b)),
+      ],
+    },
     ftsJournal: { bytes: journalBytes, decode: parsed(decodeFtsJournal) },
     ...ftsAdapters(),
     snapshotCatalog: { bytes: portableCatalog, decode: parsed(decodeSnapshotCatalog) },

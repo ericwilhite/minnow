@@ -109,17 +109,27 @@ function numericBytes(type: PhysicalType, value: ParameterValue, scratch?: ByteC
   return SLOT_BYTES + 16 * value.length + 8 * (Math.max(0, sign * exponent) + scale);
 }
 
+/** Payload extents are not derived from reservation envelopes. The latter also fund
+ * one temporary UTF16 slice, shared across slots because conversion is sequential. */
+interface ParameterSize {
+  readonly bytes: number;
+  readonly utf8Bytes: number | null;
+  readonly scratch: number;
+}
+const sized = (bytes: number): ParameterSize => ({ bytes, utf8Bytes: null, scratch: 0 });
+
 function* sizeOf(
   type: PhysicalType,
   value: ParameterValue,
   slice: Slice,
   scratch?: ByteCharge,
-): SlicedJob<number> {
-  if (value === null) return SLOT_BYTES + dataBytes(type, 1) + 4;
-  if (type.kind === "decimal") return numericBytes(type, value, scratch);
-  if (type.kind === "bytes" && value instanceof Uint8Array) return SLOT_BYTES + value.byteLength;
+): SlicedJob<ParameterSize> {
+  if (value === null) return sized(SLOT_BYTES + dataBytes(type, 1) + 4);
+  if (type.kind === "decimal") return sized(numericBytes(type, value, scratch));
+  if (type.kind === "bytes" && value instanceof Uint8Array)
+    return sized(SLOT_BYTES + value.byteLength);
   if ((type.kind !== "text" && type.kind !== "enum") || typeof value !== "string")
-    return SLOT_BYTES + (typeof value === "string" ? 8 * value.length : 0);
+    return sized(SLOT_BYTES + (typeof value === "string" ? 8 * value.length : 0));
   let bytes = 0,
     nextCheck = 8192;
   for (let i = 0; i < value.length; i++) {
@@ -140,7 +150,11 @@ function* sizeOf(
       if (slice.due()) yield;
     }
   }
-  return SLOT_BYTES + bytes + 2 * Math.min(value.length, 8192) + 24;
+  return {
+    bytes: SLOT_BYTES + bytes,
+    utf8Bytes: bytes,
+    scratch: 2 * Math.min(value.length, 8192) + 24,
+  };
 }
 
 /** All slot and scratch bytes are charged before any owned buffer is materialized. */
@@ -160,9 +174,10 @@ function prepaid(charge: ByteCharge, bytes: number): ByteCharge {
 }
 
 export interface ParameterBinding {
-  /** Owned input bytes, excluding a pressure restore's temporary I/O reservation. */
+  /** Owned input bytes, excluding temporary encoding/restoration scratch. */
   readonly logicalBytes?: number;
   readonly bytes: number;
+  /** Largest retained slot, excluding the shared encoding slice. */
   readonly largestSlot: number;
   /** Per-slot bounds survive phase handoffs; payload slots must not size unrelated keys. */
   readonly slotBytes?: readonly number[];
@@ -218,8 +233,10 @@ export function prepareParameters(
   const slice = new Slice(YIELD_INTERVAL_MS);
   function* size(): SlicedJob<ParameterBinding> {
     let bytes = 0,
-      largestSlot = 0;
+      largestSlot = 0,
+      sharedScratch = 0;
     const sizes: number[] = [];
+    const utf8Sizes: Array<number | null> = [];
     for (let slot = 0; slot < plan.parameters.length; slot++) {
       const type = plan.parameters[slot];
       if (type === undefined) throw new TypeError("missing parameter type");
@@ -237,15 +254,22 @@ export function prepareParameters(
             : 0;
       if (bytes + length > capacity)
         throw new MemoryAdmissionError("parameters", bytes + length, capacity);
-      const slotBytes = yield* sizeOf(type, value, slice, scratch);
-      sizes.push(slotBytes);
-      largestSlot = Math.max(largestSlot, slotBytes);
-      bytes += slotBytes;
-      if (bytes > capacity) throw new MemoryAdmissionError("parameters", bytes, capacity);
-      if (!Number.isSafeInteger(bytes)) throw new MemoryAdmissionError("parameters", bytes, 0);
+      const size = yield* sizeOf(type, value, slice, scratch);
+      sizes.push(size.bytes);
+      utf8Sizes.push(size.utf8Bytes);
+      largestSlot = Math.max(largestSlot, size.bytes);
+      bytes += size.bytes;
+      sharedScratch = Math.max(sharedScratch, size.scratch);
+      if (bytes + sharedScratch > capacity)
+        throw new MemoryAdmissionError("parameters", bytes + sharedScratch, capacity);
+      if (!Number.isSafeInteger(bytes + sharedScratch))
+        throw new MemoryAdmissionError("parameters", bytes + sharedScratch, 0);
     }
+    const ownedBytes = bytes;
+    bytes += sharedScratch;
     return {
       bytes,
+      logicalBytes: ownedBytes,
       largestSlot,
       slotBytes: sizes,
       bind(charge, statementTime = 0n) {
@@ -273,8 +297,9 @@ export function prepareParameters(
                   `$${String(slot + 1)}: text cannot contain a zero byte`,
                   slot,
                 );
-              const length =
-                (sizes[slot] ?? 0) - SLOT_BYTES - 2 * Math.min(value.length, 8192) - 24;
+              const length = utf8Sizes[slot];
+              if (length === null || length === undefined)
+                throw new Error("UTF-8 parameter lacks its measured extent");
               const bytes = new Uint8Array(length),
                 encoder = new TextEncoder();
               let written = 0;
@@ -291,13 +316,18 @@ export function prepareParameters(
                 )
                   end--;
                 const result = encoder.encodeInto(value.slice(at, end), bytes.subarray(written));
-                if (result.read !== end - at)
+                // encodeInto may make a short write even when the destination is
+                // large enough (Node26's vectorized tail does this). Advance by
+                // reported progress, not by the requested slice. Never truncate.
+                if (result.read === 0)
                   throw new Error("UTF-8 parameter size changed during binding");
                 written += result.written;
-                at = end;
+                at += result.read;
                 signal?.throwIfAborted();
                 if (slice.due()) yield;
               }
+              if (written !== length)
+                throw new Error("UTF-8 parameter size changed during binding");
               slots.push(
                 vector(type, { layout: "varlen", bytes, offsets: Int32Array.of(0, length) }),
               );
@@ -341,8 +371,8 @@ export function bindParameter(
   slot: number,
   charge: ByteCharge,
 ): FlatVector {
-  const bytes = runToEnd(sizeOf(type, value, new Slice(Infinity), charge));
-  return materialize(type, value, slot, prepaid(charge, bytes));
+  const size = runToEnd(sizeOf(type, value, new Slice(Infinity), charge));
+  return materialize(type, value, slot, prepaid(charge, size.bytes + size.scratch));
 }
 const TEXT: PhysicalType = { kind: "text" };
 const NUMERIC: PhysicalType = { kind: "decimal", precision: null, scale: null };

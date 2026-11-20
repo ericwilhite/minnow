@@ -40,6 +40,7 @@ function chunk(columnId: number, data: ExtentRef = extent(20_000), at = 0): Colu
     directory: blob(data, at + 16_000, 300),
     statistics: { nullCount: 0, min: null, max: null, dictionarySize: null },
     distinctSketch: blob(data, at + 16_300, 90),
+    aggregateSummary: blob(),
   };
 }
 
@@ -116,6 +117,7 @@ function fixture(): Fixture {
         want(column.data, "chunk-data");
         want(column.directory, "page-directory");
         if (column.distinctSketch !== null) want(column.distinctSketch, "distinct-sketch");
+        if (column.aggregateSummary !== null) want(column.aggregateSummary, "aggregate-summary");
       }
     }
     // Pages of 32 groups, so a directory has several.

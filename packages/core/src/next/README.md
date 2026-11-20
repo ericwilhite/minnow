@@ -4748,7 +4748,7 @@ Connection prepared handles use a bounded governor-charged cache, rather than ho
 outside its original cache's charge. Executions include the original SQL as an exact fallback
 for eviction or reconnection, under the same protocol sequence and ledger identity. Private-DDL
 preparation runs in its session and does not retain the private plan beyond that session cache.
-The unreleased protocol profile is 8 for these optional owner-side call guards/session binding;
+The unreleased protocol profile is 9 (inspection ops plus optional owner-side call guards/session binding);
 this changes no stored bytes or published package entry. Raw id-only execution requires a live
 cached handle; the internal facade always supplies fallback SQL.
 
@@ -4975,3 +4975,18 @@ Native command statements retain their memory policy across end and commit. Endi
 the command scope must not reintroduce a future background-merge estimate into the
 commit step while another admitted execution retains its workspace. The next live
 statement selects its own policy; actual merge acquisition still funds its full step.
+
+A publication captures quiet index-build coverage together with its catalog cut. Rows arriving
+while the root is assembled keep their normal index deltas and WAL coverage; they cannot revoke
+that cut's empty index root. A build over existing, uncovered rows still holds the catalog cut
+back until its entries are checkpointed. Reopen replays later rows above the table checkpoint.
+
+### Exact aggregate metadata (A1)
+
+Group roots may reference independently checksummed numeric summaries. These keep exact
+coefficients, counts, finite display scale and special-value counts for their full immutable
+sources. Missing or oversized summaries use the ordinary scan. A consumer must prove complete
+coverage of its pinned visible generation; deletes, overlays and partial selections need scan
+fallback. Summary validation does not validate unread value pages. Integer AVG keeps C11's
+float64 output and the same final conversion and division as the ordinary scan; NUMERIC AVG
+keeps NUMERIC output. All summary reads, parses and arithmetic must be admitted before work.
