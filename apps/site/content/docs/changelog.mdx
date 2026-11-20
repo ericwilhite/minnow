@@ -12,6 +12,17 @@ compatibility policy and release process.
 
 The unexported 1.0 rebuild counts DISTINCT text values that share a short prefix and end in a canonical decimal number (such as account or order codes) with exact bitmaps instead of storing every value. Results are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.
 
+The unexported 1.0 rebuild computes eligible scalar aggregates (`COUNT(*)`, `COUNT(column)`,
+`SUM`/`AVG` over INT and `SUM` over DOUBLE PRECISION, over plain columns of a table scan with no
+residual filter) straight from encoded column pages instead of building row batches. Every other
+query keeps its existing path unchanged. Results are unchanged; released 0.x behavior is unchanged;
+no stored-format change or migration is required.
+
+The Node SQL performance gate (`npm run benchmark:gate`) keys its regression thresholds by CPU
+model as well as OS, architecture and Node major version, and refuses a host whose CPU model
+has no calibrated profile instead of comparing it with another machine's thresholds. No package
+code or stored format changes.
+
 The unexported 1.0 rebuild reserves wide sort merge workspace independently of source batch size, including encoded keys and the `WITH TIES` boundary row when a competing query forces a smaller source recipe.
 
 The private 1.0 writer preserves exact BIGINT values when updating or deleting persisted
@@ -27,10 +38,66 @@ no stored-format change or migration is required.
 The writer may finish a prepaid publication before waiting for the next phase's memory;
 published state keeps its owning charge, and provisional work must be fully settled first.
 
+The private 1.0 executor sizes small ordered reads from a retained native input and bounded
+read batches. A two-row INT/TEXT/NUMERIC query no longer reserves a maximum publication
+workspace for its late fetch. A retained resident index delta keeps the fast cursor path,
+and LIMIT one omits the unused physical-order restore. Narrow LIMITs still fund
+full-batch physical fetch buffers, including the scan placeholder. Complete-source hint unions bound their
+actual output, and sort retries respect the one-row scope of a progress loan. Complete query admission and oversized-value
+accounting remain required. No stored-format change or migration is required; released 0.x
+behavior is unchanged.
+
+After recovery finishes, the private writer returns its unused WAL scan reservation
+before accepting queries. Reopened databases keep their row workspace and live buffers
+funded without blocking a query behind completed recovery work. Released 0.x behavior is
+unchanged; no stored-format change or migration is required.
+
+The private 1.0 writer admits complete phase requirements after returning unused forecasts.
+Fitting queries can reclaim idle write credit, including after UPDATE and inside an existing
+transaction. Active buffers, prepared rows and merge handoffs remain funded; private merge
+I/O uses its prepaid budget. Pressure waits remain cancellable when no idle credit is available.
+Phase settlement preserves outstanding progress loans while waking fitting queued queries.
+Funded commit and merge steps keep their prepayment until their waiting continuations resume.
+Released 0.x behavior is unchanged; no stored-format change or
+migration is required.
+
+The private 1.0 writer prepays all column-group buffers together and sizes TEXT buffers from
+the actual input. Oversized working sets return SQLSTATE `53200` before queueing; optional
+dictionary headroom is prepaid when free credit is available, with a plain fallback under
+pressure. Serialized directories and distinct sketches
+are charged until storage consumes them. Released 0.x behavior is unchanged; no stored-format
+change or migration is required.
+
+The private 1.0 writer retries temporary memory pressure while capturing an extent
+publication before entering an external observer. Failures from the observer itself remain
+fatal. No stored-format change or migration is required; released 0.x behavior is unchanged.
+
 The private 1.0 storage writer keeps space statistics exact while aborting a write,
 including when releasing part of its reserved space fails. Idle maintenance can read
 those statistics without a reservation error. Released 0.x behavior is unchanged;
 no stored-format change or migration is required.
+
+The private 1.0 core uses one UTF-8 progress helper for parameter binding, varlen
+builders and write codecs. Exact-capacity destinations remain byte-exact when
+Node 26's encoder returns a short write; the helper completes the tail in the
+same buffer without padding or temporary copies. Undersized destinations get
+the typed `MINNOW_UTF8_CAPACITY` error. Stored strings also retain a leading
+U+FEFF character. Released 0.x behavior and stored-format grammars are unchanged;
+no migration is required.
+
+The private 1.0 executor handles short UTF-8 encoder writes, including Node 26's
+exact-capacity tail behavior, without truncating or refusing valid text parameters.
+It keeps the measured byte count separate from reservation bounds and funds one
+temporary encoding slice across sequential parameter slots. Result admission separately
+includes frame metadata and construction workspace, so a fitting wide parameter result
+cannot run out of its reserved progress lane under competing memory pressure. Released 0.x behavior
+and stored formats are unchanged; no migration is required.
+
+The private 1.0 devtools binding reads canonical results, detached catalog descriptions and
+logical explain plans. Duplicate labels keep their column positions; exact integers, NUMERIC
+and microsecond timestamps retain their canonical values. Metadata stays charged until receipt.
+The released 0.x panel and public package entries are unchanged. Live devtools queries remain
+explicitly unbound. No stored-format change or migration is required.
 
 The shared parser now records each SELECT output's original label for the private 1.0
 engine, which follows PostgreSQL for duplicate labels (`SELECT 1 AS x, 2 AS x` returns two
@@ -246,9 +313,18 @@ uses bounded call arity. A repeated affected target rolls back the statement; as
 arbiter or primary-key columns are refused as in the shipped engine. Proposed rows are
 validated before arbitration: a conflicting DO NOTHING row with a NOT NULL violation is
 rejected, matching PostgreSQL (the shipped engine currently skips that check).
-Single-source index inputs retain original row locators and suppress repeated probe matches.
-Cursors beneath join or set-operation inputs retain the internal diagnostic opt-in until
-their complete admission is proved. Reads use the statement
+Native index inputs retain original row locators and suppress repeated probe matches.
+Point, IN-list and range queries, including indexed inputs beneath joins, filters, projections,
+sorts and LIMIT, share complete query admission without a diagnostic option. Large IN lists
+stream key materialization and use a bounded, spillable bitmap to suppress duplicate query
+rows; modifications and partial probes retain spillable locator sorting. Serial join inputs
+reuse cursor workspace after each input closes. Invalid constant key casts are checked
+before the first probe, even with LIMIT. Composite-prefix reads use scans
+when nullable suffix columns prevent the index from covering every matching row.
+Index keys serve equality, IN and composite equality prefixes only under byte collations
+(none, `C` or `default`); a predicate under another collation stays a filter and keeps the
+executor's typed 0A000 refusal, as a scan does.
+Reads use the pinned statement
 snapshot; statement errors roll back earlier rows. Unique and foreign-key checks use the
 existing write path. Uniqueness is checked at statement end: a later NOT NULL or CHECK
 failure wins over an earlier duplicate key, unlike PostgreSQL. For example, an existing

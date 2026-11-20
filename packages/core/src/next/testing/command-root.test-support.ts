@@ -122,6 +122,28 @@ export async function commandRootFixture(
     bindingBytes += tableRuleMinimumBytes(def.program, 1);
     sourceBytes = Math.max(sourceBytes, nativePrefixSourceBytes(def.table));
   }
+  let tables: NativeCommandRootScope["tables"] = [];
+  const statement = tx.statement({
+    signal,
+    rules: (id) => {
+      const binding = tables.find((d) => d.table.id === id);
+      if (!binding) throw new Error("root rules");
+      return binding.rules;
+    },
+  });
+  if (!(statement instanceof StatementImpl)) throw new Error("native statement");
+  // The fixture models prepaid native workspace. Fund the writer's simultaneous
+  // companion window before another admitted execution can claim the remaining
+  // capacity, just as owner dispatch does before funding the root's own grants.
+  const native = await statement.prepareNativeStep(
+    setupBytes + bindingBytes + (2 << 20) + sourceBytes + (reachGrant?.held ?? 0),
+    signal,
+  );
+  try {
+    native.check();
+  } finally {
+    native.release();
+  }
   const grants = await governor.admitGroup({
       label: "native graph fixture complete fixed workspace",
       signal,
@@ -137,19 +159,10 @@ export async function commandRootFixture(
     metadata = grants[0],
     source = grants[1];
   if (!metadata || !source) throw new Error("root grants");
-  const tables = definitions.map((d) => ({
-      table: d.table,
-      rules: bindTableRules(d.program, metadata, { capacity: 1, signal }),
-    })),
-    statement = tx.statement({
-      signal,
-      rules: (id) => {
-        const binding = tables.find((d) => d.table.id === id);
-        if (!binding) throw new Error("root rules");
-        return binding.rules;
-      },
-    });
-  if (!(statement instanceof StatementImpl)) throw new Error("native statement");
+  tables = definitions.map((d) => ({
+    table: d.table,
+    rules: bindTableRules(d.program, metadata, { capacity: 1, signal }),
+  }));
   async function ensure(grant: Grant, bytes: number, s: AbortSignal) {
     signal.throwIfAborted();
     s.throwIfAborted();

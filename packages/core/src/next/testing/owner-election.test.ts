@@ -2158,21 +2158,24 @@ describe("a broker request is bounded (connector.ts ConnectorStatus)", () => {
   });
 
   it("close() mid-request leaves no timer and sends nothing more", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const w = world();
     const timers = trackOwnerTimers();
     try {
       const { connector, silent } = silentTab(w, []);
       const start = connector.start().catch((error: unknown) => (error as Error).name);
-      await timers.wait(50);
+      // Close inside the policy window, regardless of how long the host took to run us.
+      await vi.advanceTimersByTimeAsync(50);
       expect(timers.pending.size).toBeGreaterThan(0);
       connector.close();
       expect(await start).toBe("ClientClosedError");
       expect(timers.pending.size).toBe(0);
       const sent = silent.sent;
-      await timers.wait(200);
+      await vi.advanceTimersByTimeAsync(200);
       expect(silent.sent).toBe(sent);
     } finally {
       timers.restore();
+      vi.useRealTimers();
     }
   });
 });

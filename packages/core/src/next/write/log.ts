@@ -137,6 +137,7 @@ export class LogAppender {
     onFailure: (error: Error) => void,
     readonly buffers?: BufferAllocator,
     readonly checkAppend?: () => void,
+    readonly afterBuffersSettled?: () => void,
   ) {
     this.#header = buffers?.create(LOG_HEADER_BYTES) ?? null;
     this.#session = session;
@@ -152,6 +153,16 @@ export class LogAppender {
     this.#durable = { end: position.end, chain: position.chain, lsn: position.lastLsn };
     this.#rootSequence = position.rootSequence;
     this.#onFailure = onFailure;
+  }
+
+  /** Native prepaid WAL frames remain active through queueing and acknowledgement. */
+  get hasPendingWork(): boolean {
+    return (
+      this.#streaming !== null ||
+      this.#queuedBytes > 0 ||
+      this.#inFlightBytes > 0 ||
+      this.#deferredBytes > 0
+    );
   }
 
   get lastLsn(): number {
@@ -523,6 +534,7 @@ export class LogAppender {
         this.#flushing = null;
       }
       this.#settle();
+      this.afterBuffersSettled?.();
       if (this.#encodedLsn > this.#durable.lsn) this.#schedule();
       else this.#armIdle();
     })();

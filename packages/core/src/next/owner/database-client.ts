@@ -1,3 +1,4 @@
+import type { CatalogDescription, ExplainDescription } from "./inspection.js";
 /** Internal 1.0 facade. ProtocolClient remains the sole sequence/retry/outcome dispatcher.
  * Live external-store binding is added on B8's runtime; public barrels are held for cutover. */
 import type {
@@ -359,6 +360,32 @@ export class MinnowDatabaseClient extends ClientSql {
         ),
       )
     ).value;
+  }
+  /** Detached caller-owned metadata, against the default SQL session's catalog. */
+  async describeCatalog(options: CallOptions = {}): Promise<CatalogDescription> {
+    this.check();
+    options.signal?.throwIfAborted();
+    const task = await this.track(
+      callTask(
+        this.shared.protocol,
+        this.shared.protocol.send({ t: "admin", session: 0, op: "describeCatalog", args: [] }),
+        options.signal,
+      ),
+    );
+    return task.value as CatalogDescription;
+  }
+  /** Logical lowered operators; never executes SQL or claims runtime measurements. */
+  async explain(sql: string, options: CallOptions = {}): Promise<ExplainDescription> {
+    this.check();
+    options.signal?.throwIfAborted();
+    const task = await this.track(
+      callTask(
+        this.shared.protocol,
+        this.shared.protocol.send({ t: "admin", session: 0, op: "explain", args: [sql] }),
+        options.signal,
+      ),
+    );
+    return task.value as ExplainDescription;
   }
   close(): Promise<void> {
     if (this.#close !== null) return this.#close;

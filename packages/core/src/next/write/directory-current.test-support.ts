@@ -6,7 +6,7 @@ import { decodeListPage, encodeListPage, LIST_PAGE_EXTENTS } from "../storage/ex
 import type { BlobRef } from "../storage/extents.js";
 import { xxHash32 } from "../hash/xxhash32.js";
 import { MANIFEST_FORMAT_VERSION } from "../durable-format.js";
-/** Current-root bootstrap over unchanged directory payloads, not a next-to-next upgrade.
+/** Current-metadata bootstrap over unchanged value-page payloads, not a next-to-next upgrade.
  * Archived root slots are discarded. Current and independently bundled current writers own
  * the continuing-writer tests; archived writers/roots are used only for explicit refusal. */
 import { build } from "esbuild";
@@ -15,11 +15,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { SimBackend, SimLocks, type SimDisk } from "../storage/sim-disk.js";
-import { encodeManifestRoot } from "../format/manifest-codec.js";
+import {
+  decodeGroupIndex,
+  decodeGroupPage,
+  decodeGroupRoot,
+  encodeGroupIndex,
+  encodeGroupPage,
+  encodeGroupRoot,
+  encodeManifestRoot,
+} from "../format/manifest-codec.js";
 import { readDirectoryFixture } from "./directory-frozen.js";
 import { DirectoryFiles, type DirectoryImage } from "./directory-fixture-files.js";
 import type { openDirectory } from "./directory-compat-api.js";
-/** Current-format test roots over unchanged packed group/page payloads.
+/** Current-format test metadata over unchanged packed value-page payloads.
  * Never loaded as a migration; old root slots are discarded before these are freshly encoded. */
 import type { ManifestRoot } from "../format/manifest.js";
 export const DIRECTORY_RECIPES = {
@@ -314,7 +322,7 @@ export function currentDirectoryFixture(
             ref.extent.offset + ref.offset + ref.length,
           );
         // Test-only bootstrap, not an upgrade: archive roots are discarded above. Reuse only
-        // the frozen group/page payloads. Definitions are fresh current-writer input, and the
+        // the frozen value-page payloads. Definitions are fresh current-writer input, and the
         // current writer creates the new MCAT tree/list; ordinary open never accepts old JSON.
         const legacy = decodeJson(raw(recipe.catalog)) as CatalogStreamData;
         const data = Catalog.fromStored({
@@ -326,7 +334,7 @@ export function currentDirectoryFixture(
           triggers: [],
           counters: { ...legacy.counters, nextFtsId: 1, nextTriggerId: 1 },
         }).encode();
-        const extents = recipe.extentList
+        let extents = recipe.extentList
           .flatMap((page) => decodeListPage(raw(page.blob), page))
           .filter((ref) => ref.offset !== recipe.catalog.extent.offset);
         let at = Math.ceil(stored.size / 4096) * 4096;
@@ -336,6 +344,69 @@ export function currentDirectoryFixture(
           await session.writeData(extent.offset, bytes);
           return { extent, offset: 0, length: bytes.length, checksum: xxHash32(bytes) };
         };
+        // Only ordinary value/directory pages remain unchanged. The archived one-column
+        // roots predate A1's optional reference: materialize fresh CURRENT metadata here,
+        // never teach ordinary open to accept an unreleased predecessor's grammar.
+        const table = need(recipe.tables[0]);
+        const removed = new Set<number>();
+        let groups = table.groups;
+        if (table.groupCount !== 0) {
+          const free = { allocate: () => true, free: () => undefined };
+          const pages = decodeGroupIndex(raw(table.groups), free).value;
+          removed.add(table.groups.extent.offset);
+          const packed = new Map<number, Array<{ index: number; bytes: Uint8Array }>>();
+          for (const [index, entry] of pages.entries()) {
+            const values = decodeGroupPage(raw(entry.ref), free).value;
+            for (const group of values) {
+              const old = raw(group.root);
+              const expanded = new Uint8Array(old.length + 1);
+              expanded.set(old);
+              const current = decodeGroupRoot(expanded, free).value;
+              if (
+                current.rowCount !== 1 ||
+                current.columns.length !== 1 ||
+                current.columns[0]?.type.kind !== "int32" ||
+                current.columns[0].aggregateSummary !== null
+              )
+                throw new Error("Unexpected archived one-column INT root recipe");
+              removed.add(group.root.extent.offset);
+              const root = await put(encodeGroupRoot(current));
+              extents.push(root.extent);
+              Object.assign(group, { root });
+            }
+            removed.add(entry.ref.extent.offset);
+            const sharing = packed.get(entry.ref.extent.offset) ?? [];
+            sharing.push({ index, bytes: encodeGroupPage(values) });
+            packed.set(entry.ref.extent.offset, sharing);
+          }
+          // Preserve the original pages' shared-extent relationship, which is a campaign
+          // dimension (packed-4099 has two directory pages in one extent).
+          for (const sharing of packed.values()) {
+            const bytes = new Uint8Array(sharing.reduce((sum, part) => sum + part.bytes.length, 0));
+            let offset = 0;
+            for (const part of sharing) {
+              bytes.set(part.bytes, offset);
+              offset += part.bytes.length;
+            }
+            const whole = await put(bytes);
+            extents.push(whole.extent);
+            offset = 0;
+            for (const part of sharing) {
+              Object.assign(need(pages[part.index]), {
+                ref: {
+                  extent: whole.extent,
+                  offset,
+                  length: part.bytes.length,
+                  checksum: xxHash32(part.bytes),
+                },
+              });
+              offset += part.bytes.length;
+            }
+          }
+          groups = await put(encodeGroupIndex(pages));
+          extents.push(groups.extent);
+        }
+        extents = extents.filter((extent) => !removed.has(extent.offset));
         const page = await put(encodeCatalogPage({ offset: 0, data }));
         const catalog = await put(
           encodeCatalogRoot({
@@ -358,7 +429,7 @@ export function currentDirectoryFixture(
             count: values.length,
           });
         }
-        const root = { ...recipe, catalog, extentList };
+        const root = { ...recipe, catalog, extentList, tables: [{ ...table, groups }] };
         // Both slots are fresh current publications. No old root parser or converter runs.
         for (let step = 1; step <= 2; step++)
           await session.publish(

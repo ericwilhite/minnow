@@ -1,6 +1,6 @@
 /** access/modify.ts memory contract: one statement, bounded charged input, no producer/writer hold-and-wait. */
 import fc from "fast-check";
-import { afterAll, expect, it, vi } from "vitest";
+import { afterAll, expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach, MODIFY_PROGRESS_REACH } from "../../testing/reach.js";
 import { WriteCredits } from "../write/credits.js";
@@ -38,49 +38,87 @@ for (const path of historyPaths)
         reach.beginHistory();
         const core = new StorageCore(256);
         Object.defineProperty(core.harness, "governor", { value: new Governor(64 * 1024 * 1024) });
-        const grants: Grant[] = [];
-        watchGrants(core.harness.governor, (grant) => grants.push(grant));
+        // Labels are immutable. Remember exactly the accounts each assertion observes,
+        // rather than retaining every native account and filtering it on every writer call.
+        const producers: Grant[] = [],
+          mergeGrants: Grant[] = [];
+        const observeGrant = (grant: Grant) => {
+          if (
+            grant.label.includes("query#") &&
+            /\/(scan|project|filter|values)#/u.test(grant.label)
+          )
+            producers.push(grant);
+          if (grant.label.startsWith("merge t")) mergeGrants.push(grant);
+        };
+        watchGrants(core.harness.governor, observeGrant);
         const tryAdmit = core.harness.governor.tryAdmit.bind(core.harness.governor);
         core.harness.governor.tryAdmit = (options) => {
           const grant = tryAdmit(options);
-          if (grant) grants.push(grant);
+          if (grant) observeGrant(grant);
           return grant;
         };
         await core.open();
         let checking = false,
-          verifying = false;
+          verifying = false,
+          updateInputRows = 0;
         let protocolFailure: Error | undefined;
         const verifyStop = new AbortController();
         // eslint-disable-next-line @typescript-eslint/unbound-method -- Invoked with the same native owner.
         const originalMetadata = WriteCredits.prototype.prepareMetadata;
-        const metadata = vi
-          .spyOn(WriteCredits.prototype, "prepareMetadata")
-          .mockImplementation(function (this: WriteCredits, bytes, signal) {
-            if (verifying && core.harness.path.stats().levelZeroRuns === 0) {
-              if (grants.some((g) => g.label.startsWith("merge t") && g.held > 0)) {
-                protocolFailure = new Error(
-                  "Completed merge retained working credit across future metadata admission",
-                );
-                verifyStop.abort(protocolFailure);
-                throw protocolFailure;
-              }
-              reach.reach("finished merge credit retired");
+        // Plain observers keep no mock call/result/context history or borrowed batches.
+        const checkMerge = () => {
+          if (verifying && core.harness.path.stats().levelZeroRuns === 0) {
+            if (mergeGrants.some((g) => g.held > 0)) {
+              protocolFailure = new Error(
+                "Completed merge retained working credit across future metadata admission",
+              );
+              verifyStop.abort(protocolFailure);
+              throw protocolFailure;
             }
-            return originalMetadata.call(this, bytes, signal);
-          });
-        // eslint-disable-next-line @typescript-eslint/unbound-method -- Rebound with call in the spy.
+            reach.reach("finished merge credit retired");
+          }
+        };
+        WriteCredits.prototype.prepareMetadata = function (
+          this: WriteCredits,
+          bytes,
+          signal,
+          includesProgress,
+        ) {
+          checkMerge();
+          return originalMetadata.call(this, bytes, signal, includesProgress);
+        };
+        // eslint-disable-next-line @typescript-eslint/unbound-method -- Invoked with the same native owner.
+        const originalNative = WriteCredits.prototype.prepareNativeMinimum;
+        WriteCredits.prototype.prepareNativeMinimum = function (
+          this: WriteCredits,
+          bytes,
+          signal,
+          includesProgress,
+        ) {
+          checkMerge();
+          return originalNative.call(this, bytes, signal, includesProgress);
+        };
+        // Completion is the ownership boundary even when an already-funded
+        // verification query needs no later metadata preparation at all.
+        // eslint-disable-next-line @typescript-eslint/unbound-method -- Invoked with the same native owner.
+        const originalRelease = WriteCredits.prototype.releaseMerge;
+        WriteCredits.prototype.releaseMerge = function (this: WriteCredits, grant) {
+          originalRelease.call(this, grant);
+          if (grant.held !== 0 || grant.allocated !== 0 || grant.loaned !== 0) {
+            // Record a background protocol failure without throwing into maintenance;
+            // the verification query and final check report it on the test's own stack.
+            protocolFailure = new Error("Completed merge did not return all working credit");
+            verifyStop.abort(protocolFailure);
+          } else reach.reach("finished merge credit retired");
+        };
+        // eslint-disable-next-line @typescript-eslint/unbound-method -- Rebound with call in the observer.
         const originalUpdate = TableWriterImpl.prototype.update;
-        // eslint-disable-next-line @typescript-eslint/unbound-method -- Rebound with call in the spy.
+        // eslint-disable-next-line @typescript-eslint/unbound-method -- Rebound with call in the observer.
         const originalDelete = TableWriterImpl.prototype.delete;
-        // eslint-disable-next-line @typescript-eslint/unbound-method -- Rebound with call in the spy.
+        // eslint-disable-next-line @typescript-eslint/unbound-method -- Rebound with call in the observer.
         const originalEnd = StatementImpl.prototype.end;
         const check = () => {
           if (!checking) return;
-          const producers = grants.filter(
-            (grant) =>
-              grant.label.includes("query#") &&
-              /\/(scan|project|filter|values)#/u.test(grant.label),
-          );
           expect(producers.length).toBeGreaterThan(0);
           expect(
             producers.every((grant) => grant.held === 0),
@@ -88,32 +126,28 @@ for (const path of historyPaths)
           ).toBe(true);
           reach.reach("read grants retired");
         };
-        const update = vi.spyOn(TableWriterImpl.prototype, "update").mockImplementation(function (
-          this: TableWriterImpl,
-          batch,
-          written,
-        ) {
+        TableWriterImpl.prototype.update = function (this: TableWriterImpl, batch, written) {
           check();
+          if (checking) {
+            updateInputRows += batch.selection?.count ?? batch.length;
+            expect(
+              updateInputRows,
+              "one snapshot pass bounds native UPDATE work",
+            ).toBeLessThanOrEqual(20000);
+          }
           return originalUpdate.call(this, batch, written);
-        });
-        const remove = vi.spyOn(TableWriterImpl.prototype, "delete").mockImplementation(function (
-          this: TableWriterImpl,
-          batch,
-          written,
-        ) {
+        };
+        TableWriterImpl.prototype.delete = function (this: TableWriterImpl, batch, written) {
           check();
           return originalDelete.call(this, batch, written);
-        });
-        const end = vi.spyOn(StatementImpl.prototype, "end").mockImplementation(function (
-          this: StatementImpl,
-          signal,
-        ) {
+        };
+        StatementImpl.prototype.end = function (this: StatementImpl, signal) {
           if (checking) {
             // Reading touched is a test observation. Single-table plans must not retain IDs at all.
             expect([...this.touched.values()].reduce((n, set) => n + set.size, 0)).toBe(0);
           }
           return originalEnd.call(this, signal);
-        });
+        };
         try {
           await core.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)");
           for (let from = 0; from < 20000; from += 200)
@@ -121,10 +155,10 @@ for (const path of historyPaths)
               `INSERT INTO t VALUES ${Array.from({ length: 200 }, (_, j) => `(${String(from + j)},${String(from + j)})`).join(",")}`,
             );
           checking = true;
-          const start = performance.now();
           const updated = await core.execute(`UPDATE t SET v = v + ${String(delta)}`);
           expect("rowCount" in updated ? updated.rowCount : null).toBe(20000);
-          expect(performance.now() - start).toBeLessThan(30000);
+          // Progress is bounded native work, independent of host scheduling or V8 coverage.
+          expect(updateInputRows, "all snapshot rows reach the writer exactly once").toBe(20000);
           reach.reach("single UPDATE no target set");
           reach.reach("20000 updated");
           checking = false;
@@ -155,12 +189,15 @@ for (const path of historyPaths)
           reach.reach("64 MiB");
           reach.reach("bounded spill workspace");
         } finally {
-          metadata.mockRestore();
-          update.mockRestore();
-          remove.mockRestore();
-          end.mockRestore();
+          WriteCredits.prototype.prepareMetadata = originalMetadata;
+          WriteCredits.prototype.prepareNativeMinimum = originalNative;
+          WriteCredits.prototype.releaseMerge = originalRelease;
+          TableWriterImpl.prototype.update = originalUpdate;
+          TableWriterImpl.prototype.delete = originalDelete;
+          StatementImpl.prototype.end = originalEnd;
           await core.close();
         }
+        if (protocolFailure) throw protocolFailure;
         expect(core.harness.governor.usedBytes).toBe(0);
         expect(
           core.harness.path.maintenance.lastMergeFailure,

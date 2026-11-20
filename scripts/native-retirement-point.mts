@@ -38,7 +38,8 @@ try {
     core.context(),
   );
   if (lowered.kind !== "query") throw new Error("Point read did not lower as SELECT");
-  // Existing native key access is a diagnostic opt-in until its separate cutover.
+  // Retain this probe's explicit key-order preference; ordinary point execution
+  // also uses the complete cursor/fetch recipe without an opt-in.
   const prepared = createExecutor({ keyOrder: true }).prepare(lowered.plan);
   for (let i = 0; i < warmups; i++) {
     beginTask();

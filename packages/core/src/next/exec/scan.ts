@@ -60,6 +60,7 @@ import type { GroupSegment } from "../access/snapshot.js";
 import type { ByteBudget, SpaceReader } from "../access/space.js";
 import type { ColumnPredicate, CompiledPredicate } from "../page/predicate.js";
 import type { FlatVector, Validity } from "../vector/vector.js";
+import type { PageEntry, EncodedPageCheck, EncodedPageKernel, PageRows } from "../page/consume.js";
 import { ChunkReader, type ChunkReadOptions } from "../page/reader.js";
 
 /** A column chunk as a group segment names it (format/manifest.ts `ColumnChunk`). */
@@ -71,6 +72,23 @@ export type GroupRows = Uint16Array | Uint32Array | Int32Array;
 /** What a scan or fetch calls on one column chunk (B2's `ChunkReader`). */
 export interface ChunkPages {
   readonly rowCount: number;
+  /** Verified metadata before payload; absent keeps the ordinary decoded route. */
+  pageEntry?(page: number): PageEntry;
+  /** Loaded-payload eligibility only; no transition, allocation or normalization. */
+  checkPage?(page: number, check: EncodedPageCheck): boolean;
+  /** One synchronous prebuilt kernel over a loaded, verified page, with no new normalization.
+   * Range coordinates are page-local; selection coordinates index ascending group positions.
+   * The callback cannot retain bytes or cross an await. State/workspace are already admitted.
+   */
+  consumePage?<State>(
+    page: number,
+    rows: PageRows | null,
+    from: number,
+    to: number,
+    state: State,
+    kernel: EncodedPageKernel<State>,
+  ): void;
+
   /** Page indices covering rows `[from, to)`, as `[first, end)`. */
   pagesInRange(from: number, to: number): [number, number];
   /** The distinct pages holding `rows[start … end)`. */

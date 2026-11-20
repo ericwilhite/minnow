@@ -128,8 +128,10 @@ protocol survives it: every broker request is bounded and retried, and each brok
 announces an id so clients resend and owners register again;
 [the SharedWorker restart note](https://github.com/ericwilhite/minnow/blob/main/packages/core/src/next/owner/webkit-sharedworker.md) has the measurements and the repro.
 
-The merge gate and fast SQLLogicTest profile run in `.github/workflows/ci.yml` on every push and pull
-request, spread across parallel jobs. One job runs the format, type, lint, build, API contract,
+The merge gate and fast SQLLogicTest profile run in `.github/workflows/ci.yml` on every push to
+`main` and every pull request that is not a draft, spread across parallel jobs. Draft pull requests
+skip this gate, the release-readiness conformance and the performance gate; marking a draft ready
+for review runs them. One job runs the format, type, lint, build, API contract,
 SQLLogicTest, and heap-plateau checks. The unit suite runs under coverage in seven Vitest parts; a
 final job merges their results and coverage and enforces the coverage floors on the whole suite,
 exactly as `npm run test:coverage` does. The `Format, types, lint, build, unit tests` check requires
@@ -182,8 +184,14 @@ much as it measures the code, and a merge gate that fails on a noisy runner is o
 re-run rather than read. When a completed run crosses a ratio threshold, the gate starts a fresh
 process and fails only if that same workload and comparison engine cross it again. Setup errors,
 missing profiles, and incomplete runs still fail immediately. The SQL gate records the CPU model,
-Node/V8 versions and host load before timing. Threshold profiles group machines by OS, architecture
-and Node major version; CPU context is diagnostic and does not automatically select a looser threshold.
+Node/V8 versions and host load before timing. Threshold profiles are keyed by OS, architecture, Node
+major version and CPU model (for example `linux-x64-node24-amd-epyc-9v45-96-core`), because SQLite's
+speed relative to Minnow differs between CPU families: hosted Intel runners make it relatively
+faster than the AMD runners the Linux thresholds were pinned on. A host whose CPU model has no
+calibrated profile is refused before any timing, never compared with another machine's thresholds.
+Each Intel profile takes the highest value from the gate's own `--update` runs on that model:
+Xeon 6975P-C from five runs and Platinum 8573C from four. The Platinum 8370C profile comes from a
+single run and is provisional: recalibrate it once more runners of that model have been drawn.
 `.github/workflows/browser-performance.yml` runs the [browser performance lane](#browser-performance-lane)
 nightly, also off the merge path, and uploads its JSON lines and summary as an artifact.
 
@@ -1864,6 +1872,63 @@ unordered result passes. Live subscriptions, concurrent openers, crash schedules
 native browser storage and order-dependent floating aggregates remain outside this
 serial harness; their existing suites still own those checks.
 
+### Rebuild-core encoded selection component
+
+`scripts/next-selection-workspace-bench.mts` compares two separately built core roots. Save a
+parent build, then build the candidate and run:
+
+```bash
+mkdir -p "$HOME/.cache/minnow-bench-tmp"
+TMPDIR="$HOME/.cache/minnow-bench-tmp" node scripts/next-selection-workspace-bench.mts \
+  --control-root "$HOME/.cache/minnow-parent" \
+  --output "$HOME/.cache/minnow-selection"
+```
+
+The component measures the first encoded selection through reader close, including any
+predicate decode workspace it acquires and releases. Fixture construction, reader open, page
+loading, predicate compilation, output buffers and result checks are outside the clock. Both
+nullable and all-valid pages use production readers; every selected position is checked and
+every reader must release its charges. It takes nine interleaved AB/BA rounds of CPU across all
+Node threads, with natural GC, and records raw samples, code hashes, CPU affinity and paired
+median/IQR decisions. This isolates workspace cost; it does not establish a scan, aggregate,
+browser, I/O or spill speedup. Whole-query comparisons and generated/PGlite suites remain
+separate checks.
+
+### Rebuild-core encoded plan work
+
+`next/testing/executor-encoded-cost.test.ts` counts page-capability reads and encoded
+transitions through native plans. Generated ordinary scans, selective scans, grouped or
+unsupported reductions, residual or mixed filters and limited inputs must perform no
+encoded-capability work. Every
+history also runs an eligible COUNT on the same stored data and proves that encoded
+consumption remains active. PostgreSQL checks the ordinary results; cleanup checks governor
+and spill credit. This is a work-count law, independent of elapsed time or host load.
+`next/exec/pushdown-eligibility.test.ts` also checks the planning probe against the scan
+splitter over stored literal forms, nulls, collation and compound predicates, while proving
+that eligibility never reads or copies a literal payload.
+
+### Rebuild-core encoded reduction component
+
+`scripts/next-encoded-page-bench.mts` compares selection followed by ordinary decode/reduce
+with direct encoded-page consumption, using production readers and aggregate accumulators:
+
+```bash
+TMPDIR="$HOME/.cache/minnow-bench-tmp" node scripts/next-encoded-page-bench.mts \
+  --control-root "$HOME/.cache/minnow-parent" \
+  --output "$HOME/.cache/minnow-encoded-pages"
+```
+
+Run an A/A first with both roots set to the parent and `--candidate-mode decoded`. The runner
+uses nine interleaved CPU pairs and retains every sample. It sweeps 2,048, 8,192 and 32,768-row
+selection windows under a four-MiB component budget. Each window retains 2,048-row aggregate
+transition steps; this does not authorize wider error-demand steps in production. Both nullable
+and all-valid inputs check exact integer and ordered float sums and release every charge.
+
+The CPU bracket covers selection, decode where used, and reduction over already loaded pages.
+Fixture construction, loading, state allocation, final output and checks are untimed. The
+runner records code hashes, byte peaks and median/IQR decisions, including the full range as
+a diagnostic. Whole-query and PGlite/governor checks remain separate evidence.
+
 ### Rebuild-core write CPU comparisons
 
 `scripts/write-insert-bench.mts` compares two built core `dist` directories in fresh Node
@@ -2534,6 +2599,36 @@ campaign checks the exact code, zero writable OPFS handles and writes, and the c
 unchanged native file image for all three frozen directory shapes. The pre-registry archived
 writer still refuses the current root with `MINNOW_MANIFEST_CORRUPT`; its separate check
 preserves root/data payloads, without claiming that obsolete writer has a pre-fence gate.
+
+The private executor's `parameter-utf8.test.ts` compares every encoded parameter
+with WHATWG UTF-8 output across long one- through four-byte text, lone surrogates,
+and pairs around the 8,192 UTF-16-unit slice boundary. Mixed slot types and NULLs
+vary independently. Forced slice yields and short encoder writes check that binding
+resumes by reported progress and preserves each slot's measured byte extent. The
+same cases run on Node 22, 24 and 26; source and reservation bounds are distinct.
+
+The private executor also checks wide parameter results under pinned competing credit.
+Its complete result reservation includes frame construction as well as payload bytes;
+binding-only UTF-8 scratch cannot stand in for result progress.
+
+The private core's `utf8-sites.test.ts` checks each encoder caller independently:
+varlen construction, length-prefixed strings, JSON, bounded write windows and
+parameters. It varies Unicode code points, lone surrogates, chunk boundaries,
+exact and generous buffer recipes, and native prefix or zero progress. Each
+site compares exact bytes with WHATWG UTF-8 and round-trips through its reader.
+The helper checks capacity before writing and uses no temporary byte buffer or
+UTF-16 suffix. A source guard rejects `encodeInto` access outside it, including destructured
+methods, prototype references, reflective calls and bound methods. Unknown computed
+keys on encoder values are refused too; ordinary data indexing remains allowed.
+The guard scans every production source in bounded file groups and pins each
+hidden-access form with rejection fixtures.
+
+`utf8-durability.test.ts` writes multibyte catalog names, defaults, ledger counts
+and rows through the real native writer. It reopens a WAL-only tail, crosses an
+observed publication boundary, reopens the stored varlen pages, then continues
+writing and reopens again. Both native memory and simulated storage run the
+same histories. Node 22, 24 and 26 run the encoder properties; the committed
+seeds declare Unicode, boundary, publication and cleanup reach explicitly.
 
 ### Rebuild directory-cache work counts
 

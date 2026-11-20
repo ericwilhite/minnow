@@ -107,6 +107,7 @@ describe("review B2-p2a #1: a cached directory is checked against every chunk th
       directory: blob,
       statistics: { nullCount: 0, min: null, max: null, dictionarySize: null },
       distinctSketch: null,
+      aggregateSummary: null,
     };
     const directories = new BlobCache<ChunkDirectory>(freeMemory);
     // The first reader parses it for a chunk it fits and caches it.
@@ -697,6 +698,7 @@ describe("review B2-p2a #7: decoders accept only canonical bytes", () => {
       directory: { extent: { offset: 0, length: 4096 }, offset: 100, length: 10, checksum: 0 },
       statistics: { nullCount: 0, min: null, max: null, dictionarySize: null },
       distinctSketch: null,
+      aggregateSummary: null,
     });
     const bytes = encodeGroupRoot({
       rowCount: 1,

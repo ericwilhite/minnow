@@ -77,6 +77,26 @@ export const EXECUTION_RETIREMENT_REACH = [
   "zero charges",
 ] as const;
 
+/** Encoded selection avoids unused decode scratch; real fallbacks still fund and release it. */
+export const PAGE_SELECTION_WORKSPACE_REACH = [
+  "int32",
+  "int64 FOR",
+  "decimal FOR",
+  "int64 plain",
+  "decimal128 plain",
+  "multiple pages",
+  "range",
+  "refine",
+  "mask",
+  "nullable",
+  "null predicate",
+  "encoded without workspace",
+  "fallback refused before allocation",
+  "fallback charged",
+  "workspace reused",
+  "closed and released",
+] as const;
+
 /** Ordered hot-key traversal stays linear relative to the legacy input scan. */
 export const HOT_KEY_SORT_WORK_STATES = [
   "exact ordered rows",
@@ -113,6 +133,7 @@ export const DURABLE_LONG_KEY_REACH = [
   "partial native tree",
 ] as const;
 export const DURABLE_REGISTRY_REACH = [
+  "groupAggregate",
   "databaseIdentity",
   "ftsJournal",
   "ftsRoot",
@@ -2716,6 +2737,7 @@ export const WRITE_BATCH_ADMISSION_STATES = [
 
 /** B3 review: transient reader memory must delay metadata publication, never poison it. */
 export const WRITE_METADATA_PRESSURE_STATES = [
+  "idle forecasts donated before reader pressure",
   "memory",
   "indexeddb",
   "reader owns real bytes",
@@ -6229,9 +6251,9 @@ export const FTS_CODEC_REACH = [
 ] as const;
 
 export const FTS_SELECTOR_REACH = [
-  "reader11 barrier",
-  "writer11 barrier",
-  "manifest14 barrier",
+  "reader12 barrier",
+  "writer12 barrier",
+  "manifest15 barrier",
   "commit body9",
   "wide sequence preserved",
   "checksummed roundtrip",
@@ -7515,6 +7537,7 @@ export const FTS_STATEMENT_CLOCK_REACH = [
 
 /** End-of-statement FTS admission observes its own signal before another holder releases credit. */
 export const FTS_ADMISSION_CANCEL_REACH = [
+  "native forecasts own real buffers during wait",
   "options",
   "end",
   "actual admission wait",
@@ -8068,15 +8091,15 @@ export const MODIFY_INDEX_GATE_REACH = [
   "indexRange",
   "zero SELECT limit",
   "positive SELECT limit",
-  "query unset refused",
-  "query false refused",
+  "query unset admitted",
+  "query false admitted",
   "query opt-in prepared",
   "DML unset admitted",
   "DML false admitted",
   "PG and shipped rows",
   "zero spill",
-  "nested join refused",
-  "nested set refused",
+  "nested join admitted",
+  "nested set admitted",
 ] as const;
 
 /** Root scalar registries have a fixed charged directory independent of row/event count. */
@@ -8361,6 +8384,7 @@ export const NATIVE_COMMAND_CHECK_LIFETIME_REACH = [
 ] as const;
 
 export const PREPARED_ROW_CREDIT_REACH = [
+  "other accounts own actual buffers",
   "one prepared slot",
   "owner close refuses live step",
   "reclaim keeps floor",
@@ -9278,6 +9302,8 @@ export const BOUNDED_RETIREMENT_FAULT_REACH = [
 ] as const;
 
 export const FTS_RETIREMENT_PRESSURE_REACH = [
+  "competitor owns ordinary credit",
+  "allocated peak within prepaid window",
   "owned through publication",
   "released after settlement",
   "shared source refs",
@@ -10201,6 +10227,7 @@ export const NATIVE_RI_COMPOSITE_REACH = [
 ] as const;
 
 export const NATIVE_RI_PRESSURE_REACH = [
+  "prepaid native window progresses with competitor retained",
   "commit while competitor retains bytes",
   "no future merge at commit",
   "rekey",
@@ -10623,6 +10650,7 @@ export const FOLLOW_NESTED_AFTER_REACH = [
 ] as const;
 
 export const FOLLOW_NESTED_PRESSURE_REACH = [
+  "prepaid writer progresses with competitor retained",
   "published",
   "resident",
   "64MiB competing credit",
@@ -10688,6 +10716,8 @@ export const NATIVE_WRITE_PRESSURE_REACH = [
   "exact durable rows",
   "32 MiB peak",
   "zero final charge",
+  "completed metadata workspace returned",
+  "resident metadata overlaps writer step",
 ] as const;
 
 export const NATIVE_WRITE_OPTIONAL_REACH = [
@@ -10707,6 +10737,8 @@ export const NATIVE_ROOT_LIST_FUNDING_REACH = [
 ] as const;
 
 export const NATIVE_WRITE_GROWTH_REACH = [
+  "other native accounts own real buffers",
+  "unused working floors surrendered",
   "real competing buffers",
   "complete deficit after surrender",
   "task runs while growth waits",
@@ -11181,6 +11213,7 @@ export const NATIVE_WRITE_STEP_REACH = [
 ] as const;
 
 export const NATIVE_WRITE_STEP_BORROW_REACH = [
+  "unfunded headroom refusal has bounded work",
   "foreign native chunk waits",
   "cancel with borrower still live",
   "borrow release sufficient before snapshot close",
@@ -11193,6 +11226,8 @@ export const NATIVE_WRITE_STEP_BORROW_REACH = [
 ] as const;
 
 export const NATIVE_WRITE_STEP_CREDIT_REACH = [
+  "unchanged-floor transfer invalidates witness",
+  "native funding restored after idle donation",
   "control charged before retention",
   "primary floor survives reclaim",
   "metadata and commit buffers once",
@@ -11650,4 +11685,1203 @@ export const DIRECTORY_CACHE_LATE_REACH = [
   "all-valid payload",
   "complete PostgreSQL rows",
   "all credit returned",
+] as const;
+
+/** S1 encoded scan COUNT: semantic and admission states, each reached by committed seeds. */
+export const ENCODED_SCAN_REACH = [
+  "encoded count without value vectors",
+  "metadata refusal uses ordinary batches",
+  "empty selection",
+  "nulls",
+  "visibility",
+  "sparse selection",
+  "dense selection",
+  "multiple logical steps",
+  "dictionary validity without expansion",
+  "close returns all credit",
+  "pure column remap",
+  "shared sum and average",
+  "missing column uses complete ordinary step",
+  "nested duplicate-column bindings",
+] as const;
+
+/** S1 real encoded page reductions; inspected physical paths, not generator labels. */
+export const ENCODED_PAGE_VALUES_REACH = [
+  "plain int32",
+  "FOR u8",
+  "FOR u16",
+  "delta checkpoints",
+  "plain float",
+  "scaled float",
+  "float patches",
+  "nulls",
+  "repeated positions",
+  "selected input order",
+  "all-null page",
+  "constant page",
+  "contiguous range",
+  "delta zero-width",
+  "delta u16",
+  "scaled zero-width",
+  "scaled u8",
+  "scaled u16",
+  "scaled u32",
+] as const;
+
+/** Ordered float8pl demand and prefix preservation for raw encoded pages. */
+export const ENCODED_PAGE_FLOAT_ERRORS_REACH = [
+  "positive overflow",
+  "negative overflow",
+  "infinity first",
+  "NaN first",
+  "signed zero",
+  "repeated positions before failure",
+  "plain payload error transitions",
+  "scaled payload error transitions",
+  "all-valid error transitions",
+  "nullable error transitions",
+] as const;
+
+/** Metadata-only and synchronous payload ownership at the S1 reader seam. */
+export const ENCODED_PAGE_BORROW_REACH = [
+  "metadata before payload",
+  "empty span without payload",
+  "unloaded page refused before callback",
+  "span endpoints checked",
+  "loaded page borrowed without new capacity",
+  "closed reader refused",
+  "close returns credit",
+  "loaded eligibility without transition",
+] as const;
+
+/** Expired ordinary payload and temporary column mappings cannot outlive encoded readiness. */
+export const ENCODED_PROJECT_BORROW_REACH = [
+  "single projection",
+  "nested projections",
+  "after readiness",
+  "synchronous readiness",
+  "receiver error",
+  "successful consumption",
+  "expired source collected",
+  "binding metadata collected",
+] as const;
+
+/** Ordinary SQL planning reaches encoded consumption, including a decoded memory tail. */
+export const ENCODED_NATIVE_REACH = [
+  "native encoded recipe",
+  "counted scan rows preserved",
+  "duplicate aggregate column binding",
+  "stored and memory transitions",
+  "null columns",
+  "deleted rows",
+  "retained generation pinned before update",
+  "updated generation flushed",
+  "encoded retained generation after flush",
+  "scan retained generation after flush",
+  "encoded newer generation",
+  "scan newer generation",
+  "generations keep distinct answers",
+  "complete native cleanup",
+] as const;
+
+/** Reader-legal u32 FOR/delta int32 pages which the size-choosing writer does not emit. */
+export const ENCODED_PAGE_WIDE32_REACH = [
+  "FOR u32",
+  "delta u32",
+  "signed modulo wrap",
+  "nullable FOR",
+  "duplicate positions",
+  "contiguous range",
+] as const;
+
+/** COUNT cannot hide a demanded safe-number corruption or inspect an unselected scalar. */
+export const ENCODED_COUNT_VALIDATION_REACH = [
+  "declined before count transition",
+  "demanded unsafe value refused",
+  "unselected unsafe value remains undemanded",
+  "wide lane retains direct count",
+  "int64",
+  "decimal",
+  "interval",
+] as const;
+
+/** Source-only columns retain ordinary dense/gather validation before raw reductions. */
+export const ENCODED_SOURCE_DEMAND_REACH = [
+  "int64",
+  "decimal",
+  "interval",
+  "dense unselected scalar stays demanded",
+  "entire unselected page stays demanded",
+  "sparse unsafe scalar stays undemanded",
+  "wide source stays direct",
+  "undemanded page stays direct",
+  "COUNT star",
+  "COUNT other column",
+  "pure projection hides source column",
+  "close returns all credit",
+] as const;
+
+/** Source-only out-of-line reads keep dense/gather error order and bounded fallback. */
+export const ENCODED_SOURCE_LARGE_DEMAND_REACH = [
+  "dense source value remains demanded",
+  "wholly unselected value page remains demanded",
+  "sparse value stays undemanded",
+  "separate undemanded page stays direct",
+  "COUNT star",
+  "COUNT other column",
+  "pure projection hides source column",
+  "close returns all credit",
+] as const;
+
+/** Noneligible recipes perform no encoded-capability discovery or batch dispatch. */
+export const ENCODED_COST_REACH = [
+  "plain",
+  "selective",
+  "grouped",
+  "minmax",
+  "expression",
+  "distinct",
+  "filter",
+  "numeric",
+  "mixed",
+  "limited",
+  "residual",
+  "partial residual",
+  "no capability probes",
+  "no aggregate capability discovery",
+  "no encoded transitions",
+  "nullable source",
+  "ordinary memory tail",
+  "eligible reduction remains encoded",
+  "complete cleanup",
+] as const;
+
+/** A metadata-only eligibility probe agrees with the scan splitter without payload reads. */
+export const PUSHDOWN_ELIGIBILITY_REACH = [
+  "int16",
+  "int32",
+  "int64 safe",
+  "float32",
+  "float64",
+  "float32 from f64",
+  "float64 from f32",
+  "date",
+  "timestamp",
+  "timestamptz",
+  "time",
+  "bool",
+  "int64 wide",
+  "numeric safe",
+  "numeric int64",
+  "numeric int128",
+  "numeric wide",
+  "numeric NaN",
+  "numeric Infinity",
+  "numeric -Infinity",
+  "text",
+  "bytes",
+  "uuid",
+  "interval",
+  "json",
+  "jsonb",
+  "array",
+  "enum",
+  "locator",
+  "compare",
+  "flipped",
+  "in",
+  "negated in",
+  "is null",
+  "parameter",
+  "and",
+  "mixed and",
+  "or",
+  "empty and",
+  "null literal",
+  "nonnull literal",
+  "empty literal",
+  "mismatched layout",
+  "missing column",
+  "C collation",
+  "non C collation",
+  "residual filter",
+  "accepted pushdown",
+  "no payload reads",
+  "text compare nonC",
+  "text IN nonC",
+  "null IN member accepted",
+  "null compare residual",
+] as const;
+
+/** Quiet index eligibility belongs to the same synchronous observation as its root cut. */
+export const QUIET_INDEX_CUT_REACH = [
+  "persisted empty root",
+  "stored rows before build",
+  "rows after cut before assembly",
+  "empty index settled at original cut",
+  "nonquiet build holds cut",
+  "older pin unchanged",
+  "committed",
+  "pending commit",
+  "pending rollback",
+  "NULL payload",
+  "all valid",
+  "reopen indexed values",
+  "exact inventory and continued writes",
+  "zero final charge",
+] as const;
+
+/** Interrupted owner cleanup never publishes provisional catalog/FTS output. */
+export const ROOT_DROP_ABORT_CRASH_REACH = [
+  "provisional catalog output",
+  "provisional FTS output",
+  "abort entry",
+  "owned extent release reached",
+  "before release",
+  "after release",
+  "old root unchanged",
+  "physical roots unchanged",
+  "no persistent work after stop",
+  "committed DROP and rows recovered",
+  "retry and FTS history readable",
+  "exact inventory and continued writes",
+  "zero charges",
+  "all explicit boundaries",
+] as const;
+
+/** A1 bounded group-summary codec: actual header representations and binding refusals. */
+export const GROUP_AGGREGATE_CODEC_REACH = [
+  "large source identity",
+  "int16",
+  "int32",
+  "int64",
+  "decimal",
+  "count only",
+  "sum",
+  "negative coefficient",
+  "zero coefficient",
+  "positive coefficient",
+  "specials",
+  "all null",
+  "source identity",
+  "header refusal",
+  "payload refusal",
+  "bounded omission",
+  "funded decode",
+  "released",
+] as const;
+
+export const GROUP_AGGREGATE_WRITER_REACH = [
+  "int16",
+  "int32",
+  "int64",
+  "decimal",
+  "nullable",
+  "all valid",
+  "mixed scale",
+  "fixed scale",
+  "specials",
+  "multiple pages",
+  "packed summaries",
+  "metadata only",
+  "source bytes",
+  "checksum refusal",
+  "typed header refusal",
+  "bitmap fallback",
+  "cancel release",
+  "zero charges",
+] as const;
+
+export const GROUP_AGGREGATE_FOLD_REACH = [
+  "int32 lanes",
+  "int64 lanes",
+  "int128 lanes",
+  "mixed scales",
+  "NULL payload",
+  "special counts",
+  "bounded omission",
+  "workspace refusal",
+  "exact lane carry",
+  "whole group bound",
+  "released",
+] as const;
+
+export const GROUP_AGGREGATE_NATIVE_REACH = [
+  "OPFS",
+  "IndexedDB",
+  "real stored source",
+  "pristine record",
+  "old pin valid",
+  "delete fallback",
+  "publication and reopen",
+  "R25 inventory",
+  "zero charges",
+  "index runs merged",
+  "summary refs unchanged",
+] as const;
+
+export const GROUP_AGGREGATE_PRIORITY_REACH = [
+  "summary initially funded",
+  "dictionary denied",
+  "summary reclaimed",
+  "dictionary kept",
+  "value bytes identical",
+  "zero charges",
+] as const;
+
+export const GROUP_AGGREGATE_TASK_REACH = [
+  "timer before append",
+  "complete paced fold",
+  "cancelled paced fold",
+  "abort before output",
+  "no partial metadata",
+  "zero charges",
+] as const;
+
+/** A1 optional allocations decline under real shared-governor contention. */
+export const GROUP_AGGREGATE_ADMISSION_REACH = [
+  "int32",
+  "decimal",
+  "NULL payload",
+  "all valid",
+  "real governor blocked optional",
+  "state omitted",
+  "arithmetic omitted",
+  "encode omitted",
+  "pending omitted",
+  "ample record",
+  "ordinary bytes identical",
+  "ordinary values identical",
+  "zero charges",
+] as const;
+
+/** R8: summary bytes stay owned until started I/O has drained. */
+export const GROUP_AGGREGATE_TAIL_REACH = [
+  "int32",
+  "decimal",
+  "summary append stalled",
+  "signal cancellation",
+  "explicit abort",
+  "abort waits for started I/O",
+  "charge held through I/O",
+  "no partial group",
+  "unpublished extents released",
+  "zero charges",
+] as const;
+
+export const GROUP_AGGREGATE_REBASE_REACH = [
+  "data moved",
+  "directory moved",
+  "source length changed",
+  "record moved",
+  "identity unchanged",
+  "no-op mapping",
+  "present summary",
+  "absent summary",
+  "source unchanged",
+  "kept record validates",
+  "sum record",
+  "count record",
+  "zero charges",
+] as const;
+
+export const GROUP_AGGREGATE_NATIVE_INT_REACH = [
+  ...GROUP_AGGREGATE_NATIVE_REACH,
+  "continued writes",
+] as const;
+
+export const GROUP_AGGREGATE_PACK_CANCEL_REACH = [
+  "multiple-pack demand",
+  "blocked first seal",
+  "cancel during next open",
+  "no new opens",
+  "signal cancellation",
+  "explicit abort",
+  "no new appends",
+  "no partial group",
+  "zero charges",
+] as const;
+
+export const PUBLIC_INSPECTION_REACH = [
+  "PG catalog types and names",
+  "funded metadata delivery",
+  "detached caller metadata",
+  "queued reply owns credit",
+  "explain never executes",
+  "explain hides literal payload",
+  "private DDL and rollback",
+  "catalog drift during admission",
+] as const;
+
+export const INSPECTION_ADMISSION_REACH = [
+  "cancel queued admission",
+  "retry changed source",
+  "retry changed recipe",
+  "idempotent relinquish",
+  "failed build releases charge",
+] as const;
+
+export const INSPECTION_RECEIPT_REACH = [
+  "connection end releases reply",
+  "cancel posted reply releases credit",
+  "paused receipt retains credit",
+] as const;
+
+export const INSPECTION_RECONNECT_REACH = [
+  "lost private inspection refuses",
+  "idle inspection resends",
+  "rollback restores inspection",
+] as const;
+
+export const NATIVE_DEVTOOLS_REACH = [
+  "JSON and JSONB spelling",
+  "exact bigint",
+  "numeric scale",
+  "microsecond timestamp",
+  "binary and arrays",
+  "nested arrays",
+  "duplicate positional labels",
+  "object last wins",
+  "NULL marker",
+  "catalog metadata",
+  "quoted completion",
+  "logical explain",
+  "cursor close",
+  "live not bound",
+  "empty result",
+  "lazy display",
+  "preview bound",
+  "native owner retired",
+] as const;
+
+export const INSPECTION_LIVENESS_REACH = [
+  "live reply retained",
+  "non-live became live",
+  "lost liveness swept",
+  "zero reply ownership",
+] as const;
+
+export const INSPECTION_RETIREMENT_REACH = [
+  "funded before retirement",
+  "closed before reply arrival",
+  "cancelled before reply arrival",
+  "no late ownership",
+] as const;
+
+export const NATIVE_PREVIEW_DECODE_REACH = [
+  "flat",
+  "constant",
+  "dictionary",
+  "multiple frames",
+  "one-cell decode",
+  "visible-only decoding",
+  "empty preview",
+  "bounded preview",
+  "cached entry reuse",
+  "off-screen refusal",
+] as const;
+
+export const DIRECTORY_OPENER_SETTLEMENT_REACH = [
+  "success before owner work",
+  "failure before owner work",
+  "success after owner work",
+  "failure after owner work",
+  "deferred consumer",
+  "original error retained",
+] as const;
+
+export const PARAMETER_UTF8_REACH = [
+  "one byte",
+  "two bytes",
+  "three bytes",
+  "four bytes",
+  "lone high",
+  "lone low",
+  "pair crosses 8192",
+  "pair before 8192",
+  "pair after 8192",
+  "mixed slots",
+  "null slot",
+  "enum slot",
+  "text first",
+  "text middle",
+  "text last",
+  "sizing and binding yield",
+  "short write",
+  "zero retained",
+] as const;
+
+export const PARAMETER_RESULT_PROGRESS_REACH = [
+  "join",
+  "except",
+  "ASCII",
+  "multibyte",
+  "additional scalar columns",
+  "three columns",
+  "five MiB",
+  "occupied credit",
+  "frame progress",
+  "zero retained",
+] as const;
+
+export const UTF8_SITES_REACH = [
+  "empty",
+  "one byte",
+  "two bytes",
+  "three bytes",
+  "four bytes",
+  "valid pair",
+  "lone high",
+  "lone low",
+  "BOM character",
+  "longer than chunk",
+  "pair across chunk",
+  "exact recipe",
+  "generous recipe",
+  "native prefix",
+  "native zero",
+  "zero retained",
+] as const;
+
+export const UTF8_DURABILITY_REACH = [
+  "WAL reopen",
+  "catalog names and defaults",
+  "JSON ledger",
+  "published pages reopen",
+  "continued writing",
+  "NULL payload",
+  "non-NULL payload",
+  "chunk-boundary pair and lone surrogates",
+  "two bytes",
+  "three bytes",
+  "four bytes",
+  "BOM catalog and payload",
+  "zero retained",
+] as const;
+
+export const EXECUTOR_DEMAND_ADMISSION_REACH = [
+  "pinned competitor denies optional growth",
+  "PGlite exact ordered rows",
+  "declared widths",
+  "unknown widths",
+  "descending physical reorder",
+  "ascending physical reorder",
+  "LIMIT zero",
+  "unbounded LIMIT",
+  "bound LIMIT",
+  "oversized row",
+  "nullable input",
+  "minimum versus charged peak",
+  "zero final query credit",
+] as const;
+
+export const READ_DEMAND_COVERAGE_REACH = [
+  "physical prefix is not complete chunk",
+  "whole chunk covers every subinterval",
+  "unused byte target not retained",
+  "one-row hints cover whole source",
+  "zero sizing credits",
+] as const;
+
+export const EXECUTOR_DEMAND_PUBLICATION_REACH = [
+  "resident source retained before publication",
+  "publication after complete admission",
+  "old snapshot exact values after publication",
+  "8MiB query zero final credit",
+] as const;
+
+export const RESIDENT_RANGE_REACH = [
+  "bounded resident minimum",
+  "real delta replacement keeps captured arrays",
+  "publication before open",
+  "cancel before open",
+  "cancel transferred input before next",
+  "cancel pending input keeps charge until settle",
+  "descending exact locators",
+  "ascending exact locators",
+  "pinned optional growth denied",
+  "zero cursor credits",
+] as const;
+
+export const EXECUTOR_LEGACY_DEMAND_REACH = [
+  "optional range capability absent",
+  "complete query fits8MiB",
+  "PGlite exact direct projection",
+  "ascending",
+  "descending",
+  "legacy diagnostic cursor exercised",
+  "operator requests within reserved capacity",
+  "zero final credits",
+] as const;
+
+/** Independent factory allocations across input/output batch and variable width boundaries. */
+export const EXECUTOR_DEMAND_BOUNDARIES_REACH = [
+  "BYTEA",
+  "JSON",
+  "JSONB",
+  "native",
+  "ties",
+  "distinct",
+  "sql-distinct",
+  "2047",
+  "2048",
+  "2049",
+  "4097",
+  "8193",
+  "DISTINCT returns rows beyond offset",
+  "wide payload",
+  "variable NUMERIC coefficients",
+  "safe coefficient source",
+  "int64 coefficient source",
+  "int128 coefficient source",
+  "LIMIT above batch",
+  "OFFSET crosses batch",
+  "independent backing credit",
+  "pinned pressure",
+  "PGlite exact rows",
+  "zero final credit",
+] as const;
+
+/** One-locator admission must retain full physical-position workspace. */
+export const EXECUTOR_KEY_ORDER_DEMAND_REACH = [
+  "2",
+  "257",
+  "2049",
+  "int",
+  "text",
+  "numeric",
+  "resident",
+  "stored",
+  "ASC",
+  "DESC",
+  "OFFSET",
+  "no OFFSET",
+  "PG exact",
+  "independent backing",
+  "released",
+] as const;
+
+export const NATIVE_WRITE_DICTIONARY_PRESSURE_REACH = [
+  ...NATIVE_WRITE_OPTIONAL_REACH,
+  "actual immutable input bounds",
+  "complete plain workspace prepaid",
+  "no dictionary retained by plain fallback",
+] as const;
+
+export const WRITE_RECOVERY_CREDIT_REACH = [
+  "retired scan excluded from native witness",
+  "scan buffer owned through suspension",
+  "completed scan returned",
+  "small live rows",
+  "live rows above working floor",
+  "prepared row preserved",
+  "no prepared row",
+  "idle scan forecast returned",
+  "retirement idempotent",
+  "competing reader progresses",
+  "zero final charge",
+] as const;
+
+export const NATIVE_RECOVERY_CREDIT_REACH = [
+  "recovery read and working buffers coexist",
+  "recovery competitor owns real bytes",
+  "scan forecast retired before ready",
+  "query admitted without completed scan credit",
+  "32 MiB",
+  "64 MiB",
+  "exact reopened rows",
+  "continued native writes",
+  "zero final charge",
+] as const;
+
+export const WRITE_SINK_CAPTURE_REACH = [
+  "internal capture retries",
+  "sink error",
+  "sink pressure",
+  "no unasked sink abort",
+  "accepted rows survive reopen",
+  "zero final charge",
+] as const;
+
+export const WRITE_GROUP_MINIMUM_REACH = [
+  "typed whole-group refusal",
+  "no admission queued",
+  "refused before any buffer allocation",
+  "zero final charge",
+] as const;
+
+export const WRITE_GROUP_FITTING_REACH = [
+  "actual short-value buffers",
+  "no emit-step growth",
+  "serialized tails charged before append",
+  "shared buffers dropped before refund",
+  "exact stored rows",
+  "zero final charge",
+] as const;
+
+export const WRITE_GROUP_VALUE_REACH = [
+  "out-of-line pointer bounds",
+  "inline limit",
+  "NULL",
+  "empty valid value",
+  "same-length rollback invalidates cached bounds",
+  "exact native group flush",
+  "zero final charge",
+] as const;
+
+export const WRITE_GROUP_FORECAST_REACH = [
+  "above whole-cap typed refusal",
+  "no admission attempted",
+  "zero final charge",
+] as const;
+
+export const WRITE_GROUP_TYPES_REACH = [
+  "all physical buffers within preflight",
+  "single row",
+  "multiple pages",
+] as const;
+
+export const WRITE_STEP_CONCURRENCY_REACH = [
+  "only live ownership at growth admission",
+  "two owners",
+  "three owners",
+  "four owners",
+  "reader retained",
+  "merge retained",
+  "bounded progress",
+  "all owners complete",
+  "zero final charge",
+] as const;
+
+export const WRITE_MERGE_ADMISSION_REACH = [
+  "metadata owned through native merge handoff",
+  "cold read under competing credit",
+  "metadata retry reached",
+  "no private merge during admission",
+  "exact merged rows",
+  "zero final charge",
+  "other accounts own real buffers",
+  "real global metadata wait",
+] as const;
+
+export const WRITE_COMMIT_CONTINUATION_REACH = [
+  "reader retained during prefix",
+  "growth during active WAL step",
+  "later frame produced with prepaid credit",
+  "completed metadata window retired",
+  "exact strict commit and reopen",
+  "zero final charge",
+] as const;
+
+export const WRITE_MAINTENANCE_CREDIT_REACH = [
+  "maintenance queued behind transaction",
+  "idle metadata moves before row admission",
+  "writer progresses before slot release",
+  "maintenance completes after rollback",
+  "zero final charge",
+  "completed WAL window returned",
+] as const;
+
+/** A writer's idle forecasts cannot block a fitting native SQL reader. */
+export const WRITE_QUERY_RECLAIM_REACH = [
+  "52 MiB",
+  "56 MiB",
+  "60 MiB",
+  "64 MiB",
+  "reader and live ownership fit together",
+  "reported reader minimum",
+  "larger real reader workspace",
+  "initial exact rows",
+  "accepted keyed mutation",
+  "post-write query progressed",
+  "exact updated rows",
+  "continued writes after reclamation",
+  "zero final charge",
+  "idle explicit transaction",
+  "autocommit writer",
+] as const;
+
+/** Idle reclamation keeps actual buffers and prepared native handoffs owned. */
+export const WRITE_IDLE_FORECAST_REACH = [
+  "funded metadata retained across await",
+  "live row metadata and WAL buffers",
+  "funded merge retained across await",
+  "prepared row retained across reclaim",
+  "all other dormant credit returned",
+  "merge consumes its prepaid buffers",
+  "zero final charge",
+] as const;
+
+/** Pending readers must be reconsidered when a protected native step becomes idle. */
+export const WRITE_IDLE_NOTIFICATION_REACH = [
+  "reader queued during active step",
+  "real buffers retained",
+  "settlement wakes existing admission",
+  "zero final charge",
+] as const;
+
+/** Reused credit cannot also remain promised as an old metadata forecast. */
+export const WRITE_DONATED_METADATA_REACH = [
+  "live metadata survives forecast donation",
+  "metadata forecast funded",
+  "metadata credit donated to row step",
+  "merge retains only still funded metadata",
+  "real later metadata step readmitted",
+  "zero final charge",
+] as const;
+
+export const WRITE_LIVE_GROWTH_REACH = [
+  "each step fits alone",
+  "steps cannot fit with peers' retained rows",
+  "every owner keeps rows",
+  "some owners keep rows",
+  "live rows spilled before waiting",
+  "growth waited",
+  "growth funded at once",
+  "two owners",
+  "three owners",
+  "four owners",
+  "all owners complete",
+  "zero final charge",
+] as const;
+
+export const WRITE_OPEN_HOLDINGS_REACH = [
+  "one byte over refused at open",
+  "exact cap admitted at open",
+  "one byte under admitted at open",
+  "unservable owner minimum refused",
+  "zero final charge",
+] as const;
+
+export const WRITE_PINNED_BOUNDARY_REACH = [
+  "waited while the reader held its pins",
+  "proceeded after the pins were released",
+  "crash recovery",
+  "clean restart",
+  "zero final charge",
+] as const;
+
+export const WRITE_OWNER_BOUNDARY_REACH = [
+  "refused at the owner minimum (before construction)",
+  "refusal left only the owner grant",
+  "retry recovered every row",
+  "exact cap reopened",
+  "one byte under reopened",
+  "crash recovery",
+  "clean restart",
+] as const;
+
+export const WRITE_RECOVERY_HOLDINGS_REACH = [
+  "crash recovery growth",
+  "clean reopen growth",
+  "exact rows after recovery",
+  "zero final charge",
+] as const;
+
+export const WRITE_PIN_HOLDINGS_REACH = [
+  "pins charged to the space",
+  "owner floor unchanged by pins",
+  "pins refunded on release",
+  "zero final charge",
+] as const;
+
+export const WRITE_RELEASABLE_HOLDER_REACH = [
+  "waited while the pin was held",
+  "proceeded after the pin was released",
+  "zero final charge",
+] as const;
+
+export const WRITE_OWNER_HOLDINGS_REACH = [
+  "scratch-control holdings",
+  "storage-floor holdings",
+  "one byte under the cap admitted",
+  "exactly the cap admitted",
+  "one byte over the cap refused",
+  "zero final charge",
+] as const;
+
+export const WRITE_RETAINED_MERGE_REACH = [
+  "required metadata retained",
+  "merge alone fills the cap",
+  "merge alone fits",
+  "exact whole cap",
+  "below whole cap",
+  "zero final charge",
+] as const;
+
+export const WRITE_RETAINED_MERGE_ENGINE_REACH = [
+  "merge readers retained at admission",
+  "oversized merge refused with 53200",
+  "fitting merge completes",
+  "exact rows after maintenance",
+  "cap 32 MiB",
+  "cap 64 MiB",
+  "cap 128 MiB",
+  "zero final charge",
+] as const;
+
+export const WRITE_PRIVATE_MERGE_REACH = [
+  "complete step exceeds ordinary capacity",
+  "whole cap admitted without loan",
+  "all private buffers funded",
+  "exact whole cap",
+  "below whole cap",
+  "zero final charge",
+] as const;
+
+export const WRITE_RECLAIM_PROGRESS_REACH = [
+  "competitor owns real buffers",
+  "zero-progress callback returns",
+  "waiting admission cancelled",
+  "waiting admission completed",
+  "exact native rows",
+  "32 MiB",
+  "48 MiB",
+  "64 MiB",
+  "zero final charge",
+] as const;
+
+/** Queued recycling owns no slot or workspace and cannot obstruct a fitting reader. */
+export const WRITE_QUEUED_READER_REACH = [
+  "recycling waits behind idle transaction",
+  "future workspace has no live allocation",
+  "fitting reader progresses before transaction releases slot",
+  "recycling completes after reader and transaction",
+  "exact rows and continued writes",
+  "32 MiB",
+  "48 MiB",
+  "64 MiB",
+  "zero final charge",
+] as const;
+
+/** Optional dictionary credit is prepaid before construction, never required for progress. */
+export const WRITE_DICTIONARY_PREFLIGHT_REACH = [
+  "required future workspace retained",
+  "unused optional prepayment reclaimed",
+  "preflight precedes every group buffer",
+  "competing live allocation",
+  "no emit growth or minimum increase",
+  "bounded plain fallback",
+  "plentiful dictionary retained",
+  "exact NULL and UTF8 rows",
+  "zero final charge",
+] as const;
+
+export const WRITE_LOAN_NOTIFICATION_REACH = [
+  "row loan",
+  "metadata loan",
+  "commit loan",
+  "merge loan",
+  "reader queued during phase",
+  "loan and real buffer retained",
+  "queued reader progresses",
+  "zero final charge",
+] as const;
+
+export const WRITE_DELTA_OBSERVER_REACH = [
+  "resident descriptors",
+  "streamed additions",
+  "streamed releases",
+  "mutable cursor descriptors copied",
+  "cursors closed before prepare returns",
+  "snapshot survives source retirement",
+] as const;
+
+export const WRITE_FUNDED_HANDOFF_REACH = [
+  "merge first",
+  "commit first",
+  "finite funding work",
+  "funded handoffs consumed",
+  "compound metadata funded",
+  "idle forecasts returned",
+  "real metadata buffer retained",
+  "zero final charge",
+] as const;
+
+export const WRITE_MEMTABLE_OWNERSHIP_ORACLE_REACH = [
+  "live",
+  "borrowed",
+  "both",
+  "actual ownership accepted",
+  "unfunded ownership rejected despite spare credit",
+] as const;
+
+/** Non-waiting warm credit never becomes a hold-and-wait dependency. */
+export const WRITE_WARM_CREDIT_REACH = [
+  "warm WAL and merge preserved",
+  "cold forecasts transferred before wait",
+  "no denied growth before internal transfer",
+  "real buffers retained",
+  "rows",
+  "metadata",
+  "zero final charge",
+] as const;
+
+/** Indexed SELECTs share complete query admission and scan-equivalent pinned visibility. */
+export const QUERY_INDEX_REACH = [
+  "mixed serial set inputs",
+  "memory",
+  "stored",
+  "reopen",
+  "root",
+  "range root",
+  "projection",
+  "filter",
+  "sort",
+  "limit/offset",
+  "ascending",
+  "descending",
+  "keyLookup",
+  "indexRange",
+  "forced scan",
+  "PGlite",
+  "IN duplicates",
+  "nonadjacent duplicates",
+  "NULL key",
+  "NULL bound",
+  "coerced key",
+  "widening scan",
+  "limit early stop",
+  "text key",
+  "composite point",
+  "composite range",
+  "composite prefix",
+  "join",
+  "simultaneous sources",
+  "zero limit",
+  "pinned concurrent writes",
+  "concurrent publication",
+  "reopen after writes",
+  "zero charge",
+] as const;
+
+export const QUERY_INDEX_STAGED_REACH = [
+  "staged native input",
+  "point and range",
+  "NULL and duplicates",
+  "rollback",
+  "commit",
+  "reopen",
+  "zero ownership",
+] as const;
+
+export const QUERY_INDEX_PRESSURE_REACH = [
+  "serial index workspaces",
+  "point",
+  "range",
+  "oversized absent key",
+  "large IN",
+  "duplicates and NULL",
+  "near-limit key",
+  "medium key",
+  "short key",
+  "stored",
+  "memory",
+  "no late admission",
+  "protected minimum",
+  "observed wait",
+  "cancel",
+  "grant after wait",
+  "zero ownership",
+] as const;
+
+export const QUERY_INDEX_SPILL_REACH = [
+  "complete minimum",
+  "stored range",
+  "spilled sort",
+  "full payload exact",
+  "ascending",
+  "descending",
+  "files retired",
+  "zero ownership",
+] as const;
+
+export const QUERY_INDEX_NULLABLE_REACH = [
+  "memory",
+  "stored",
+  "reopen",
+  "nullable suffix",
+  "declared nonnull suffix",
+  "safe index",
+  "scan fallback",
+  "forced scan",
+  "PGlite",
+  "partial prefixes",
+  "complete point and null argument",
+  "strict residual proof",
+  "IN proof",
+  "IS NOT NULL proof",
+  "no proof from NULL-safe or OR",
+  "null first component",
+  "UPDATE and DELETE targets",
+  "zero ownership",
+] as const;
+
+/** Index keys serve only byte-collation predicates; others keep the executor's typed refusal. */
+export const QUERY_INDEX_COLLATION_REACH = [
+  "forced scan",
+  "index route considered",
+  "index served",
+  "byte collation index",
+  "matching key",
+  "no matching key",
+  "non-byte collation refused",
+  "no COLLATE",
+  "C",
+  "default",
+  "POSIX",
+  "ucs_basic",
+  "und-x-icu",
+  "composite equality prefix",
+  "IN list",
+  "collated key side",
+  "collated column side",
+  "unique",
+  "primary",
+  "composite",
+  "select",
+  "update",
+  "memory",
+  "stored",
+  "reopen",
+  "zero ownership",
+] as const;
+
+export const QUERY_INDEX_COERCION_REACH = [
+  "cast first",
+  "cast later",
+  "smallint",
+  "integer",
+  "success",
+  "22003",
+  "matching prefix",
+  "no early match",
+  "NULL keys",
+  "LIMIT",
+  "ordered result",
+  "memory",
+  "stored",
+  "reopen",
+  "PGlite",
+  "forced scan",
+  "index path",
+  "before any key probe",
+  "modify error order",
+  "unchanged rows after error",
+  "zero ownership",
+] as const;
+
+/** A large unordered IN input deduplicates online without an unbounded locator set. */
+export const QUERY_INDEX_SEEN_REACH = [
+  "sparse locator blocks",
+  "bitmap spill",
+  "one file",
+  "NULL and repeated keys",
+  "PGlite",
+  "forward keys",
+  "reverse keys",
+  "cancel after spill",
+  "fenced cleanup",
+  "read after cancel",
+  "zero ownership",
 ] as const;
