@@ -6,6 +6,7 @@ import { seedsFor } from "../../testing/seeds.js";
 import { createReach, NATIVE_RI_PRESSURE_REACH } from "../../testing/reach.js";
 import { referentialFixture } from "./referential.test-support.js";
 import { batch, ints } from "../write/test-support.js";
+import { yieldTask } from "../task.js";
 import { valueAt } from "../exec/kernels/test-support.js";
 for (const seed of seedsFor("next-native-ri-pressure", [0xb641, 0xb642]))
   it(`completes streamed native RI under competing credit ${String(seed)}`, async () => {
@@ -44,20 +45,49 @@ for (const seed of seedsFor("next-native-ri-pressure", [0xb641, 0xb642]))
               admitGroup = governor.admitGroup.bind(governor),
               commit = f.tx.commit.bind(f.tx);
             let committing = false,
-              futureMerge = 0;
+              futureMerge = 0,
+              blockedNative = 0;
             const commitSpy = vi.spyOn(f.tx, "commit").mockImplementation((request) => {
               committing = true;
               return commit(request);
             });
-            const admissionSpy = vi.spyOn(governor, "admitGroup").mockImplementation((options) => {
-              if (committing && options.label === "grow write merge credit") {
-                futureMerge++;
-                // Release only to turn the forbidden wait into a finite semantic RED.
-                // The good path retains the real competing allocation through commit.
-                competing.close();
-              }
-              return admitGroup(options);
-            });
+            const admissionSpy = vi
+              .spyOn(governor, "admitGroup")
+              .mockImplementation(async (options) => {
+                if (
+                  committing &&
+                  (options.label === "grow write merge credit" ||
+                    options.label === "complete grow write merge credit")
+                ) {
+                  futureMerge++;
+                  // Cleanup only: preserve the original future-merge assertion below.
+                  competing.close();
+                }
+                const pending = admitGroup(options);
+                if (
+                  options.grants.some(
+                    (part) => part.label.startsWith("write growth ") && part.minimumBytes > 0,
+                  )
+                ) {
+                  const state = { settled: false };
+                  void pending.then(
+                    () => {
+                      state.settled = true;
+                    },
+                    () => {
+                      state.settled = true;
+                    },
+                  );
+                  for (let turn = 0; turn < 32 && !state.settled; turn++) await yieldTask();
+                  if (!state.settled) {
+                    blockedNative++;
+                    // A commit has its own lifetime; release only for cleanup, then
+                    // reject the bounded progress assertion without timing out.
+                    competing.close();
+                  }
+                }
+                return pending;
+              });
             try {
               await pg.exec("DROP TABLE IF EXISTS c,p CASCADE");
               for (const sql of setup) await pg.exec(sql);
@@ -84,6 +114,11 @@ for (const seed of seedsFor("next-native-ri-pressure", [0xb641, 0xb642]))
               }
               const paid = f.charge.allocated;
               await f.end();
+              expect(
+                blockedNative,
+                "prepaid native window must progress with competitor retained",
+              ).toBe(0);
+              reach.reach("prepaid native window progresses with competitor retained");
               expect(futureMerge, "commit must not fund a future background merge").toBe(0);
               expect(committing).toBe(true);
               expect(competing.allocated).toBe(retained);

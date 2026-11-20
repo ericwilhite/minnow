@@ -1,4 +1,5 @@
 /** Execution-owned parameter vectors. Binding uses the accepted forms on executor.ts. */
+import { encodeUtf8Into } from "../utf8.js";
 import type { PhysicalPlan } from "../ir/ir.js";
 import {
   INT16_MIN,
@@ -300,8 +301,7 @@ export function prepareParameters(
               const length = utf8Sizes[slot];
               if (length === null || length === undefined)
                 throw new Error("UTF-8 parameter lacks its measured extent");
-              const bytes = new Uint8Array(length),
-                encoder = new TextEncoder();
+              const bytes = new Uint8Array(length);
               let written = 0;
               for (let at = 0; at < value.length;) {
                 let end = Math.min(value.length, at + 8192);
@@ -315,14 +315,8 @@ export function prepareParameters(
                   next <= 0xdfff
                 )
                   end--;
-                const result = encoder.encodeInto(value.slice(at, end), bytes.subarray(written));
-                // encodeInto may make a short write even when the destination is
-                // large enough (Node26's vectorized tail does this). Advance by
-                // reported progress, not by the requested slice. Never truncate.
-                if (result.read === 0)
-                  throw new Error("UTF-8 parameter size changed during binding");
-                written += result.written;
-                at += result.read;
+                written += encodeUtf8Into(value.slice(at, end), bytes.subarray(written));
+                at = end;
                 signal?.throwIfAborted();
                 if (slice.due()) yield;
               }

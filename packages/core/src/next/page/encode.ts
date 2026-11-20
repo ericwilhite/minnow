@@ -63,6 +63,11 @@ export class PageScratch {
     return this.#buffer.byteLength;
   }
 
+  /** The owner drops the backing buffer before refunding its accounting. */
+  clear(): void {
+    this.#buffer = new ArrayBuffer(0);
+  }
+
   /** A zeroed buffer of at least `bytes`, valid until the next call. */
   take(bytes: number): ArrayBuffer {
     if (bytes > this.#buffer.byteLength) {

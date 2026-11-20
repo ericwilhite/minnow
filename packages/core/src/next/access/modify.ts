@@ -72,6 +72,9 @@ import type { MaybePromise } from "./key-index.js";
 import type { Snapshot } from "./snapshot.js";
 
 export interface StatementOptions {
+  /** Owner-classified query: retains a read view but may not open row or DDL writers.
+   * Its presence alone cannot pin a dormant transaction's future write minimum. */
+  readonly readOnly?: boolean;
   /**
    * The executor's row rules per table, compiled against the statement's catalog (the executor's
    * `compileTableRules(table, catalogVersion)`, cached per version): called for every row the

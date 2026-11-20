@@ -105,10 +105,17 @@ for (const boundary of ["retirement", "group"] as const) {
           let reclaims = 0;
           let reader: Grant | undefined;
           let held: Uint8Array | undefined;
+          let resident: Uint8Array | undefined;
+          let residentGrant: Grant | undefined;
           let timer: ReturnType<typeof setTimeout> | undefined;
           const releaseReader = () => {
             if (held !== undefined) expect(held.at(-1)).toBe(7);
             held = undefined;
+            if (resident !== undefined) expect(resident.at(-1)).toBe(13);
+            const residentBytes = resident?.byteLength ?? 0;
+            resident = undefined;
+            if (residentBytes > 0) residentGrant?.free(residentBytes);
+            residentGrant = undefined;
             if (reader !== undefined && reader.allocated > 0) reader.free(reader.allocated);
             if (reader !== undefined && reader.held > 0) reader.release(reader.held);
           };
@@ -125,6 +132,14 @@ for (const boundary of ["retirement", "group"] as const) {
             credits.reclaimRows();
             reach.reach("idle row credit reclaimed");
             if (reader !== undefined && reclaims === 0) {
+              // Model other resident native metadata overlapping the prepaid step.
+              // These are real charged bytes, not a lowered cap or a fake denial.
+              residentGrant = credits.metadata;
+              const live = residentGrant.held - residentGrant.allocated - 4096;
+              expect(live).toBeGreaterThan(0);
+              expect(residentGrant.allocate(live)).toBe(true);
+              resident = new Uint8Array(live).fill(13);
+              reach.reach("resident metadata overlaps writer step");
               credits.reclaimMetadata();
               const bytes = governor.capBytes - governor.reserveBytes - governor.usedBytes;
               expect(bytes).toBeGreaterThan(0);
@@ -228,6 +243,10 @@ for (const boundary of ["retirement", "group"] as const) {
               );
             };
             checkRootFunding();
+            expect(credits?.metadata.held, "completed phase returns metadata workspace").toBe(
+              credits?.metadata.allocated,
+            );
+            reach.reach("completed metadata workspace returned");
             armed = false;
             await core.harness.reopen();
             checkRootFunding();

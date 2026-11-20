@@ -2,6 +2,9 @@
  * Review B3-p2a-1, findings 1–6: each reviewer probe as a test (rulings 1–6).
  */
 import { describe, expect, it } from "vitest";
+import fc from "fast-check";
+import { seedsFor } from "../../testing/seeds.js";
+import { createReach, WRITE_MEMTABLE_OWNERSHIP_ORACLE_REACH } from "../../testing/reach.js";
 import { ForeignKeyViolationError } from "../access/modify.js";
 import type { Snapshot } from "../access/snapshot.js";
 import { Governor } from "../memory/governor.js";
@@ -20,7 +23,19 @@ import {
   rowsOf,
   rules,
   tableInput,
+  watchGrants,
 } from "./test-support.js";
+
+/** Grant.allocated is actual ownership; total governor credit also contains revocable forecasts. */
+function assertMemtableCharge(
+  observed: { readonly allocated: number; readonly usedBytes: number },
+  stats: { readonly memtableBytes: number; readonly borrowedChunkBytes: number },
+): void {
+  expect(
+    observed.allocated,
+    "row account owns both live memtables and published borrowed chunks",
+  ).toBeGreaterThanOrEqual(stats.memtableBytes + stats.borrowedChunkBytes);
+}
 
 const FREE = { allocate: () => true, free: () => undefined };
 
@@ -206,32 +221,102 @@ describe("review B3-p2a-1", () => {
     const harness = new Harness("strict", "memory");
     // A small cap: the memtable cap (a quarter, at least 16 MiB) binds before the governor's.
     Object.assign(harness, { governor: new Governor(64 * 1024 * 1024) });
-    const path = await harness.open();
-    const before = harness.governor.usedBytes;
-    const tables: number[] = [];
-    for (let k = 0; k < 6; k++) tables.push(await create(path, `t${String(k)}`));
-    for (const t of tables) await load(path, t, 0, 60_000);
-    await path.quiesce();
-    expect(harness.governor.usedBytes).toBeGreaterThan(before);
-    expect(path.stats().memtableBytes).toBeLessThanOrEqual(16 * 1024 * 1024 + 8 * 1024 * 1024);
-    expect(path.publications).toBeGreaterThan(0);
-    // A reader borrowing a memtable chunk across its publication keeps that chunk charged.
-    const t = await create(path, "borrow");
-    await load(path, t, 0, MEMTABLE_ROWS);
-    const old = path.pin();
-    const table = old.table(t, { budget: FREE });
-    const segment = table.segments.at(-1);
-    if (segment?.kind !== "memory") throw new Error("expected a memory segment");
-    await segment.chunk(table.columns[0]?.id ?? 0, 0, {
-      flat: ints([0]),
-      codes: new Int32Array(0),
-      varlen: null,
+    const rows = new Set<{ readonly allocated: number }>();
+    watchGrants(harness.governor, (grant) => {
+      if (grant.label === "write path") rows.add(grant);
     });
-    await load(path, t, MEMTABLE_ROWS, MEMTABLE_ROWS + 1);
-    await path.quiesce();
-    expect(path.stats().borrowedChunkBytes).toBeGreaterThan(0);
-    old.release();
-    expect(path.stats().borrowedChunkBytes).toBe(0);
-    await harness.close();
+    const allocated = () => [...rows].reduce((sum, grant) => sum + grant.allocated, 0);
+    const path = await harness.open();
+    const before = allocated();
+    let old: ReturnType<WritePathImpl["pin"]> | undefined;
+    try {
+      const tables: number[] = [];
+      for (let k = 0; k < 6; k++) tables.push(await create(path, `t${String(k)}`));
+      for (const t of tables) await load(path, t, 0, 60_000);
+      await path.quiesce();
+      // Loading may return more unused forecast credit than the new rows consume.
+      // Observe actual allocations, independently of that legitimate credit reduction.
+      expect(allocated()).toBeGreaterThan(before);
+      assertMemtableCharge(
+        { allocated: allocated(), usedBytes: harness.governor.usedBytes },
+        path.stats(),
+      );
+      expect(path.stats().memtableBytes).toBeLessThanOrEqual(16 * 1024 * 1024 + 8 * 1024 * 1024);
+      expect(path.publications).toBeGreaterThan(0);
+      // A reader borrowing a memtable chunk across its publication keeps that chunk charged.
+      const t = await create(path, "borrow");
+      await load(path, t, 0, MEMTABLE_ROWS);
+      old = path.pin();
+      const table = old.table(t, { budget: FREE });
+      const segment = table.segments.at(-1);
+      if (segment?.kind !== "memory") throw new Error("expected a memory segment");
+      await segment.chunk(table.columns[0]?.id ?? 0, 0, {
+        flat: ints([0]),
+        codes: new Int32Array(0),
+        varlen: null,
+      });
+      await load(path, t, MEMTABLE_ROWS, MEMTABLE_ROWS + 1);
+      await path.quiesce();
+      expect(path.stats().borrowedChunkBytes).toBeGreaterThan(0);
+      assertMemtableCharge(
+        { allocated: allocated(), usedBytes: harness.governor.usedBytes },
+        path.stats(),
+      );
+      old.release();
+      old = undefined;
+      expect(path.stats().borrowedChunkBytes).toBe(0);
+    } finally {
+      old?.release();
+      await harness.close();
+    }
+    expect(harness.governor.usedBytes).toBe(0);
   });
 });
+
+for (const seed of seedsFor("next-write-memtable-ownership-oracle", [47251, 47252]))
+  it(`distinguishes actual row ownership from unused governor credit (seed ${String(seed)})`, async () => {
+    const reach = createReach("memtable ownership observer", WRITE_MEMTABLE_OWNERSHIP_ORACLE_REACH);
+    await fc.assert(
+      fc.asyncProperty(
+        fc.integer({ min: 1, max: 65536 }),
+        fc.constantFrom("live", "borrowed", "both"),
+        fc.boolean(),
+        async (bytes, kind, charged) => {
+          reach.beginHistory();
+          const stats = {
+            memtableBytes: kind === "borrowed" ? 0 : bytes,
+            borrowedChunkBytes: kind === "live" ? 0 : bytes + 1,
+          };
+          const owned = stats.memtableBytes + stats.borrowedChunkBytes;
+          const observation = {
+            allocated: charged ? owned + 64 : owned - 1,
+            usedBytes: owned * 4 + 4096,
+          };
+          if (charged) assertMemtableCharge(observation, stats);
+          else
+            expect(() => assertMemtableCharge(observation, stats)).toThrow(
+              "row account owns both live memtables and published borrowed chunks",
+            );
+          reach.reach(kind);
+          reach.reach(
+            charged
+              ? "actual ownership accepted"
+              : "unfunded ownership rejected despite spare credit",
+          );
+        },
+      ),
+      {
+        seed,
+        numRuns: 32,
+        examples: [
+          [1, "live", true],
+          [1, "live", false],
+          [1, "borrowed", true],
+          [1, "borrowed", false],
+          [1, "both", true],
+          [1, "both", false],
+        ],
+      },
+    );
+    reach.assertReached();
+  });

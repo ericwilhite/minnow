@@ -59,7 +59,41 @@ bytes stay with their owner. Storage can take retained buffers from these native
 there is no second allocation counter that can become stale after a takeover.
 
 Additional growth first transfers idle row estimates, then requests ordinary admission
-with cancellation. Closing the writer cancels pending growth before releasing its inputs.
+with cancellation. Before it would wait, the owner's bound relief spills or unwinds dependent
+live state (the engine releases its pooled arenas), and idle forecasts are returned. Every byte
+still held through the wait (live allocations, loans, protected floors and an active merge)
+belongs to the step's complete minimum together with the deficit, and so do the owner's
+permanent holdings outside the write accounts: the space's non-evictable storage (fixed
+slabs plus `SpaceStats.permanentBytes`: workspace, extent map and root memory) and the
+scratch-control grant each native owner keeps. An owner that already holds such a grant passes
+it as `EngineInput.ownerHoldings`, bound before the write minimum is admitted, so open, load and
+recovery growth count it (a minimum that cannot fit beside it is refused at once); a grant
+admitted after open registers through `WritePath.retainOwnerHoldings`. Independently
+releasable memory is not counted: budgetless reader pins are charged to the space
+(`retainedBytes`) but refunded on release, so growth waits for them instead of refusing, as it
+does for query memory. When that complete minimum
+exceeds the cap (or ordinary capacity, net of loans, for a step without private progress),
+growth refuses at once with the typed 53200 `MemoryAdmissionError`; it never queues a request
+that could only be served by freeing its own inputs. A background merge refused this way is
+retried once and then left unmerged, without failing the write path.
+
+Merge debt from refused merges is reported, not bounded. Inputs refused twice are not retried
+until a new flush changes their level, and they no longer make writers stall for merges, so
+level-0 runs can accumulate beyond the stall bound while the cap stays too small for their
+merge. The write path's `maintenance.mergeFailures` counts each refusal and
+`maintenance.lastMergeFailure` keeps the latest message (the 53200 refusal names the
+complete minimum and the cap). Raising the memory cap, or fewer and smaller runs, lets later
+merges proceed.
+`live-growth.test.ts` and `testing/write-retained-merge.test.ts` generate owners with
+substantial live rows and merges beside retained readers.
+
+Limit: memtable rows leave memory only through a metadata publication, so the engine counts
+them as required inputs instead of spilling them. That is deadlock-free only while one governor
+serves one write engine; two engines on one governor could each keep rows the other's step
+needs. `write/owner-claim.ts` enforces the invariant production already follows (one governor
+and one write engine per owner, `owner/native-boot.ts`): attaching a second engine fails with
+`WriteOwnerConflictError`, and closing (or a simulated crash in test support) frees the
+governor. `write/owner-claim.test.ts` pins it. There is no memtable eviction path. Closing the writer cancels pending growth before releasing its inputs.
 Metadata allocation distinguishes an individual object larger than the whole cap from
 transient pressure: only the former is a typed size refusal. A metadata parse still has
 to fit as one step; this does not add a new stored format or a streaming manifest parser.
