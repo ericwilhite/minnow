@@ -12,6 +12,7 @@
  * Serialized form: u8 precision (10), u8 form (0 dense, 1 sparse), u16 entry count; dense is the
  * 1,024 registers, sparse is `count` × (u16 register, u8 value) for the non-zero registers.
  */
+import type { ByteCharge } from "../vector/varlen.js";
 import { requireTag, DURABLE_CODECS, CONDITIONAL_FORMAT } from "../durable-format.js";
 import { xxHash32 } from "../hash/xxhash32.js";
 import { check, PageCorruptionError } from "./format.js";
@@ -80,10 +81,13 @@ export class DistinctSketch {
     return raw;
   }
 
-  serialize(): Uint8Array {
+  serialize(charge?: ByteCharge): Uint8Array {
     let nonZero = 0;
     for (let index = 0; index < REGISTERS; index++)
       if ((this.registers[index] ?? 0) !== 0) nonZero++;
+    const length = 4 + (nonZero * 3 < REGISTERS ? nonZero * 3 : REGISTERS);
+    if (charge !== undefined && !charge.allocate(length))
+      throw new RangeError("The sketch needs prepaid working memory");
     if (nonZero * 3 < REGISTERS) {
       const out = new Uint8Array(4 + nonZero * 3);
       out[0] = SKETCH_PRECISION;

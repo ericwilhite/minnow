@@ -52,6 +52,19 @@ it.each(["index", "skip", "fetch", "frame", "publish"] as const)(
         });
       const snapshot: Snapshot = new Proxy(pin, {
         get(target, name) {
+          // This fixture owns the publication-wide index-I/O path. Hide the optional
+          // retained read capability so resident-input specialization cannot bypass
+          // its injected cursor publication. The new resident route has its own
+          // publication-after-admission generator and captured-input lifetime checks.
+          if (name === "table" && phase === "publish")
+            return (...args: Parameters<Snapshot["table"]>) =>
+              new Proxy(target.table(...args), {
+                get(table, key) {
+                  if (key === "prepareRead") return undefined;
+                  const value: unknown = Reflect.get(table, key, table);
+                  return typeof value === "function" ? (value.bind(table) as unknown) : value;
+                },
+              });
           if (name === "index")
             return (...args: Parameters<Snapshot["index"]>): IndexReader => {
               const reader = target.index(...args);

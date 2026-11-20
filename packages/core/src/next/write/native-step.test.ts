@@ -1,7 +1,7 @@
 /** NativeWriteStepBoundary/WriteCredits contract: account the actual joint owner once,
  * preserve prepaid primary progress, and reject a stale witness before root allocation. */
 import fc from "fast-check";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach, NATIVE_WRITE_STEP_CREDIT_REACH } from "../../testing/reach.js";
 import { Governor } from "../memory/governor.js";
@@ -18,7 +18,8 @@ for (const seed of seedsFor("next-native-write-owner-credit", [0xb715, 0xb716]))
         fc.integer({ min: 1, max: 16 }),
         fc.boolean(),
         fc.boolean(),
-        async (units, active, privateProgress) => {
+        fc.boolean(),
+        async (units, active, privateProgress, donated) => {
           reach.beginHistory();
           const governor = new Governor(4 << 20),
             credits = await WriteCredits.open(governor, minimum),
@@ -28,6 +29,7 @@ for (const seed of seedsFor("next-native-write-owner-credit", [0xb715, 0xb716]))
             buffer: null,
             injected: false,
           };
+          let nextHeadroom = 0;
           let steps: NativeWriteSteps | null = null,
             primary: PreparedWriteCredit | null = null,
             boundary: NativeWriteStepBoundary | null = null,
@@ -51,6 +53,7 @@ for (const seed of seedsFor("next-native-write-owner-credit", [0xb715, 0xb716]))
                     pressure.buffer = null;
                     steps?.changed();
                   }
+                  await credits.prepareNativeMinimum(nextHeadroom, stop.signal, privateProgress);
                   credits.reclaimNativeStep();
                   if (!pressure.injected) {
                     pressure.injected = true;
@@ -81,6 +84,7 @@ for (const seed of seedsFor("next-native-write-owner-credit", [0xb715, 0xb716]))
             const rows = new Uint8Array(payload);
             rows[0] = 61;
             primary = credits.protectRows(progress);
+            nextHeadroom = headroom;
             await credits.prepareMetadata(headroom);
             if (credits.metadata.held < metadata + headroom)
               await credits.growTo(credits.metadata, metadata + headroom);
@@ -98,6 +102,14 @@ for (const seed of seedsFor("next-native-write-owner-credit", [0xb715, 0xb716]))
             const rowFloor = payload + NATIVE_WRITE_STEP_BYTES + WRITE_ROW_STEP_BYTES + progress,
               mergeFloor = active ? 2 * minimum.merge + units * 1024 : minimum.merge,
               expected = rowFloor + metadata + headroom + minimum.commits + mergeFloor;
+            if (donated) {
+              credits.reclaimIdleForecasts();
+              expect(
+                credits.protectedBytes(minimum.merge, headroom),
+                "the prospective minimum includes donated WAL credit",
+              ).toBe(expected);
+              reach.reach("native funding restored after idle donation");
+            }
             boundary = await steps.prepare(owner, units * 1024, stop.signal, {
               includesProgress: privateProgress,
             });
@@ -117,6 +129,7 @@ for (const seed of seedsFor("next-native-write-owner-credit", [0xb715, 0xb716]))
             reach.reach("metadata and commit buffers once");
             reach.reach(active ? "active merge once" : "future merge forecast reclaimed");
             const newer = headroom + units * 4096;
+            nextHeadroom = newer;
             await credits.prepareMetadata(newer, stop.signal);
             expect(boundary.invalidated.aborted).toBe(true);
             expect(() => boundary?.check()).toThrow("footprint changed");
@@ -128,6 +141,28 @@ for (const seed of seedsFor("next-native-write-owner-credit", [0xb715, 0xb716]))
             });
             boundary.check();
             expect(boundary.protectedWriteBytes).toBe(expected + newer - headroom);
+            // Keep the native metadata step live and inject a non-waiting growth
+            // refusal, forcing an unchanged-floor WAL transfer on the cold pass.
+            credits.bindWorkingMinimum(() => ({ metadata: credits.metadata.held }));
+            const immediate = vi.spyOn(credits.rows, "tryGrow").mockReturnValue(false);
+            try {
+              await credits.growTo(credits.rows, credits.rows.held + units * 64, stop.signal);
+            } finally {
+              immediate.mockRestore();
+              credits.bindWorkingMinimum(() => ({}));
+            }
+            expect(
+              boundary.invalidated.aborted,
+              "transferred credit invalidates even an unchanged protected floor",
+            ).toBe(true);
+            reach.reach("unchanged-floor transfer invalidates witness");
+            boundary.release();
+            boundary = await steps.prepare(owner, units * 1024, stop.signal, {
+              includesProgress: privateProgress,
+            });
+            boundary.check();
+            expect(boundary.protectedWriteBytes).toBe(expected + newer - headroom);
+            nextHeadroom = headroom;
             await credits.prepareMetadata(headroom, stop.signal);
             expect(boundary.invalidated.aborted).toBe(true);
             expect(() => boundary?.check()).toThrow("footprint changed");
@@ -160,10 +195,10 @@ for (const seed of seedsFor("next-native-write-owner-credit", [0xb715, 0xb716]))
         seed,
         numRuns: 16,
         examples: [
-          [1, false, false],
-          [2, true, true],
-          [3, false, true],
-          [4, true, false],
+          [1, false, false, false],
+          [2, true, true, true],
+          [3, false, true, true],
+          [4, true, false, false],
         ],
       },
     );

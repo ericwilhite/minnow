@@ -226,6 +226,9 @@ export interface WritePath {
   /** Owner installs renderer2; missing capability makes writes invalidate, never reinterpret cells. */
   installFtsRenderer?(renderer: import("./fts-write.js").FtsWriteRenderer): void;
   readonly durability: Durability;
+  /** The owner registers a permanent grant it keeps beside the write path (scratch control),
+   * so write growth's complete minimum includes it. Returns the unregistration. */
+  retainOwnerHoldings(bytes: () => number): () => void;
   readonly appliedLsn: number;
   readonly durableLsn: number;
   /** The latest committed catalog. */

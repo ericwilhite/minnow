@@ -400,5 +400,19 @@ export function rebaseExtents(
     }
     return out;
   };
-  return rebase(chunks) as ColumnChunk[];
+  // MAGS binds the full data and directory refs inside its checksummed payload.
+  // A raw extent copy cannot rebind that payload: omit the optional fact when
+  // either source changes. Moving only the record itself keeps its binding valid.
+  const changes = (extent: ExtentRef): boolean => {
+    const target = moved.get(extent.offset);
+    return (
+      target !== undefined && (target.offset !== extent.offset || target.length !== extent.length)
+    );
+  };
+  const sources = chunks.map((chunk) =>
+    changes(chunk.data.extent) || changes(chunk.directory.extent)
+      ? { ...chunk, aggregateSummary: null }
+      : chunk,
+  );
+  return rebase(sources) as ColumnChunk[];
 }

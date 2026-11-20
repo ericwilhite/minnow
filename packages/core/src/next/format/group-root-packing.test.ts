@@ -19,6 +19,7 @@ function references(columns: readonly ColumnChunk[]): ExtentRef[] {
     column.data.extent,
     column.directory.extent,
     ...(column.distinctSketch === null ? [] : [column.distinctSketch.extent]),
+    ...(column.aggregateSummary === null ? [] : [column.aggregateSummary.extent]),
   ]);
 }
 function packed(refs: readonly ExtentRef[]): void {
@@ -66,6 +67,7 @@ for (const seed of seedsFor("next-root-packing", [0xb301, 0xb302]))
                   dictionarySize: null,
                 },
                 distinctSketch: i === 0 ? null : ref,
+                aggregateSummary: ref,
               };
             }),
           };

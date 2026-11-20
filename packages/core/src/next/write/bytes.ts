@@ -4,6 +4,8 @@
  * check failure is `StoreCorruptionError`: these bytes came from storage after a checksum passed,
  * so a structural mismatch is a format or software bug, never data.
  */
+import { encodeUtf8Into, utf8Length } from "../utf8.js";
+export { utf8Length } from "../utf8.js";
 import { DURABLE_CODECS, requireTag } from "../durable-format.js";
 import { StoreCorruptionError } from "../storage/contract.js";
 import { SMALL_COMMIT_BYTES, StreamCommit, type BufferAllocator } from "./commit-buffers.js";
@@ -48,28 +50,9 @@ export function charged(charge: Charge, bytes: number): void {
   if (!charge.allocate(bytes)) throw new MemtableMemoryError(bytes);
 }
 
-/** UTF-8 byte count without materializing an encoded copy. Lone surrogates become U+FFFD. */
-export function utf8Length(value: string): number {
-  let bytes = 0;
-  for (let k = 0; k < value.length; k++) {
-    const code = value.charCodeAt(k);
-    if (code < 0x80) bytes++;
-    else if (code < 0x800) bytes += 2;
-    else if (
-      code >= 0xd800 &&
-      code <= 0xdbff &&
-      value.charCodeAt(k + 1) >= 0xdc00 &&
-      value.charCodeAt(k + 1) <= 0xdfff
-    ) {
-      bytes += 4;
-      k++;
-    } else bytes += 3;
-  }
-  return bytes;
-}
-
 const encoder = new TextEncoder();
-const decoder = new TextDecoder("utf-8", { fatal: true });
+// Stored strings have no transport BOM: U+FEFF is data, including at offset zero.
+const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const EMPTY_BYTES = new Uint8Array(0);
 const EMPTY_VIEW = new DataView(EMPTY_BYTES.buffer);
 
@@ -218,7 +201,7 @@ export class ByteWriter {
     const length = utf8Length(value);
     this.varuint(length);
     this.ensure(length);
-    encoder.encodeInto(value, this.bytes.subarray(this.length, this.length + length));
+    encodeUtf8Into(value, this.bytes.subarray(this.length, this.length + length), length);
     this.length += length;
   }
 
@@ -382,8 +365,9 @@ export function encodeJson(value: unknown, allocator?: BufferAllocator): Uint8Ar
       return item;
     });
     if (allocator === undefined) return encoder.encode(text);
-    const bytes = allocator.create(utf8Length(text));
-    encoder.encodeInto(text, bytes);
+    const length = utf8Length(text),
+      bytes = allocator.create(length);
+    encodeUtf8Into(text, bytes, length);
     return bytes;
   } finally {
     release?.();

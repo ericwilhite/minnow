@@ -17,6 +17,8 @@ on:
   push:
     branches: [main]
   pull_request:
+    # Drafts skip the gate; marking a PR ready for review runs it.
+    types: [opened, synchronize, reopened, ready_for_review]
   # The whole gate on any branch (`gh workflow run CI --ref <branch>`), e.g. a merge candidate,
   # without opening a pull request. Release publishing follows only push runs on main.
   workflow_dispatch:
@@ -32,6 +34,7 @@ permissions:
 jobs:
   static:
     name: Format, types, lint, build, API contract, SQLLogicTest, heap plateau
+    if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -72,6 +75,7 @@ jobs:
   # coverage instrumentation. The parallel unit lane keeps deterministic work counts.
   stall-latency:
     name: Event-loop latency guarantees (isolated)
+    if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -92,6 +96,7 @@ jobs:
   # its files and its reach-union check in one part.
   unit:
     name: Unit tests with coverage (${{ matrix.part }})
+    if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
     strategy:
@@ -144,7 +149,7 @@ jobs:
   coverage:
     name: Unit test results and coverage floors
     needs: unit
-    if: ${{ !cancelled() }}
+    if: ${{ (!cancelled()) && (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -181,7 +186,7 @@ jobs:
   # static checks, every unit-test part, and the merged coverage gate all passed.
   check:
     name: Format, types, lint, build, unit tests
-    if: always()
+    if: ${{ (always()) && (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
     needs: [static, unit, coverage, stall-latency]
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -201,6 +206,7 @@ jobs:
 
   browser-matrix:
     name: Real browser (${{ matrix.name }})
+    if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     # Each browser step first runs `tsc -b packages/core --force`, which outgrew Node's default
@@ -355,7 +361,7 @@ jobs:
   # result fail the aggregate gate.
   browser:
     name: Real browsers
-    if: always()
+    if: ${{ (always()) && (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
     needs: browser-matrix
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -386,6 +392,7 @@ jobs:
 
   engines-floor-part:
     name: Unit tests on the oldest supported Node (${{ matrix.shard }})
+    if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
     runs-on: ubuntu-latest
     # The whole unit suite without coverage, in four parts balanced by measured file duration
     # (scripts/test-shards.ts). Node 22 runs the fake-indexeddb simulator seeds about twice as
@@ -436,7 +443,7 @@ jobs:
   # Preserve the stable check name for the oldest-Node gate: it passes only when every shard did.
   engines-floor:
     name: Unit tests on the oldest supported Node
-    if: always()
+    if: ${{ (always()) && (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
     needs: engines-floor-part
     runs-on: ubuntu-latest
     timeout-minutes: 10

@@ -6,11 +6,14 @@
  * set lacks and releases only extents it holds.
  */
 import { watchGrants } from "./test-support.js";
+import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import type { PublishDelta } from "../access/write-path.js";
 import { reachableExtents } from "../format/reachable.js";
-import type { ExtentSpace } from "../storage/extents.js";
-import { createReach } from "../../testing/reach.js";
+import type { ExtentRef, ExtentSpace } from "../storage/extents.js";
+import type { RetirementInventory } from "../storage/retirement-contract.js";
+import { MemoryExtentSpace } from "../page/memory-extents.js";
+import { createReach, WRITE_DELTA_OBSERVER_REACH } from "../../testing/reach.js";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import { need } from "./bytes.js";
 import { ExtentSinkError, type WritePathImpl } from "./engine.js";
@@ -33,6 +36,137 @@ import type { PublicationKind } from "./engine.js";
 import type { Statement } from "../access/modify.js";
 
 const FREE = { allocate: () => true, free: () => undefined };
+
+/** Test oracle storage, not engine working memory. PublishDelta's arrays AND
+ * inventories form the exact set change. Snapshot borrowed cursors during prepare,
+ * before publication settlement can release their private descriptors. */
+async function observerDelta(delta: PublishDelta): Promise<PublishDelta> {
+  const added = [...delta.added],
+    released = [...delta.released];
+  for (const [input, output] of [
+    [delta.addedInventory, added],
+    [delta.releasedInventory, released],
+  ] as const) {
+    if (input === undefined) continue;
+    const cursor = input.cursor({ budget: FREE });
+    let count = 0;
+    try {
+      while (await cursor.next()) {
+        output.push({ offset: cursor.offset, length: cursor.length });
+        count++;
+      }
+    } finally {
+      await cursor.close();
+    }
+    expect(count, "observer consumes the complete inventory").toBe(input.count);
+  }
+  return { added, released, writer: delta.writer };
+}
+
+for (const seed of seedsFor("next-write-delta-observer", [47243, 47244]))
+  it(`snapshots both resident and streamed delta descriptors before settlement (seed ${String(seed)})`, async () => {
+    const reach = createReach("exact delta observer inputs", WRITE_DELTA_OBSERVER_REACH);
+    await fc.assert(
+      fc.asyncProperty(
+        fc.integer({ min: 2, max: 128 }),
+        fc.constantFrom("resident", "added", "released", "both"),
+        async (count, mode) => {
+          reach.beginHistory();
+          let closed = 0;
+          const source = (values: readonly ExtentRef[]): RetirementInventory => {
+            let items = values,
+              live = true;
+            return {
+              get count() {
+                return items.length;
+              },
+              cursor: () => {
+                if (!live) throw new Error("Observer source retired");
+                let at = 0,
+                  offset = 0,
+                  length = 0,
+                  done = false;
+                return {
+                  get offset() {
+                    return offset;
+                  },
+                  get length() {
+                    return length;
+                  },
+                  next: () => {
+                    if (!live || done) throw new Error("Observer cursor retired");
+                    const value = items[at++];
+                    offset = value?.offset ?? 0;
+                    length = value?.length ?? 0;
+                    return value !== undefined;
+                  },
+                  close: async () => {
+                    if (!done) {
+                      done = true;
+                      closed++;
+                    }
+                  },
+                };
+              },
+              release: async () => {
+                live = false;
+                items = [];
+              },
+            };
+          };
+          const added = Array.from({ length: count }, (_, i) => ({
+            offset: (i + 1) * 4096,
+            length: 4096,
+          }));
+          const released = added.map((ref) => ({ ...ref, offset: ref.offset + 1_000_000 }));
+          const addedInventory =
+            mode === "added" || mode === "both" ? source(added.slice(1)) : undefined;
+          const releasedInventory =
+            mode === "released" || mode === "both" ? source(released.slice(1)) : undefined;
+          const inventories = [addedInventory, releasedInventory].filter(
+            (value) => value !== undefined,
+          );
+          const writer = new MemoryExtentSpace().beginWrite("delta observer");
+          try {
+            const snapshot = await observerDelta({
+              added: addedInventory === undefined ? added : added.slice(0, 1),
+              released: releasedInventory === undefined ? released : released.slice(0, 1),
+              ...(addedInventory === undefined ? {} : { addedInventory }),
+              ...(releasedInventory === undefined ? {} : { releasedInventory }),
+              writer,
+            });
+            expect(closed).toBe(inventories.length);
+            await Promise.all(inventories.map((input) => input.release()));
+            expect(snapshot.added).toEqual(added);
+            expect(snapshot.released).toEqual(released);
+            reach.reach("resident descriptors");
+            reach.reach("cursors closed before prepare returns");
+            if (addedInventory !== undefined) reach.reach("streamed additions");
+            if (releasedInventory !== undefined) reach.reach("streamed releases");
+            if (inventories.length > 0) {
+              reach.reach("mutable cursor descriptors copied");
+              reach.reach("snapshot survives source retirement");
+            }
+          } finally {
+            await Promise.all(inventories.map((input) => input.release()));
+            await writer.abort();
+          }
+        },
+      ),
+      {
+        seed,
+        numRuns: 20,
+        examples: [
+          [2, "resident"],
+          [3, "added"],
+          [4, "released"],
+          [128, "both"],
+        ],
+        endOnFailure: true,
+      },
+    );
+    reach.assertReached();
+  });
 
 /** Every extent the space's current root reaches, by offset → length. */
 async function walk(space: ExtentSpace): Promise<Map<number, number>> {
@@ -89,6 +223,11 @@ describe("extent deltas (ruling R25)", () => {
     it(`replaying the deltas gives each root's reachable extents (seed ${String(seed)})`, async () => {
       const random = mulberry32(seed);
       const int = (n: number) => Math.floor(random() * n);
+      // Background hooks fire a timing-dependent number of times (flush and merge
+      // scheduling varies with host load and coverage). They draw from their own
+      // stream so the generated history itself replays exactly from its seed.
+      const hookRandom = mulberry32(seed ^ 0x5bd1e995);
+      const hookInt = (n: number) => Math.floor(hookRandom() * n);
       // Some merge attempts fail after their prepare, at the encode step (a hook) or at metadata
       // admission (the next allocation refused): the attempt aborts, the merge retries, the path
       // goes on (review B3-p2b-3 C2).
@@ -99,11 +238,12 @@ describe("extent deltas (ruling R25)", () => {
         idleGarbageBytes: 1,
         // Some flushes wait a few tasks before publishing, so a drop can commit while they write.
         beforeFlushPublish: async () => {
-          for (let turns = random() < 0.5 ? int(12) : 0; turns > 0; turns--) await yieldTask();
+          for (let turns = hookRandom() < 0.5 ? hookInt(12) : 0; turns > 0; turns--)
+            await yieldTask();
         },
         afterDeltaPrepared: (kind) => {
           if (kind !== "merge") return;
-          const roll = random();
+          const roll = hookRandom();
           if (roll < 0.2) throw new Error("injected failure at encode");
           if (roll < 0.4) refuseNextAllocation = true;
         },
@@ -130,7 +270,8 @@ describe("extent deltas (ruling R25)", () => {
       // The committed list changes only at commit(); a prepared delta is provisional until then.
       let pending: { attempt: number; delta: PublishDelta } | null = null;
       harness.extentDeltas = {
-        prepare: (attempt, delta) => {
+        prepare: async (attempt, input) => {
+          const delta = await observerDelta(input);
           try {
             checkPrepare(attempt, delta);
           } catch (error) {

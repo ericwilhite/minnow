@@ -130,7 +130,8 @@ async function openResources(
       options: { durability: options.durability ?? "strict" },
     });
     startup.release(startup.held - startup.allocated - startup.loaned);
-    path = await opening;
+    const openedPath = await opening;
+    path = openedPath;
     options.signal?.throwIfAborted();
     checkLease(lease);
     const scratch = backend.scratch(lease);
@@ -146,6 +147,9 @@ async function openResources(
       });
       scratchMemory = governor.registerCache({ evictableBytes: 0, evict: () => 0 });
       spill = new ScratchSpillService(scratch, { budget: scratchControl, memory: scratchMemory });
+      // Permanent beside the write engine: part of every write growth step's complete minimum.
+      const control = scratchControl;
+      openedPath.retainOwnerHoldings(() => control.held);
     }
     // Native recovery must finish before old temporary ownership is swept.
     await spill.sweep();
