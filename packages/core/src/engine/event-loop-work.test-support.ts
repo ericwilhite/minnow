@@ -1,13 +1,14 @@
 /**
  * Count work between real MessageChannel tasks, independently of host pauses and GC.
  * One synthetic clock unit is 1,024 source field/descriptor reads, one generator step,
- * or 64 KiB transferred through sync handles. It drives the real shared slice clock;
+ * 16 indexed/delivered native records, or 64 KiB transferred through storage handles. It drives the real shared slice clock;
  * it is not a prediction of wall time. No generator or storage operation is replaced.
  */
 import { vi } from "vitest";
 import * as slices from "../work-slicer.js";
 
 export class EventLoopWork {
+  constructor(readonly clock: "work" | "wall" = "work") {}
   #active = false;
   #clock = 0;
   #turnStart = 0;
@@ -16,6 +17,7 @@ export class EventLoopWork {
   #steps = 0;
   #bytes = 0;
   #turns = 0;
+  #items = 0;
 
   #add(units: number): void {
     this.#clock += units;
@@ -33,6 +35,7 @@ export class EventLoopWork {
   }
 
   rows<T extends object>(rows: readonly T[]): T[] {
+    if (this.clock === "wall") return rows as T[];
     return rows.map(
       (row) =>
         new Proxy(row, {
@@ -47,6 +50,13 @@ export class EventLoopWork {
           },
         }),
     );
+  }
+
+  /** A native index insertion or cursor-delivered record, e.g. an immutable key forward. */
+  item(): void {
+    if (!this.#active) return;
+    this.#items++;
+    this.#add(1 / 16);
   }
 
   transfer(bytes: number): void {
@@ -74,7 +84,37 @@ export class EventLoopWork {
     return proxy;
   }
 
+  async #measureWall(work: () => Promise<void>) {
+    const start = performance.now();
+    let last = start,
+      largest = 0;
+    const watchdog = setInterval(() => {
+      const now = performance.now();
+      largest = Math.max(largest, now - last);
+      last = now;
+    }, 1);
+    try {
+      await work();
+      const end = performance.now();
+      return {
+        // Preserve the original one-millisecond watchdog statistic.
+        wallLargest: Math.round(largest),
+        wallElapsed: end - start,
+        largest: 0,
+        fields: 0,
+        steps: 0,
+        bytes: 0,
+        turns: 0,
+        items: 0,
+      };
+    } finally {
+      clearInterval(watchdog);
+    }
+  }
   async measure(work: () => Promise<void>) {
+    // The latency lane runs ordinary records, native clocks and native scheduler
+    // methods. Work-count proxies and spies would change what it measures.
+    if (this.clock === "wall") return this.#measureWall(work);
     const run = slices.runSteps,
       sliced = slices.runStepsSliced,
       yieldTurn = slices.yieldToEventLoop;
@@ -132,11 +172,14 @@ export class EventLoopWork {
       await yieldTurn();
       await work();
       return {
+        wallLargest: null,
+        wallElapsed: null,
         largest: this.#largest,
         fields: this.#fields,
         steps: this.#steps,
         bytes: this.#bytes,
         turns: this.#turns,
+        items: this.#items,
       };
     } finally {
       this.#active = false;

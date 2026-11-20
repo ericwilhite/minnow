@@ -7,33 +7,41 @@ import { MemoryBlockStore } from "../storage/index.js";
 import { MinnowDatabase } from "./database.js";
 import { compileQuery, clonePlanTree } from "./query.js";
 let pg = new PGlite();
+const reach = createReach<string>("shipped locking CTE graph", ROW_LOCK_GRAPH_STATES);
+const cases = rowLockGraphs();
+const databases = Array.from({ length: 8 }, () => new MinnowDatabase(new MemoryBlockStore()));
+const checked = new Uint8Array(cases.length);
+const blocks = Array.from({ length: Math.ceil(cases.length / 512) }, (_, index) => ({
+  first: index * 512,
+  end: Math.min((index + 1) * 512, cases.length),
+}));
 beforeAll(async () => {
   for (const sql of GRAPH_DDL) await pg.exec(sql);
+  for (const [index, db] of databases.entries())
+    for (const sql of index < 4 ? GRAPH_DDL : GRAPH_DDL.slice(0, 2)) await db.execute(sql);
 });
 afterAll(async () => {
   await pg.close();
+  for (const db of databases) await db.close();
 });
 function outcome(error: unknown): string {
   if (typeof error === "object" && error !== null && "code" in error) return String(error.code);
   return String(error).includes("in a read-only transaction") ? "25006" : String(error);
 }
-// 5,568 graph shapes through four entry points take about 22 s alone, past the 20 s local default.
-it("refuses the same CTE dependency graphs as PostgreSQL through SQL and copied typed plans", async () => {
-  const reach = createReach<string>("shipped locking CTE graph", ROW_LOCK_GRAPH_STATES);
-  const failures: string[] = [];
-  const databases = Array.from({ length: 8 }, () => new MinnowDatabase(new MemoryBlockStore()));
-  for (const [index, db] of databases.entries())
-    for (const sql of index < 4 ? GRAPH_DDL : GRAPH_DDL.slice(0, 2)) await db.execute(sql);
-  const cases = rowLockGraphs();
-  expect(cases.length).toBe(5568);
-  try {
-    for (const [caseNumber, test] of cases.entries()) {
-      // Independent histories need no shared PG lifetime; bound repeated error recovery.
-      if (caseNumber > 0 && caseNumber % 512 === 0) {
-        await pg.close();
-        pg = new PGlite();
-        for (const sql of GRAPH_DDL) await pg.exec(sql);
-      }
+// Keep the original 512-case PostgreSQL lifetimes, but give each independent block its
+// own unchanged deadline. Read-only Minnow fixtures are built once and shared by all blocks.
+it.each(blocks)(
+  "refuses the same CTE dependency graphs as PostgreSQL through SQL and copied typed plans [$first,$end)",
+  async ({ first, end }) => {
+    const failures: string[] = [];
+    if (first > 0) {
+      await pg.close();
+      pg = new PGlite();
+      for (const sql of GRAPH_DDL) await pg.exec(sql);
+    }
+    for (let caseNumber = first; caseNumber < end; caseNumber++) {
+      const test = cases[caseNumber];
+      if (test === undefined) throw new Error("Missing graph case");
       await pg.exec("BEGIN READ ONLY");
       let expected = "rows";
       try {
@@ -66,6 +74,7 @@ it("refuses the same CTE dependency graphs as PostgreSQL through SQL and copied 
         } finally {
           await db.execute("ROLLBACK");
         }
+        checked[caseNumber] = (checked[caseNumber] ?? 0) + 1;
         if (actual !== expected)
           failures.push(`${String(entry)}: ${test.sql}\nPG ${expected}; Minnow ${actual}`);
         else {
@@ -75,8 +84,12 @@ it("refuses the same CTE dependency graphs as PostgreSQL through SQL and copied 
       }
     }
     expect(failures.join("\n")).toBe("");
-    reach.assertReached();
-  } finally {
-    for (const db of databases) await db.close();
-  }
-}, 120_000);
+  },
+  120_000,
+);
+
+it("checks all 5,568 graph shapes through all four entry points", () => {
+  expect(cases.length).toBe(5568);
+  expect([...checked].every((count) => count === 4)).toBe(true);
+  reach.assertReached();
+});
