@@ -164,7 +164,7 @@ export function allocationAudit(covered: () => number) {
   const scanSpy = vi.spyOn(scans, "TableScan").mockImplementation(function (
     ...args: ConstructorParameters<typeof Scan>
   ) {
-    return call("TableScan.constructor", args[0].budget, () => new Scan(...args));
+    return call("TableScan.constructor", args[0].budget, () => Reflect.construct(Scan, args));
   });
   restore.push(() => scanSpy.mockRestore());
   // Native output replacements are synchronous and retain their old charge until
@@ -183,7 +183,7 @@ export function allocationAudit(covered: () => number) {
   const poolSpy = vi.spyOn(pools, "Pool").mockImplementation(function (
     ...args: ConstructorParameters<typeof Pool>
   ) {
-    const instance = call("Pool.constructor", args[0], () => new Pool(...args));
+    const instance = call("Pool.constructor", args[0], () => Reflect.construct(Pool, args));
     const paid = completed.at(-1)?.credit ?? 0;
     if (instance.room + instance.used > paid) throw Error("Uncharged pool capacity");
     return instance;
@@ -193,7 +193,7 @@ export function allocationAudit(covered: () => number) {
   const sortSpy = vi.spyOn(sorts, "SortOperator").mockImplementation(function (
     ...args: ConstructorParameters<typeof Sort>
   ) {
-    return call("SortOperator.constructor", args[1].grant, () => new Sort(...args));
+    return call("SortOperator.constructor", args[1].grant, () => Reflect.construct(Sort, args));
   });
   restore.push(() => sortSpy.mockRestore());
   const Result = results.ResultBuffers;
@@ -201,7 +201,9 @@ export function allocationAudit(covered: () => number) {
   const resultSpy = vi.spyOn(results, "ResultBuffers").mockImplementation(function (
     ...args: ConstructorParameters<typeof Result>
   ) {
-    const instance = call("ResultBuffers.constructor", args[0], () => new Result(...args));
+    const instance = call("ResultBuffers.constructor", args[0], () =>
+      Reflect.construct(Result, args),
+    );
     resultCredit.set(instance, completed.at(-1)?.credit ?? 0);
     return instance;
   });
@@ -226,7 +228,7 @@ export function allocationAudit(covered: () => number) {
   const storeSpy = vi.spyOn(stores, "ColumnStore").mockImplementation(function (
     ...args: ConstructorParameters<typeof Store>
   ) {
-    const instance = call("ColumnStore.constructor", args[1], () => new Store(...args));
+    const instance = call("ColumnStore.constructor", args[1], () => Reflect.construct(Store, args));
     storeCharges.set(instance, args[1]);
     return instance;
   });
@@ -268,7 +270,9 @@ export function allocationAudit(covered: () => number) {
   const builderSpy = vi.spyOn(varlen, "VarlenBuilder").mockImplementation(function (
     ...args: ConstructorParameters<typeof Builder>
   ) {
-    const instance = call("VarlenBuilder.constructor", args[1], () => new Builder(...args));
+    const instance = call("VarlenBuilder.constructor", args[1], () =>
+      Reflect.construct(Builder, args),
+    );
     builders.set(instance, args[1]);
     return instance;
   });
