@@ -306,9 +306,9 @@ describe("published core tarball", () => {
       // 1,028,455 packed bytes. Raise packed once by 500; unpacked/isolation caps stay.
       // Native display-label provenance: 1,028,540 packed bytes (40 over the old cap).
       // Raise packed once by 250; unpacked/isolation caps and next/ exclusion stay.
-      // Copy-meter hooks for metered native trigger preparation: 1,029,266 packed bytes.
-      // Raise packed once by 750; unpacked/download/isolation limits stay unchanged.
-      expect(report?.size, "packed bytes").toBeLessThanOrEqual(1_029_500);
+      // Copy-meter hooks for metered native trigger preparation: 1,029,691 packed bytes.
+      // Raise packed once by 1,250; unpacked/download/isolation limits stay unchanged.
+      expect(report?.size, "packed bytes").toBeLessThanOrEqual(1_030_000);
       expect(report?.unpackedSize, "unpacked bytes").toBeLessThanOrEqual(4_500_000);
       const emitted = await readFile(join(isolatedCore, "dist", "engine", "optimizer.js"), "utf8");
       expect(emitted).not.toContain("/**");
