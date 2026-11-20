@@ -5,6 +5,9 @@
 name: next/ speed claim
 
 on:
+  # SCRATCH BRANCH ONLY (ci/p1-claim-j2): J2 claim run. Never merge.
+  push:
+    branches: [ci/p1-claim-j2]
   workflow_dispatch:
     inputs:
       candidate:
@@ -35,7 +38,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: next-claim-${{ inputs.control }}-${{ inputs.candidate }}
+  group: next-claim-f857fe4a0d1892ff68a6d19ec3d40e5b1ebf8634-68e145db678560483998aad6fb4f5dfe26864125
   cancel-in-progress: false
 
 jobs:
@@ -55,10 +58,10 @@ jobs:
       - id: refs
         shell: bash
         env:
-          CONTROL: ${{ inputs.control }}
-          CANDIDATE: ${{ inputs.candidate }}
-          DATASETS: ${{ inputs.datasets }}
-          SHARDS: ${{ inputs.shards }}
+          CONTROL: f857fe4a0d1892ff68a6d19ec3d40e5b1ebf8634
+          CANDIDATE: 68e145db678560483998aad6fb4f5dfe26864125
+          DATASETS: both
+          SHARDS: 6
         run: |
           resolve() { git rev-parse --verify "origin/$1^{commit}" 2>/dev/null || git rev-parse --verify "$1^{commit}"; }
           echo "control=$(resolve "$CONTROL")" >> "$GITHUB_OUTPUT"
@@ -106,10 +109,10 @@ jobs:
           mkdir -p claim &&
           node scripts/next-claim.mts run
           --dataset ${{ matrix.dataset }}
-          --shard ${{ matrix.shard }}/${{ inputs.shards }}
-          --only "${{ inputs.only }}"
-          --pairs "${{ inputs.pairs }}"
-          --targets "${{ inputs.targets }}"
+          --shard ${{ matrix.shard }}/6
+          --only ""
+          --pairs "15"
+          --targets "join_fact_fact_int"
           --seed "${{ github.run_id }}"
           --control "$RUNNER_TEMP/control"
           --candidate "$RUNNER_TEMP/candidate"
