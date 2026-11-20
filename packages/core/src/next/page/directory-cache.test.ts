@@ -110,6 +110,7 @@ it.each(seedsFor("next-directory-cache-identity", [0xb503, 0xb504]))(
               directory: ref,
               data: { extent: padding.extent, offset: 0, length: DATA_ALIGN },
               distinctSketch: null,
+              aggregateSummary: null,
               statistics: { nullCount: 0, min: null, max: null, dictionarySize: null },
             },
             parse = vi.spyOn(directoryCode, "parseDirectory"),
