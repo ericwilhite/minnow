@@ -971,6 +971,21 @@ function setNull(column: Column, k: number, at: number): void {
   column.hasNulls = true;
 }
 
+/** Marks slots `at … at + count` of chunk k null: whole words at once. */
+function setNullRange(column: Column, k: number, at: number, count: number): void {
+  const chunk = column.chunks[k];
+  const bitmap = column.bitmaps[k];
+  if (chunk === undefined || bitmap === undefined || count <= 0) return;
+  let i = at;
+  const end = at + count;
+  for (; i < end && (i & 31) !== 0; i++)
+    bitmap[i >>> 5] = (bitmap[i >>> 5] ?? 0) & ~(1 << (i & 31));
+  for (; i + 32 <= end; i += 32) bitmap[i >>> 5] = 0;
+  for (; i < end; i++) bitmap[i >>> 5] = (bitmap[i >>> 5] ?? 0) & ~(1 << (i & 31));
+  chunk.validity = bitmap;
+  column.hasNulls = true;
+}
+
 /** Marks slot `at` valid (only needed when a chunk slot is rewritten). */
 function setValidSlot(column: Column, k: number, at: number): void {
   const bitmap = column.bitmaps[k];
@@ -1185,6 +1200,12 @@ function writeFromSource(column: Column, k: number, at: number, source: Source, 
   }
   let used = column.used[k] ?? 0;
   if (out.layout === "varlen" && at === 0) out.offsets[0] = 0;
+  if (source.form === 1 && source.validity !== null && ((source.validity[0] ?? 0) & 1) === 0) {
+    // A NULL constant (an all-NULL or unread column): one bitmap range, empty varlen values.
+    setNullRange(column, k, at, n);
+    if (out.layout === "varlen") for (let i = 1; i <= n; i++) out.offsets[at + i] = used;
+    return;
+  }
   if (out.layout === "varlen" && flatNoNulls) {
     // Flat bytes without nulls: contiguous rows copy in bulk, selected rows without a switch.
     const data = source.flat.data as Varlen;

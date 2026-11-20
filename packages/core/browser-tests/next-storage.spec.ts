@@ -74,6 +74,9 @@ test.describe("rebuild core storage on OPFS", () => {
       body: JSON.stringify(result, null, 2),
       contentType: "application/json",
     });
+    // A stall reports the iteration, the phase its kill aimed at, what the page waited for, the
+    // waited-on worker's last steps and (after a verification) the store's locks and handles.
+    expect(result.failure, JSON.stringify(result.failure, null, 2)).toBeNull();
     expect(result.iterations).toHaveLength(12);
     // Every phase of a round was the moment of a kill, several times (review B1-p2b finding 5).
     for (const phase of ["writing", "publishing", "published"] as const)
@@ -85,6 +88,36 @@ test.describe("rebuild core storage on OPFS", () => {
         expect(iteration.round).toBeGreaterThanOrEqual(iteration.killedRound);
       if (iteration.round > 1) expect(iteration.previous).toBe(iteration.round - 1);
     }
+  });
+
+  test("reports where a stalled verification stopped, with locks before termination", async ({
+    page,
+  }) => {
+    test.setTimeout(120_000);
+    // The stall report's own check: a verifier that never returns from "audit".
+    const result = await page.evaluate(async (url) => {
+      return ((await import(url)) as Run).runKillDuringPublish(3, 0x6b11, {
+        stallAt: "audit",
+        verifyStallMs: 5_000,
+      });
+    }, RUN);
+    const failure = result.failure;
+    expect(failure).not.toBeNull();
+    if (!failure) return;
+    expect(failure.iteration).toBe(0);
+    expect(failure.stage).toMatch(/^verifying after the kill in round /u);
+    expect(failure.error).toBe("the verification did not finish in 5000 ms");
+    expect(failure.steps.at(-1)).toMatch(/ms: audit$/u);
+    // The stalled verifier still owned the store: its lock shows only before termination.
+    const before = failure.locksBeforeTermination as { held: string[]; pending: string[] };
+    expect(before.held.length).toBeGreaterThan(0);
+    const after = failure.afterTermination as {
+      held: string[];
+      pending: string[];
+      files: Record<string, string>;
+    };
+    expect(after.held).toEqual([]);
+    expect(Object.values(after.files).every((outcome) => outcome.startsWith("free"))).toBe(true);
   });
 
   test("survives the owner's tab closing during publish", async ({ context, page }) => {
@@ -178,6 +211,7 @@ async function indexedDbScenarios(page: Page, iterations: number) {
 
 function expectIndexedDbScenarios(result: Awaited<ReturnType<typeof indexedDbScenarios>>) {
   expect(result.conformance.filter((entry) => entry.error !== null)).toEqual([]);
+  expect(result.kill.failure, JSON.stringify(result.kill.failure, null, 2)).toBeNull();
   for (const phase of ["writing", "publishing", "published"] as const)
     expect(result.kill.iterations.some((iteration) => iteration.target === phase)).toBe(true);
   for (const iteration of result.kill.iterations) {

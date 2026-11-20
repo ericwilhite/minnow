@@ -60,6 +60,7 @@ import { rankingBounds } from "./window-topk-plan.js";
 import { Slice, runSliced, type SlicedJob } from "./slices.js";
 /** Immutable pipeline recipes; every execution instantiates its own operators and kernels. */
 import type { MaybePromise } from "../access/key-index.js";
+import { columnsRead } from "../ir/columns-read.js";
 import type { PhysicalPlan, Rel, ScalarExpr, SortKey } from "../ir/ir.js";
 import { ResultSink, resultRowStepBytes } from "./result-sink.js";
 import { aggregateProgressLayout, simpleAggregateType } from "./agg/parameter-copies.js";
@@ -116,6 +117,15 @@ import {
   type StarBound,
 } from "./star-bound.js";
 import { StarDictionaryBooks } from "./star-dictionary.js";
+import { StarLookups } from "./join-star-lookups.js";
+import { starParameterFootprint } from "./join-star-parameters.js";
+
+import {
+  starLookupShape,
+  starLookupBound,
+  type StarLookupShape,
+  type StarLookupBound,
+} from "./join-star-shape.js";
 import { starColumns } from "./star-pipeline.js";
 import type { PartitionBounds } from "./agg/partition-probe.js";
 import {
@@ -653,6 +663,8 @@ export interface CompileOptions {
   readonly aggregateInputPacking?: boolean;
   /** False retains ordinary TEXT producers for star-join diagnostic controls. */
   readonly starDictionary?: boolean;
+  /** False retains all three resident native star joins for diagnostic controls. */
+  readonly starLookups?: boolean;
   /** Diagnostic control for bounded sole rank/row_number windows. */
   readonly windowTopK?: boolean;
   /** Parent control for the resident full numeric columnar sort. */
@@ -767,6 +779,34 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
     loanSlots: number;
   }> = [];
   const compoundColumns = new Map<number, number>();
+  /**
+   * Join output columns its consumer reads (absent: every column). The consumer is a direct
+   * parent projection, or a parent inner join that passes on its own demand plus its keys.
+   */
+  const joinOutputDemand = new Map<number, ReadonlySet<number>>();
+  /** Whether an inner join's demand can narrow what it gathers and what its inputs supply. */
+  const prunable = (join: Extract<Rel, { op: "join" }>): boolean =>
+    (join.kind === "inner" || join.kind === "cross") &&
+    join.residual === null &&
+    (join.filter ?? null) === null;
+  /**
+   * Build store columns an inner join need not gather: key-only columns it added past the
+   * build input, and input columns its consumer never reads. Not for a residual, a filter or
+   * an outer/semi/mark join. A star rewrite changes column types only, never positions.
+   */
+  const unusedBuildOf = (
+    join: Rel,
+    probeWidth: number,
+    buildWidth: number,
+    storeWidth: number,
+  ): { unusedBuild?: number[] } => {
+    if (join.op !== "join" || !prunable(join)) return {};
+    const read = joinOutputDemand.get(join.id);
+    const unused: number[] = [];
+    for (let c = 0; c < storeWidth; c++)
+      if (c >= buildWidth || (read !== undefined && !read.has(probeWidth + c))) unused.push(c);
+    return unused.length === 0 ? {} : { unusedBuild: unused };
+  };
   const compoundCopies = new Map<number, number>();
   const indexFetchOwners = new Set<number>();
   interface IndexWorkspace {
@@ -849,6 +889,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
   };
   findIds(plan.root);
   const readSources = new Map<number, ReadSource>();
+  const scanRecipes = new Map<number, Recipe>();
   const starPlanners = new Map<
     number,
     { shape: StarDictionaryShape; identity: OperatorIdentity }
@@ -856,7 +897,12 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
   const starCompilers = new Map<number, number>();
   const starChoices = new WeakMap<
     QueryRuntime,
-    { shape: StarDictionaryShape; identity: OperatorIdentity; bound: StarBound }
+    {
+      shape: StarDictionaryShape;
+      identity: OperatorIdentity;
+      bound: StarBound;
+      lookup?: { shape: StarLookupShape; bound: StarLookupBound };
+    }
   >();
   const starBooks = new WeakMap<QueryRuntime, StarDictionaryBooks>();
   const starRel = (runtime: QueryRuntime, rel: Rel): Rel =>
@@ -1539,110 +1585,13 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           });
       }
       case "scan": {
-        if (!pageScan) {
-          const input = types(rel).slice(0, rel.columns.length),
-            filter = rel.filter;
-          // Only the terminal full-table export has no downstream consumer that may re-read.
-          // Other scans keep their selective/cache policy; TableScan also handles deletion,
-          // reader capability, memory refusal, pacing and cancellation fallbacks itself.
-          const terminal =
-            rel === terminalInput &&
-            filter === null &&
-            rel.runtimeFilters.length === 0 &&
-            !rel.emitLocator;
-          readSources.set(rel.id, {
-            id: rel.id,
-            tableId: rel.tableId,
-            columns: rel.columns,
-            types: input,
-            stagingBytes: memoryScanBufferBytes(input),
-            windowBytes: terminal ? 64 * 1024 * 1024 : 0,
-            rows: null,
-          });
-          const kernelBytes =
-            filter === null
-              ? 0
-              : measureCompilerBuffers(
-                  compilation,
-                  input,
-                  BATCH_ROWS,
-                  (context) => new FilterOperator(filter, context, DISCARD),
-                  (filter) => filter.abort(undefined),
-                );
-          fixed(rel, (cap) => kernelBytes + batchTargetFor(cap, 4) + BATCH_ROWS * 16);
-          return (runtime, downstream, stops, rowsNeeded) => {
-            if (stops.some((stop) => stop())) return downstream.finish();
-            const target = batchTargetFor(runtime.request.governor.capBytes, 4);
-            return instantiate(
-              runtime,
-              rel,
-              input,
-              kernelBytes + target + BATCH_ROWS * 16,
-              BATCH_ROWS,
-              (context, grant) => ({ context, grant }),
-              ({ context, grant }) =>
-                then(runtime.table(rel.tableId, grant), (table) => {
-                  const terminalFull =
-                    terminal &&
-                    rel.columns.length === table.columns.length &&
-                    rel.columns.every((id, k) => id === table.columns[k]?.id);
-                  const owner = terminalFull
-                    ? downstream instanceof ResultSink
-                      ? downstream
-                      : exportOwners.get(downstream)
-                    : undefined;
-                  const output = owner?.grant;
-                  const directories = directoryCacheFor(runtime.view.pages);
-                  const scan = new TableScan({
-                    table,
-                    pages: runtime.readPages(runtime.view.pages),
-                    reads: runtime.request.reads,
-                    ...(directories === undefined
-                      ? {}
-                      : { directories, directoryOnce: !runtime.sourceRetains(rel.id) }),
-                    budget: grant,
-                    columns: rel.columns,
-                    filter: rel.filter,
-                    emitLocator: rel.emitLocator,
-                    context,
-                    loans: { borrow: (bytes) => grant.borrow(bytes, runtime.signal) },
-                    // Larger batches remain restricted to explicit relinquishing export consumers.
-                    targetBytes: runtime.request.outputBuffers
-                      ? (owner?.terminalBatchTarget(2 * target) ?? target)
-                      : target,
-                    boundedMemory: true,
-                    readWindowBytes: terminalFull ? runtime.sourceWindow(rel.id) : 0,
-                    ...(output === undefined
-                      ? {}
-                      : {
-                          transferOutputs: "dictionary" as const,
-                          outputBudget: output,
-                          ...(runtime.request.outputBuffers
-                            ? { outputBuffers: runtime.request.outputBuffers }
-                            : {}),
-                          outputDictionary: (dictionary) =>
-                            owner?.admitDictionary(dictionary) ?? false,
-                          borrowOutputOnRefusal: true,
-                        }),
-                    ...(runtime.sourceBatchRows(rel.id) === undefined
-                      ? rowsNeeded === undefined
-                        ? {}
-                        : { rowsNeeded }
-                      : { rowsNeeded: () => Math.min(rowsNeeded?.() ?? BATCH_ROWS, 1) }),
-                  });
-                  const books = starBooks.get(runtime);
-                  const outputSink = books?.shape.columns.has(rel.id)
-                    ? starColumns((batch) => books.encode(rel.id, batch), downstream)
-                    : downstream;
-                  return fts.scan(runtime, rel, scan, counted(runtime, rel, outputSink), stops);
-                }),
-            );
-          };
-        }
+        // One recipe for both scan forms: a page-consuming parent (pageScan) selects encoded
+        // pages and page counting; otherwise ordinary batches. Both size their target from the
+        // bounded demand (sourceTarget), so the two forms cannot drift apart.
         const input = types(rel).slice(0, rel.columns.length),
           filter = rel.filter,
-          count = countedPages,
-          Scan = EncodedTableScan;
+          count = pageScan ? countedPages : counted,
+          Scan = pageScan ? EncodedTableScan : TableScan;
         // Only the terminal full-table export has no downstream consumer that may re-read.
         // Other scans keep their selective/cache policy; TableScan also handles deletion,
         // reader capability, memory refusal, pacing and cancellation fallbacks itself.
@@ -1675,7 +1624,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           (_cap, runtime) =>
             kernelBytes + sourceTarget(runtime, rel.tableId, input) + BATCH_ROWS * 16,
         );
-        return (runtime, downstream, stops, rowsNeeded) => {
+        const scanRecipe: Recipe = (runtime, downstream, stops, rowsNeeded) => {
           if (stops.some((stop) => stop())) return downstream.finish();
           const target = sourceTarget(runtime, rel.tableId, input);
           return instantiate(
@@ -1703,7 +1652,8 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                   ? starColumns((batch) => books.encode(rel.id, batch), downstream)
                   : downstream;
                 const countedSink = count(runtime, rel, outputSink);
-                const pageConsumer = !fts.enabled && !books ? countedSink.pageConsumer : undefined;
+                const pageConsumer =
+                  pageScan && !fts.enabled && !books ? countedSink.pageConsumer : undefined;
                 const oneRow = runtime.sourceBatchRows(rel.id) !== undefined;
                 const demand = oneRow
                   ? () => Math.min(rowsNeeded?.() ?? BATCH_ROWS, 1)
@@ -1752,6 +1702,8 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
               }),
           );
         };
+        scanRecipes.set(rel.id, scanRecipe);
+        return scanRecipe;
       }
       case "fts": {
         const child = prepare(rel.input),
@@ -1780,6 +1732,12 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
       case "filter":
       case "project":
       case "limit": {
+        // A projection over a join reads only these join output columns (output demand).
+        // An expression the walker cannot classify leaves the join's full output demanded.
+        if (rel.op === "project" && rel.input.op === "join") {
+          const read = columnsRead(rel.exprs);
+          if (read !== null) joinOutputDemand.set(rel.input.id, read);
+        }
         const encoded = pageScan && rel.op === "project",
           count = encoded ? countedPages : counted,
           Project = encoded ? PageProjectOperator : ProjectOperator,
@@ -2384,7 +2342,13 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
             !terminalStar(plan, rel.id)
               ? null
               : starDictionaryShape(aggregate, plan.volatile);
-          if (star) {
+          // Bound TEXT is new only for the exact three-lookup family. Existing
+          // literal dictionary recipes keep their broader, unchanged eligibility.
+          if (
+            star &&
+            (plan.parameters.length === 0 ||
+              (options.starLookups !== false && starLookupShape(star) !== null))
+          ) {
             const identity: OperatorIdentity = {
               id: nextPhysicalId++,
               op: "project",
@@ -2595,8 +2559,46 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                   !(operator instanceof ExternalAggregateOperator) &&
                   !(operator instanceof HybridAggregateOperator) &&
                   !(operator instanceof RestoredAggregateOperator)
-                )
-                  return child(runtime, operator, []);
+                ) {
+                  const lookup = starChoices.get(runtime)?.lookup;
+                  if (lookup === undefined) return child(runtime, operator, []);
+                  return instantiate(
+                    runtime,
+                    lookup.bound.owner,
+                    [],
+                    lookup.bound.minimum,
+                    1,
+                    (context, grant) => {
+                      const lookups = new StarLookups(
+                        lookup.shape,
+                        lookup.bound,
+                        grant,
+                        runtime.signal,
+                      );
+                      context.ownOperator?.(lookups);
+                      return lookups;
+                    },
+                    (lookups) =>
+                      (async () => {
+                        try {
+                          const c = scanRecipes.get(lookup.shape.c.scan.id),
+                            facts = scanRecipes.get(lookup.shape.fact.id),
+                            a = scanRecipes.get(lookup.shape.a.scan.id),
+                            b = scanRecipes.get(lookup.shape.b.scan.id);
+                          if (!c || !facts || !a || !b) throw new Error("Missing star scan");
+                          // Keep the native source barriers and drain every B prefix before next().
+                          await c(runtime, lookups.dimension(2), []);
+                          await facts(runtime, lookups.fact(), []);
+                          await a(runtime, lookups.dimension(0), []);
+                          await lookups.linkFacts();
+                          await b(runtime, lookups.probe(operator), []);
+                        } finally {
+                          lookups.close();
+                        }
+                      })(),
+                    true,
+                  );
+                }
                 runtime.dispose(() => operator.closed);
                 return (async () => {
                   try {
@@ -2905,6 +2907,21 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           throw new UnsupportedPlanError("a keyed nested-loop physical join", {
             construct: "join",
           });
+        // A child join supplies only what this join's demand and keys read.
+        const read = joinOutputDemand.get(rel.id);
+        if (read !== undefined && prunable(rel)) {
+          const width = rel.left.output.length,
+            probe = new Set<number>(),
+            build = new Set<number>();
+          for (const c of read) (c < width ? probe : build).add(c < width ? c : c - width);
+          // Keys the walker cannot classify leave that child fully demanded.
+          const probeRead = columnsRead(rel.leftKeys, probe),
+            buildRead = columnsRead(rel.rightKeys, build);
+          if (rel.left.op === "join" && probeRead !== null)
+            joinOutputDemand.set(rel.left.id, probeRead);
+          if (rel.right.op === "join" && buildRead !== null)
+            joinOutputDemand.set(rel.right.id, buildRead);
+        }
         const left = prepare(rel.left),
           right = prepare(rel.right),
           lt = types(rel.left),
@@ -2973,6 +2990,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
             ),
             // Runtime filters are optional acceleration; scans still evaluate every predicate.
             publishes: [],
+            ...unusedBuildOf(actual, lt.length, rt.length, rk.types.length),
           };
           if (runtime === undefined || grant === null) validateHashJoinSpec(spec);
           const join =
@@ -4030,9 +4048,19 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           if (
             !active.has(shape.aggregate.id) ||
             !starPrimaryKeys(shape, runtime.view.catalog) ||
-            shape.scans.some((scan) => !starPredicate(scan.filter))
+            shape.scans.some((scan) => !starPredicate(scan.filter, plan.parameters))
           )
             continue;
+          const parameterFootprint = yield* readValue(
+            starParameterFootprint(
+              plan,
+              runtime.request.parameters,
+              runtime.nativeParameters !== null,
+              runtime.signal,
+              runtime.request.governor.capBytes,
+            ),
+          );
+          if (parameterFootprint === null) continue;
           const proofs = new Map<number, PartitionBounds>();
           for (const scan of shape.scans) {
             const read = bounds.get(scan.id);
@@ -4061,7 +4089,13 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
             if (proof === null) break;
             proofs.set(scan.id, proof);
           }
-          const bound = starBound(shape, runtime.view.catalog, proofs, starCompilers);
+          const bound = starBound(
+            shape,
+            runtime.view.catalog,
+            proofs,
+            starCompilers,
+            plan.parameters,
+          );
           if (bound === null) continue;
           const minima = new Map([
             ...bound.joins,
@@ -4078,7 +4112,14 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           });
           const priorStrategy = choices.get(shape.aggregate.id);
           configureChoice(shape.aggregate.id, { kind: "hash", minimum: bound.aggregate, loans: 0 });
-          if (runtime.minimumBytes(entries) > runtime.request.governor.capBytes) {
+          if (
+            runtime.minimumBytes(
+              entries,
+              parameterFootprint.bytes,
+              parameterFootprint.largestSlot,
+              parameterFootprint.slotBytes ?? [],
+            ) > runtime.request.governor.capBytes
+          ) {
             if (priorStrategy) configureChoice(shape.aggregate.id, priorStrategy);
             for (const prior of saved) {
               prior.entry.minimum = prior.minimum;
@@ -4089,7 +4130,19 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           // All probe grants have closed. Only numeric facts survive this complete atomic
           // admission; no source buffer or private partial reservation waits for credit.
           choices.set(shape.aggregate.id, { kind: "hash", minimum: bound.aggregate, loans: 0 });
-          starChoices.set(runtime, { shape, identity, bound });
+          const lookup = options.starLookups === false ? null : starLookupShape(shape),
+            lookupBound =
+              lookup === null
+                ? null
+                : starLookupBound(shape, lookup, bound, proofs, runtime.view.catalog);
+          starChoices.set(runtime, {
+            shape,
+            identity,
+            bound,
+            ...(lookup === null || lookupBound === null
+              ? {}
+              : { lookup: { shape: lookup, bound: lookupBound } }),
+          });
           break;
         }
       choicesReady = true;
