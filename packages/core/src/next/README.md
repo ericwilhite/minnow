@@ -998,6 +998,11 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
   scratch and compare word pairs or 128-bit limbs. Row loops do no BigInt work: bounds become
   numbers once per page, and the dictionary-code bitmap once per chunk. `reader.refine(compiled, rows, …)`
   narrows a selection (in place allowed), for conjunctions across columns.
+  Single-range integer kernels (plain int32 and frame-of-reference widths 1, 2 and 4, and the
+  general single-range loop with nulls or a row selection) are branch-free: each row writes its
+  position and the count advances by the 0/1 match, so random predicates do not mispredict. The
+  furthest slot written equals the all-match case's, and in place a write lands at or before the
+  row just read. Float, decimal, varlen and multi-range selections keep their existing loops.
 - Semantics are PostgreSQL's: NULLs never satisfy a comparison; float NaN equals NaN and sorts
   above +Infinity, −0 equals +0; decimals compare exactly (specials −Infinity < finite <
   +Infinity < NaN); text, bytes and uuid in byte order (C collation).

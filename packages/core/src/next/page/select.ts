@@ -418,7 +418,19 @@ export function selectPage(
   }
 }
 
-/** One loop for a value array against number ranges: the hot path of plain and FOR pages. */
+/** The single-range kernels below, as test observations name them. */
+export type RangeKernel = "scan8" | "scan16" | "scan32" | "scanI32" | "single-range";
+let kernelObserver: ((kernel: RangeKernel) => void) | null = null;
+/** Test-only: reports each single-range kernel a page selection runs (null in production). */
+export function observeRangeKernels(observer: ((kernel: RangeKernel) => void) | null): void {
+  kernelObserver = observer;
+}
+
+/** One loop for a value array against number ranges: the hot path of plain and FOR pages.
+ * Single-range loops are branch-free: each row writes its position and the count advances
+ * by the 0/1 match, so a random predicate does not mispredict. The slot past the last match
+ * is written but not counted; the furthest slot written equals the all-match case's. In place
+ * (`out` is `rows`), a write lands at or before the row just read. */
 function rangeKernel(
   context: SelectContext,
   rows: Rows | null,
@@ -440,19 +452,31 @@ function rangeKernel(
     // over a union of typed arrays runs several times slower).
     const low = ranges.lows[0] ?? 0;
     const high = ranges.highs[0] ?? 0;
-    if (values instanceof Uint8Array) return scan8(values, from, to, low, high, out, at, first);
-    if (values instanceof Uint16Array) return scan16(values, from, to, low, high, out, at, first);
-    if (values instanceof Uint32Array) return scan32(values, from, to, low, high, out, at, first);
+    if (values instanceof Uint8Array) {
+      if (kernelObserver !== null) kernelObserver("scan8");
+      return scan8(values, from, to, low, high, out, at, first);
+    }
+    if (values instanceof Uint16Array) {
+      if (kernelObserver !== null) kernelObserver("scan16");
+      return scan16(values, from, to, low, high, out, at, first);
+    }
+    if (values instanceof Uint32Array) {
+      if (kernelObserver !== null) kernelObserver("scan32");
+      return scan32(values, from, to, low, high, out, at, first);
+    }
+    if (kernelObserver !== null) kernelObserver("scanI32");
     return scanI32(values, from, to, low, high, out, at, first);
   }
   if (ranges.count === 1) {
     const low = ranges.lows[0] ?? 0;
     const high = ranges.highs[0] ?? 0;
+    if (kernelObserver !== null) kernelObserver("single-range");
     for (let k = from; k < to; k++) {
       const row = rows === null ? k : (rows[k] ?? 0) - first;
-      if (validity !== null && (((validity[row >>> 5] ?? 0) >>> (row & 31)) & 1) === 0) continue;
+      const valid = validity === null ? 1 : ((validity[row >>> 5] ?? 0) >>> (row & 31)) & 1;
       const value = values === null ? constant : (values[row] ?? 0);
-      if (value >= low && value <= high) out[at + count++] = first + row;
+      out[at + count] = first + row;
+      count += valid & Number(value >= low) & Number(value <= high);
     }
     return count;
   }
@@ -478,7 +502,8 @@ function scan8(
   let count = 0;
   for (let row = from; row < to; row++) {
     const value = values[row] ?? 0;
-    if (value >= low && value <= high) out[at + count++] = first + row;
+    out[at + count] = first + row;
+    count += Number(value >= low) & Number(value <= high);
   }
   return count;
 }
@@ -495,7 +520,8 @@ function scan16(
   let count = 0;
   for (let row = from; row < to; row++) {
     const value = values[row] ?? 0;
-    if (value >= low && value <= high) out[at + count++] = first + row;
+    out[at + count] = first + row;
+    count += Number(value >= low) & Number(value <= high);
   }
   return count;
 }
@@ -512,7 +538,8 @@ function scan32(
   let count = 0;
   for (let row = from; row < to; row++) {
     const value = values[row] ?? 0;
-    if (value >= low && value <= high) out[at + count++] = first + row;
+    out[at + count] = first + row;
+    count += Number(value >= low) & Number(value <= high);
   }
   return count;
 }
@@ -529,7 +556,8 @@ function scanI32(
   let count = 0;
   for (let row = from; row < to; row++) {
     const value = values[row] ?? 0;
-    if (value >= low && value <= high) out[at + count++] = first + row;
+    out[at + count] = first + row;
+    count += Number(value >= low) & Number(value <= high);
   }
   return count;
 }

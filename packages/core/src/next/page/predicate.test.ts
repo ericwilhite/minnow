@@ -19,6 +19,7 @@ import {
   type PredicateConstant,
 } from "./predicate.js";
 import { ChunkReader, DENSE_SELECTION, prefersDense } from "./reader.js";
+import { observeRangeKernels } from "./select.js";
 import { defined, writeGroup, type DecimalValue, type TestValue } from "./test-support.js";
 
 const SEEDS = seedsFor("next-predicate-pushdown", [0x9e11, 0x2a, 0x77d1]);
@@ -78,6 +79,16 @@ for (const codec of CODECS) for (const op of codecOps[codec]) reachStates.push(`
 for (const op of OPS) reachStates.push(`pruned:${op}`, `kept:${op}`);
 for (const codec of CODECS)
   if (codec !== "allNull") reachStates.push(`sparse:${codec}`, `dense:${codec}`);
+// Every single-range selection kernel (select.ts rangeKernel), branch-free since B-select.
+const KERNELS = [
+  "kernel:scan8",
+  "kernel:scan16",
+  "kernel:scan32",
+  "kernel:scanI32",
+  "kernel:single-range:select",
+  "kernel:single-range:refine",
+] as const;
+reachStates.push(...KERNELS);
 const reach = createReach("next-predicate-pushdown", reachStates);
 afterAll(() => {
   reach.assertReached();
@@ -119,6 +130,8 @@ function values(family: Family): fc.Arbitrary<TestValue[]> {
   const ints64 = fc.oneof(
     fc.bigInt({ min: -3n, max: 3n }),
     fc.bigInt({ min: 0n, max: 70_000n }),
+    // Spans past 16 bits but within 32: frame-of-reference pages four bytes wide (scan32).
+    fc.bigInt({ min: 0n, max: 4_000_000_000n }),
     fc.bigInt({ min: -(2n ** 63n), max: 2n ** 63n - 1n }),
     fc.constantFrom(2n ** 53n + 1n, -(2n ** 63n), 2n ** 63n - 1n),
   );
@@ -529,8 +542,16 @@ describe.each(SEEDS)("predicate pushdown matches decode-then-filter (seed %i)", 
           // Page pruning is sound; select reads only the unpruned pages.
           const kept = reader.pagesMatching(compiled);
           await reader.load(kept);
+          const kernels = new Set<string>();
+          let phase = "select";
+          observeRangeKernels((kernel) =>
+            kernels.add(
+              kernel === "single-range" ? `kernel:single-range:${phase}` : `kernel:${kernel}`,
+            ),
+          );
           const out = new Uint16Array(values.length);
           const count = reader.select(compiled, 0, values.length, out);
+          observeRangeKernels(null);
           expect(Array.from(out.subarray(0, count))).toEqual(expected);
           // The dense path: a 0/1 mask, at an offset.
           const mask = new Uint8Array(values.length + 3).fill(9);
@@ -550,11 +571,19 @@ describe.each(SEEDS)("predicate pushdown matches decode-then-filter (seed %i)", 
           const wanted = Array.from(subset).filter((row) =>
             modelMatches(family, values[row] ?? null, predicate),
           );
+          phase = "refine";
+          observeRangeKernels((kernel) =>
+            kernels.add(
+              kernel === "single-range" ? `kernel:single-range:${phase}` : `kernel:${kernel}`,
+            ),
+          );
           const refined = reader.refine(compiled, subset, 0, subset.length, subset);
+          observeRangeKernels(null);
           expect(Array.from(subset.subarray(0, refined))).toEqual(wanted);
 
           // Declared reach.
           reach.beginHistory();
+          for (const kernel of kernels) reach.reach(kernel);
           const op = predicate.op;
           const keptSet = new Set(kept);
           reader.directory.pages.forEach((entry, page) => {
