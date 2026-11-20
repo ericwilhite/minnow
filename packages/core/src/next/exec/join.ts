@@ -210,13 +210,17 @@ export interface HashJoinContext {
   readonly direct?: boolean;
 }
 
+/** Test observation of output demand; null in production (one null check, no allocation). */
+let gatherObserver: ((relId: number | undefined, gathered: readonly number[]) => void) | null =
+  null;
+
 /**
- * Test observation of output demand: each join reports the build columns it gathers for
- * matched pairs, by plan id. Null outside tests; it never changes what a join does.
+ * Test-only: reports each join's gathered build columns, by plan id, until reset with null.
+ * It never changes what a join does.
  */
-export const joinGatherObserver: {
-  observe: ((relId: number | undefined, gathered: readonly number[]) => void) | null;
-} = { observe: null };
+export function observeJoinGathers(observer: typeof gatherObserver): void {
+  gatherObserver = observer;
+}
 
 export interface HashJoinProfile {
   rowsOut: number;
@@ -529,7 +533,7 @@ class Shared {
     this.gatherColumns = this.buildColumns.filter(
       (c) => (reuse[c] ?? -1) < 0 && !this.unused.has(c),
     );
-    joinGatherObserver.observe?.(context.relId, this.gatherColumns);
+    if (gatherObserver !== null) gatherObserver(context.relId, this.gatherColumns);
     this.buildPart = new ColumnStore(
       this.gatherColumns.map((c) => columnOf(spec.buildTypes, c)),
       this.pool,

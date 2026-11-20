@@ -9,7 +9,7 @@ import fc from "fast-check";
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { createReach, JOIN_DEMAND_EXPRESSION_REACH } from "../../testing/reach.js";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
-import { joinGatherObserver } from "../exec/join.js";
+import { observeJoinGathers } from "../exec/join.js";
 import { oracleRows } from "./differential-adapter.js";
 import { StorageCore } from "./storage-core.js";
 
@@ -128,11 +128,11 @@ it("keeps a build column read only inside a CASE parent join key", async () => {
 /** Every join's gathered build columns while `sql` runs (and its result still matches). */
 async function gathered(sql: string): Promise<number[][]> {
   const seen: number[][] = [];
-  joinGatherObserver.observe = (_relId, columns) => seen.push([...columns]);
+  observeJoinGathers((_relId, columns) => seen.push([...columns]));
   try {
     await same(sql);
   } finally {
-    joinGatherObserver.observe = null;
+    observeJoinGathers(null);
   }
   return seen;
 }
