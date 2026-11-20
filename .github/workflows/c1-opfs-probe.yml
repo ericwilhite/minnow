@@ -1,6 +1,7 @@
 # Bounded hosted probe for the Firefox OPFS kill-during-publish stall (#26). Branch-only: runs on
-# pushes to ci/c1-opfs-probe (or by dispatch); no other workflow triggers on this branch. It repeats
-# the spec on hosted Firefox and keeps every attempt's diagnostics (the failure record names the
+# pushes to ci/c1-opfs-probe (or by dispatch); no other workflow triggers on this branch. Round 2:
+# three parallel runs of the whole Firefox library suite (the spec alone passed 20/20) keeping
+# every attempt's diagnostics (the failure record names the
 # iteration, phase, stage, the verifier's last steps, the locks before termination and the handle
 # probe after it) and traces.
 name: C1 OPFS probe
@@ -18,12 +19,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  firefox-kill-publish:
-    name: Firefox kill during publish x20
+  firefox-library:
+    name: Firefox full library (repeat ${{ matrix.repeat }})
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 75
     env:
       NODE_OPTIONS: --max-old-space-size=4096
+    strategy:
+      fail-fast: false
+      matrix:
+        repeat: [1, 2, 3]
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/install
@@ -42,16 +47,13 @@ jobs:
         if: steps.browser.outputs.cache-hit != 'true'
       - name: Install browser system dependencies
         run: npx playwright install-deps firefox
-      - name: Build core
-        run: npx tsc -b packages/core --force
-      - name: Repeat the kill-during-publish spec on Firefox
+      # The whole Firefox library suite, where the stall was seen: every spec beside the kill test,
+      # on CI's two workers, no retries, traces kept for every failure.
+      - name: Full Firefox library suite
         id: probe
         run: >-
-          npx playwright test --config playwright.library.config.ts
-          packages/core/browser-tests/next-storage.spec.ts --project firefox
-          -g "survives a worker killed in every phase of publishing"
-          --repeat-each 20 --retries 0 --workers 2 --trace retain-on-failure
-          --reporter list,json
+          npm run test:browser:library -- --project firefox --retries 0
+          --trace retain-on-failure --reporter list,json
         env:
           MINNOW_BROWSER: firefox
           PLAYWRIGHT_JSON_OUTPUT_NAME: probe-report.json
@@ -59,7 +61,7 @@ jobs:
         if: always() && (steps.probe.outcome == 'success' || steps.probe.outcome == 'failure')
         uses: actions/upload-artifact@v7
         with:
-          name: c1-opfs-probe
+          name: c1-opfs-probe-library-${{ matrix.repeat }}
           path: |
             probe-report.json
             playwright-report/
