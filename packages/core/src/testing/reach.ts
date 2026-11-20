@@ -11948,3 +11948,36 @@ export const UTF8_DURABILITY_REACH = [
   "BOM catalog and payload",
   "zero retained",
 ] as const;
+
+/** Flat TEXT batches intern keys in one loop and grow exactly as the per-row route. */
+export const FLAT_BYTE_BATCH_REACH = [
+  "nonzero offset base",
+  "ordinary frozen lookup",
+  "partial selection",
+  "hash collision",
+  "pinned competitor",
+  "second batch",
+  "NULL then flat",
+  "dictionary then flat",
+  "independent backing",
+  "reversed selection",
+  "duplicates",
+  "unique growth",
+  "unaligned view",
+  "UUID36",
+  "hash boundary",
+  "zero charges",
+] as const;
+
+/** Native flat byte grouping retains exact PG results after a denied growth spills. */
+export const FLAT_BYTE_PG_REACH = [
+  "PG exact",
+  "pinned 8 MiB",
+  "spill",
+  "later pass",
+  "selection",
+  "NULL",
+  "non-NULL flat",
+  "UUID36 width",
+  "zero state and spill",
+] as const;

@@ -2075,6 +2075,10 @@ shipped-engine or stored-format change.
   tuple for several keys: direct-mapped (the value ids bit-packed into a slot of a table of at
   most 2^16) while the columns' value counts fit, hashed column by column past that. SQL GROUP BY equality: NULLs together, −0 = 0, NaN = NaN, NUMERIC by
   value.
+- A non-NULL flat text key column is interned in one loop per batch with the source's
+  DataView made once; keys of 16 to 64 bytes hash through it with the same XXH32, and byte
+  equality still resolves collisions. Storage grows on each new key exactly as the per-row
+  route grows it, so batch peaks are unchanged; the batch's complete growth is admitted first.
 - One int2/int4/date key whose range spans no more slots than the hash table would hold (twice
   its slots, at most 2^22 values) is direct-mapped instead: slot `key − base`, no hashing or
   probing, half the bytes. A key past the span widens it; a range too wide goes back to hashing;
