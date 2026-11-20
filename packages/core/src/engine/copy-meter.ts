@@ -1,7 +1,7 @@
 /**
  * Optional metering of syntax-tree copies, for the private 1.0 rebuild's admitted trigger
- * preparation (next/owner/native-command.ts). The released engine never installs a meter, so its
- * parse and compile do exactly what they did before; every hook below returns at once.
+ * preparation (next/owner/native-command.ts). The released engine never installs a meter; every
+ * hook below returns at once for it, and its parse and compile give the same results.
  *
  * While a meter is installed (synchronously, around one parse/compile/lowering call), each copy
  * helper charges the node it is about to copy before allocating the copy: `cloneTreeValue` per

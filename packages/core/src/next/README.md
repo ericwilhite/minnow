@@ -5114,36 +5114,47 @@ The internal ordinary owner dispatches qualified INSERT/UPDATE/DELETE commands t
 and row-rule funding stay separate. Graph I/O and leases retire before rules and credit.
 There is no public override, package-entry change or default-engine switch.
 
-Preparation is metered under a growing reservation and never waits while holding preparation.
-Each table rule set and trigger body is charged a base share, linear in stored text
-(`owner/native-preparation-bound.ts`: SQL tokens and characters, bindings, and the columns,
-stored DEFAULT/generated text and keys of each table the text names), before it is built. The
-copies of one source subtree that the shared parser, optimizer and lowering are known to make are
-charged as they happen: the private-rebuild copy meter (`engine/copy-meter.ts`) is installed only around native
-preparation, and the copy helpers (`cloneTreeValue`, the expression copy sites such as simple
-CASE operands, BETWEEN, row predicates, statistical aggregates, alias and merged-column
-references and grouping sets, repeated DEFAULT cells and per-join column lists in lowering)
-charge each node before copying it. Passes that used to copy every descendant's list again at
-each ancestor (top-level name resolution, correlated references) or re-type every subtree at
-each node (integer typing) now run in linear time. The released engine installs no meter, so its parse and compile are unchanged.
-When a charge does not fit, the attempt is abandoned: every attempt object and charge is
-released, and the reservation is admitted again from nothing at max(known need, min(2 x
-previous, cap)). A reservation the cap cannot grant beside the writer is reduced to the largest
-that fits, so only a known need above it is a typed 53200. Setup, rule and parameter
-workspaces, sized from the built preparation, take the same path. Attempts are at most
-ceil(log2(cap / first reservation)) + 1. A cached root plan learns its measured need, not the
-padding of the reservation that found it, so a later execution admits exactly that need in one
-attempt. Parameters are sized for every execution, in their own admission before the first
-attempt, because a reused plan can receive values of a different size (a NUMERIC beyond int64).
-Wide ROLLUP and CUBE charge every grouping-set array and every lowered reference to their
-columns before building them, and each grouping set's member block charges the parts it shares.
-The factor that covers a copy's lowered IR (`COPY_IR_FACTOR`, 8) is empirical: generated bodies
-retain at most about 0.6 of their charge. Three checks back this: the retained plan graph against
-the charge over generated bodies; heap growth after a wide ROLLUP's lowering aborts on its
-budget; and a scaling test that lowers every grammar shape at N and 4N and requires array volume
-and heap growth to scale no faster than the charge. None of them traces every transient
-allocation, closure or WeakMap entry, so a new kind of copy is caught when it changes scaling or
-retained size, not by construction.
+Preparation is metered under a growing reservation and never waits while holding preparation. Each
+table rule set and trigger body is charged a base share, linear in stored text
+(`owner/native-preparation-bound.ts`: SQL tokens and characters, bindings, and the columns, stored
+DEFAULT/generated text and keys of each table the text names), before it is built. The copies of one
+source subtree that the shared parser, optimizer and lowering are known to make are charged as they
+happen: the private-rebuild copy meter (`engine/copy-meter.ts`) is installed only around native
+preparation, and the copy helpers (`cloneTreeValue`, the expression copy sites such as simple CASE
+operands, BETWEEN, row predicates, statistical aggregates, alias and merged-column references and
+grouping sets, repeated DEFAULT cells and per-join column lists in lowering) charge each node before
+copying it. Passes that copied every descendant's list again at each ancestor (top-level name
+resolution, correlated references), re-typed every subtree at each node (integer typing, and
+datetime typing, which every subtraction asks of both operands), or scanned every conjunct for every
+unit and step of inner-join ordering now do work linear in the shapes the scaling test below lowers
+(join ordering: in the conjuncts that touch each unit). The released engine installs no meter; it
+shares these passes, so its compile gives the same results with less work. When a charge does not
+fit, the attempt is abandoned: every attempt object and charge is released, and the reservation is
+admitted again from nothing at max(known need, min(2 x previous, cap)). A reservation the cap cannot
+grant beside the writer is reduced to the largest that fits, so only a known need above it is a
+typed 53200. Setup, rule and parameter workspaces, sized from the built preparation, take the same
+path. Attempts are at most ceil(log2(cap / first reservation)) + 1. A cached root plan learns its
+measured need, not the padding of the reservation that found it, so a later execution admits exactly
+that need in one attempt. Parameters are sized for every execution, in their own admission before
+the first attempt, because a reused plan can receive values of a different size (a NUMERIC beyond
+int64). Wide ROLLUP and CUBE charge every grouping-set array and every lowered reference to their
+columns before building them, and each grouping set's member block charges the parts it shares. The
+factor that covers a copy's lowered IR (`COPY_IR_FACTOR`, 8) is empirical: generated bodies retain
+at most about 0.6 of their charge. Three checks back this: the retained plan graph against the
+charge over generated bodies; heap growth after a wide ROLLUP's lowering aborts on its budget; and a
+scaling test (`testing/native-preparation-scaling.test.ts`) that lowers each shape it lists at N and
+8N: operator chains over int, numeric, text, boolean, comparison, date, timestamp and interval
+operands, date differences, nesting, CASE arms, IN and row IN lists, inner and USING join chains,
+grouping sets, DEFAULT rows and correlated subqueries. Array-builtin volume, and the bytes each JS
+function allocates (garbage included, sampled by V8's heap profiler, builtins counted in their
+caller), must grow no faster than the faster-growing part of the charge. Its limits: a shape it does
+not list is not judged; a join chain's metered charge is itself quadratic (each join lists its
+inputs' columns), so sites in join shapes are judged at quadratic order and an uncharged quadratic
+site there passes (a cubic one fails); a site allocating under 16 KiB at N is judged against 16 KiB;
+and it measures the interpreter and baseline tiers (TurboFan and Maglev are off while it samples, at
+fixed intervals), so the measure repeats exactly but does not see what optimized code would
+allocate. None of these checks proves that every allocation is charged, so a new kind of copy is
+caught when it changes scaling or retained size, not by construction.
 
 The same funded/SQL histories run at 32 MiB with `MINNOW_TRIGGER_CAP_MIB=32` and at
 64 MiB by default. They compare PostgreSQL BEFORE/AFTER name order, RI and nested bodies,

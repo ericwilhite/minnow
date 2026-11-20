@@ -4694,12 +4694,24 @@ function someNestedBlock(block: CompiledQuery, test: (nested: CompiledQuery) => 
  * answer only ever widens once the catalog is known.
  */
 /**
- * Per-pass memo for `integerTypedExpression` while `annotateIntegerDivision` runs. That pass
- * types every node bottom-up; without the memo each node re-types its whole subtree, which is
- * quadratic in an operator chain. Keyed by the column resolver, so a subquery block's own scope
+ * Per-pass memo for `integerTypedExpression` and `datetimeTypeKind` while
+ * `annotateIntegerDivision` runs. That pass types every node bottom-up; without the memo each
+ * node re-types its whole subtree, which is quadratic in an operator chain. Keyed by the column resolver, so a subquery block's own scope
  * never shares answers with its parent. Cleared when the outermost pass returns.
  */
-let integerMemo: WeakMap<object, WeakMap<Expression, boolean>> | null = null;
+let typingMemo: WeakMap<object, WeakMap<Expression, unknown>> | null = null;
+
+/** One answer of `compute` per expression and resolver while the pass memo is active (integer
+ * typing, and `datetimeTypeKind`, which every subtraction asks of both operands). */
+function memoizedType<T>(resolver: object, expression: Expression, compute: () => T): T {
+  if (typingMemo === null) return compute();
+  let memo = typingMemo.get(resolver);
+  if (memo === undefined) typingMemo.set(resolver, (memo = new WeakMap()));
+  if (memo.has(expression)) return memo.get(expression) as T;
+  const answer = compute();
+  memo.set(expression, answer);
+  return answer;
+}
 
 export function integerTypedExpression(
   expression: Expression,
@@ -4708,27 +4720,15 @@ export function integerTypedExpression(
   columnDatetime: (reference: string) => DatetimeTypeKind | undefined = () => undefined,
   tableDatetimes?: (table: string) => DatetimeColumns | undefined,
 ): boolean {
-  if (integerMemo === null)
-    return integerTypedExpressionOnce(
+  return memoizedType(columnInteger, expression, () =>
+    integerTypedExpressionOnce(
       expression,
       columnInteger,
       tableIntegerColumns,
       columnDatetime,
       tableDatetimes,
-    );
-  let memo = integerMemo.get(columnInteger);
-  if (memo === undefined) integerMemo.set(columnInteger, (memo = new WeakMap()));
-  const known = memo.get(expression);
-  if (known !== undefined) return known;
-  const answer = integerTypedExpressionOnce(
-    expression,
-    columnInteger,
-    tableIntegerColumns,
-    columnDatetime,
-    tableDatetimes,
+    ),
   );
-  memo.set(expression, answer);
-  return answer;
 }
 
 function integerTypedExpressionOnce(
@@ -4934,7 +4934,7 @@ export function annotateIntegerDivision(
   columnDatetime: (reference: string) => DatetimeTypeKind | undefined = () => undefined,
   tableDatetimes?: (table: string) => DatetimeColumns | undefined,
 ): void {
-  if (integerMemo !== null)
+  if (typingMemo !== null)
     return annotateIntegerDivisionOnce(
       expression,
       columnInteger,
@@ -4942,7 +4942,7 @@ export function annotateIntegerDivision(
       columnDatetime,
       tableDatetimes,
     );
-  integerMemo = new WeakMap();
+  typingMemo = new WeakMap();
   try {
     annotateIntegerDivisionOnce(
       expression,
@@ -4952,7 +4952,7 @@ export function annotateIntegerDivision(
       tableDatetimes,
     );
   } finally {
-    integerMemo = null;
+    typingMemo = null;
   }
 }
 
@@ -5292,6 +5292,14 @@ function unifiedDatetimeKind(
 export function datetimeTypeKind(
   expression: Expression,
   column: (reference: string) => DatetimeTypeKind | undefined = () => undefined,
+  tables?: (table: string) => DatetimeColumns | undefined,
+): DatetimeTypeKind | undefined {
+  return memoizedType(column, expression, () => datetimeTypeKindOnce(expression, column, tables));
+}
+
+function datetimeTypeKindOnce(
+  expression: Expression,
+  column: (reference: string) => DatetimeTypeKind | undefined,
   tables?: (table: string) => DatetimeColumns | undefined,
 ): DatetimeTypeKind | undefined {
   const kind = (candidate: Expression): DatetimeTypeKind | undefined =>

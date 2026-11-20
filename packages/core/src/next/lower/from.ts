@@ -156,8 +156,10 @@ function sourcesOf(expr: ScalarExpr): Set<number> {
   return new Set([...columnsIn(expr)].map(sourceOf));
 }
 
-const subset = (a: ReadonlySet<number>, b: ReadonlySet<number>) =>
-  [...a].every((item) => b.has(item));
+const subset = (a: ReadonlySet<number>, b: ReadonlySet<number>): boolean => {
+  for (const item of a) if (!b.has(item)) return false;
+  return true;
+};
 
 function conjunctsOf(typed: Typed): Typed[] {
   if (typed.expr.op !== "and") return [typed];
@@ -1134,10 +1136,10 @@ const DEFAULT_NUM_DISTINCT = 200;
  */
 function distinctOf(
   expr: ScalarExpr,
-  units: readonly Unit[],
+  unitCovering: (sources: ReadonlySet<number>) => Unit | undefined,
   entries: readonly Entry[],
 ): { readonly distinct: number; readonly known: boolean } {
-  const unit = units.find((candidate) => subset(sourcesOf(expr), candidate.sources));
+  const unit = unitCovering(sourcesOf(expr));
   const rows = unit?.rows ?? DEFAULT_TABLE_ROWS;
   const fallback = { distinct: Math.min(rows, DEFAULT_NUM_DISTINCT), known: false };
   if (expr.op !== "column") return fallback;
@@ -1169,29 +1171,41 @@ function orderInner(
   builder: PlanBuilder,
   entries: readonly Entry[],
 ): Unit {
-  const applyCovered = (unit: Unit): Unit => {
-    const covered = pool.filter(
-      (conjunct) =>
-        !conjunct.used && conjunct.sources.size > 0 && subset(conjunct.sources, unit.sources),
-    );
-    for (const conjunct of covered) conjunct.used = true;
-    return filterUnit(
-      unit,
-      covered.map((conjunct) => conjunct.typed),
-      builder,
-    );
-  };
   if (units.length === 0) throw new PlanningError("empty FROM", "XX000");
-  const ready = units.map(applyCovered);
+  // Units read disjoint sources, so each source names at most one unit. Conjuncts are matched to
+  // units through this map, never by scanning the pool per unit or per step (quadratic in a chain).
+  const unitOfSource = new Map<number, number>();
+  units.forEach((unit, index) => {
+    for (const source of unit.sources) unitOfSource.set(source, index);
+  });
+  /** The one unit reading every source in `sources` (the first unit for none), if any. */
+  const unitIndexCovering = (sources: ReadonlySet<number>): number | undefined => {
+    let found: number | undefined;
+    for (const source of sources) {
+      const unit = unitOfSource.get(source);
+      if (unit === undefined || (found !== undefined && unit !== found)) return undefined;
+      found = unit;
+    }
+    return found ?? 0;
+  };
+  // A conjunct whose sources one unit covers filters that unit, in pool order.
+  const coveredBy: Typed[][] = units.map(() => []);
+  for (const conjunct of pool) {
+    if (conjunct.used || conjunct.sources.size === 0) continue;
+    const unit = unitIndexCovering(conjunct.sources);
+    if (unit === undefined) continue;
+    conjunct.used = true;
+    at(coveredBy, unit).push(conjunct.typed);
+  }
+  const ready = units.map((unit, index) => filterUnit(unit, at(coveredBy, index), builder));
   if (ready.length === 1) return at(ready, 0);
   // Join order and build sides come from the estimates.
   builder.dependsOnStatistics();
   const n = ready.length;
-  // Every open conjunct is planned by the units it reads (indices into `ready`), computed once.
-  const unitOfSource = new Map<number, number>();
-  ready.forEach((unit, index) => {
-    for (const source of unit.sources) unitOfSource.set(source, index);
-  });
+  const unitCovering = (sources: ReadonlySet<number>): Unit | undefined => {
+    const index = unitIndexCovering(sources);
+    return index === undefined ? undefined : at(ready, index);
+  };
   /** The units covering `sources`, or null when one is outside this group (never applies). */
   const unitsOf = (sources: ReadonlySet<number>): number[] | null => {
     const units = new Set<number>();
@@ -1204,18 +1218,27 @@ function orderInner(
   };
   const planned: PlannedConjunct[] = [];
   const keys: PlannedKey[] = [];
-  for (const conjunct of pool) {
+  // The open conjuncts over this group's units, by pool position, and those mentioning each unit:
+  // a step checks only the conjuncts of the unit it joins.
+  const open: Array<{ readonly conjunct: Conjunct; readonly position: number; units: number[] }> =
+    [];
+  const openAt: number[][] = Array.from({ length: n }, () => []);
+  for (const [position, conjunct] of pool.entries()) {
     if (conjunct.used) continue;
     const units = unitsOf(conjunct.sources);
     if (units === null) continue;
+    if (units.length > 0) {
+      for (const unit of units) at(openAt, unit).push(open.length);
+      open.push({ conjunct, position, units });
+    }
     const expr = conjunct.typed.expr;
     const equality = expr.op === "compare" && expr.cmp === "=";
     planned.push({
       units,
       selectivity: equality
         ? equalitySelectivity(
-            distinctOf(expr.left, ready, entries),
-            distinctOf(expr.right, ready, entries),
+            distinctOf(expr.left, unitCovering, entries),
+            distinctOf(expr.right, unitCovering, entries),
           )
         : 1 / 3,
     });
@@ -1231,15 +1254,21 @@ function orderInner(
       : greedyOrder(ready, planned, keys, builder.costs);
   const [first, ...rest] = steps;
   let acc = at(ready, first?.unit ?? 0);
+  const joined = new Uint8Array(n);
+  joined[first?.unit ?? 0] = 1;
   for (const step of rest) {
     const unit = at(ready, step.unit);
-    const sources = new Set([...acc.sources, ...unit.sources]);
-    const covered = pool.filter(
-      (conjunct) =>
-        !conjunct.used && conjunct.sources.size > 0 && subset(conjunct.sources, sources),
-    );
-    for (const conjunct of covered) conjunct.used = true;
-    const conditions = covered.map((conjunct) => conjunct.typed);
+    joined[step.unit] = 1;
+    // Newly covered: open conjuncts of this unit whose units are now all joined, in pool order.
+    const covered: Array<{ readonly conjunct: Conjunct; readonly position: number }> = [];
+    for (const id of at(openAt, step.unit)) {
+      const item = at(open, id);
+      if (item.conjunct.used || !item.units.every((other) => joined[other] === 1)) continue;
+      item.conjunct.used = true;
+      covered.push(item);
+    }
+    covered.sort((a, b) => a.position - b.position);
+    const conditions = covered.map((item) => item.conjunct.typed);
     // The smaller estimate is the build side (IR `right`).
     acc =
       unit.rows <= acc.rows
@@ -1359,7 +1388,8 @@ function exhaustiveOrder(
 /**
  * A left-deep order of any number of units, greedily: start from the smallest, then repeatedly
  * join the cheapest connected unit (a cross product only when nothing connects). Row estimates
- * are kept incrementally, so the order costs O(n² × conjuncts) with no limit on n.
+ * are kept incrementally, and each candidate reads only the conjuncts and keys that mention it,
+ * so a step costs O(n + conjuncts touching the open units) and allocates nothing per candidate.
  */
 function greedyOrder(
   ready: readonly Unit[],
@@ -1369,9 +1399,24 @@ function greedyOrder(
 ): JoinStep[] {
   const n = ready.length;
   const placed = new Uint8Array(n);
-  const isPlaced = (unit: number) => placed[unit] === 1;
-  const within = (units: readonly number[], extra: number) =>
-    units.every((unit) => unit === extra || isPlaced(unit));
+  /** Whether every unit in `units` is placed or is `extra`. */
+  const within = (units: readonly number[], extra: number): boolean => {
+    for (const unit of units) if (unit !== extra && placed[unit] !== 1) return false;
+    return true;
+  };
+  /** Whether every unit in `units` is `index`. */
+  const alone = (units: readonly number[], index: number): boolean => {
+    for (const unit of units) if (unit !== index) return false;
+    return true;
+  };
+  // The conjuncts and keys mentioning each unit, in their original order (so selectivities
+  // multiply in the same order as a scan of all of them would).
+  const conjunctsAt: PlannedConjunct[][] = Array.from({ length: n }, () => []);
+  for (const conjunct of planned)
+    for (const unit of new Set(conjunct.units)) at(conjunctsAt, unit).push(conjunct);
+  const keysAt: PlannedKey[][] = Array.from({ length: n }, () => []);
+  for (const key of keys)
+    for (const unit of new Set([...key.left, ...key.right])) at(keysAt, unit).push(key);
   const start = ready.reduce(
     (min, unit, index) => (unit.rows < at(ready, min).rows ? index : min),
     0,
@@ -1387,17 +1432,20 @@ function greedyOrder(
     let choiceCost = Infinity;
     let choiceRows = 0;
     for (let index = 0; index < n; index += 1) {
-      if (isPlaced(index)) continue;
-      const alone = (units: readonly number[]) => units.every((unit) => unit === index);
-      const keyed = keys.some(
-        (key) =>
-          (key.left.every(isPlaced) && alone(key.right)) ||
-          (key.right.every(isPlaced) && alone(key.left)),
-      );
+      if (placed[index] === 1) continue;
+      // A key whose one side is all placed and other side is only `index` mentions `index`.
+      let keyed = false;
+      for (const key of at(keysAt, index))
+        if (
+          (within(key.left, -1) && alone(key.right, index)) ||
+          (within(key.right, -1) && alone(key.left, index))
+        ) {
+          keyed = true;
+          break;
+        }
       let out = rows * at(ready, index).rows;
-      for (const conjunct of planned)
-        if (conjunct.units.includes(index) && within(conjunct.units, index))
-          out *= conjunct.selectivity;
+      for (const conjunct of at(conjunctsAt, index))
+        if (within(conjunct.units, index)) out *= conjunct.selectivity;
       out = Math.max(1, out);
       const cost =
         stepCost(rows, at(ready, index).rows, out, keyed, costs) +

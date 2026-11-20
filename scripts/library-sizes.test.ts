@@ -53,7 +53,7 @@ describe("compressed download budgets", () => {
     // Native display-label provenance: 573,743 combined gzip bytes (+75 versus a249070e).
     // The client is byte-identical; only shared engine/query.js grows (186 raw bytes).
     // Raise once by 256 bytes; the audit finds no native/test input or new module.
-    // Copy-meter hooks: 574,458 combined gzip bytes (worker 561,064 + client 13,394).
+    // Copy-meter hooks and linear typing: 574,475 combined gzip bytes.
     // Raise once by 768 bytes; client/private-input isolation budgets stay unchanged.
     expect(
       worker.totalGzipBytes + client.totalGzipBytes,
