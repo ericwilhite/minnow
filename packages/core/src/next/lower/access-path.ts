@@ -78,6 +78,16 @@ interface Facts {
   readonly upper: Map<number, Bound>;
 }
 
+/**
+ * Whether a comparison under `collation` is byte comparison, the only order and equality the
+ * index keys encode (C8). This is exactly the executor's accepted set (exec/kernels/compare.ts
+ * `checkComparable`, exec/kernels/compile.ts IN): a predicate under any other collation stays
+ * in place, so the index never consumes it and the executor reports its typed refusal.
+ */
+function byteCollation(collation: string | null): boolean {
+  return collation === null || collation === "C" || collation === "default";
+}
+
 function factsOf(conjuncts: readonly Typed[]): Facts {
   const facts: Facts = {
     nonNull: new Set(),
@@ -95,6 +105,7 @@ function factsOf(conjuncts: readonly Typed[]): Facts {
       if (expr.list.length > 0) facts.nonNull.add(position);
       if (
         expr.list.length > 0 &&
+        byteCollation(expr.collation) &&
         expr.list.every((item) => isKey(item) && sameBaseKind(item, expr.arg))
       )
         if (!facts.lists.has(position))
@@ -113,13 +124,13 @@ function factsOf(conjuncts: readonly Typed[]): Facts {
           : [null, null, null];
     if (columnSide === null) continue;
     if (!sameBaseKind(columnSide, keySide)) continue;
+    // Byte equality and order are index equality and order only under a byte collation (C8).
+    if (!byteCollation(expr.collation)) continue;
     const position = columnSide.index;
     if (cmp === "=") {
       if (!facts.equal.has(position)) facts.equal.set(position, { key: keySide, conjunct: index });
       continue;
     }
-    // Byte order is index order only under the default collation (C8).
-    if (expr.collation !== null && expr.collation !== "C") continue;
     if (cmp === ">" || cmp === ">=") {
       if (!facts.lower.has(position))
         facts.lower.set(position, { key: keySide, inclusive: cmp === ">=", conjunct: index });

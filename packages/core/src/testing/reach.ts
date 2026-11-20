@@ -11453,6 +11453,36 @@ export const QUERY_INDEX_NULLABLE_REACH = [
 ] as const;
 
 /** Pure IN-key casts are ready before probing, including LIMIT and DML source rules. */
+/** Index keys serve only byte-collation predicates; others keep the executor's typed refusal. */
+export const QUERY_INDEX_COLLATION_REACH = [
+  "forced scan",
+  "index route considered",
+  "index served",
+  "byte collation index",
+  "matching key",
+  "no matching key",
+  "non-byte collation refused",
+  "no COLLATE",
+  "C",
+  "default",
+  "POSIX",
+  "ucs_basic",
+  "und-x-icu",
+  "composite equality prefix",
+  "IN list",
+  "collated key side",
+  "collated column side",
+  "unique",
+  "primary",
+  "composite",
+  "select",
+  "update",
+  "memory",
+  "stored",
+  "reopen",
+  "zero ownership",
+] as const;
+
 export const QUERY_INDEX_COERCION_REACH = [
   "cast first",
   "cast later",

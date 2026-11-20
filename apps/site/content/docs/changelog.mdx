@@ -252,6 +252,9 @@ rows; modifications and partial probes retain spillable locator sorting. Serial 
 reuse cursor workspace after each input closes. Invalid constant key casts are checked
 before the first probe, even with LIMIT. Composite-prefix reads use scans
 when nullable suffix columns prevent the index from covering every matching row.
+Index keys serve equality, IN and composite equality prefixes only under byte collations
+(none, `C` or `default`); a predicate under another collation stays a filter and keeps the
+executor's typed 0A000 refusal, as a scan does.
 Reads use the pinned statement
 snapshot; statement errors roll back earlier rows. Unique and foreign-key checks use the
 existing write path. Uniqueness is checked at statement end: a later NOT NULL or CHECK
