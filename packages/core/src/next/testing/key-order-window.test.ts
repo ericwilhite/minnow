@@ -8,7 +8,8 @@ import fc from "fast-check";
 import { afterAll, beforeAll, expect, it, vi } from "vitest";
 import { createReach, KEY_ORDER_WINDOW_REACH } from "../../testing/reach.js";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
-import { WINDOW_SIZING_LABEL } from "../exec/key-order.js";
+import { WINDOW_SIZING_LABEL, windowSegments } from "../exec/key-order.js";
+import { packLocator } from "../vector/locator.js";
 import { MetadataReader } from "../format/metadata-reader.js";
 import { Governor } from "../memory/governor.js";
 import { ViewIndex } from "../write/view.js";
@@ -359,4 +360,35 @@ it("reads the pinned snapshot when a writer commits between sizing and execution
   );
   // A later query sees the commit, still exactly PostgreSQL's rows.
   await run(sql);
+});
+
+it("charges the window's segment list until sizing releases it (review repro)", async () => {
+  // 2048 locators in 2048 distinct segments: the list is as large as its bound.
+  const governor = new Governor(16 << 20);
+  const rows = 2048;
+  let served = 0;
+  const plan = {
+    minimumBytes: 4096,
+    open: () => ({
+      skip: (count: number) => count,
+      next(out: Float64Array) {
+        const n = Math.min(out.length, rows - served);
+        for (let k = 0; k < n; k++) out[k] = packLocator(rows - 1 - (served + k), 0);
+        served += n;
+        return n;
+      },
+      close() {
+        // Nothing pending.
+      },
+    }),
+  };
+  const window = await windowSegments(plan, 0, rows, governor, new AbortController().signal);
+  expect(window.segments.length).toBe(rows);
+  expect(Array.from(window.segments.subarray(0, 3))).toEqual([0, 1, 2]);
+  // The list is charged (4 bytes a locator) while sizing may still read it; the scratch is not.
+  expect(governor.usedBytes).toBeGreaterThanOrEqual(rows * Uint32Array.BYTES_PER_ELEMENT);
+  expect(governor.usedBytes).toBeLessThan(rows * Float64Array.BYTES_PER_ELEMENT);
+  window.release();
+  window.release();
+  expect(governor.usedBytes).toBe(0);
 });

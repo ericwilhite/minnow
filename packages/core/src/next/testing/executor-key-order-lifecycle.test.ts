@@ -10,10 +10,21 @@ import { oracleRows } from "./differential-adapter.js";
 import { createExecutor } from "../exec/create.js";
 import { WINDOW_SIZING_LABEL } from "../exec/key-order.js";
 
-it.each(["index", "skip", "fetch", "frame", "publish"] as const)(
-  "settles ordered-index %s before releasing query resources",
-  async (phase) => {
-    const reach = createReach("key-order lifecycle", [phase]);
+// Index and skip I/O are gated in each cursor role: a sized window opens a sizing cursor, then
+// the execution cursor, and each must close at once on cancel and settle before release.
+it.each([
+  ["index", "sizing"],
+  ["index", "execution"],
+  ["skip", "sizing"],
+  ["skip", "execution"],
+  ["fetch", null],
+  ["frame", null],
+  ["publish", null],
+] as const)(
+  "settles ordered-index %s (gated cursor: %s) before releasing query resources",
+  async (phase, gatedRole) => {
+    const label = gatedRole === null ? phase : `${phase}:${gatedRole}`;
+    const reach = createReach("key-order lifecycle", [label]);
     reach.beginHistory();
     const core = await new StorageCore(8192).open(),
       governor = new Governor(64 << 20);
@@ -96,7 +107,7 @@ it.each(["index", "skip", "fetch", "frame", "publish"] as const)(
                       return {
                         skip: async (count) => {
                           const n = await cursor.skip(count);
-                          if (phase === "skip") {
+                          if (phase === "skip" && role === gatedRole) {
                             gated ??= role;
                             await gate();
                           }
@@ -104,7 +115,7 @@ it.each(["index", "skip", "fetch", "frame", "publish"] as const)(
                         },
                         next: async (out) => {
                           const n = await cursor.next(out);
-                          if (phase === "index") {
+                          if (phase === "index" && role === gatedRole) {
                             gated ??= role;
                             await gate();
                           }
@@ -223,14 +234,19 @@ it.each(["index", "skip", "fetch", "frame", "publish"] as const)(
         }
         const result = await Promise.allSettled([execution.executed, execution.delivered]);
         expect(result.every((r) => r.status === "rejected")).toBe(true);
-        if (phase === "index" || phase === "skip") {
+        if (gatedRole === "sizing") {
           // Cancelled inside the sizing pass: its cursor closed on abort, its memory was held
           // until the gated index call settled, and no execution cursor ever opened.
           expect(gated).toBe("sizing");
           expect([sizingOpens, executionOpens, closes]).toEqual([1, 0, 1]);
-        } else expect([sizingOpens, executionOpens, closes]).toEqual([1, 1, 2]);
+        } else {
+          // Sizing finished and closed; the execution cursor was cancelled (with a pending index
+          // call when it is the gated role) and closed at once.
+          if (gatedRole === "execution") expect(gated).toBe("execution");
+          expect([sizingOpens, executionOpens, closes]).toEqual([1, 1, 2]);
+        }
       }
-      reach.reach(phase);
+      reach.reach(label);
       reach.assertReached();
       expect(core.spill.bytesInUse).toBe(0);
       expect(governor.usedBytes).toBe(0);

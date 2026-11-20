@@ -97,11 +97,11 @@ export interface ReadSource {
   /** Optional exact int32 address certificate for a complete, unfiltered source. */
   readonly domainColumn?: number;
   /**
-   * The only segments (indexes into the pinned table's segments) the source can read: a
-   * locator window's segments. Others are neither read nor sized. The bound is exact for
+   * The only segments (indexes into the pinned table's segments, ascending and distinct) the
+   * source can read: a locator window's segments. Others are neither read nor sized. The bound is exact for
    * those segments only, so the caller must read no other segment of the same pinned view.
    */
-  readonly segments?: ReadonlySet<number>;
+  readonly segments?: Uint32Array;
 }
 export interface ReadBound {
   readonly batchRows?: 1;
@@ -247,10 +247,14 @@ export function boundSource(
     const single = source.singleValueBound === true;
     if (single && source.columns.length !== 1)
       throw new TypeError("Single-value sizing needs one column");
+    let listed = 0;
     for (const [index, segment] of table.segments.entries()) {
       signal.throwIfAborted();
       if (remaining === 0) break;
-      if (source.segments !== undefined && !source.segments.has(index)) continue;
+      if (source.segments !== undefined) {
+        while (listed < source.segments.length && (source.segments[listed] ?? 0) < index) listed++;
+        if (source.segments[listed] !== index) continue;
+      }
       if (segment.rowCount === 0) continue;
       // LIMIT counts live rows. A sparse/deleted group may reach any stored position,
       // including its last page, before it produces the requested live prefix.

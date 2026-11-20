@@ -4684,26 +4684,32 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                 ),
               )
             : undefined;
-        const payload = yield* readValue(
-          boundSource(
-            runtime.sourceView(),
-            {
-              id: project.id,
-              tableId: scan.tableId,
-              columns: shape.columns,
-              types: shape.types,
-              windowBytes: 0,
-              stagingBytes: memoryScanBufferBytes(shape.types),
-              rows: null,
-              ...(window === undefined ? {} : { segments: window }),
-            },
-            runtime.request.governor,
-            runtime.signal,
-            targetBytes,
-            BATCH_ROWS,
-            runtime.metadataCaches(),
-          ),
-        );
+        // The window's segment list keeps its charge until this sizing finishes.
+        let payload: ReadBound;
+        try {
+          payload = yield* readValue(
+            boundSource(
+              runtime.sourceView(),
+              {
+                id: project.id,
+                tableId: scan.tableId,
+                columns: shape.columns,
+                types: shape.types,
+                windowBytes: 0,
+                stagingBytes: memoryScanBufferBytes(shape.types),
+                rows: null,
+                ...(window === undefined ? {} : { segments: window.segments }),
+              },
+              runtime.request.governor,
+              runtime.signal,
+              targetBytes,
+              BATCH_ROWS,
+              runtime.metadataCaches(),
+            ),
+          );
+        } finally {
+          window?.release();
+        }
         const read: AdmittedIndexRead = {
           plan: range,
           cursor: cursorIdentity,
