@@ -1,14 +1,13 @@
-/** Cursor/fetch admission remains diagnostic-only until it shares the complete query minimum. */
+/** Native cursors compile through the complete query minimum with every key-order option. */
 import fc from "fast-check";
 import { expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach } from "../../testing/reach.js";
 import type { PhysicalPlan, Rel } from "../ir/ir.js";
 import { createExecutor } from "./create.js";
-import { UnsupportedPlanError } from "../errors.js";
 
 it.each(seedsFor("next-index-range-gate", [0xe133, 0xe134]))(
-  "requires the same explicit diagnostic opt-in for SQL and IR (seed %i)",
+  "compiles native query cursors without diagnostic opt-in (seed %i)",
   (seed) => {
     const reach = createReach("index range gate", [
       "unset",
@@ -57,13 +56,7 @@ it.each(seedsFor("next-index-range-gate", [0xe133, 0xe134]))(
           ["unset", {}],
           ["false", { keyOrder: false }],
         ] as const) {
-          try {
-            createExecutor(options).prepare(plan);
-            throw new Error("diagnostic cursor was admitted");
-          } catch (error) {
-            expect(error).toBeInstanceOf(UnsupportedPlanError);
-            expect((error as UnsupportedPlanError).construct).toBe("indexRange");
-          }
+          expect(() => createExecutor(options).prepare(plan)).not.toThrow();
           reach.reach(name);
         }
         expect(() => createExecutor({ keyOrder: true }).prepare(plan)).not.toThrow();

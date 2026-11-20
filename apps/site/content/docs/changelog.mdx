@@ -311,9 +311,18 @@ uses bounded call arity. A repeated affected target rolls back the statement; as
 arbiter or primary-key columns are refused as in the shipped engine. Proposed rows are
 validated before arbitration: a conflicting DO NOTHING row with a NOT NULL violation is
 rejected, matching PostgreSQL (the shipped engine currently skips that check).
-Single-source index inputs retain original row locators and suppress repeated probe matches.
-Cursors beneath join or set-operation inputs retain the internal diagnostic opt-in until
-their complete admission is proved. Reads use the statement
+Native index inputs retain original row locators and suppress repeated probe matches.
+Point, IN-list and range queries, including indexed inputs beneath joins, filters, projections,
+sorts and LIMIT, share complete query admission without a diagnostic option. Large IN lists
+stream key materialization and use a bounded, spillable bitmap to suppress duplicate query
+rows; modifications and partial probes retain spillable locator sorting. Serial join inputs
+reuse cursor workspace after each input closes. Invalid constant key casts are checked
+before the first probe, even with LIMIT. Composite-prefix reads use scans
+when nullable suffix columns prevent the index from covering every matching row.
+Index keys serve equality, IN and composite equality prefixes only under byte collations
+(none, `C` or `default`); a predicate under another collation stays a filter and keeps the
+executor's typed 0A000 refusal, as a scan does.
+Reads use the pinned statement
 snapshot; statement errors roll back earlier rows. Unique and foreign-key checks use the
 existing write path. Uniqueness is checked at statement end: a later NOT NULL or CHECK
 failure wins over an earlier duplicate key, unlike PostgreSQL. For example, an existing

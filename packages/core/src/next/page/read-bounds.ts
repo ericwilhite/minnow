@@ -79,6 +79,9 @@ function run<T>(
 export interface ReadSource {
   /** Pressure-only unfiltered scan step. The executor enforces this row bound. */
   readonly batchRows?: 1;
+  /** A physical locator is selected before decoding, with no pushed predicates.
+   * At most one data page per column is live, rather than a whole scan interval. */
+  readonly selectedRow?: true;
   /** Also measure the largest cell of one selected key column, without a batch sum. */
   readonly singleValueBound?: boolean;
   /** Explicit terminal export: sizing misses must not pollute the shared cache. */
@@ -428,8 +431,9 @@ export function boundSource(
           const stored = root.value.columns
             .filter((column) => source.columns.includes(column.columnId))
             .reduce((sum, column) => sum + column.data.length, 0);
-          const span =
-            windowBytes === 0
+          const span = source.selectedRow
+            ? Math.max(1, rows)
+            : windowBytes === 0
               ? BATCH_ROWS
               : Math.max(
                   BATCH_ROWS,
@@ -515,6 +519,9 @@ export function boundSource(
                   );
                 io = Math.max(io, Math.min(MAX_READ_BYTES, dictionary.length));
               }
+              let selectedHeld = 0,
+                selectedEncoded = 0,
+                selectedValues = 0;
               for (const [index, page] of reader.directory.pages.entries()) {
                 if (page.firstRow >= rows) break;
                 const encoded = page.length;
@@ -560,8 +567,13 @@ export function boundSource(
                 }
                 if (!page.largeRegion && !singleVarlen) valueBytes = Math.max(valueBytes, raw);
                 for (let w = first; w <= last; w++) {
-                  held[w] = (held[w] ?? 0) + encoded + raw + lane + 1024;
-                  encodedBytes[w] = (encodedBytes[w] ?? 0) + encoded;
+                  if (source.selectedRow) {
+                    selectedHeld = Math.max(selectedHeld, encoded + raw + lane + 1024);
+                    selectedEncoded = Math.max(selectedEncoded, encoded);
+                  } else {
+                    held[w] = (held[w] ?? 0) + encoded + raw + lane + 1024;
+                    encodedBytes[w] = (encodedBytes[w] ?? 0) + encoded;
+                  }
                   if (page.largeRegion) {
                     const from = Math.max(w * span, page.firstRow),
                       to = Math.min(rows, (w + 1) * span, page.firstRow + page.rowCount);
@@ -578,7 +590,8 @@ export function boundSource(
                         }
                       }
                     } else large = reader.largeValueBytes(from, to);
-                    values[w] = (values[w] ?? 0) + large;
+                    if (source.selectedRow) selectedValues = Math.max(selectedValues, large);
+                    else values[w] = (values[w] ?? 0) + large;
                     largestValue = Math.max(largestValue, large);
                     if (single) {
                       for (let row = from; row < to; row++) {
@@ -597,6 +610,11 @@ export function boundSource(
                   const pause = pauseIfDue(task);
                   if (pause) yield pause;
                 }
+              }
+              if (source.selectedRow) {
+                held[0] = (held[0] ?? 0) + selectedHeld;
+                encodedBytes[0] = (encodedBytes[0] ?? 0) + selectedEncoded;
+                values[0] = (values[0] ?? 0) + selectedValues;
               }
               reader.close();
               readers.pop();
