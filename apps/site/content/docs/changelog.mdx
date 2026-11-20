@@ -10,6 +10,12 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The unexported 1.0 rebuild's inner joins skip gathering build-side columns that no consumer reads, when a projection sits directly over the join and the join has no residual condition. Results are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.
+
+The unexported 1.0 rebuild again sizes ordinary scans of small retained tables from their row count, as page-consuming scans already did, after a merge lost the change for ordinary scans. Results are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.
+
+The unexported 1.0 rebuild bounds the work of its short-key join dispatch and hashes short TEXT keys through an extraction-local view over the buffers it already holds. Results are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.
+
 The unexported 1.0 rebuild's streaming star join keeps each source's native read demand: it passes each prefix of the last dimension's matches through the ordinary aggregate before reading more input, so errors keep their PostgreSQL order. Results and errors are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.
 
 The unexported 1.0 rebuild groups by a non-NULL text column in one loop per batch. Results and memory use are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.
@@ -51,8 +57,11 @@ its statement-end work (the full-text publication step) in its last native step,
 root's bytes, so ending never waits while the root holds credit; the governor serves growth from an owner that holds credit it cannot release (a
 native root's retained base, the writer inside a native step) before queued new admissions, so
 such an owner never waits behind a request only its own release could serve; an admission that
-could be served only by releasing an owner's lifetime holdings is refused with 53200 at once
-instead of waiting; that step is
+could be served only by releasing an owner's lifetime holdings (including what the write engine
+keeps until close: its cache slabs, permanent storage and resident metadata) is refused with 53200
+at once instead of waiting; an idle writer flushes unflushed rows when another request needs their
+memory, and a statement or transaction ending wakes requests waiting for the writer's idle
+memory; that step is
 reserved only when
 a full-text index or pending full-text state exists. A trigger body's query sizes its batches
 from what its root can afford beside the writer. These changes keep the qualified SQL histories

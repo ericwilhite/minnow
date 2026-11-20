@@ -4,12 +4,15 @@
  * concurrently and hold nothing while they wait. Laws: every request is eventually served (the
  * stall guard turns a stuck wait into a failure), nothing at or below the cap is refused, the cap
  * is never exceeded, and a holder's growth never waits behind a new admission that only its own
- * release could serve. */
+ * release could serve. Order is checked at the governor's grant points (`observeGrants`, reported
+ * synchronously), not through promise resolution, which lags the grant: no new admission is
+ * granted while a holder, loan or read request is queued, no holder while a loan or read is, and
+ * no synchronous fast path while anything is. */
 import fc from "fast-check";
 import { expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach, GOVERNOR_HOLDER_PRIORITY_REACH } from "../../testing/reach.js";
-import { Governor, type Grant } from "./governor.js";
+import { Governor, type Grant, type GrantEvent } from "./governor.js";
 
 const KIB = 1024;
 const pause = (turns: number) =>
@@ -69,7 +72,9 @@ for (const seed of seedsFor("next-governor-holder-priority", [50101, 50102]))
             reach.beginHistory();
             const governor = new Governor(capMib << 20),
               ordinary = governor.capBytes - governor.reserveBytes,
-              events: Event[] = [];
+              events: Event[] = [],
+              grants: GrantEvent[] = [];
+            governor.observeGrants((event) => grants.push(event));
             let clock = 0,
               peak = 0;
             const tick = () => ++clock;
@@ -177,6 +182,25 @@ for (const seed of seedsFor("next-governor-holder-priority", [50101, 50102]))
             expect(peak).toBeLessThanOrEqual(governor.capBytes);
             expect(governor.usedBytes).toBe(0);
             expect(events.every((event) => event.served !== null)).toBe(true);
+            // The serving order, at the moment of each grant.
+            for (const grant of grants) {
+              const { loans, reads, holders, admissions } = grant.queued;
+              const ahead =
+                grant.source === "loan"
+                  ? 0
+                  : grant.source === "read"
+                    ? loans
+                    : grant.source === "holder"
+                      ? loans + reads
+                      : grant.source === "admission"
+                        ? loans + reads + holders
+                        : loans + reads + holders + admissions;
+              expect(ahead, `${grant.source} "${grant.label}" granted past a queued request`).toBe(
+                0,
+              );
+              if (grant.source === "holder" && admissions > 0)
+                reach.reach("holder granted while a new admission waits");
+            }
             // A holder queued after a still-waiting new admission was served before it.
             for (const holder of events.filter((event) => event.kind === "holder"))
               for (const earlier of events)

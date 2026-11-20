@@ -343,6 +343,21 @@ class GrantImpl implements Grant {
 
 /** The reference governor: rules 1–8. */
 /** One holder in a stall report: the grants of one label, summed. */
+/** One grant, reported synchronously at the moment the governor makes it (`observeGrants`). */
+export interface GrantEvent {
+  readonly label: string;
+  /** The queue it was served from, or the synchronous fast path that granted it. */
+  readonly source: "loan" | "read" | "holder" | "admission" | "tryAdmit" | "grow" | "charge";
+  readonly bytes: number;
+  /** Requests still queued in each class at that moment, this one excluded. */
+  readonly queued: {
+    readonly loans: number;
+    readonly reads: number;
+    readonly holders: number;
+    readonly admissions: number;
+  };
+}
+
 export interface StallHolder {
   readonly label: string;
   readonly held: number;
@@ -397,6 +412,32 @@ export class Governor implements MemoryGovernor {
    * window would also be reported.
    */
   static stallAfterMs: number | null = null;
+  readonly #grantObservers = new Set<(event: GrantEvent) => void>();
+
+  /** Reports every grant synchronously, with the queues as they stand at that moment, so a
+   * suite checks the serving order itself rather than promise resolution, which lags the grant
+   * (GOVERNOR-WAIT-POLICY). For tests and diagnostics; returns the unsubscription. */
+  observeGrants(observer: (event: GrantEvent) => void): () => void {
+    this.#grantObservers.add(observer);
+    return () => this.#grantObservers.delete(observer);
+  }
+
+  #observeGrant(label: string, source: GrantEvent["source"], bytes: number): void {
+    if (this.#grantObservers.size === 0) return;
+    const event: GrantEvent = {
+      label,
+      source,
+      bytes,
+      queued: {
+        loans: this.#loans.length,
+        reads: this.#reads.length,
+        holders: this.#holders.length,
+        admissions: this.#admissions.length,
+      },
+    };
+    for (const observer of this.#grantObservers) observer(event);
+  }
+
   readonly capBytes: number;
   readonly reserveBytes: number;
   usedBytes = 0;
@@ -421,8 +462,11 @@ export class Governor implements MemoryGovernor {
     return total;
   }
 
-  /** The most a request may ever be granted while the permanent holdings persist. */
-  #usable(includesProgress: boolean): number {
+  /** The most one request may ever be granted while the registered lifetime holdings persist:
+   * the cap (with `includesProgress`) or `cap - reserve`, less every registered permanent
+   * holding (GOVERNOR-WAIT-POLICY). A request above it is refused with 53200 at once; one at or
+   * below it is served once the holder chains ahead of it finish. */
+  usableCapacity(includesProgress = false): number {
     return (
       (includesProgress ? this.capBytes : this.capBytes - this.reserveBytes) - this.permanentBytes
     );
@@ -432,7 +476,7 @@ export class Governor implements MemoryGovernor {
   #refuseUnservable(): void {
     for (const queue of [this.#holders, this.#admissions])
       for (const request of [...queue]) {
-        const usable = this.#usable(request.includesProgress);
+        const usable = this.usableCapacity(request.includesProgress);
         if (request.bytes > usable)
           this.#reject(
             queue,
@@ -538,6 +582,7 @@ export class Governor implements MemoryGovernor {
     if (!this.#room(bytes, false)) return false;
     this.#take(bytes);
     grant.held += bytes;
+    this.#observeGrant(grant.label, "grow", bytes);
     return true;
   }
 
@@ -812,6 +857,17 @@ export class Governor implements MemoryGovernor {
         grant.loan = wanted;
         grant.loanPending = false;
       }
+      this.#observeGrant(
+        request.label,
+        loan
+          ? "loan"
+          : queue === this.#reads
+            ? "read"
+            : queue === this.#holders
+              ? "holder"
+              : "admission",
+        wanted,
+      );
       request.resolve(grant);
     }
   }
@@ -929,8 +985,12 @@ export class Governor implements MemoryGovernor {
   }
 
   async admit(options: AdmitOptions): Promise<Grant> {
-    if (options.minimumBytes > this.#usable(false))
-      throw new MemoryAdmissionError(options.label, options.minimumBytes, this.#usable(false));
+    if (options.minimumBytes > this.usableCapacity(false))
+      throw new MemoryAdmissionError(
+        options.label,
+        options.minimumBytes,
+        this.usableCapacity(false),
+      );
     return this.#enqueue(
       options.holdsCredit === true ? this.#holders : this.#admissions,
       {
@@ -964,7 +1024,7 @@ export class Governor implements MemoryGovernor {
     }
     signal?.throwIfAborted();
     // The cap less every registered permanent holding: above it, this can never be served.
-    const capacity = this.#usable(includesProgress === true);
+    const capacity = this.usableCapacity(includesProgress === true);
     if (total > capacity) throw new MemoryAdmissionError(label, total, capacity);
     const pool = options.idleCredit;
     if (pool !== undefined) {
@@ -1057,6 +1117,7 @@ export class Governor implements MemoryGovernor {
       return null;
     if (!this.#room(options.minimumBytes, false)) return null;
     this.#take(options.minimumBytes);
+    this.#observeGrant(options.label, "tryAdmit", options.minimumBytes);
     const grant = new GrantImpl(this, options.label, options.spillable);
     this.#grants.add(grant);
     grant.held += options.minimumBytes;
@@ -1104,6 +1165,7 @@ export class Governor implements MemoryGovernor {
           return false;
         if (this.#missing(bytes, false) > 0) return false;
         this.#take(bytes);
+        this.#observeGrant("cache", "charge", bytes);
         return true;
       },
       release: (bytes: number): void => {

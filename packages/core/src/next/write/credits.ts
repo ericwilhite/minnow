@@ -672,7 +672,11 @@ export class WriteCredits {
     } finally {
       this.#mergeFloor = 0;
       // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- #takeMerge installs the active grant across its await.
-      if (this.#mergeActive === null) this.#mergeMetadataFunding = 0;
+      if (this.#mergeActive === null) {
+        this.#mergeMetadataFunding = 0;
+        // A cancelled or failed preparation ends the merge step: its forecast may be retired.
+        this.#changed?.();
+      }
     }
   }
 

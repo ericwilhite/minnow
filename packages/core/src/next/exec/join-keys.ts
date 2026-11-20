@@ -34,7 +34,7 @@
  * Extraction reads flat, constant and dictionary vectors, writes caller-owned scratch, and
  * allocates nothing per row.
  */
-import { XxHash32Stream, xxHash32 } from "../hash/xxhash32.js";
+import { XxHash32Stream, xxHash32, xxHash32View } from "../hash/xxhash32.js";
 import { KeyBatch, encodeKeyBatch, type KeyColumn } from "../keys/key-encoding.js";
 import type { PhysicalType } from "../types.js";
 import type { ByteCharge } from "../vector/varlen.js";
@@ -421,6 +421,9 @@ export function extractKeys(
     const flat = flatOf(vector);
     const data = flat.data as { bytes: Uint8Array; offsets: Int32Array };
     out.rawData = data;
+    const view = hash
+      ? new DataView(data.bytes.buffer, data.bytes.byteOffset, data.bytes.byteLength)
+      : undefined;
     const slots = out.slots;
     // A dictionary (or constant) repeats slots: each distinct one is hashed once.
     const shared = vector.form !== "flat";
@@ -442,7 +445,7 @@ export function extractKeys(
         out.hashes2[k] = out.hashes2[seenAt?.get(slot) ?? 0] ?? 0;
         continue;
       }
-      hashInto(out, k, data.bytes, data.offsets[slot] ?? 0, data.offsets[slot + 1] ?? 0);
+      hashInto(out, k, data.bytes, data.offsets[slot] ?? 0, data.offsets[slot + 1] ?? 0, view);
       seen?.set(slot, hashes[k] ?? 0);
       seenAt?.set(slot, k);
     }
@@ -613,8 +616,19 @@ export const LONG_KEY_BYTES = 64;
 export const HASH_SEED2 = 0x6a09_e667;
 
 /** Both hashes of one key, at once (the synchronous paths; the key fits a step). */
-function hashInto(out: KeyScratch, k: number, bytes: Uint8Array, start: number, end: number): void {
-  out.hashes[k] = xxHash32(bytes, HASH_SEED, start, end);
+function hashInto(
+  out: KeyScratch,
+  k: number,
+  bytes: Uint8Array,
+  start: number,
+  end: number,
+  view?: DataView,
+): void {
+  const length = end - start;
+  out.hashes[k] =
+    view !== undefined && length >= 16 && length <= LONG_KEY_BYTES
+      ? xxHash32View(view, HASH_SEED, start, end)
+      : xxHash32(bytes, HASH_SEED, start, end);
   out.hashes2[k] = end - start > LONG_KEY_BYTES ? xxHash32(bytes, HASH_SEED2, start, end) : 0;
 }
 
@@ -721,7 +735,7 @@ export function* equalJob(
 }
 
 /**
- * `extractKeys` as a sliced job: the bytes family's hashing goes through `hashKeyJob` (every
+ * `extractKeys` as a sliced job: bounded short keys hash inline; long keys use `hashKeyJob` (every
  * byte counted, long keys streamed) and repeated dictionary slots are hashed once per `memo`
  * (a caller's per-batch cache: slot → [h1, h2]); the words family is extracted at once.
  */
@@ -749,6 +763,9 @@ export function* extractKeysJob(
     out.count = done;
   } else done = extractKeys(keys, ids, from, count, out, false);
   const pair = new Uint32Array(2);
+  const raw = layout.family === "raw" ? out.rawData?.bytes : undefined;
+  const view =
+    raw === undefined ? undefined : new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
   const strict = ~layout.nullSafeMask;
   for (let k = 0; k < done; k++) {
     let bytes: Uint8Array;
@@ -772,7 +789,14 @@ export function* extractKeysJob(
       bytes = data.bytes;
       start = data.offsets[slot] ?? 0;
       end = data.offsets[slot + 1] ?? 0;
-      yield* hashKeyJob(bytes, start, end, work, slice, pair);
+      if (end - start <= LONG_KEY_BYTES) {
+        pair[0] =
+          view !== undefined && end - start >= 16
+            ? xxHash32View(view, HASH_SEED, start, end)
+            : xxHash32(bytes, HASH_SEED, start, end);
+        pair[1] = 0;
+        if (work.spend(end - start, slice)) yield;
+      } else yield* hashKeyJob(bytes, start, end, work, slice, pair);
       out.hashes[k] = pair[0] ?? 0;
       out.hashes2[k] = pair[1] ?? 0;
       if (out.rawShared) memo?.set(slot, [pair[0] ?? 0, pair[1] ?? 0]);
@@ -783,7 +807,11 @@ export function* extractKeysJob(
     bytes = encoded.writer.bytes;
     start = encoded.offsets[k] ?? 0;
     end = encoded.offsets[k + 1] ?? 0;
-    yield* hashKeyJob(bytes, start, end, work, slice, pair);
+    if (end - start <= LONG_KEY_BYTES) {
+      pair[0] = xxHash32(bytes, HASH_SEED, start, end);
+      pair[1] = 0;
+      if (work.spend(end - start, slice)) yield;
+    } else yield* hashKeyJob(bytes, start, end, work, slice, pair);
     out.hashes[k] = pair[0] ?? 0;
     out.hashes2[k] = pair[1] ?? 0;
   }
@@ -892,4 +920,20 @@ export function bytesEqual(
   if (aEnd - aStart !== bEnd - bStart) return false;
   for (let i = 0; i < aEnd - aStart; i++) if (a[aStart + i] !== b[bStart + i]) return false;
   return true;
+}
+
+/**
+ * Compare at most LONG_KEY_BYTES without a nested generator. Callers prove equal
+ * lengths and fund the same KeyWork before acting on this result. A mismatch returns
+ * minus its inspected byte count; equality returns length (including zero).
+ */
+export function shortKeyCompare(
+  a: Uint8Array,
+  as: number,
+  b: Uint8Array,
+  bs: number,
+  length: number,
+): number {
+  for (let i = 0; i < length; i++) if (a[as + i] !== b[bs + i]) return -(i + 1);
+  return length;
 }
