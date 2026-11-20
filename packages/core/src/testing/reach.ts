@@ -11550,6 +11550,14 @@ export const WRITE_LIVE_GROWTH_REACH = [
   "zero final charge",
 ] as const;
 
+export const WRITE_OWNER_HOLDINGS_REACH = [
+  "scratch-control holdings",
+  "storage-floor holdings",
+  "exactly the cap admitted",
+  "one byte over the cap refused",
+  "zero final charge",
+] as const;
+
 export const WRITE_RETAINED_MERGE_REACH = [
   "required metadata retained",
   "merge alone fills the cap",

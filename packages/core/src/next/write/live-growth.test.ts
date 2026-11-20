@@ -12,6 +12,7 @@ import { seedsFor } from "../../testing/seeds.js";
 import {
   createReach,
   WRITE_LIVE_GROWTH_REACH,
+  WRITE_OWNER_HOLDINGS_REACH,
   WRITE_RETAINED_MERGE_REACH,
 } from "../../testing/reach.js";
 import { Governor, MemoryAdmissionError, type Grant } from "../memory/governor.js";
@@ -239,6 +240,92 @@ for (const seed of seedsFor("next-write-retained-merge", [47303, 47304]))
           [8, 2, 14],
           [16, 4, 12],
           [32, 1, 15],
+        ],
+        endOnFailure: true,
+      },
+    );
+    reach.assertReached();
+  });
+
+for (const seed of seedsFor("next-write-owner-holdings", [47307, 47308]))
+  it(`counts permanent owner holdings at the exact cap boundary (seed ${String(seed)})`, async () => {
+    const reach = createReach("owner holdings boundary", WRITE_OWNER_HOLDINGS_REACH);
+    await fc.assert(
+      fc.asyncProperty(
+        fc.constantFrom(8, 16, 32),
+        fc.integer({ min: 1, max: 4 }),
+        // Permanent holdings: the 20 KiB scratch-control grant, or larger storage floors.
+        fc.constantFrom(20 * KiB, MiB / 4, MiB),
+        fc.constantFrom(0, 1),
+        async (capMiB, retainedSixteenths, holdingsBytes, over) => {
+          reach.beginHistory();
+          const governor = new Governor(capMiB * MiB);
+          const holdings = await governor.admit({
+            label: "owner scratch control",
+            minimumBytes: holdingsBytes,
+            spillable: false,
+          });
+          const credits = await WriteCredits.open(governor, {
+            rows: 0,
+            metadata: 0,
+            commits: 0,
+            merge: 0,
+          });
+          credits.bindOwnerHoldings(() => holdings.held);
+          const retained = (governor.capBytes * retainedSixteenths) / 16;
+          // Write-account inputs plus the merge equal the cap minus the holdings, plus `over`.
+          const bytes = governor.capBytes - retained - holdingsBytes + over;
+          let merge: Grant | undefined;
+          try {
+            await credits.prepareMetadata(retained);
+            expect(credits.metadata.allocate(retained)).toBe(true);
+            credits.retireMetadataHeadroom(0);
+            reach.reach(
+              holdingsBytes === 20 * KiB ? "scratch-control holdings" : "storage-floor holdings",
+            );
+            const settled = credits.acquireMerge("merge beside owner holdings", bytes).then(
+              (grant) => ({ grant }),
+              (error: unknown) => ({ error }),
+            );
+            let outcome: { grant: Grant } | { error: unknown } | undefined;
+            void settled.then((value) => (outcome = value));
+            for (let turn = 0; turn < 64 && outcome === undefined; turn++) await yieldTask();
+            expect(outcome, "a merge at the cap boundary must not wait").toBeDefined();
+            if (over === 1) {
+              expect(outcome && "error" in outcome && outcome.error).toBeInstanceOf(
+                MemoryAdmissionError,
+              );
+              expect((outcome as { error: MemoryAdmissionError }).error.sqlState).toBe("53200");
+              reach.reach("one byte over the cap refused");
+            } else {
+              expect(outcome && "grant" in outcome).toBe(true);
+              merge = (outcome as { grant: Grant }).grant;
+              expect(merge.allocate(bytes)).toBe(true);
+              expect(governor.usedBytes).toBe(governor.capBytes);
+              reach.reach("exactly the cap admitted");
+            }
+            expect(governor.peakBytes).toBeLessThanOrEqual(governor.capBytes);
+          } finally {
+            if (merge) {
+              merge.free(merge.allocated);
+              credits.releaseMerge(merge);
+            }
+            credits.metadata.free(credits.metadata.allocated);
+            credits.close();
+            holdings.close();
+          }
+          expect(governor.usedBytes).toBe(0);
+          reach.reach("zero final charge");
+        },
+      ),
+      {
+        seed,
+        numRuns: 24,
+        examples: [
+          [8, 2, 20 * KiB, 0],
+          [8, 2, 20 * KiB, 1],
+          [16, 4, MiB, 1],
+          [32, 1, MiB / 4, 0],
         ],
         endOnFailure: true,
       },

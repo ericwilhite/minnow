@@ -130,6 +130,19 @@ export class WriteCredits {
 
   #workingMinimum: () => Partial<WriteMinimum> = () => ({});
   #relief: (() => MaybePromise<void>) | null = null;
+  #ownerHoldings: () => number = () => 0;
+
+  /** Permanent native-owner holdings outside these four accounts (non-evictable storage,
+   * scratch control): held for as long as this owner works, so every complete step's
+   * feasibility includes them. Independently releasable query memory is not one of them. */
+  bindOwnerHoldings(holdings: () => number): void {
+    this.#ownerHoldings = holdings;
+  }
+
+  /** The bound permanent owner holdings, now (observation). */
+  get ownerHoldingsBytes(): number {
+    return this.#ownerHoldings();
+  }
 
   /** The owner's spill/unwind of dependent live state (rows it could write out or rebuild).
    * Growth calls it before it would wait, so a waiting owner never keeps live state another
@@ -490,7 +503,9 @@ export class WriteCredits {
       // this step. Above capacity the wait could never be served; refuse it (53200).
       // Loan-backed bytes come from the shared reserve, as in the governor's own room check.
       const complete =
-        desired.reduce((sum, bytes) => sum + bytes, 0) + (this.#mergeActive?.held ?? 0);
+        desired.reduce((sum, bytes) => sum + bytes, 0) +
+        (this.#mergeActive?.held ?? 0) +
+        this.#ownerHoldings();
       const loaned =
         accounts.reduce((sum, account) => sum + account.loaned, 0) +
         (this.#mergeActive?.loaned ?? 0);

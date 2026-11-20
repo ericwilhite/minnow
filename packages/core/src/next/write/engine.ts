@@ -908,6 +908,13 @@ export class WritePathImpl implements WritePath, EngineHooks {
         : credits.reclaimRows();
     };
     grant.onReclaimRequest(reclaimWriter);
+    // Non-evictable storage and owner-registered permanent grants (scratch control) are
+    // held while this engine works: they belong to every growth step's complete minimum.
+    credits.bindOwnerHoldings(() =>
+      engine === null
+        ? FIXED_CACHE_BYTES + input.space.stats.retainedBytes
+        : engine.#mandatoryOwnerBytes(),
+    );
     // Before any growth wait: pooled arenas are live but dependent (rebuilt on demand), so
     // they are released rather than kept through the wait. Memtable rows, cached run
     // readers and in-flight buffers remain required inputs counted in the complete minimum.
@@ -2181,6 +2188,21 @@ export class WritePathImpl implements WritePath, EngineHooks {
       })
       .catch(() => undefined);
     return run;
+  }
+
+  readonly #ownerHoldings = new Set<() => number>();
+
+  /** The owner registers a permanent grant it keeps beside this engine (scratch control).
+   * Returns the unregistration, for when the owner closes that grant. */
+  retainOwnerHoldings(bytes: () => number): () => void {
+    this.#ownerHoldings.add(bytes);
+    return () => this.#ownerHoldings.delete(bytes);
+  }
+
+  #mandatoryOwnerBytes(): number {
+    let total = FIXED_CACHE_BYTES + this.#space.stats.retainedBytes;
+    for (const bytes of this.#ownerHoldings) total += bytes();
+    return total;
   }
 
   /** Non-evictable storage accounts are part of the same compound native owner.

@@ -8,6 +8,7 @@ import { expect, it, onTestFinished, vi } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach, WRITE_RETAINED_MERGE_ENGINE_REACH } from "../../testing/reach.js";
 import { Governor } from "../memory/governor.js";
+import { FIXED_CACHE_BYTES } from "../storage/page-cache.js";
 import { yieldTask } from "../task.js";
 import { WriteCredits } from "../write/credits.js";
 import {
@@ -37,6 +38,7 @@ for (const seed of seedsFor("next-write-retained-merge-engine", [47305, 47306]))
             merges: { mode: "manual", fanIn: 2 },
           });
           Object.defineProperty(h, "governor", { value: new Governor(capMiB * MiB) });
+          let holdingsAtMerge = 0;
           let retainedAtMerge = -1,
             stepAtMerge = 0,
             requested = 0;
@@ -46,6 +48,7 @@ for (const seed of seedsFor("next-write-retained-merge-engine", [47305, 47306]))
             .spyOn(WriteCredits.prototype, "acquireMerge")
             .mockImplementation(function (this: WriteCredits, label, bytes) {
               retainedAtMerge = this.retainedBytes;
+              holdingsAtMerge = this.ownerHoldingsBytes;
               // An intrinsically large merge whose own deficit (its bytes plus the next
               // metadata step) fits the whole cap, while the deficit plus the readers and
               // other live bytes it keeps does not. Growth surrenders the prepaid metadata step before it waits and asks for it
@@ -94,6 +97,8 @@ for (const seed of seedsFor("next-write-retained-merge-engine", [47305, 47306]))
             expect(state.complete, "an unservable merge must not wait").toBe(true);
             await pending;
             expect(retainedAtMerge, "merge readers retained at admission").toBeGreaterThan(0);
+            // The non-evictable storage floor is part of the merge's complete minimum.
+            expect(holdingsAtMerge).toBeGreaterThan(FIXED_CACHE_BYTES);
             reach.reach("merge readers retained at admission");
             expect(path.failure).toBeNull();
             if (mode === "oversized") {

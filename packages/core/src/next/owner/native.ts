@@ -80,6 +80,8 @@ export async function openNativeOwnerEngine(
     });
     startup.release(startup.held - startup.allocated - startup.loaned);
     path = await opening;
+    // The owner's scratch control stays beside every write path it opens.
+    path.retainOwnerHoldings(() => spillCredit.held);
     engine?.installWritePath(path);
     return path;
   };
