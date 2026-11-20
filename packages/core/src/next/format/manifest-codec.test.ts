@@ -215,6 +215,7 @@ const groupRoot: fc.Arbitrary<GroupRoot> = extents
                 directory: blobIn(pool),
                 statistics,
                 distinctSketch: fc.option(blobIn(pool), { nil: null }),
+                aggregateSummary: fc.option(blobIn(pool), { nil: null }),
               }),
             ),
           ),
@@ -634,6 +635,7 @@ describe("manifest codec rules", () => {
         directory: ref(owner, columnId * 100 + 50, 20),
         statistics: { nullCount: 0, min: 1n, max: 2n, dictionarySize: null },
         distinctSketch: null,
+        aggregateSummary: null,
       })),
     };
     const parsed = decodeGroupRoot(encodeGroupRoot(root), tracked()).value;
@@ -661,6 +663,7 @@ describe("manifest codec rules", () => {
           dictionarySize: 1,
         },
         distinctSketch: ref(owner),
+        aggregateSummary: ref(owner),
       })),
     };
     expect(() => encodeGroupRoot(wide)).toThrow(RangeError);

@@ -306,7 +306,12 @@ describe("B2-1 #6 / R15.1–R15.2: chunks are written through ExtentBuilders; re
     }
     expect(defined(small).data.extent).toBe(defined(bools).data.extent); // packed together
     expect(defined(wide).data.extent).not.toBe(defined(small).data.extent);
-    expect(new Set(group.extents).size).toBe(2);
+    expect(new Set(group.columns.map((chunk) => chunk.data.extent)).size).toBe(2);
+    const summaries = group.columns.flatMap((chunk) =>
+      chunk.aggregateSummary === null ? [] : [chunk.aggregateSummary],
+    );
+    expect(new Set(summaries.map((ref) => ref.extent)).size).toBe(1);
+    expect(new Set(group.extents).size).toBe(3); // two original data extents + one A1 metadata pack
     for (const chunk of group.columns) expect((await readChunk(space, chunk)).length).toBe(20_000);
   });
 

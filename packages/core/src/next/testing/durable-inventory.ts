@@ -238,7 +238,7 @@ export const DURABLE_EMISSIONS: Readonly<
   },
   "page/writer.ts:appendTo:builder.append -> ExtentBuilder.append": {
     count: 1,
-    kinds: ["page", "pageDirectory", "largeValue", "sketch", "arrayValue"],
+    kinds: ["page", "pageDirectory", "largeValue", "sketch", "arrayValue", "groupAggregate"],
   },
   "storage/extent-list.ts:flush:delta.writer.write -> ExtentWriter.write": {
     count: 1,
@@ -375,6 +375,7 @@ export const DURABLE_REFERENCES: Readonly<Record<string, readonly string[]>> = {
   "ColumnChunk.data": ["page"],
   "ColumnChunk.directory": ["pageDirectory"],
   "ColumnChunk.distinctSketch": ["sketch"],
+  "ColumnChunk.aggregateSummary": ["groupAggregate"],
   "RunRef.keyStorage": ["runKeyPointer"],
   "RunKeyStorage.minimum": ["runKeyPointer"],
   "RunKeyStorage.maximum": ["runKeyPointer"],

@@ -89,6 +89,7 @@ function groupRoot(columns: number): GroupRoot {
       dictionarySize: columnId % 3 === 0 ? 1000 : null,
     },
     distinctSketch: blob(columnId * 20_000 + 19_400, 300),
+    aggregateSummary: null,
   }));
   return { rowCount: 65_536, rowIds: { kind: "dense" }, columns: chunks };
 }

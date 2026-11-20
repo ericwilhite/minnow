@@ -152,6 +152,7 @@ try {
         extents.add(column.data.extent);
         extents.add(column.directory.extent);
         if (column.distinctSketch !== null) extents.add(column.distinctSketch.extent);
+        if (column.aggregateSummary !== null) extents.add(column.aggregateSummary.extent);
       }
       inc("completeExtentPairs", extents.size);
       return held;
