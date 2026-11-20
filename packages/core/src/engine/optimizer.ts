@@ -1137,17 +1137,19 @@ function expressionHasCorrelatedSubquery(expression: Expression): boolean {
   return childExpressions(expression).some(expressionHasCorrelatedSubquery);
 }
 
-/** Qualified outer references used by correlated scalar subqueries inside one expression. */
-function correlatedOuterReferences(expression: Expression): string[] {
+/** Qualified outer references used by correlated scalar subqueries inside one expression, in
+ * depth-first order. One accumulator: a per-level flatMap would copy every descendant's list
+ * again at each enclosing node, quadratic in the expression depth. */
+function correlatedOuterReferences(expression: Expression, references: string[] = []): string[] {
   if (
     (expression.kind === "subquery" || expression.kind === "exists") &&
     blockReferencesOutside(expression.block)
   ) {
-    const references: string[] = [];
     collectOutsideReferences(expression.block, new Set(), references);
     return references;
   }
-  return childExpressions(expression).flatMap(correlatedOuterReferences);
+  for (const child of childExpressions(expression)) correlatedOuterReferences(child, references);
+  return references;
 }
 
 /** Replaces every supported correlated subquery leaf inside an arbitrary expression. */

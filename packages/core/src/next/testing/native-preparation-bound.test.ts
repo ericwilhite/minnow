@@ -6,6 +6,10 @@
  * generated and CHECK text, row count x DEFAULT cells x default size, every parser copy site
  * including negated forms (row NOT IN, NOT BETWEEN), nesting, grouping sets, and quoted keyword
  * identifiers (`"cube"`, `"rollup"`). A copy that bypasses the meter fails this check. */
+// eslint-disable-next-line no-restricted-imports -- Test-only GC access for the peak check.
+import { setFlagsFromString } from "node:v8";
+// eslint-disable-next-line no-restricted-imports -- Test-only GC access for the peak check.
+import { runInNewContext } from "node:vm";
 import { PGlite } from "@electric-sql/pglite";
 import fc from "fast-check";
 import { expect, it } from "vitest";
@@ -17,6 +21,8 @@ import {
   rulePreparationBound,
   ruleRetainedBytes,
   scanSql,
+  PREPARATION_TEXT_BYTES,
+  PREPARATION_TOKEN_BYTES,
 } from "../owner/native-preparation-bound.js";
 import { lowerBodyMetered } from "../owner/native-command.js";
 import { withCopyMeter, type CopyMeter } from "../../engine/copy-meter.js";
@@ -62,6 +68,8 @@ const shape = fc.record({
     "groupingSet" as const,
     "rollup" as const,
     "rowNotInLiteral" as const,
+    "rollupWide" as const,
+    "cubeWide" as const,
   ),
   operand: fc.integer({ min: 0, max: 60 }),
   arms: fc.integer({ min: 1, max: 30 }),
@@ -124,6 +132,16 @@ function copied(h: Shape): { readonly value: string | null; readonly predicate: 
       return {
         value: null,
         predicate: ` AND (note, '${"x".repeat(h.literal)}') NOT IN (${Array.from({ length: h.arms }, (_, i) => `('a${String(i)}', 'b')`).join(", ")})`,
+      };
+    case "rollupWide":
+      return {
+        value: null,
+        predicate: ` AND id IN (SELECT k FROM u WHERE w > ${x} GROUP BY ROLLUP (${Array.from({ length: h.arms }, (_, i) => (i % 2 === 0 ? "k" : "w")).join(", ")}))`,
+      };
+    case "cubeWide":
+      return {
+        value: null,
+        predicate: ` AND id IN (SELECT k FROM u WHERE w > ${x} GROUP BY CUBE (${Array.from({ length: Math.min(5, h.arms) }, (_, i) => (i % 2 === 0 ? "k" : "w")).join(", ")}))`,
       };
     case "rowNotIn":
       return { value: null, predicate: ` AND (id, ${x}) NOT IN (${items})` };
@@ -206,6 +224,8 @@ const COPY_SITES = [
   "groupingSet",
   "rollup",
   "rowNotInLiteral",
+  "rollupWide",
+  "cubeWide",
 ] as const;
 /** An unlimited meter that only sums its charges. */
 function counting(): CopyMeter & { charged: number } {
@@ -544,5 +564,50 @@ it("runs single-set grouping and quoted keyword bodies like PostgreSQL", async (
     await db.close();
     await owner.close();
     await pg.close();
+  }
+});
+
+it("charges a wide ROLLUP before building its prefixes (peak check)", async () => {
+  // Live heap at the meter's abort must not exceed what the meter charged: an allocation built
+  // before its charge shows up here even though no plan graph survives.
+  setFlagsFromString("--expose-gc");
+  const gc = runInNewContext("gc") as () => void;
+  const core = new StorageCore(256);
+  await core.open();
+  try {
+    for (const sql of [
+      "CREATE TABLE p(id INT PRIMARY KEY)",
+      "CREATE TABLE t(id INT PRIMARY KEY, note TEXT)",
+      "CREATE TABLE u(k INT PRIMARY KEY, w INT)",
+      "CREATE TRIGGER r AFTER UPDATE ON p BEGIN UPDATE t SET note = 'x' WHERE id = OLD.id; END",
+    ])
+      await core.execute(sql);
+    const columns = Array.from({ length: 2000 }, () => "k").join(", ");
+    const sql = `DELETE FROM t WHERE id IN (SELECT k FROM u GROUP BY ROLLUP (${columns}))`;
+    // The statement's own base share (its parse and linear lowering) is charged first, as native
+    // preparation charges a body's base share before lowering it.
+    const scan = scanSql(sql),
+      base = PREPARATION_TOKEN_BYTES * scan.tokens + PREPARATION_TEXT_BYTES * scan.characters,
+      budget = base + (4 << 20);
+    let charged = base;
+    const meter: CopyMeter = {
+      charge(bytes) {
+        if (charged + bytes > budget) throw new RangeError("meter budget");
+        charged += bytes;
+      },
+    };
+    gc();
+    const before = process.memoryUsage().heapUsed;
+    let live = 0;
+    try {
+      withCopyMeter(meter, () => core.lowerer.lower(sql, core.context()));
+    } catch (error) {
+      live = process.memoryUsage().heapUsed - before;
+      expect(String(error)).toMatch(/meter budget/u);
+    }
+    // The unmetered prefixes alone were about 16 MB for this body.
+    expect(live).toBeLessThanOrEqual(charged + (2 << 20));
+  } finally {
+    await core.close();
   }
 });

@@ -5114,8 +5114,16 @@ released, and the reservation is admitted again from nothing at max(known need, 
 previous, cap)). A reservation the cap cannot grant beside the writer is reduced to the largest
 that fits, so only a known need above it is a typed 53200. Setup, rule and parameter
 workspaces, sized from the built preparation, take the same path. Attempts are at most
-ceil(log2(cap / first reservation)) + 1, and the final reservation is kept per cached root
-plan, so a later execution admits it at once.
+ceil(log2(cap / first reservation)) + 1. A cached root plan learns its measured need, not the
+padding of the reservation that found it, so a later execution admits exactly that need in one
+attempt. Parameters are sized for every execution, in their own admission before the first
+attempt, because a reused plan can receive values of a different size (a NUMERIC beyond int64).
+Wide ROLLUP and CUBE charge every grouping-set array and every lowered reference to their
+columns before building them, and each grouping set's member block charges the parts it shares.
+The factor that covers a copy's lowered IR (`COPY_IR_FACTOR`, 8) is empirical: generated bodies
+retain at most about 0.6 of their charge. The checks compare the retained plan graph with the
+charge, and live heap with the charge at a meter abort; they do not trace every transient
+allocation, closure or WeakMap entry.
 
 The same funded/SQL histories run at 32 MiB with `MINNOW_TRIGGER_CAP_MIB=32` and at
 64 MiB by default. They compare PostgreSQL BEFORE/AFTER name order, RI and nested bodies,

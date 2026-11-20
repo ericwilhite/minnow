@@ -3,7 +3,14 @@ import {
   rememberIdentifierSource,
   copyIdentifierSource,
 } from "./identifier-sources.js";
-import { asLoweredCopy, asTransientCopy, chargeNode, chargeSubtree } from "./copy-meter.js";
+import {
+  asLoweredCopy,
+  asTransientCopy,
+  chargeNode,
+  chargeSlotArrays,
+  chargeSubtree,
+  copyMeterActive,
+} from "./copy-meter.js";
 import {
   rememberAlwaysIdentity,
   rememberForeignKeyActions,
@@ -3054,6 +3061,24 @@ export function clonePlanTree<T>(value: T): T {
 }
 
 /** A whole-plan pass copy (the pass returns it in place of its input). Metered at its own size. */
+/** Grouping-set arrays about to be rebuilt by a map: their slots are metered first. */
+function chargedSets<T extends ReadonlyArray<readonly unknown[]>>(sets: T): T {
+  if (copyMeterActive()) chargeSlotArrays(sets.map((set) => set.length));
+  return sets;
+}
+
+function groupingSetSlots(sets: ReadonlyArray<readonly unknown[]>): number {
+  let slots = 0;
+  for (const set of sets) slots += set.length;
+  return slots;
+}
+
+function bitCount(mask: number): number {
+  let count = 0;
+  for (let rest = mask; rest !== 0; rest &= rest - 1) count++;
+  return count;
+}
+
 export function clonePlanRoot<T>(value: T): T {
   return asTransientCopy(() => clonePlanTree(value));
 }
@@ -10808,12 +10833,25 @@ class Parser {
         throw new TypeError("CUBE supports at most 5 expressions (32 grouping sets)");
       }
       const sets: Expression[][] = [];
+      if (copyMeterActive()) {
+        chargeSlotArrays(Array.from({ length: 1 << columns.length }, (_, mask) => bitCount(mask)));
+        // Each column is lowered again in every set that keeps it: 2^(n-1) of them.
+        for (const column of columns) chargeSubtree(column, 1 << (columns.length - 1));
+      }
       for (let mask = (1 << columns.length) - 1; mask >= 0; mask -= 1) {
         sets.push(columns.filter((_, index) => (mask & (1 << index)) !== 0));
       }
       return sets;
     }
     const sets: Expression[][] = [];
+    // Every prefix is its own array: quadratic in the column count, so meter it before building.
+    if (copyMeterActive()) {
+      chargeSlotArrays(Array.from({ length: columns.length + 1 }, (_, length) => length));
+      // Each column is lowered again in every prefix that keeps it: column i in n - i of them.
+      columns.forEach((column, index) => {
+        chargeSubtree(column, columns.length - index);
+      });
+    }
     for (let length = columns.length; length >= 0; length -= 1) {
       sets.push(columns.slice(0, length));
     }
@@ -13483,6 +13521,12 @@ function desugarGroupingSets(parts: SelectBlockParts, nextSequence: () => number
     }
   }
   const signatureOf = (expression: Expression): string => encodeQueryIdentity(expression);
+  if (copyMeterActive()) {
+    chargeSlotArrays([2 * groupingSetSlots(sets)]);
+    // Every member block shares the source, joins, filters and unchanged select items by
+    // reference, and each member lowers them again into its own IR.
+    if (sets.length > 1) chargeSubtree(blockParts, sets.length - 1);
+  }
   const universe = new Set(sets.flat().map(signatureOf));
   const members = sets.map((set) => {
     const setSignatures = new Set(set.map(signatureOf));
@@ -13754,6 +13798,8 @@ function unifyGroupedReferences<
     groupingSets?: Expression[][];
   },
 >(block: T, resolve: (reference: string) => string | undefined): T {
+  if (copyMeterActive() && block.groupingSets !== undefined)
+    chargeSlotArrays([3 * (block.groupBy.length + groupingSetSlots(block.groupingSets))]);
   const groupingReferences = [...block.groupBy, ...(block.groupingSets ?? []).flat()].flatMap(
     (expression) => (expression.kind === "column" ? [expression.reference] : []),
   );
@@ -13818,7 +13864,7 @@ function unifyGroupedReferences<
     ),
     ...(block.groupingSets === undefined
       ? {}
-      : { groupingSets: block.groupingSets.map((set) => set.map(respell)) }),
+      : { groupingSets: chargedSets(block.groupingSets).map((set) => set.map(respell)) }),
   };
   return respelled > 0 ? unified : block;
 }
@@ -14080,7 +14126,7 @@ function desugarComposedFullJoin(
       })),
       ...(parts.groupingSets === undefined
         ? {}
-        : { groupingSets: parts.groupingSets.map((set) => set.map(rewrite)) }),
+        : { groupingSets: chargedSets(parts.groupingSets).map((set) => set.map(rewrite)) }),
     },
     nextSequence,
   );
@@ -14253,7 +14299,7 @@ function lowerSelectBlock(
   if (parts.groupByResolved !== true) {
     const sourceHasColumn = sourceColumnPresence([parts.base, ...parts.joins], columnsOf);
     const groupBy = resolveGroupByReferences(parts.groupBy, parts.select, sourceHasColumn);
-    const groupingSets = parts.groupingSets?.map((set) =>
+    const groupingSets = (parts.groupingSets && chargedSets(parts.groupingSets))?.map((set) =>
       resolveGroupByReferences(set, parts.select, sourceHasColumn),
     );
     if (groupBy === undefined || groupingSets?.includes(undefined) === true) {
@@ -14943,6 +14989,8 @@ export function expandNaturalJoins(
           throw new TypeError(`A NATURAL join needs known columns for: ${source.table}`);
         return own;
       };
+      // One prefix per NATURAL join: quadratic in the join count, so metered first.
+      if (copyMeterActive()) chargeSlotArrays([index + 1]);
       const preceding = sources.slice(0, index + 1);
       const shared: Array<{ left: string; name: string }> = [];
       for (const name of columnsFor(join)) {
@@ -15843,6 +15891,7 @@ function joinMergedNames(
   if (join === undefined) return [];
   if (join.using !== undefined) return join.using;
   if (join.natural !== true) return [];
+  if (copyMeterActive()) chargeSlotArrays([index]);
   const preceding = sources.slice(0, index);
   return (columnsFor(join) ?? []).filter((name) =>
     preceding.some((source) => columnsFor(source)?.includes(name) === true),
@@ -15922,6 +15971,8 @@ export function mergeJoinColumns(
       if (join.using === undefined && join.natural !== true) return;
       const names = joinMergedNames(sources, index + 1, columnsFor);
       const conditions: Expression[] | null = nativeFull ? [] : null;
+      // One prefix per merged name per join: metered before each is built.
+      if (copyMeterActive()) chargeSlotArrays(names.map(() => index + 1));
       const owners = names.map((name) => {
         const owner = sources
           .slice(0, index + 1)

@@ -20,7 +20,10 @@ export interface CopyMeter {
 /** One copied object or array: header plus a slot per field. */
 const NODE_BYTES = 64;
 const SLOT_BYTES = 8;
-/** A copied expression and the retained IR lowered from it, per source byte. */
+/** A copied expression and the retained IR lowered from it, per source byte. Empirical, not
+ * proved: calibrated by testing/native-preparation-bound.test.ts, whose generated bodies retain
+ * at most about 0.6 of their metered charge across every copy site, and which fails loudly when
+ * a site needs more. */
 export const COPY_IR_FACTOR = 8;
 
 let meter: CopyMeter | null = null;
@@ -92,6 +95,19 @@ export function chargeSubtree(value: unknown, scale = 1): void {
 export function chargeExactBytes(bytes: number): void {
   if (meter === null) return;
   meter.charge(bytes);
+}
+
+/** Charges arrays of references about to be built: one array of `outer` slots holding arrays of
+ * the given lengths (for example, grouping sets). Exact; the referenced nodes are not copied. */
+export function chargeSlotArrays(lengths: Iterable<number>): void {
+  if (meter === null) return;
+  let bytes = NODE_BYTES,
+    outer = 0;
+  for (const length of lengths) {
+    bytes += NODE_BYTES + SLOT_BYTES * length;
+    outer++;
+  }
+  meter.charge(bytes + SLOT_BYTES * outer);
 }
 
 /** The size of a tree as `chargeNode` counts it, iteratively (no recursion depth limit). */

@@ -11685,6 +11685,20 @@ export const NATIVE_PREPARATION_BOUND_REACH = [
   "copies groupingSet",
   "copies rollup",
   "copies rowNotInLiteral",
+  "copies rollupWide",
+  "copies cubeWide",
+] as const;
+
+/** Learned native preparation needs are reused exactly; concurrent statements grow safely. */
+export const NATIVE_COMMAND_REUSE_REACH = [
+  "reuse in one attempt",
+  "parameter sizing changed on reuse",
+  "two statements growing at once",
+  "reuse with memory full after admission",
+  "large NUMERIC parameter",
+  "large body",
+  "exact PG rows",
+  "zero ownership",
 ] as const;
 
 /** Native trigger preparation admits its whole bound before building and never waits holding it. */

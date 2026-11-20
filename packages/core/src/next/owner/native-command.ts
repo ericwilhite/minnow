@@ -23,7 +23,6 @@ import {
   prepareParameters,
   needsParameterSizing,
   PARAMETER_SIZING_BYTES,
-  type ParameterBinding,
 } from "../exec/parameters.js";
 import { nativeParameterMinimumBytes } from "../exec/native-parameters.js";
 import { StatementImpl } from "../write/transaction.js";
@@ -183,11 +182,27 @@ interface Prepared {
   readonly preparation: NativeRootPreparation;
   readonly fixedMetadata: number;
   readonly ruleBytes: number;
-  readonly parameters: ParameterBinding;
 }
 /** The complete initial working set last needed by a cached root plan for one catalog. Lets
  * the next execution admit it at once instead of learning it by one released attempt. */
 const learnedWants = new WeakMap<PhysicalPlan, Want>();
+/** What a plan learns from a completed preparation: its measured need, never the padding of
+ * the reservation that found it, and no parameter bytes (each execution sizes its own). */
+export function learnedEntry(prepared: {
+  readonly fixedMetadata: number;
+  readonly ruleBytes: number;
+}): Want {
+  return {
+    metadata: prepared.fixedMetadata,
+    need: prepared.fixedMetadata,
+    rules: prepared.ruleBytes,
+    parameters: 0,
+  };
+}
+/** Test view of a plan's learned preparation entry (its measured need, without padding). */
+export function learnedNativePreparation(plan: PhysicalPlan): Readonly<Want> | undefined {
+  return learnedWants.get(plan);
+}
 /** Runs a qualified ordinary-owner modification. Returns the root count and
  * invalidation reach; no child-count approximation is made. */
 export async function executeNativeCommand(
@@ -236,12 +251,31 @@ export async function executeNativeCommand(
       closure = closurePreparationBound(catalog, (plan.root as { tableId: number }).tableId);
     // The initial size is an estimate; only control and reach are a certain need, so an
     // estimate that cannot be granted falls back to them rather than refusing.
-    let want: Want = learnedWants.get(plan) ?? {
-      metadata: Math.min(governor.capBytes, base + PREPARATION_INITIAL_FACTOR * closure.bytes),
-      need: base,
-      rules: 0,
-      parameters: needsParameterSizing(plan, request.parameters) ? PARAMETER_SIZING_BYTES : 0,
-    };
+    // Parameter sizing depends on this execution's values, never on a cached plan's last run.
+    // A learned entry is the plan's measured need, without the doubling padding that found it:
+    // reuse admits exactly that, so it neither waits for nor is refused over unused padding.
+    // Size this execution's parameters first, in their own admission holding nothing, so every
+    // attempt admits their exact bytes. Sizing retains nothing once it returns.
+    if (needsParameterSizing(plan, request.parameters))
+      await paid.reserve({ parameters: PARAMETER_SIZING_BYTES }, signal);
+    const parameters = await prepareParameters(
+      plan,
+      request.parameters,
+      signal,
+      governor.capBytes,
+      paid.parameters,
+    );
+    if (paid.parameters.allocated) throw new TypeError("Parameter sizing retained credit");
+    paid.releaseAll();
+    const learned = learnedWants.get(plan);
+    let want: Want = learned
+      ? { ...learned, parameters: parameters.bytes }
+      : {
+          metadata: Math.min(governor.capBytes, base + PREPARATION_INITIAL_FACTOR * closure.bytes),
+          need: base,
+          rules: 0,
+          parameters: parameters.bytes,
+        };
     let prepared: Prepared | null = null;
     while (!prepared) {
       signal.throwIfAborted();
@@ -262,12 +296,12 @@ export async function executeNativeCommand(
           ),
           need: outcome.retry.metadata,
           rules: Math.max(want.rules, outcome.retry.rules),
-          parameters: Math.max(want.parameters, outcome.retry.parameters),
+          parameters: parameters.bytes,
         };
       } else prepared = outcome;
     }
-    learnedWants.set(plan, { ...want, need: undefined });
-    const { preparation, parameters } = prepared;
+    learnedWants.set(plan, learnedEntry(prepared));
+    const { preparation } = prepared;
     if (
       !paid.cover({
         metadata: prepared.fixedMetadata,
@@ -342,13 +376,6 @@ export async function executeNativeCommand(
         });
         let bodyCount = 0;
         for (const definition of prepared.triggers) bodyCount += definition.statements.length;
-        const parameters = await prepareParameters(
-          plan,
-          request.parameters,
-          signal,
-          governor.capBytes,
-          paid.parameters,
-        );
         // Preparation object, its arrays, one binding/trigger entry each, and the clock.
         meter.charge(containerPreparationBound(tables.length, prepared.triggers.length, bodyCount));
         const clock = clockParameter(
@@ -429,7 +456,7 @@ export async function executeNativeCommand(
             retry: { metadata: fixedMetadata, rules: ruleBytes, parameters: parameters.bytes },
           };
         }
-        return { preparation, fixedMetadata, ruleBytes, parameters };
+        return { preparation, fixedMetadata, ruleBytes };
       } catch (error) {
         release();
         // Set by the meter's closure; the aborted call may have wrapped its error, so the meter's
