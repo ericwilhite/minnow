@@ -24,15 +24,17 @@ jobs:
           cache: npm
       - run: bash scripts/ci-install.sh
       - run: npx tsc -b packages/core
-      - name: Calibrate
+      - name: Verify the committed profile, then calibrate again
         shell: bash
         run: |
           mkdir -p calibration
           node -p 'require("os").cpus()[0].model' > calibration/cpu.txt
-          npm run benchmark:gate -- ${{ env.MODE }} 2>&1 | tee calibration/gate.txt
+          set +e
+          npm run benchmark:gate 2>&1 | tee calibration/verify.txt
+          echo "${PIPESTATUS[0]}" > calibration/verify-status.txt
+          set -e
+          npm run benchmark:gate -- --update 2>&1 | tee calibration/gate.txt
           cp packages/core/perf-baseline.json calibration/perf-baseline.json
-        env:
-          MODE: --update
       - if: always()
         uses: actions/upload-artifact@v7
         with:

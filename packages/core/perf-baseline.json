@@ -481,6 +481,486 @@
           "pglite": 5.23
         }
       }
+    },
+    "linux-x64-node24-intel-xeon-6975p-c": {
+      "thresholds": {
+        "bulk-ingest": {
+          "sqlite": 6.28,
+          "pglite": 0.53
+        },
+        "count-star": {
+          "sqlite": 0.701,
+          "pglite": 0.00296
+        },
+        "filter-scan": {
+          "sqlite": 0.763,
+          "pglite": 0.231
+        },
+        "group-aggregate": {
+          "sqlite": 0.131,
+          "pglite": 0.183
+        },
+        "top-n": {
+          "sqlite": 0.316,
+          "pglite": 0.0925
+        },
+        "join-aggregate": {
+          "sqlite": 0.462,
+          "pglite": 0.363
+        },
+        "like-scan": {
+          "sqlite": 0.666,
+          "pglite": 0.231
+        },
+        "window-running": {
+          "sqlite": 1.33,
+          "pglite": 0.351
+        },
+        "distinct-aggregate": {
+          "sqlite": 0.545,
+          "pglite": 0.266
+        },
+        "point-lookup": {
+          "sqlite": 0.0018,
+          "pglite": 0.000588
+        },
+        "correlated-count-lookup": {
+          "sqlite": 0.133,
+          "pglite": 0.0421
+        },
+        "kysely-point-lookup": {
+          "sqlite": 0.00472,
+          "pglite": 0.00159
+        },
+        "exact-numeric-filter": {
+          "sqlite": 1.52,
+          "pglite": 0.214
+        },
+        "exact-point-lookup": {
+          "sqlite": 7.38,
+          "pglite": 0.0252
+        },
+        "composite-key-lookup": {
+          "sqlite": 3.56,
+          "pglite": 0.0166
+        },
+        "range-scan": {
+          "sqlite": 0.108,
+          "pglite": 0.0368
+        },
+        "sort-numeric": {
+          "sqlite": 0.446,
+          "pglite": 0.0847
+        },
+        "deep-page": {
+          "sqlite": 1.01,
+          "pglite": 0.223
+        },
+        "catalog-point-lookup": {
+          "sqlite": 0.00125,
+          "pglite": 0.000396
+        },
+        "delta-point-lookup": {
+          "sqlite": 0.00184,
+          "pglite": 0.000701
+        },
+        "delta-count-star": {
+          "sqlite": 0.709,
+          "pglite": 0.00277
+        },
+        "delta-filter-scan": {
+          "sqlite": 0.727,
+          "pglite": 0.22
+        },
+        "memo-hit-aggregate": {
+          "sqlite": 0.000136,
+          "pglite": 0.000188
+        },
+        "point-update": {
+          "sqlite": 0.342,
+          "pglite": 0.118
+        },
+        "range-update": {
+          "sqlite": 0.46,
+          "pglite": 0.162
+        },
+        "filtered-update": {
+          "sqlite": 0.405,
+          "pglite": 0.194
+        },
+        "wide-guarded-upsert": {
+          "sqlite": 8.37,
+          "pglite": 0.0951
+        },
+        "wide-insert-row": {
+          "sqlite": 272,
+          "pglite": 6.37
+        },
+        "wide-upsert-row": {
+          "sqlite": 225,
+          "pglite": 3.73
+        },
+        "wide-update-row": {
+          "sqlite": 399,
+          "pglite": 10
+        },
+        "wide-delete-row": {
+          "sqlite": 303,
+          "pglite": 3.93
+        },
+        "wide-level-zero-point-lookup": {
+          "sqlite": 10.2,
+          "pglite": 0.288
+        },
+        "wide-level-zero-select": {
+          "sqlite": 6250,
+          "pglite": 421
+        },
+        "wide-level-zero-scan": {
+          "sqlite": 6.93,
+          "pglite": 2.37
+        },
+        "settle-after-updates": {
+          "sqlite": 1.61,
+          "pglite": 0.498
+        },
+        "settled-point-lookup": {
+          "sqlite": 0.00245,
+          "pglite": 0.000756
+        },
+        "settled-count-star": {
+          "sqlite": 0.647,
+          "pglite": 0.00247
+        },
+        "settled-filter-scan": {
+          "sqlite": 0.704,
+          "pglite": 0.229
+        },
+        "bulk-delete": {
+          "sqlite": 8.88,
+          "pglite": 3.13
+        }
+      }
+    },
+    "linux-x64-node24-intel-xeon-platinum-8370c": {
+      "thresholds": {
+        "bulk-ingest": {
+          "sqlite": 5.53,
+          "pglite": 0.478
+        },
+        "count-star": {
+          "sqlite": 0.655,
+          "pglite": 0.00268
+        },
+        "filter-scan": {
+          "sqlite": 0.381,
+          "pglite": 0.167
+        },
+        "group-aggregate": {
+          "sqlite": 0.129,
+          "pglite": 0.177
+        },
+        "top-n": {
+          "sqlite": 0.181,
+          "pglite": 0.0697
+        },
+        "join-aggregate": {
+          "sqlite": 0.463,
+          "pglite": 0.372
+        },
+        "like-scan": {
+          "sqlite": 0.276,
+          "pglite": 0.155
+        },
+        "window-running": {
+          "sqlite": 1.13,
+          "pglite": 0.336
+        },
+        "distinct-aggregate": {
+          "sqlite": 0.827,
+          "pglite": 0.385
+        },
+        "point-lookup": {
+          "sqlite": 0.00117,
+          "pglite": 0.0007
+        },
+        "correlated-count-lookup": {
+          "sqlite": 0.0737,
+          "pglite": 0.0457
+        },
+        "kysely-point-lookup": {
+          "sqlite": 0.00313,
+          "pglite": 0.00183
+        },
+        "exact-numeric-filter": {
+          "sqlite": 1.6,
+          "pglite": 0.209
+        },
+        "exact-point-lookup": {
+          "sqlite": 7.9,
+          "pglite": 0.0247
+        },
+        "composite-key-lookup": {
+          "sqlite": 3.64,
+          "pglite": 0.016
+        },
+        "range-scan": {
+          "sqlite": 0.0703,
+          "pglite": 0.0436
+        },
+        "sort-numeric": {
+          "sqlite": 0.369,
+          "pglite": 0.0756
+        },
+        "deep-page": {
+          "sqlite": 0.954,
+          "pglite": 0.223
+        },
+        "catalog-point-lookup": {
+          "sqlite": 0.000749,
+          "pglite": 0.000449
+        },
+        "delta-point-lookup": {
+          "sqlite": 0.00106,
+          "pglite": 0.000658
+        },
+        "delta-count-star": {
+          "sqlite": 0.694,
+          "pglite": 0.00285
+        },
+        "delta-filter-scan": {
+          "sqlite": 0.405,
+          "pglite": 0.185
+        },
+        "memo-hit-aggregate": {
+          "sqlite": 0.00014,
+          "pglite": 0.000193
+        },
+        "point-update": {
+          "sqlite": 0.145,
+          "pglite": 0.0867
+        },
+        "range-update": {
+          "sqlite": 0.282,
+          "pglite": 0.171
+        },
+        "filtered-update": {
+          "sqlite": 0.309,
+          "pglite": 0.207
+        },
+        "wide-guarded-upsert": {
+          "sqlite": 7.87,
+          "pglite": 0.0862
+        },
+        "wide-insert-row": {
+          "sqlite": 289,
+          "pglite": 5.7
+        },
+        "wide-upsert-row": {
+          "sqlite": 270,
+          "pglite": 3.76
+        },
+        "wide-update-row": {
+          "sqlite": 438,
+          "pglite": 7.44
+        },
+        "wide-delete-row": {
+          "sqlite": 314,
+          "pglite": 2.15
+        },
+        "wide-level-zero-point-lookup": {
+          "sqlite": 43.5,
+          "pglite": 1.22
+        },
+        "wide-level-zero-select": {
+          "sqlite": 6640,
+          "pglite": 323
+        },
+        "wide-level-zero-scan": {
+          "sqlite": 3.69,
+          "pglite": 1.93
+        },
+        "settle-after-updates": {
+          "sqlite": 0.691,
+          "pglite": 0.404
+        },
+        "settled-point-lookup": {
+          "sqlite": 0.00149,
+          "pglite": 0.000852
+        },
+        "settled-count-star": {
+          "sqlite": 0.681,
+          "pglite": 0.00277
+        },
+        "settled-filter-scan": {
+          "sqlite": 0.405,
+          "pglite": 0.185
+        },
+        "bulk-delete": {
+          "sqlite": 9.28,
+          "pglite": 2.98
+        }
+      }
+    },
+    "linux-x64-node24-intel-xeon-platinum-8573c": {
+      "thresholds": {
+        "bulk-ingest": {
+          "sqlite": 6.04,
+          "pglite": 0.526
+        },
+        "count-star": {
+          "sqlite": 0.662,
+          "pglite": 0.00248
+        },
+        "filter-scan": {
+          "sqlite": 0.718,
+          "pglite": 0.205
+        },
+        "group-aggregate": {
+          "sqlite": 0.128,
+          "pglite": 0.18
+        },
+        "top-n": {
+          "sqlite": 0.337,
+          "pglite": 0.0974
+        },
+        "join-aggregate": {
+          "sqlite": 0.429,
+          "pglite": 0.328
+        },
+        "like-scan": {
+          "sqlite": 0.565,
+          "pglite": 0.196
+        },
+        "window-running": {
+          "sqlite": 1.25,
+          "pglite": 0.349
+        },
+        "distinct-aggregate": {
+          "sqlite": 0.556,
+          "pglite": 0.277
+        },
+        "point-lookup": {
+          "sqlite": 0.00219,
+          "pglite": 0.000669
+        },
+        "correlated-count-lookup": {
+          "sqlite": 0.157,
+          "pglite": 0.0486
+        },
+        "kysely-point-lookup": {
+          "sqlite": 0.00731,
+          "pglite": 0.00223
+        },
+        "exact-numeric-filter": {
+          "sqlite": 2.18,
+          "pglite": 0.285
+        },
+        "exact-point-lookup": {
+          "sqlite": 7.98,
+          "pglite": 0.0287
+        },
+        "composite-key-lookup": {
+          "sqlite": 5.07,
+          "pglite": 0.0254
+        },
+        "range-scan": {
+          "sqlite": 0.133,
+          "pglite": 0.0414
+        },
+        "sort-numeric": {
+          "sqlite": 0.474,
+          "pglite": 0.0776
+        },
+        "deep-page": {
+          "sqlite": 0.931,
+          "pglite": 0.216
+        },
+        "catalog-point-lookup": {
+          "sqlite": 0.00142,
+          "pglite": 0.000433
+        },
+        "delta-point-lookup": {
+          "sqlite": 0.00239,
+          "pglite": 0.000763
+        },
+        "delta-count-star": {
+          "sqlite": 0.785,
+          "pglite": 0.00289
+        },
+        "delta-filter-scan": {
+          "sqlite": 0.677,
+          "pglite": 0.197
+        },
+        "memo-hit-aggregate": {
+          "sqlite": 0.000148,
+          "pglite": 0.0002
+        },
+        "point-update": {
+          "sqlite": 0.32,
+          "pglite": 0.101
+        },
+        "range-update": {
+          "sqlite": 0.439,
+          "pglite": 0.163
+        },
+        "filtered-update": {
+          "sqlite": 0.421,
+          "pglite": 0.185
+        },
+        "wide-guarded-upsert": {
+          "sqlite": 6.87,
+          "pglite": 0.0802
+        },
+        "wide-insert-row": {
+          "sqlite": 248,
+          "pglite": 6.05
+        },
+        "wide-upsert-row": {
+          "sqlite": 235,
+          "pglite": 3.75
+        },
+        "wide-update-row": {
+          "sqlite": 451,
+          "pglite": 11.4
+        },
+        "wide-delete-row": {
+          "sqlite": 259,
+          "pglite": 2.58
+        },
+        "wide-level-zero-point-lookup": {
+          "sqlite": 9.11,
+          "pglite": 0.278
+        },
+        "wide-level-zero-select": {
+          "sqlite": 6270,
+          "pglite": 371
+        },
+        "wide-level-zero-scan": {
+          "sqlite": 7.63,
+          "pglite": 2.18
+        },
+        "settle-after-updates": {
+          "sqlite": 1.48,
+          "pglite": 0.452
+        },
+        "settled-point-lookup": {
+          "sqlite": 0.00263,
+          "pglite": 0.000809
+        },
+        "settled-count-star": {
+          "sqlite": 0.693,
+          "pglite": 0.00251
+        },
+        "settled-filter-scan": {
+          "sqlite": 0.748,
+          "pglite": 0.228
+        },
+        "bulk-delete": {
+          "sqlite": 8.95,
+          "pglite": 3.08
+        }
+      }
     }
   }
 }
