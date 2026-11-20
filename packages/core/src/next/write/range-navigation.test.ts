@@ -201,8 +201,11 @@ for (const seed of seedsFor("next-write-range-navigation-pressure", [0xb3d1]))
           const stop = new AbortController(),
             waiting = h.governor
               .admit({
+                // The largest servable request (GOVERNOR-WAIT-POLICY): the idle writer's
+                // reclaimable forecasts cannot serve it while the holders above persist, so it
+                // stays queued. A smaller one is now served by that reclaim.
                 label: "queued admission prevents cache growth",
-                minimumBytes: MiB,
+                minimumBytes: h.governor.usableCapacity(),
                 spillable: false,
                 signal: stop.signal,
               })

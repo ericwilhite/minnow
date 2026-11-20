@@ -11807,6 +11807,7 @@ export const GOVERNOR_HOLDER_PRIORITY_REACH = [
   "holder without progress credit",
   "new admission of almost all room",
   "holder queued inside a reclaim callout",
+  "holder granted while a new admission waits",
 ] as const;
 
 /** A native trigger statement on an FTS-indexed table ends without waiting. */

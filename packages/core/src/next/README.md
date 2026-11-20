@@ -1621,13 +1621,20 @@ and the owner import it directly.
   cap (or `cap - reserve`) less those holdings can never be served, so it gets 53200 at once rather
   than an endless wait, and queued requests are re-checked when a registration changes. An admission
   within that usable cap is served once the finite holder chains ahead of it finish. The writer's
-  floors are revocable when idle, so they are not counted as permanent. The writer and a native root
+  floors are revocable when idle, so they are not counted as permanent; what the write engine keeps
+  until close is (the page cache's fixed slabs, permanent storage, resident metadata, the current
+  state's pin, its fixed controls and resident commit writers). Unflushed memtable rows are not
+  permanent: reclaim on an idle writer flushes them. Every transition that can make the writer's
+  forecasts retirable (a statement or transaction ending, a flush, merge or commit finishing) wakes
+  queued admissions. `Governor.observeGrants` reports each grant synchronously with the queues at
+  that moment, so suites check the serving order itself. The writer and a native root
   cannot wait on each other (one writer per governor; a native root queues its own step only after
   the writer's step has settled). Readers are not holders: query preparation is to wait only while
   holding nothing (a preparation credit, pending), since readers each retaining a source recipe
   while waiting could otherwise wait on each other. Policy: `holdsCredit` and `registerPermanent` in
   `memory/governor.ts`; tests: `memory/holder-priority.test.ts`,
-  `memory/wait-policy-regressions.test.ts`, `testing/native-command-fifo.test.ts`. In test runs,
+  `memory/wait-policy-regressions.test.ts`, `memory/wait-wake-regressions.test.ts`,
+  `testing/native-command-fifo.test.ts`. In test runs,
   `MINNOW_GOVERNOR_STALL_MS` turns any wait without governor progress into a `GovernorStallError`
   naming every holder.
 - A grant _holds_ bytes, and its operator _allocates_ buffers out of them, so a non-spillable

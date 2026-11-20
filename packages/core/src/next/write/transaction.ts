@@ -108,6 +108,8 @@ export interface EngineHooks {
     options?: NativeWriteStepOptions,
   ): Promise<NativeWriteStepBoundary>;
   checkNativeStepReady?(statement: StatementImpl): void;
+  /** A statement closed (ended or rolled back): its forecasts may now be reclaimable. */
+  statementEnded?(): void;
   closeNativeStep?(statement: StatementImpl): Promise<void>;
   readonly shared: Shared;
   /** The one key batch writers encode into (one writer at a time; consumed before reuse). */
@@ -326,6 +328,7 @@ export class TransactionImpl implements WriteTransaction {
     if (this.#open === statement) {
       this.#lastNativeCommands = statement.nativeCommandMode;
       this.#open = null;
+      this.hooks.statementEnded?.();
     }
   }
 

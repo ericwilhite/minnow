@@ -25,6 +25,8 @@ export interface RootPin {
   /** Diagnostic label (backpressure reports the oldest pin by it). */
   readonly label: string;
   readonly released: boolean;
+  /** Bytes the pin charges while held, when its registry charges pins. */
+  readonly bytes?: number;
   /** Idempotent. */
   release(): void;
 }

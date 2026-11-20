@@ -118,6 +118,10 @@ export class LogAppender {
   #deferredBytes = 0;
   #streaming: Promise<number> | null = null;
   #header: Uint8Array | null;
+  /** The frame header buffer, charged to the commit buffers until close. */
+  get residentBytes(): number {
+    return this.#header === null ? 0 : this.#header.byteLength + COMMIT_BUFFER_OVERHEAD;
+  }
   #flushing: Promise<void> | null = null;
   #scheduled = false;
   #idle: ReturnType<typeof setTimeout> | null = null;
