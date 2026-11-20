@@ -193,7 +193,11 @@ rounds, after checking that both give the same answers. It writes one table per 
 summary: main, 0.20 and the fixed DuckDB-Wasm target per cell, with their ratios. Run it locally
 with `node scripts/head-to-head.mts run --dataset W1M --shipped <unpacked package> --output <dir>`
 (`--rows` and `--scale` shrink the fixtures). A timing never fails the lane; an engine that cannot
-load its fixture does.
+load its fixture does. With a `candidate` git ref (the workflow input, or `--candidate <built
+checkout>` locally) the same lane compares main's rebuild engine with that ref's instead of 0.20,
+at the columnar frames boundary, and reports each cell's paired per-round difference: a gain or
+regression needs its median difference above the IQR and at least seven of nine rounds the same
+way. That is a screen for a change in review, not an acceptance measurement.
 
 Each browser runner owns its test directory, server, port, and build prerequisites. Shared browser
 defaults live in `playwright.shared.mjs`; runner-specific configuration stays in its named
