@@ -1,4 +1,5 @@
 import { prepareGroup } from "../page/query-roots.js";
+import type { ChunkReadOptions } from "../page/reader.js";
 /**
  * The `scan` operator's source (ir/ir.ts): one table of a snapshot (access/snapshot.ts), every
  * segment in row-id order, batches of at most `BATCH_ROWS` rows and about `targetBytes`, its
@@ -176,6 +177,11 @@ export interface ScanStats {
 }
 
 export interface TableScanOptions {
+  /** The pin owner's charged immutable cache, resolved before wrapping page reads. */
+  readonly directories?: NonNullable<ChunkReadOptions["directories"]>;
+  /** Non-retaining sources borrow hits without admitting directory misses, even
+   * when coalesced windows are disabled or refused. */
+  readonly directoryOnce?: boolean;
   /** Fresh detachable outputs for terminal unfiltered groups without locators/deletions/missing columns.
    * true flattens dictionaries to UTF-8; "dictionary" preserves codes and retains dictionary charges.
    * At most four batches / four target MiB (plus one oversized row) may be retained.
@@ -749,7 +755,10 @@ export class TableScan implements BatchSource {
           this.#options.reads.open(this.#options.pages, chunk, {
             budget: this.#memory,
             signal: this.#readAbort.signal,
-            ...(windowBytes > 0
+            ...(this.#options.directories === undefined
+              ? {}
+              : { directories: this.#options.directories }),
+            ...(windowBytes > 0 || this.#options.directoryOnce === true
               ? { once: true, ...(this.#readTask ? { task: this.#readTask } : {}) }
               : {}),
           }),

@@ -72,6 +72,7 @@ import {
   type ExceptCheckpoint,
 } from "./except.js";
 import { readValue, boundSource, type ReadSource, type ReadBound } from "../page/read-bounds.js";
+import { directoryCacheFor } from "../page/directory-cache.js";
 import { batchTargetFor, type Grant } from "../memory/governor.js";
 import { jsonLiteralBytes, jsonInputsBounded, phaseRetainingParents } from "./json-plan.js";
 import { JsonExpressions } from "./json-expressions.js";
@@ -1499,10 +1500,14 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                     : exportOwners.get(downstream)
                   : undefined;
                 const output = owner?.grant;
+                const directories = directoryCacheFor(runtime.view.pages);
                 const scan = new TableScan({
                   table,
                   pages: runtime.readPages(runtime.view.pages),
                   reads: runtime.request.reads,
+                  ...(directories === undefined
+                    ? {}
+                    : { directories, directoryOnce: !runtime.sourceRetains(rel.id) }),
                   budget: grant,
                   columns: rel.columns,
                   filter: rel.filter,
@@ -2987,8 +2992,9 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                 input,
                 fetchMinimum(runtime.request.governor.capBytes),
                 BATCH_ROWS,
-                (context, grant) =>
-                  new LateFetchOperator(
+                (context, grant) => {
+                  const directories = directoryCacheFor(runtime.view.pages);
+                  return new LateFetchOperator(
                     {
                       onePass: options.lateFetchOnce !== false,
                       snapshot: runtime.view,
@@ -3003,6 +3009,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                       grant,
                       restoreGrant,
                       reads: runtime.request.reads,
+                      ...(directories === undefined ? {} : { directories }),
                       spill: runtime.request.spill,
                       queryId: runtime.request.queryId,
                       targetBytes: batchTargetFor(runtime.request.governor.capBytes, 4),
@@ -3010,7 +3017,8 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                       onPipeline: () => runtime.pipeline(),
                     },
                     counted(runtime, project, downstream),
-                  ),
+                  );
+                },
                 (fetch) => {
                   runtime.onAbort((reason) => fetch.abort(reason));
                   runtime.dispose(() => fetch.closed);

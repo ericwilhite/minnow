@@ -11521,3 +11521,105 @@ export const QUERY_INDEX_SEEN_REACH = [
   "read after cancel",
   "zero ownership",
 ] as const;
+
+/** PC2/PC4/R15.7: immutable native validation is reused only within its owner. */
+export const DIRECTORY_CACHE_NATIVE_REACH = [
+  "same blob",
+  "different blob",
+  "replaced root",
+  "eviction",
+  "restore",
+  "once",
+  "dense sketch",
+  "sparse sketch",
+  "warm query performs no validation",
+  "nullable input",
+  "all-valid input",
+  "eviction returns cache credit",
+  "restore creates a new cache scope",
+  "once misses are not retained",
+  "once execution without windows",
+  "once hits do not promote",
+  "close with live directory lease",
+  "close returns all credit",
+] as const;
+
+/** Charged metadata-only directory leases and exact immutable cache identities. */
+export const DIRECTORY_CACHE_REACH = [
+  "same blob",
+  "extent length",
+  "containing extent",
+  "invalid extent",
+  "reused address",
+  "invalid body",
+  "short chunk hit",
+  "wrong type hit",
+  "eviction",
+  "once miss",
+  "once hit",
+  "cache refusal",
+  "close while pinned",
+  "late read after close",
+  "new owner",
+  "pending cold close",
+  "overlapping cold opens",
+  "pending read owns funded bytes",
+  "overlapping reads own funded bytes",
+  "shared directory after overlap",
+  "forward completion",
+  "reverse completion",
+  "close between completions",
+  "open through both completions",
+  "remaining reader keeps pin",
+  "overlap cache eviction returns bytes",
+  "dense sketch",
+  "sparse sketch",
+  "invalid body refused on first read",
+  "late unpin does not retain",
+  "full containing identity checked",
+  "hit context rechecked",
+  "checksum identity checked",
+  "eviction revalidates",
+  "once keeps eviction order",
+  "owner scope isolated",
+  "all credit returned",
+] as const;
+
+/** A cached metadata pin must be returned even when the holder's allocator throws. */
+export const DIRECTORY_CACHE_HIT_BUDGET_REACH = [
+  "throwing holder budget",
+  "refused holder budget",
+  "once pin returned",
+  "ordinary pin returned",
+  "failed hit remains evictable",
+  "holder credit unchanged",
+  "all fixture credit returned",
+] as const;
+
+/** Copied directory payload is admitted before parse and remains charged while retained. */
+export const DIRECTORY_CACHE_PAYLOAD_REACH = [
+  "dense sketch",
+  "sparse sketch",
+  "byte statistics",
+  "integer statistics",
+  "retained payload funded",
+  "valid payload refused before parse",
+  "invalid payload refused before parse",
+  "all fixture credit returned",
+] as const;
+
+/** The separate late-materialization scan borrows its owner's directory cache. */
+export const DIRECTORY_CACHE_LATE_REACH = [
+  "late shape selected",
+  "retaining payload primer",
+  "ordered index payload",
+  "late sort payload",
+  "dense sketch",
+  "sparse sketch",
+  "warm payload performs no validation",
+  "once payload opens",
+  "nullable payload",
+  "all-valid payload",
+  "complete PostgreSQL rows",
+  "all credit returned",
+] as const;

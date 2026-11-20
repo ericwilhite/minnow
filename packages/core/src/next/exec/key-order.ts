@@ -1,6 +1,7 @@
 /** Ordered index cursors and private locator fetches share the query's pinned view. */
 import type { IndexCursor, IndexReader, IndexRangePlan } from "../access/key-index.js";
 import type { ReadBound } from "../page/read-bounds.js";
+import { directoryCacheFor } from "../page/directory-cache.js";
 import type { PhysicalPlan, Rel } from "../ir/ir.js";
 import { BATCH_ROWS, type FlatVector } from "../vector/vector.js";
 import { batchTargetFor, OBJECT_OVERHEAD_BYTES } from "../memory/governor.js";
@@ -166,6 +167,7 @@ export async function runIndexOrder(
   runtime.dispose(() => arena.close());
   runtime.dispose(() => fetchArena.close());
   const vector = arena.flat({ kind: "locator", tableId: shape.tableId }).vector;
+  const directories = directoryCacheFor(runtime.view.pages);
   const fetch = new LateFetchOperator(
     {
       snapshot: runtime.view,
@@ -185,6 +187,7 @@ export async function runIndexOrder(
       grant: fetchGrant,
       restoreGrant,
       reads: runtime.request.reads,
+      ...(directories === undefined ? {} : { directories }),
       spill: runtime.request.spill,
       queryId: runtime.request.queryId,
       targetBytes: batchTargetFor(runtime.request.governor.capBytes, 4),
