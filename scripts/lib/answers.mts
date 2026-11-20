@@ -8,11 +8,16 @@
  *   NaN and infinities compare exactly;
  * - text, JSON and bytes are encoded losslessly (JSON objects with sorted keys, bytes as hex);
  * - booleans, dates and timestamps compare exactly;
- * - a value of an unknown kind is encoded losslessly by its JavaScript type.
+ * - a value of another recognised type ("value": intervals, arrays) is encoded losslessly and
+ *   exactly by its JavaScript type, with no tolerance.
  * Every encoding carries a tag, so NULL, undefined, text "1.0" and NUMERIC 1.0 all differ.
+ * A result whose column types are missing, incomplete or differ between the two sides is
+ * "unverifiable": it never compares equal.
  *
- * Small results travel inline and compare value by value. An unordered result is first sorted
- * by an exact key, and only then compared pairwise with the tolerance. Large results (more than
+ * Small results travel inline and compare value by value. An unordered result is grouped by its
+ * exact (non-float) columns; inside each group the float columns are matched with the
+ * tolerance (sorted pairing for one float column; for several, sorted pairing and then a
+ * bipartite matching for groups of up to MATCH_BOUND rows, else "unverifiable"). Large results (more than
  * INLINE_VALUES values) are hashed exactly at full precision: in order under a total ORDER BY,
  * otherwise as a multiset (a sum of per-row digests). Those cells return stored columns, not
  * computed floats.
@@ -23,6 +28,8 @@ export const ABS_TOLERANCE = 1e-12;
 export const REL_TOLERANCE = 1e-9;
 /** Results up to this many values compare inline with tolerance; larger ones hash exactly. */
 export const INLINE_VALUES = 2_000_000;
+/** Largest group of equal exact columns matched by bipartite search under the tolerance. */
+export const MATCH_BOUND = 256;
 
 export type ColumnKind =
   "integer" | "numeric" | "float" | "text" | "json" | "bytes" | "bool" | "temporal" | "value";
@@ -71,6 +78,8 @@ export interface AnswerDigest {
   readonly hash?: string;
   /** fixture: rows that did not match the generator (empty when all match). */
   readonly mismatches?: string[];
+  /** Why the values cannot be compared (missing or incomplete column types). */
+  readonly unverifiable?: string;
 }
 export interface AnswerComparison {
   readonly same: boolean;
@@ -101,14 +110,15 @@ function canonicalJson(value: unknown): string {
     .join(",")}}`;
 }
 
-/** Lossless encoding by JavaScript type, for a value of an unknown kind or the wrong kind. */
+/** Lossless, exact encoding by JavaScript type: never compared with a tolerance. */
 function byType(value: unknown): Normal {
   if (value === null) return null;
   if (value === undefined) return "u";
   if (typeof value === "bigint") return `i${String(value)}`;
   if (typeof value === "number") {
     if (Number.isInteger(value)) return `i${BigInt(value).toString()}`;
-    return Number.isFinite(value) ? value : `f${String(value)}`;
+    // The shortest round-trip text of a double is exact.
+    return `r${String(value)}`;
   }
   if (typeof value === "string") return `s${value}`;
   if (typeof value === "boolean") return value ? "b1" : "b0";
@@ -117,7 +127,7 @@ function byType(value: unknown): Normal {
   return `j${canonicalJson(value)}`;
 }
 
-export function normalize(value: unknown, kind: ColumnKind = "value"): Normal {
+export function normalize(value: unknown, kind: ColumnKind): Normal {
   if (value === null) return null;
   if (value === undefined) return "u";
   switch (kind) {
@@ -211,6 +221,7 @@ export class AnswerCollector {
   #rows = 0;
   #inline: Normal[][] | null = [];
   #values = 0;
+  #unverifiable: string | undefined;
   readonly #ordinal = createHash("sha256");
   #multiset = 0n;
   constructor(ordered: boolean, kinds?: readonly ColumnKind[]) {
@@ -223,7 +234,10 @@ export class AnswerCollector {
     this.#kinds = kinds;
   }
   add(row: readonly unknown[]): void {
-    const normal = row.map((value, c) => normalize(value, this.#kinds?.[c] ?? "value"));
+    const kinds = this.#kinds;
+    if (kinds === undefined) this.#unverifiable ??= "no column types";
+    else if (kinds.length !== row.length) this.#unverifiable ??= "incomplete column types";
+    const normal = row.map((value, c) => normalize(value, kinds?.[c] ?? "value"));
     this.#rows++;
     this.#values += normal.length;
     const line = JSON.stringify(normal);
@@ -240,7 +254,10 @@ export class AnswerCollector {
     }
   }
   finish(): AnswerDigest {
-    const kinds = this.#kinds === undefined ? {} : { kinds: [...this.#kinds] };
+    const kinds = {
+      ...(this.#kinds === undefined ? {} : { kinds: [...this.#kinds] }),
+      ...(this.#unverifiable === undefined ? {} : { unverifiable: this.#unverifiable }),
+    };
     if (this.#inline !== null)
       return { method: "inline", rows: this.#rows, ...kinds, values: this.#inline };
     return this.#ordered
@@ -254,11 +271,89 @@ export class AnswerCollector {
   }
 }
 
+function rowDifference(x: readonly Normal[], y: readonly Normal[]): string | null {
+  if (x.length !== y.length) return "width";
+  for (let c = 0; c < x.length; c++)
+    if (!closeEnough(x[c] ?? null, y[c] ?? null))
+      return `column ${String(c)}: ${JSON.stringify(x[c])} vs ${JSON.stringify(y[c])}`;
+  return null;
+}
+
+/** Whether a perfect pairing of rows within tolerance exists (Kuhn's augmenting paths). */
+function bipartite(left: readonly Normal[][], right: readonly Normal[][]): boolean {
+  const owner = new Array<number>(right.length).fill(-1);
+  const close = (i: number, j: number) => rowDifference(left[i] ?? [], right[j] ?? []) === null;
+  const augment = (i: number, seen: boolean[]): boolean => {
+    for (let j = 0; j < right.length; j++) {
+      if (seen[j] === true || !close(i, j)) continue;
+      seen[j] = true;
+      const current = owner[j] ?? -1;
+      if (current < 0 || augment(current, seen)) {
+        owner[j] = i;
+        return true;
+      }
+    }
+    return false;
+  };
+  for (let i = 0; i < left.length; i++) if (!augment(i, [])) return false;
+  return true;
+}
+
+/**
+ * Unordered rows: equal multisets of exact (non-float) columns, then float columns matched with
+ * the tolerance inside each group. Null when every row matches; else what does not.
+ */
+function matchUnordered(
+  left: readonly Normal[][],
+  right: readonly Normal[][],
+  floats: readonly number[],
+): string | null {
+  const isFloat = new Set(floats);
+  const groups = new Map<string, [Normal[][], Normal[][]]>();
+  const add = (rows: readonly Normal[][], side: 0 | 1) => {
+    for (const row of rows) {
+      const key = JSON.stringify(row.filter((_, c) => !isFloat.has(c)));
+      let group = groups.get(key);
+      if (group === undefined) groups.set(key, (group = [[], []]));
+      group[side].push(row);
+    }
+  };
+  add(left, 0);
+  add(right, 1);
+  for (const [key, [x, y]] of groups) {
+    if (x.length !== y.length)
+      return `${String(x.length)} vs ${String(y.length)} rows with exact columns ${key}`;
+    const byFloats = (p: readonly Normal[], q: readonly Normal[]) =>
+      compareRows(
+        floats.map((c) => p[c] ?? null),
+        floats.map((c) => q[c] ?? null),
+      );
+    x.sort(byFloats);
+    y.sort(byFloats);
+    // Sorted pairing decides one float column; several may need a search for a pairing.
+    if (x.every((row, r) => rowDifference(row, y[r] ?? []) === null)) continue;
+    if (floats.length <= 1) return `no pairing within tolerance for exact columns ${key}`;
+    if (x.length > MATCH_BOUND)
+      return `unverifiable: ${String(x.length)} rows share exact columns ${key}, over the matching bound`;
+    if (!bipartite(x, y)) return `no pairing within tolerance for exact columns ${key}`;
+  }
+  return null;
+}
+
 export function compareAnswers(
   a: AnswerDigest,
   b: AnswerDigest,
   ordered: boolean,
 ): AnswerComparison {
+  // Values without complete, matching column types are never equal by default.
+  const unverifiable =
+    a.unverifiable ??
+    b.unverifiable ??
+    (a.rows > 0 && JSON.stringify(a.kinds) !== JSON.stringify(b.kinds)
+      ? "different column types"
+      : undefined);
+  if (unverifiable !== undefined)
+    return { same: false, method: a.method, detail: `unverifiable: ${unverifiable}` };
   if (a.method !== b.method)
     return { same: false, method: a.method, detail: `methods ${a.method}/${b.method}` };
   if (a.rows !== b.rows)
@@ -274,24 +369,19 @@ export function compareAnswers(
       ? { same: true, method: a.method }
       : { same: false, method: a.method, detail: "hash" };
   }
-  const left = [...(a.values ?? [])],
-    right = [...(b.values ?? [])];
+  const left = a.values ?? [],
+    right = b.values ?? [];
   if (!ordered) {
-    left.sort(compareRows);
-    right.sort(compareRows);
+    const floats = (a.kinds ?? []).flatMap((kind, c) => (kind === "float" ? [c] : []));
+    const unmatched = matchUnordered(left, right, floats);
+    return unmatched === null
+      ? { same: true, method: "inline" }
+      : { same: false, method: "inline", detail: unmatched };
   }
   for (let r = 0; r < left.length; r++) {
-    const x = left[r] ?? [],
-      y = right[r] ?? [];
-    if (x.length !== y.length)
-      return { same: false, method: "inline", detail: `row ${String(r)} width` };
-    for (let c = 0; c < x.length; c++)
-      if (!closeEnough(x[c] ?? null, y[c] ?? null))
-        return {
-          same: false,
-          method: "inline",
-          detail: `row ${String(r)} column ${String(c)}: ${JSON.stringify(x[c])} vs ${JSON.stringify(y[c])}`,
-        };
+    const difference = rowDifference(left[r] ?? [], right[r] ?? []);
+    if (difference !== null)
+      return { same: false, method: "inline", detail: `row ${String(r)} ${difference}` };
   }
   return { same: true, method: "inline" };
 }
@@ -301,9 +391,16 @@ export function checkFixtureRows(
   rows: ReadonlyArray<Record<string, unknown>>,
   columns: readonly string[],
   expected: (id: number) => Record<string, unknown>,
-  kinds?: readonly ColumnKind[],
+  kinds: readonly ColumnKind[] | undefined,
 ): AnswerDigest {
   const mismatches: string[] = [];
+  if (rows.length > 0 && (kinds === undefined || kinds.length !== columns.length))
+    return {
+      method: "fixture",
+      rows: rows.length,
+      mismatches: [],
+      unverifiable: kinds === undefined ? "no column types" : "incomplete column types",
+    };
   const seen = new Set<number>();
   for (const row of rows) {
     const id = Number(row.id);

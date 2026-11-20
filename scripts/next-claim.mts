@@ -30,6 +30,7 @@
  * Without --manifest, `run` declares a one-dataset manifest from its own arguments.
  */
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -145,6 +146,8 @@ export interface ClaimResult {
   readonly aa: CellRecord[];
   readonly ab: CellRecord[];
   readonly void: boolean;
+  /** manifestDigest of the manifest this shard ran under: binds the artefact to its run. */
+  readonly manifest: string;
 }
 
 /** The run declared at dispatch: what a complete run must report. */
@@ -167,6 +170,92 @@ export const shardCells = (cells: readonly string[], index: number, count: numbe
 
 const CELL = /^[A-Za-z0-9_]+$/u;
 const SHA = /^[0-9a-f]{40}$/u;
+
+/** The manifest's fields in a fixed order (its digest is over exactly this). */
+function canonicalManifest(m: ClaimManifest): ClaimManifest {
+  return {
+    control: m.control,
+    candidate: m.candidate,
+    pairs: m.pairs,
+    targets: [...m.targets],
+    datasets: m.datasets.map((d) => ({
+      dataset: d.dataset,
+      shards: d.shards,
+      controls: [...d.controls],
+      cells: [...d.cells],
+    })),
+  };
+}
+
+/** SHA-256 of the canonical manifest: every result artefact carries it. */
+export function manifestDigest(m: ClaimManifest): string {
+  return createHash("sha256")
+    .update(JSON.stringify(canonicalManifest(m)))
+    .digest("hex");
+}
+
+/**
+ * Checks a loaded manifest against the schema: both SHAs, 9 to 101 pairs, 1 to 32 shards per
+ * dataset, the mandatory A/A controls of each dataset, unique Gate B cells and declared targets.
+ */
+export async function validateManifest(raw: unknown): Promise<ClaimManifest> {
+  const fail = (message: string): never => {
+    throw new Error(`Invalid claim manifest: ${message}`);
+  };
+  const record = (value: unknown, what: string): Record<string, unknown> =>
+    value !== null && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : fail(`${what} is not an object`);
+  const names = (value: unknown, what: string): string[] => {
+    if (!Array.isArray(value) || !value.every((v) => typeof v === "string" && CELL.test(v)))
+      return fail(`${what} must be a list of cell names`);
+    const list = value as string[];
+    if (new Set(list).size !== list.length) fail(`${what} repeats a cell`);
+    return list;
+  };
+  const m = record(raw, "the manifest");
+  const keys = ["candidate", "control", "datasets", "pairs", "targets"];
+  if (JSON.stringify(Object.keys(m).sort()) !== JSON.stringify(keys))
+    fail(`fields must be exactly ${keys.join(", ")}`);
+  const control = m.control,
+    candidate = m.candidate,
+    pairs = m.pairs;
+  if (typeof control !== "string" || typeof candidate !== "string")
+    return fail("control and candidate must be commit SHAs");
+  if (!SHA.test(control) || !SHA.test(candidate) || control === candidate)
+    fail("control and candidate must be two different full commit SHAs");
+  if (typeof pairs !== "number" || !Number.isSafeInteger(pairs) || pairs < 9 || pairs > 101)
+    fail("pairs must be an integer from 9 to 101");
+  const targets = names(m.targets, "targets");
+  if (!Array.isArray(m.datasets) || m.datasets.length === 0) return fail("no datasets");
+  const datasets: Array<ClaimManifest["datasets"][number]> = [];
+  for (const raw of m.datasets as unknown[]) {
+    const d = record(raw, "a dataset");
+    const dataset = d.dataset;
+    if (dataset !== "W1M" && dataset !== "S1") return fail(`unknown dataset ${String(dataset)}`);
+    if (datasets.some((e) => e.dataset === dataset)) fail(`${dataset} declared twice`);
+    const shards = d.shards;
+    if (typeof shards !== "number" || !Number.isSafeInteger(shards) || shards < 1 || shards > 32)
+      fail(`${dataset} shards must be an integer from 1 to 32`);
+    const controls = names(d.controls, `${dataset} controls`);
+    if (JSON.stringify(controls) !== JSON.stringify(CONTROL_CELLS[dataset]))
+      fail(`${dataset} must run its A/A controls ${CONTROL_CELLS[dataset].join(", ")}`);
+    const cells = names(d.cells, `${dataset} cells`);
+    if (cells.length === 0) fail(`${dataset} has no cells`);
+    const known = new Set(await gateBCells(dataset));
+    for (const cell of cells) if (!known.has(cell)) fail(`${cell} is not a ${dataset} Gate B cell`);
+    datasets.push({ dataset, shards: shards as number, controls, cells });
+  }
+  for (const target of targets)
+    if (!datasets.some((d) => d.cells.includes(target))) fail(`target ${target} is not a cell`);
+  return canonicalManifest({
+    control: control as string,
+    candidate: candidate as string,
+    pairs: pairs as number,
+    targets,
+    datasets,
+  });
+}
 
 /** Validates the dispatch inputs and declares the run. */
 export async function claimManifest(options: {
@@ -204,13 +293,13 @@ export async function claimManifest(options: {
   for (const target of options.targets)
     if (!datasets.some((entry) => entry.cells.includes(target)))
       throw new Error(`Target ${target} is not a selected cell`);
-  return {
+  return validateManifest({
     control: options.control,
     candidate: options.candidate,
     pairs: options.pairs,
     targets: [...options.targets],
     datasets,
-  };
+  });
 }
 
 /** Target rule: the paired gain/regression rule plus the minimum per-query effect. */
@@ -285,7 +374,7 @@ async function run(): Promise<void> {
           targets: values.targets.split(",").filter(Boolean),
           only: values.only.split(",").filter(Boolean),
         })
-      : (JSON.parse(await readFile(resolve(values.manifest), "utf8")) as ClaimManifest);
+      : await validateManifest(JSON.parse(await readFile(resolve(values.manifest), "utf8")));
   if (manifest.control !== revisions.control || manifest.candidate !== revisions.candidate)
     throw new Error("The built checkouts are not the manifest's control and candidate");
   const entry = manifest.datasets.find((d) => d.dataset === dataset);
@@ -483,6 +572,7 @@ async function run(): Promise<void> {
     aa,
     ab,
     void: flagged,
+    manifest: manifestDigest(manifest),
   };
   await writeFile(
     join(output, `claim-${dataset}-${String(shardIndex)}.json`),
@@ -503,6 +593,13 @@ const fmt = (value: number | undefined, digits = 1) =>
 export function claimProblems(results: readonly ClaimResult[], manifest: ClaimManifest): string[] {
   const problems: string[] = [];
   const declared = new Set<string>();
+  const digest = manifestDigest(manifest);
+  for (const result of results)
+    if (
+      result.manifest !== digest ||
+      JSON.stringify(result.targets) !== JSON.stringify(manifest.targets)
+    )
+      problems.push(`${result.dataset} shard ${result.shard} ran under a different manifest`);
   for (const entry of manifest.datasets)
     for (let index = 0; index < entry.shards; index++) {
       const shard = `${String(index)}/${String(entry.shards)}`;
@@ -667,7 +764,9 @@ else if (mode === "manifest") {
     allowPositionals: true,
   });
   if (values.manifest === undefined) throw new Error("report needs --manifest");
-  const manifest = JSON.parse(await readFile(resolve(values.manifest), "utf8")) as ClaimManifest;
+  const manifest = await validateManifest(
+    JSON.parse(await readFile(resolve(values.manifest), "utf8")),
+  );
   const results = await Promise.all(
     positionals.map(
       async (file) => JSON.parse(await readFile(resolve(file), "utf8")) as ClaimResult,

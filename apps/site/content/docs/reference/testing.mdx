@@ -205,9 +205,15 @@ engine's result types (0.20 reports none, so it uses the same ones):
 - **Floats:** equal within an absolute 1e-12 plus a relative 1e-9.
 - **Text, JSON and bytes:** losslessly, so text `1.0` and `1.00` differ.
 - **SQL `NULL`:** differs from a missing value.
+- **Other types** (intervals, arrays): exactly, with no tolerance.
 
-Results of up to two million values compare value by value; an unordered result is first sorted
-by an exact key and only then compared with the tolerance. Larger results (the export and the full
+A result whose column types are missing, incomplete or different on the two sides is
+"unverifiable" and never counts as the same.
+
+Results of up to two million values compare value by value. An unordered result is grouped by
+its exact (non-float) columns, and inside each group the float columns are paired within the
+tolerance: sorted pairing for one float column, and for several a search for a valid pairing in
+groups of up to 256 rows (a larger group is unverifiable). Larger results (the export and the full
 sorts of stored columns) compare by an exact hash of every value of every row, in order or as a
 multiset. An unordered `LIMIT`, which may return any rows, is checked row by row against the
 generator.
@@ -1373,7 +1379,9 @@ same sequence, and a summary of the table is compared with SQLite's after each s
 Any statement that `next/` is faster, or not slower, cites a run of
 `.github/workflows/next-claim.yml` (`scripts/next-claim.mts`), the one protocol for such claims.
 At dispatch the workflow validates its inputs and declares the run in a manifest: both commit
-SHAs, the datasets, shards, cells, targets and pairs. Every later job reads the manifest.
+SHAs, the datasets, shards, cells, mandatory A/A controls, targets and pairs. Every later job
+validates the manifest again and reads it, and every result carries the manifest's SHA-256: a
+result from a different manifest counts as missing.
 
 1. Each build (control and candidate) loads its own fixture once with its own writer and captures it
    as a native storage image. The control build times each cell once to size its bracket: a fixed

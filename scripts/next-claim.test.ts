@@ -4,9 +4,11 @@ import {
   bracketRepeats,
   claimManifest,
   holm,
+  manifestDigest,
   report,
   signTestP,
   targetVerdict,
+  validateManifest,
   MIN_EFFECT,
   type CellRecord,
   type ClaimManifest,
@@ -124,6 +126,7 @@ const shard = (
   aa,
   ab,
   void: false,
+  manifest: manifestDigest(manifest),
 });
 // W1M shard 0 holds t and s2, shard 1 holds s1; S1 has one shard.
 const complete = (): ClaimResult[] => [
@@ -196,5 +199,77 @@ describe("next/ claim report", () => {
     await expect(claimManifest({ ...base, control: "main" })).rejects.toThrow(/SHA/u);
     const declared = await claimManifest({ ...base, datasets: ["W1M", "S1"] });
     expect(declared.datasets.map((d) => d.cells.length)).toEqual([29, 16]);
+  });
+
+  // Review of #12, second round (P2): manifests were neither validated nor bound to results.
+  it("refuses results that ran under a different manifest", () => {
+    // The shards ran with no targets; a manifest edited afterwards to target t gives no gain.
+    const untargeted: ClaimManifest = { ...manifest, targets: [] };
+    const results = complete().map((r) => ({
+      ...r,
+      targets: [],
+      manifest: manifestDigest(untargeted),
+    }));
+    expect(report(results, untargeted)).not.toContain("INCOMPLETE");
+    const text = report(results, manifest);
+    expect(text).toContain("ran under a different manifest");
+    expect(text).not.toContain("**gain**");
+  });
+
+  it("refuses an artefact whose manifest digest differs, even when everything else matches", () => {
+    const results = complete();
+    results[2] = { ...(results[2] as ClaimResult), manifest: "0".repeat(64) };
+    const text = report(results, manifest);
+    expect(text).toContain("S1 shard 0/1 ran under a different manifest");
+    expect(text).not.toContain("**gain**");
+  });
+
+  it("validates a loaded manifest, including its mandatory A/A controls", async () => {
+    const good = await claimManifest({
+      control: A,
+      candidate: B,
+      datasets: ["W1M", "S1"],
+      shards: 2,
+      pairs: 15,
+      targets: ["join_fact_fact_int"],
+      only: [],
+    });
+    const raw = JSON.parse(JSON.stringify(good)) as {
+      datasets: Array<{ controls: string[]; cells: string[]; shards: number }>;
+      targets: string[];
+    } & Record<string, unknown>;
+    expect(await validateManifest(raw)).toEqual(good);
+    const broken = (change: (m: typeof raw) => void) => {
+      const copy = JSON.parse(JSON.stringify(raw)) as typeof raw;
+      change(copy);
+      return validateManifest(copy);
+    };
+    await expect(
+      broken((m) => {
+        for (const d of m.datasets) d.controls = [];
+      }),
+    ).rejects.toThrow(/A\/A controls/u);
+    await expect(
+      broken((m) => {
+        const first = m.datasets[0];
+        if (first !== undefined) first.controls = ["scan_proj3_agg"];
+      }),
+    ).rejects.toThrow(/A\/A controls/u);
+    await expect(
+      broken((m) => {
+        m.targets = ["scan_first_page_typo"];
+      }),
+    ).rejects.toThrow(/target/u);
+    await expect(
+      broken((m) => {
+        m.extra = true;
+      }),
+    ).rejects.toThrow(/fields/u);
+    await expect(
+      broken((m) => {
+        const first = m.datasets[0];
+        if (first !== undefined) first.shards = 0;
+      }),
+    ).rejects.toThrow(/shards/u);
   });
 });
