@@ -175,6 +175,9 @@ export interface ClientLiveOptions {
   ): void | Promise<void>;
   onError(error: Error): void | Promise<void>;
   onLoading?(): void;
+  /** Terminal identity reset: discard rows/diffs and cancel decoding immediately, even while
+   * an onResult promise is pending. A new database requires an explicit client reopen. */
+  onReset?(reason: "databaseReplaced"): void;
 }
 export interface ClientLiveHandle {
   refresh(): void;
@@ -724,6 +727,8 @@ export class ProtocolClient {
     params: readonly WireValue[],
     options: ClientLiveOptions,
   ): ClientLiveHandle {
+    if (this.#closed) throw new ClientClosedError();
+    if (this.#replaced !== null) throw this.#replaced;
     const state: ClientLiveState = {
       sql,
       params: structuredClone(params),
@@ -736,6 +741,7 @@ export class ProtocolClient {
       token: 0,
       closed: false,
     };
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- parameter getters can close the client during structuredClone.
     if (this.#closed) throw new ClientClosedError();
     this.#live.add(state);
     this.#startLive(state);
@@ -768,6 +774,10 @@ export class ProtocolClient {
       this.#port?.postMessage({ t: "cancel", target: state.seq, close: true });
   }
   #startLive(state: ClientLiveState): void {
+    if (this.#replaced !== null) {
+      this.#liveError(state, this.#replaced);
+      return;
+    }
     const token = ++state.token;
     const generation = this.#generation;
     state.initialErrorHandled = false;
@@ -1554,6 +1564,21 @@ export class ProtocolClient {
     if (this.#replaced !== null) return this.#replaced;
     const error = new DatabaseReplacedError();
     this.#replaced = error;
+    this.#liveBySeq.clear();
+    // No replacement registration can enter this Set: subscribeLive refuses the sticky
+    // identity error before capture. Remove before callbacks, which may close other handles.
+    for (const live of this.#live) {
+      this.#live.delete(live);
+      live.token++;
+      live.queued = null;
+      live.params = EMPTY_LIVE_PARAMS;
+      try {
+        live.options.onReset?.("databaseReplaced");
+      } catch {
+        /* Reset callbacks do not own replacement or typed-error delivery. */
+      }
+      this.#liveError(live, error);
+    }
     this.#welcome?.reject(error);
     this.#welcome = null;
     for (const pending of [...this.#pending.values()]) this.#fail(pending, error);

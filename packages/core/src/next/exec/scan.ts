@@ -60,7 +60,7 @@ import type { GroupSegment } from "../access/snapshot.js";
 import type { ByteBudget, SpaceReader } from "../access/space.js";
 import type { ColumnPredicate, CompiledPredicate } from "../page/predicate.js";
 import type { FlatVector, Validity } from "../vector/vector.js";
-import { ChunkReader } from "../page/reader.js";
+import { ChunkReader, type ChunkReadOptions } from "../page/reader.js";
 
 /** A column chunk as a group segment names it (format/manifest.ts `ColumnChunk`). */
 export type ColumnChunkRef = NonNullable<ReturnType<GroupSegment["chunk"]>>;
@@ -178,6 +178,7 @@ export interface ChunkReads {
       readonly signal?: AbortSignal;
       readonly once?: boolean;
       readonly task?: TaskWork;
+      readonly directories?: NonNullable<ChunkReadOptions["directories"]>;
     },
   ): MaybePromise<ChunkPages>;
   /** Coalesce a full scan's row window across columns; leases still belong to each reader. */

@@ -468,6 +468,9 @@ export class QueryRuntime {
   sourceBatchRows(id: number): number | undefined {
     return this.#readBounds.get(id)?.batchRows;
   }
+  sourceRetains(id: number): boolean {
+    return this.#readBounds.get(id)?.retain !== false;
+  }
   sourceWindow(id: number): number {
     return this.#readBounds.get(id)?.windowBytes ?? 0;
   }

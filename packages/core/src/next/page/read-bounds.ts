@@ -5,6 +5,7 @@ import type { ByteBudget, ExtentReader as SpaceReader, BlobRef } from "../storag
 import { ReadDeniedError } from "../storage/extents.js";
 import { MetadataReader } from "../format/metadata-reader.js";
 import type { QueryRoots, ScanRootFacts } from "./query-roots.js";
+import { directoryCacheFor } from "./directory-cache.js";
 import { parseCharge, ParseBudgetError } from "../format/manifest-codec.js";
 import { PageEncoding } from "../format/manifest.js";
 import type { Grant, MemoryGovernor } from "../memory/governor.js";
@@ -199,6 +200,7 @@ export function boundSource(
   }
   return result;
   function* size(): ReadJob<ReadBound> {
+    const directoryCache = directoryCacheFor(view.pages);
     const table = yield* readValue(view.table(source.tableId, { budget: NO_ALLOCATION }));
     const certificate = new Int32DomainCertificate(
       source.domainColumn,
@@ -448,8 +450,8 @@ export function boundSource(
               const chunk = root.value.columns.find((candidate) => candidate.columnId === column);
               if (!chunk) continue;
               const before = budget.allocated;
-              // No directory/inflate admission is needed by the sizing pass. Exact-sized
-              // encoded reads keep this attempt's complete reservation a hard limit.
+              // Encoded reads and parsed holders stay within this admitted sizing
+              // attempt. On release, only the owner cache may fund idle retention.
               const pages: SpaceReader = {
                 ...(view.pages.dataLength === undefined
                   ? {}
@@ -467,7 +469,10 @@ export function boundSource(
               const reader = yield* readValue(
                 ChunkReader.open(pages, chunk, {
                   budget,
-                  once: true,
+                  // Ordinary sizing may share its independently funded parse with
+                  // execution. Non-retaining exports only borrow preexisting hits.
+                  once: directoryCache === undefined || retention.retain === false,
+                  ...(directoryCache === undefined ? {} : { directories: directoryCache }),
                   signal,
                   task,
                 }),

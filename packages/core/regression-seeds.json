@@ -80,6 +80,17 @@
     "next-live-admission-close": [8866, 8867],
     "next-live-row-backing": [8870, 8871],
     "next-live-row-identity": [8868, 8869],
-    "next-live-row-binary": [8872, 8873]
+    "next-live-column-codec": [8902, 8903],
+    "next-live-snapshot-import": [8900, 8901],
+    "next-live-row-binary": [8872, 8873],
+    "next-live-store-binding": [],
+    "next-live-store-disposal": [],
+    "next-native-kysely-live": [],
+    "next-live-store-account": [],
+    "next-live-store-capture": [],
+    "next-live-store-reset": [8904, 8905],
+    "next-live-store-metadata": [8906, 8907],
+    "next-live-store-data": [8908, 8909],
+    "next-live-store-canonical": [8910, 8911]
   }
 }

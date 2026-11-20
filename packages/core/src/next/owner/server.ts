@@ -277,6 +277,9 @@ export class OwnerServer {
     // Disconnected clients can still own started native cleanup after their request
     // has settled. Never close/reuse the native path or scratch beneath that work.
     await Promise.all([...this.#draining].map((other) => other.drained()));
+    // Live sessions are outside ordinary request slots. Drain their native cleanup and
+    // detach the old feed before import admission, path close or scratch reuse.
+    await this.#engine.retireLive?.();
     // Session queue finalizers follow their run's completion.
     await Promise.resolve();
     signal.throwIfAborted();
@@ -434,6 +437,8 @@ class Connection {
    * result production is discarded as on disconnect, so credits cannot hold up replacement. */
   async drainForReplacement(except: number | null): Promise<void> {
     this.#drainingForRestore = true;
+    for (const handle of this.#live.values()) handle.close();
+    this.#live.clear();
     for (const queued of this.#queued.values()) queued.cancelled = true;
     for (const [seq, running] of this.#running) {
       if (seq === except) continue;

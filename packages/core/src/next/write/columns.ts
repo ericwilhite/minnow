@@ -17,7 +17,8 @@
  * `TableChange.inserts.columns`): a layout tag, a validity bitmap (or none), then the layout's raw
  * little-endian arrays. Decoding yields a fresh `FlatVector` that replay appends like any batch.
  */
-import { DURABLE_CODECS, requireHeader, requireTag } from "../durable-format.js";
+import { decodeColumnBytes } from "../vector/column-codec.js";
+import { DURABLE_CODECS } from "../durable-format.js";
 import { StoreCorruptionError } from "../storage/contract.js";
 import { layoutOf, type PhysicalType } from "../types.js";
 import { int128At, setInt128 } from "../vector/int128.js";
@@ -496,15 +497,6 @@ function writeInt64(writer: ByteSink, values: Int64Values, from: number, count: 
   writer.typed(values.values.subarray(from, from + count));
 }
 
-function readInt64(reader: ByteReader, count: number): Int64Values {
-  const repr = reader.u8();
-  requireTag(repr, DURABLE_CODECS.integerRepr, "integer representation", StoreCorruptionError);
-  const bytes = reader.raw(count * 8).slice();
-  if (repr === 0) return { repr: "safe", values: new Float64Array(bytes.buffer) };
-  if (repr === 1) return { repr: "int64", values: new BigInt64Array(bytes.buffer) };
-  throw new StoreCorruptionError("Bad int64 representation in a log column");
-}
-
 /**
  * Encodes slots `[from, from + count)` of `vector` (a stored flat vector), appended to `writer`
  * (a fresh one when omitted, whose bytes are returned).
@@ -591,94 +583,7 @@ function writeBits(writer: ByteSink, validity: Uint32Array, from: number, count:
   }
 }
 
-function readFlag(reader: ByteReader): boolean {
-  const value = reader.u8();
-  requireTag(value, DURABLE_CODECS.boolean, "column flag", StoreCorruptionError);
-  return value === 1;
-}
-
-/** Decodes an encoded column into a fresh flat vector of `type`. */
+/** Decodes native storage with its existing corruption-error identity. */
 export function decodeColumn(bytes: Uint8Array, type: PhysicalType): FlatVector {
-  requireHeader("column", bytes, StoreCorruptionError);
-  const reader = new ByteReader(bytes);
-  const tag = reader.u8();
-  const layout = layoutOf(type);
-  if (LAYOUT_TAG[layout] !== tag)
-    throw new StoreCorruptionError("A log column's layout differs from its type");
-  const count = reader.varuint();
-  const validity = readFlag(reader)
-    ? new Uint32Array(reader.raw(Math.ceil(count / 32) * 4).slice().buffer)
-    : null;
-  if (
-    validity !== null &&
-    (count & 31) !== 0 &&
-    (validity[validity.length - 1] ?? 0) >>> (count & 31) !== 0
-  )
-    throw new StoreCorruptionError("Nonzero log column validity padding");
-  const copy = (bytesPer: number) => reader.raw(count * bytesPer).slice().buffer;
-  let data: VectorData;
-  switch (layout) {
-    case "bool": {
-      const values = new Uint8Array(copy(1));
-      for (let row = 0; row < count; row++)
-        if (bitValid(validity, row))
-          requireTag(values[row] ?? 0, DURABLE_CODECS.boolean, "log boolean", StoreCorruptionError);
-      data = { layout, values };
-      break;
-    }
-    case "i32":
-      data = { layout, values: new Int32Array(copy(4)) };
-      break;
-    case "f64":
-      data = { layout, values: new Float64Array(copy(8)) };
-      break;
-    case "f32":
-      data = { layout, values: new Float32Array(copy(4)) };
-      break;
-    case "int64":
-      data = { layout, values: readInt64(reader, count) };
-      break;
-    case "decimal": {
-      const mixed = readFlag(reader);
-      const scales = mixed ? new Uint16Array(copy(2)) : null;
-      const scale = mixed ? null : reader.varuint();
-      const specials = readFlag(reader) ? reader.raw(count).slice() : null;
-      if (specials !== null)
-        for (let row = 0; row < count; row++)
-          if (bitValid(validity, row))
-            requireTag(
-              specials[row] ?? 0,
-              DURABLE_CODECS.decimalSpecial,
-              "decimal special",
-              StoreCorruptionError,
-            );
-      const tier = reader.u8();
-      requireTag(tier, DURABLE_CODECS.decimalRepr, "decimal representation", StoreCorruptionError);
-      let coefficients: DecimalData["coefficients"];
-      if (tier === 2) coefficients = { repr: "int128", limbs: new Uint32Array(copy(16)) };
-      else {
-        reader.offset -= 1;
-        coefficients = readInt64(reader, count);
-      }
-      data = { layout, scale, scales, coefficients, specials };
-      break;
-    }
-    case "varlen": {
-      const relative = new Int32Array(reader.raw((count + 1) * 4).slice().buffer);
-      const values = reader.raw(relative[count] ?? 0).slice();
-      data = { layout, bytes: values, offsets: relative };
-      break;
-    }
-    case "fixed16":
-      data = { layout, bytes: new Uint8Array(copy(16)) };
-      break;
-    case "interval": {
-      const months = new Int32Array(copy(4));
-      const days = new Int32Array(copy(4));
-      data = { layout, months, days, micros: readInt64(reader, count) };
-      break;
-    }
-  }
-  reader.end();
-  return { form: "flat", type, length: count, validity, data };
+  return decodeColumnBytes(bytes, type, ByteReader, StoreCorruptionError);
 }

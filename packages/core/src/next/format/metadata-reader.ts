@@ -32,7 +32,7 @@ import {
   type GroupPageEntry,
   type Parsed,
 } from "./manifest-codec.js";
-import type { GroupRef, GroupRoot } from "./manifest.js";
+import type { ChunkDirectory, GroupRef, GroupRoot } from "./manifest.js";
 import type { Held, ManifestReader } from "./reachable.js";
 
 export type MaybePromise<T> = T | Promise<T>;
@@ -43,6 +43,8 @@ export interface MetadataCaches {
   readonly groupRoots?: BlobCache<GroupRoot>;
   readonly groupPages?: BlobCache<readonly GroupRef[]>;
   readonly groupIndexes?: BlobCache<readonly GroupPageEntry[]>;
+  /** Independently validated immutable column directories, scoped to this owner. */
+  readonly directories?: BlobCache<ChunkDirectory>;
 }
 
 // The owner already registers/clears these caches. This weak binding adds no second cache,

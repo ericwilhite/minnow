@@ -2,7 +2,7 @@
  * Size cloneable data before allocation; prepaid scratch funds the bounded walk and fallback.
  */
 import type { WireError } from "../owner/errors.js";
-import { bigintBytes, OBJECT_OVERHEAD_BYTES, stringBytes } from "../memory/governor.js";
+import { bigintBytes, OBJECT_OVERHEAD_BYTES, stringBytes } from "../memory-values.js";
 import { LIVE_ERROR_MAX_BYTES } from "./constants.js";
 
 const REFUSE = new RangeError("Live error diagnostic exceeds its bounded shape");
