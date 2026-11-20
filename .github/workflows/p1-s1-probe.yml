@@ -1,0 +1,86 @@
+# SCRATCH BRANCH ONLY (ci/p1-s1-probe). Never merge this campaign or its worker into main.
+# The S1 WIP is a collapsed snapshot (prerequisite + S1 + P3 port + zero-cost fix), so the
+# component control is fresh main: it measures the combined piece, not an isolated kernel.
+name: P1 S1 eight-cell probe (branch only)
+on:
+  push:
+    branches: [ci/p1-s1-probe]
+  workflow_dispatch:
+    inputs:
+      main:
+        description: Exact fresh main SHA on which the candidate is based
+        required: true
+      component_parent:
+        description: Exact prerequisite SHA for the isolated component control
+        required: false
+        default: "3881fff536b358ebbd66411b88b8d286815fa912"
+      candidate:
+        description: Candidate SHA; empty uses this scratch branch HEAD
+        required: false
+        default: ""
+permissions:
+  contents: read
+concurrency:
+  group: p1-s1-probe-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  probe:
+    if: github.ref == 'refs/heads/ci/p1-s1-probe'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      UV_THREADPOOL_SIZE: "1"
+      NODE_OPTIONS: --max-old-space-size=4096
+      # Pin the fresh baseline chosen for this candidate; a moving ref must not change it.
+      B4_MAIN: ${{ inputs.main || '3881fff536b358ebbd66411b88b8d286815fa912' }}
+      B4_COMPONENT_PARENT: ${{ inputs.component_parent || '3881fff536b358ebbd66411b88b8d286815fa912' }}
+      B4_CANDIDATE: ${{ inputs.candidate }}
+      B4_FROZEN: 5811568dbe5a1c6c3756e3df19789deb75a7ffbf
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "26.12.0"
+      - name: Cache-only directories and runner identity
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.cache/b4-probe/tmp" "$HOME/.cache/b4-probe/results"
+          echo "TMPDIR=$HOME/.cache/b4-probe/tmp" >> "$GITHUB_ENV"
+          echo "npm_config_cache=$HOME/.cache/npm" >> "$GITHUB_ENV"
+          node -p 'JSON.stringify({node:process.version,cpus:require("os").cpus(),memory:require("os").totalmem()})' > "$HOME/.cache/b4-probe/results/runner.json"
+          node -e 'if (require("os").totalmem() < 14 * 2**30) throw Error("B4 probe requires the 16 GB runner")'
+      - name: Install and build harness
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npx tsc -b --pretty false
+          npx tsc --noEmit --pretty false -p scripts
+      - name: Build the three query runtimes and component parent serially
+        shell: bash
+        run: |
+          git worktree add --detach "$HOME/.cache/b4-probe/main" "$B4_MAIN"
+          git worktree add --detach "$HOME/.cache/b4-probe/candidate" "${B4_CANDIDATE:-HEAD}"
+          git worktree add --detach "$HOME/.cache/b4-probe/frozen" "$B4_FROZEN"
+          git worktree add --detach "$HOME/.cache/b4-probe/component-parent" "$B4_COMPONENT_PARENT"
+          for arm in main candidate frozen component-parent; do
+            (cd "$HOME/.cache/b4-probe/$arm" && npm ci --ignore-scripts --no-audit --no-fund && npx tsc -b packages/core --pretty false)
+          done
+      - name: Isolated component controls, writer-native images, W1M cohorts and profiles
+        shell: bash
+        run: |
+          node --v8-pool-size=1 scripts/b4-perf-probe.mts --main "$HOME/.cache/b4-probe/main" --candidate "$HOME/.cache/b4-probe/candidate" --frozen "$HOME/.cache/b4-probe/frozen" --component-parent "$HOME/.cache/b4-probe/component-parent" --output "$HOME/.cache/b4-probe/results" 2>&1 | tee "$HOME/.cache/b4-probe/results/run.log"
+      - name: Upload raw evidence, including failed or incomplete attempts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: b4-probe-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ~/.cache/b4-probe/results/*.json
+            ~/.cache/b4-probe/results/*.jsonl
+            ~/.cache/b4-probe/results/*.cpuprofile
+            ~/.cache/b4-probe/results/*.log
+            ~/.cache/b4-probe/results/*-writer-image/manifest.*
+            ~/.cache/b4-probe/results/component-*/*.json
+          if-no-files-found: error
+          retention-days: 30
