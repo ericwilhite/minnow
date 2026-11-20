@@ -10350,6 +10350,8 @@ export const PREPARATION_CREDIT_REACH = [
   "served from credit",
   "concurrent restarts",
   "cancel during credit wait",
+  "publish between attempts",
+  "join",
 ] as const;
 
 export const NATIVE_BODY_LIFETIME_REACH = [

@@ -6,10 +6,11 @@
  * 2. Complete executions atomically admit their whole minimum FIFO, holding nothing while
  *    waiting. `includesProgress` includes their private I/O and per-operator progress credit.
  *    Admissions before that minimum (query preparation: retained source recipes, sizing
- *    scratch, planning probes) come from one preparation credit carved with `carve`, or are
- *    immediate (`canAdmitNow`), or wait only while the query holds nothing. Otherwise the query
- *    releases everything and waits, holding nothing, for a larger credit, then prepares again
- *    (exec/preparation.ts).
+ *    scratch, planning probes) come from one preparation credit (`carve`, `adopt`:
+ *    released bytes return to it), grown only by immediate admissions (`canAdmitNow`), or wait
+ *    only while the query holds nothing. Otherwise the query releases everything and waits,
+ *    holding nothing, for a credit covering its peak need, up to the usable capacity, then prepares
+ *    again (exec/preparation.ts).
  * 3. Only a complete minimum above the whole cap is a typed admission-size refusal. An
  *    incomplete legacy operator minimum leaves the shared reserve for its isolated step loans.
  * 4. Held and allocated differ: allocate/free suballocate an existing grant. Allocation and
@@ -869,6 +870,29 @@ export class Governor implements MemoryGovernor {
     source.held -= bytes;
     grant.held += bytes;
     return grant;
+  }
+
+  /**
+   * From now on `child` returns the bytes it releases to `parent` while `parent` is open, exactly
+   * as if it had been carved from it. False (nothing changes) for a closed, foreign, idle or
+   * already parented grant.
+   */
+  adopt(parent: Grant, child: Grant): boolean {
+    if (
+      !(parent instanceof GrantImpl) ||
+      !(child instanceof GrantImpl) ||
+      parent === child ||
+      parent.governor !== this ||
+      child.governor !== this ||
+      parent.closed ||
+      child.closed ||
+      child.parent !== null ||
+      this.#idleCredit.has(parent) ||
+      this.#idleCredit.has(child)
+    )
+      return false;
+    child.parent = parent;
+    return true;
   }
 
   transferCredit(source: Grant, target: Grant, bytes: number): boolean {

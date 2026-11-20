@@ -2,22 +2,25 @@
  * Query preparation never waits while it holds memory (memory governor: no hold-and-wait).
  *
  * From the query's first preparation admission (retained source recipes, sizing scratch, planning
- * probes, parameter sizing) through its reservation, every admission is served from one held
- * preparation credit, or else only by an immediate admission. When one would wait, preparation
- * throws PreparationWouldWait; the execution releases everything the attempt holds (recipes,
- * scratch, credit), waits holding nothing for a credit of max(2 x the previous request, held +
- * requested), and restarts preparation from scratch on a fresh runtime. Requests grow
- * monotonically to the governor's capacity, so attempts are bounded; a need above the cap is the
- * typed MemoryAdmissionError (53200), never a refusal below it.
+ * probes, parameter sizing) through its reservation, every admission is immediate (the governor
+ * serves it at once: an immediate whole, or the governor's own group call with its label and
+ * named parts) or, after a restart, served from the preparation credit, a single pool: every
+ * grant the attempt obtains returns the bytes it releases to that credit while it is open, so a
+ * freed scratch grant's bytes serve the next phase, and the credit grows only by immediate
+ * admissions. An attempt that holds nothing at all may wait as usual: that is already a wait
+ * holding nothing.
  *
- * An attempt that holds nothing at all just waits for the admission (that is already a wait
- * holding nothing; there is nothing to release or redo). Admissions the governor serves at once
- * are admitted as on the ordinary path, through the same group call.
+ * Otherwise preparation throws PreparationWouldWait. The execution releases everything the attempt
+ * holds (recipes, scratch, credit), waits holding nothing, and prepares again from scratch on a
+ * fresh runtime. That wait is the admission that would have waited (its label and named parts)
+ * plus one `…/preparation-credit` part; once admitted, all of it is the next attempt's credit.
  *
- * The credit is admitted as the very admission that would have waited: the same group label and
- * named parts, plus one `…/preparation-credit` part for the rest. The next attempt receives those
- * part grants when it asks for the same admission again; everything else it needs is carved from
- * the credit part. So what the governor sees a query wait for is still its own named minimum.
+ * The request covers the attempt's peak simultaneous need (live grants at their peak, or live
+ * grants plus the request that would have waited), at least twice the previous request but no more
+ * than the usable capacity (usableCapacity: the cap less the reserve unless private progress,
+ * less lifetime holdings). A credit of the usable capacity serves every preparation whose peak
+ * fits, so a query restarts at most ceil(log2(usable / first request)) + 1 times; a peak need above
+ * the usable capacity is the typed MemoryAdmissionError (53200), never a refusal below it.
  *
  * Once the reservation is installed the facade passes every admission to the real governor.
  */
@@ -32,8 +35,6 @@ import {
 } from "../memory/governor.js";
 
 type Part = NativeGrantGroupOptions["grants"][number];
-const samePart = (a: Part, b: Part | undefined) =>
-  b?.label === a.label && b.minimumBytes === a.minimumBytes && b.spillable === a.spillable;
 
 /** A preparation admission could not be served without waiting. */
 export class PreparationWouldWait extends Error {
@@ -42,10 +43,12 @@ export class PreparationWouldWait extends Error {
     readonly requested: number,
     /** Whether the request needed the progress reserve (more than cap - reserve). */
     readonly includesProgress: boolean,
-    /** Bytes the attempt held at that moment (live preparation grants). */
+    /** Bytes the attempt's live grants held at that moment. */
     readonly held: number,
     /** The named parts of the admission that would have waited (their sum is `requested`). */
     readonly parts: readonly Part[],
+    /** The attempt's peak simultaneous need, including this request. */
+    readonly needed = held + requested,
   ) {
     super(`${label}: query preparation would wait while it holds memory`);
     this.name = "PreparationWouldWait";
@@ -55,11 +58,12 @@ export class PreparationWouldWait extends Error {
 export class PreparationGovernor implements MemoryGovernor {
   #credit: Grant | null = null;
   #preparing = true;
-  /** Grants this attempt took; their live holdings are the "held" part of the next request. */
+  /** Grants this attempt took; their live holdings are what it holds besides the credit. */
   readonly #taken = new Set<Grant>();
-  /** The admission the last attempt would have waited for, admitted with the credit. */
-  #waited: { readonly label: string; readonly parts: readonly Part[]; grants: Grant[] } | null =
-    null;
+  /** The attempt's peak live holdings. */
+  #peak = 0;
+  /** Whether the attempt made a private-progress request (its credit may use the reserve). */
+  #progress = false;
   #need = 0;
   #attempts = 1;
   constructor(
@@ -100,6 +104,15 @@ export class PreparationGovernor implements MemoryGovernor {
   get credit(): Grant | null {
     return this.#credit;
   }
+  /**
+   * The most one request can ever be granted: the cap (less the reserve unless it includes
+   * private progress), less lifetime holdings. Lifetime holdings are not registered with the
+   * governor yet; when #11 adds Governor.usableCapacity, this becomes
+   * `return this.governor.usableCapacity(includesProgress);`.
+   */
+  usableCapacity(includesProgress = false): number {
+    return includesProgress ? this.capBytes : this.capBytes - this.reserveBytes;
+  }
   registerCache(cache: EvictableCache): ReturnType<MemoryGovernor["registerCache"]> {
     return this.governor.registerCache(cache);
   }
@@ -107,26 +120,10 @@ export class PreparationGovernor implements MemoryGovernor {
     return this.governor.transferCredit(source, target, bytes);
   }
 
-  /** From the credit, else an immediate admission; never waits. */
-  tryAdmit(options: Omit<AdmitOptions, "signal">): Grant | null {
-    if (!this.#preparing) return this.governor.tryAdmit(options);
-    if (this.#waited?.label === options.label) {
-      // The admitted wait itself, asked for again: as one grant, or (for a group asked through
-      // an immediate whole first) by its group request.
-      const [grant] = this.#claim(options.label, [options]) ?? [];
-      return grant ?? null;
-    }
-    const carved =
-      this.#credit === null
-        ? null
-        : this.governor.carve(this.#credit, options.label, options.spillable, options.minimumBytes);
-    const grant =
-      carved ??
-      (options.minimumBytes > this.capBytes - this.reserveBytes
-        ? null
-        : this.governor.tryAdmit(options));
-    if (grant !== null) this.#taken.add(grant);
-    return grant;
+  /** Unused credit bytes. */
+  #room(): number {
+    const credit = this.#credit;
+    return credit === null ? 0 : credit.held - credit.allocated - credit.loaned;
   }
   /** Live bytes held by this attempt's grants. */
   #live(): number {
@@ -135,65 +132,80 @@ export class PreparationGovernor implements MemoryGovernor {
     return bytes;
   }
   /**
-   * Holding nothing (no live grant, credit or admitted wait), an attempt may simply wait: that is
-   * already a wait holding nothing, and there is nothing to release or prepare again.
+   * Records a grant of this attempt. With a credit (after a restart), its released bytes go back
+   * to the credit from now on.
    */
-  #holdsNothing(): boolean {
-    return this.#credit === null && this.#waited === null && this.#live() === 0;
-  }
   #took(grant: Grant): Grant {
-    if (this.#preparing) this.#taken.add(grant);
+    if (!this.#preparing) return grant;
+    if (this.#credit !== null && grant !== this.#credit) this.governor.adopt(this.#credit, grant);
+    this.#taken.add(grant);
+    this.#peak = Math.max(this.#peak, this.#live());
     return grant;
   }
-  /** The admitted wait's grants when this request is that same admission, else null. */
-  #claim(label: string, parts: readonly Part[]): Grant[] | null {
-    const waited = this.#waited;
-    if (waited?.label !== label) return null;
-    if (
-      waited.parts.length !== parts.length ||
-      !waited.parts.every((part, i) => samePart(part, parts[i]))
-    ) {
-      // A different request under the same label: keep the bytes in the credit instead.
-      if (parts.length === 1 && waited.parts.length > 1) return null;
-      this.#dropWaited();
-      return null;
-    }
-    this.#waited = null;
-    for (const grant of waited.grants) this.#taken.add(grant);
-    return waited.grants;
+  /**
+   * Adds `bytes` to the credit if the governor admits them at once (FIFO order kept: nothing
+   * queued). The request keeps the label of the admission it serves.
+   */
+  #growCredit(credit: Grant, label: string, bytes: number): boolean {
+    if (bytes <= 0) return true;
+    if (bytes > this.usableCapacity(false)) return false;
+    const whole = this.governor.tryAdmit({ label, minimumBytes: bytes, spillable: false });
+    if (whole === null) return false;
+    const moved = this.governor.transferCredit(whole, credit, bytes);
+    whole.close();
+    return moved;
   }
-  /** Returns an unclaimed admitted wait to the credit (or to the governor without one). */
-  #dropWaited(): void {
-    const waited = this.#waited;
-    if (waited === null) return;
-    this.#waited = null;
-    for (const grant of waited.grants) {
-      if (this.#credit !== null && grant.allocated === 0 && grant.loaned === 0)
-        this.governor.transferCredit(grant, this.#credit, grant.held);
-      grant.close();
-    }
+  #carve(source: Grant, label: string, spillable: boolean, bytes: number): Grant | null {
+    const grant = this.governor.carve(source, label, spillable, bytes);
+    return grant === null ? null : this.#took(grant);
   }
-  #room(): number {
-    const credit = this.#credit;
-    return credit === null ? 0 : credit.held - credit.allocated - credit.loaned;
+  /**
+   * Holding no live grant, the attempt may wait like any execution: it first returns the idle
+   * credit, so the wait holds nothing.
+   */
+  #holdsNothing(): boolean {
+    if (this.#live() !== 0) return false;
+    const idle = this.#room();
+    if (idle > 0) this.#credit?.release(idle);
+    return this.#credit === null || this.#credit.held === 0;
+  }
+  #wouldWait(label: string, total: number, progress: boolean, parts: readonly Part[]) {
+    const live = this.#live();
+    return new PreparationWouldWait(
+      label,
+      total,
+      progress,
+      live,
+      parts,
+      Math.max(this.#peak, live + total),
+    );
+  }
+
+  /**
+   * From the credit when it has the room, else the governor's own immediate grant (the same
+   * request as without the facade), adopted by any credit; never waits.
+   */
+  tryAdmit(options: Omit<AdmitOptions, "signal">): Grant | null {
+    if (!this.#preparing) return this.governor.tryAdmit(options);
+    if (options.minimumBytes > this.usableCapacity(false)) return null;
+    const room = this.#room();
+    if (this.#credit !== null && room > 0 && room >= options.minimumBytes)
+      return this.#carve(this.#credit, options.label, options.spillable, options.minimumBytes);
+    const grant = this.governor.tryAdmit(options);
+    return grant === null ? null : this.#took(grant);
   }
   admit(options: AdmitOptions): Promise<Grant> {
     if (!this.#preparing) return this.governor.admit(options);
     options.signal?.throwIfAborted();
     const grant = this.tryAdmit(options);
-    if (grant === null && this.#holdsNothing())
+    if (grant !== null) return Promise.resolve(grant);
+    if (this.#holdsNothing())
       return this.governor.admit(options).then((admitted) => this.#took(admitted));
-    return grant === null
-      ? Promise.reject(
-          new PreparationWouldWait(options.label, options.minimumBytes, false, this.#live(), [
-            {
-              label: options.label,
-              minimumBytes: options.minimumBytes,
-              spillable: options.spillable,
-            },
-          ]),
-        )
-      : Promise.resolve(grant);
+    return Promise.reject(
+      this.#wouldWait(options.label, options.minimumBytes, false, [
+        { label: options.label, minimumBytes: options.minimumBytes, spillable: options.spillable },
+      ]),
+    );
   }
   admitGroup(options: NativeGrantGroupOptions): Promise<readonly Grant[]> {
     if (!this.#preparing) return this.governor.admitGroup(options);
@@ -215,92 +227,85 @@ export class PreparationGovernor implements MemoryGovernor {
   #serveGroup(options: NativeGrantGroupOptions, total: number): Promise<readonly Grant[]> {
     try {
       options.signal?.throwIfAborted();
-      const claimed = this.#claim(options.label, options.grants);
-      if (claimed !== null) return Promise.resolve(claimed);
       const progress = options.includesProgress === true;
-      const capacity = progress ? this.capBytes : this.capBytes - this.reserveBytes;
-      if (total > capacity) throw new MemoryAdmissionError(options.label, total, capacity);
-      // All or nothing. From the credit, each part is carved directly (so it returns there).
-      if (this.#credit !== null && this.#room() >= total) {
-        const credit = this.#credit;
-        return Promise.resolve(this.#split(credit, options.grants, false));
-      }
-      // Otherwise immediately, in admitWorkingSet's order: one immediate whole split into the
-      // parts, else the governor's own group when it serves that group at once (a private-
-      // progress group may use the reserve). Never a queued wait.
-      const whole =
-        total > this.capBytes - this.reserveBytes
-          ? null
-          : this.governor.tryAdmit({ label: options.label, minimumBytes: total, spillable: false });
-      if (whole !== null) return Promise.resolve(this.#split(whole, options.grants, true));
-      if (this.governor.canAdmitNow(total, progress)) {
-        // Any idle pool was registered already; the parts are an ordinary group.
-        const group: NativeGrantGroupOptions = {
+      if (progress) this.#progress = true;
+      const usable = this.usableCapacity(progress);
+      if (total > usable) throw new MemoryAdmissionError(options.label, total, usable);
+      // All or nothing: from the credit (grown at once by an immediate whole if it is short);
+      // before any restart, from one immediate whole split into the parts.
+      const credit = this.#credit;
+      if (credit !== null) {
+        if (this.#growCredit(credit, options.label, total - this.#room()))
+          return Promise.resolve(this.#split(credit, options.grants));
+      } else if (total <= this.usableCapacity(false)) {
+        const whole = this.governor.tryAdmit({
           label: options.label,
-          grants: options.grants,
-          includesProgress: progress,
-          ...(options.signal === undefined ? {} : { signal: options.signal }),
-        };
-        return this.governor.admitGroup(group).then((grants) => {
-          for (const grant of grants) this.#taken.add(grant);
-          return grants;
+          minimumBytes: total,
+          spillable: false,
         });
+        if (whole !== null) {
+          try {
+            return Promise.resolve(this.#split(whole, options.grants));
+          } finally {
+            whole.close();
+          }
+        }
       }
-      if (this.#holdsNothing()) {
-        const group: NativeGrantGroupOptions = {
-          label: options.label,
-          grants: options.grants,
-          includesProgress: progress,
-          ...(options.signal === undefined ? {} : { signal: options.signal }),
-        };
+      // Else the governor's own group, when it serves that group at once (a private-progress
+      // group may use the reserve), or an ordinary wait when the attempt holds nothing.
+      const group: NativeGrantGroupOptions = {
+        label: options.label,
+        grants: options.grants,
+        includesProgress: progress,
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+      };
+      if (this.governor.canAdmitNow(total, progress) || this.#holdsNothing())
         return this.governor
           .admitGroup(group)
           .then((grants) => grants.map((grant) => this.#took(grant)));
-      }
-      throw new PreparationWouldWait(options.label, total, progress, this.#live(), options.grants);
+      throw this.#wouldWait(options.label, total, progress, options.grants);
     } catch (error) {
       return Promise.reject(error instanceof Error ? error : new Error(String(error)));
     }
   }
-  /** Carves `parts` from `source` (all or nothing); a transient whole is then closed. */
-  #split(source: Grant, parts: NativeGrantGroupOptions["grants"], transient: boolean): Grant[] {
+  /** Carves every part from `source` (all or nothing). */
+  #split(source: Grant, parts: NativeGrantGroupOptions["grants"]): Grant[] {
     const grants: Grant[] = [];
-    try {
-      for (const part of parts) {
-        const grant = this.governor.carve(source, part.label, part.spillable, part.minimumBytes);
-        if (grant === null) throw new Error("A carved preparation group did not split");
-        grants.push(grant);
+    for (const part of parts) {
+      const grant = this.#carve(source, part.label, part.spillable, part.minimumBytes);
+      if (grant === null) {
+        for (const done of grants) {
+          this.#taken.delete(done);
+          done.close();
+        }
+        throw new Error("A carved preparation group did not split");
       }
-    } catch (error) {
-      for (const done of grants) done.close();
-      throw error;
-    } finally {
-      if (transient) source.close();
+      grants.push(grant);
     }
-    for (const grant of grants) this.#taken.add(grant);
     return grants;
   }
 
   /**
    * After the attempt released everything it held: waits, holding nothing, for the next credit.
-   * The request is max(2 x the previous request, held + requested), capped at the capacity.
+   * The request is the attempt's peak need, at least twice the previous request, at most the
+   * usable capacity.
    */
   async regrow(wait: PreparationWouldWait, signal: AbortSignal): Promise<void> {
     if (!this.#preparing) throw new TypeError("Preparation already reserved");
     this.#credit?.close();
     this.#credit = null;
-    this.#dropWaited();
-    const capacity = this.capBytes - (wait.includesProgress ? 0 : this.reserveBytes);
-    const wanted = wait.held + wait.requested;
-    if (wanted > capacity) throw new MemoryAdmissionError(wait.label, wanted, capacity);
-    this.#need = Math.min(capacity, Math.max(2 * this.#need, wanted));
     this.#taken.clear();
+    this.#peak = 0;
+    const progress = wait.includesProgress || this.#progress;
+    const usable = this.usableCapacity(progress);
+    if (wait.needed > usable) throw new MemoryAdmissionError(wait.label, wait.needed, usable);
+    this.#need = Math.max(wait.needed, Math.min(2 * this.#need, usable));
     this.#attempts++;
-    // The admission that would have waited, with its own label and parts, plus the credit
-    // (need >= held + requested, so the credit part covers at least what the attempt held).
+    // The admission that would have waited, with its own label and parts, plus the rest of the
+    // credit. All of it becomes the next attempt's credit.
     const grants = await this.governor.admitGroup({
       label: wait.label,
-      includesProgress: wait.includesProgress,
+      includesProgress: progress,
       signal,
       grants: [
         ...wait.parts,
@@ -317,15 +322,17 @@ export class PreparationGovernor implements MemoryGovernor {
       signal.throwIfAborted();
       throw new Error("Preparation credit was not admitted");
     }
+    for (const part of grants.slice(0, -1)) {
+      this.governor.transferCredit(part, credit, part.held);
+      part.close();
+    }
     this.#credit = credit;
-    this.#waited = { label: wait.label, parts: wait.parts, grants: grants.slice(0, -1) };
   }
 
   /** The reservation is installed: release the unused credit and pass admissions through. */
   finish(): void {
     this.#preparing = false;
     this.#taken.clear();
-    this.#dropWaited();
     this.#credit?.close();
     this.#credit = null;
   }

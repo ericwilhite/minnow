@@ -32,6 +32,12 @@ async function prepare(
     } catch (error) {
       for (const grant of grants) grant.close();
       if (!(error instanceof PreparationWouldWait)) throw error;
+      // Attempts are bounded; a preparation that keeps restarting fails here (an unbounded
+      // loop of resolved promises would starve the test's own timeout).
+      if (facade.attempts > 64)
+        throw new Error(`preparation did not terminate: ${String(facade.attempts)} attempts`, {
+          cause: error,
+        });
       onRegrow?.(error);
       await facade.regrow(error, signal);
     }
@@ -57,7 +63,7 @@ it("grows the credit geometrically: restarts are bounded by log2(capacity / firs
     Array.from({ length: parts }, () => size),
     new AbortController().signal,
     (wait) => {
-      if (first === 0) first = wait.held + wait.requested;
+      if (first === 0) first = wait.needed;
       needs.push(facade.needBytes);
     },
   );
@@ -72,6 +78,107 @@ it("grows the credit geometrically: restarts are bounded by log2(capacity / firs
   for (let k = 1; k < needs.length; k++) expect(needs[k] ?? 0).toBeGreaterThan(needs[k - 1] ?? 0);
   for (const grant of grants) grant.close();
   facade.close();
+  expect(governor.usedBytes).toBe(0);
+});
+
+it("reuses freed preparation bytes across phases: the credit needs only the peak (review repro)", async () => {
+  // Recipe cap/8, then scratch 3cap/4 (closed), then the reservation 3cap/4: the peak is 7cap/8.
+  // A FIFO competitor asks for one byte more than the free room at every attempt.
+  const governor = new Governor(16 << 20);
+  const usable = governor.capBytes - governor.reserveBytes;
+  const facade = new PreparationGovernor(governor);
+  const needs: number[] = [];
+  let first = 0,
+    done = false;
+  for (let attempt = 0; attempt < 12 && !done; attempt++) {
+    const owned: Grant[] = [];
+    let competitor: Promise<Grant> | undefined;
+    try {
+      owned.push(
+        await facade.admit({ label: "recipe", minimumBytes: usable / 8, spillable: false }),
+      );
+      competitor = governor.admit({
+        label: "competitor",
+        minimumBytes: usable - governor.usedBytes + 1,
+        spillable: false,
+      });
+      const scratch = await facade.admit({
+        label: "scratch",
+        minimumBytes: (usable * 3) / 4,
+        spillable: false,
+      });
+      scratch.close();
+      owned.push(
+        await facade.admit({
+          label: "reservation",
+          minimumBytes: (usable * 3) / 4,
+          spillable: false,
+        }),
+      );
+      facade.finish();
+      done = true;
+    } catch (error) {
+      if (!(error instanceof PreparationWouldWait)) throw error;
+      for (const grant of owned.splice(0)) grant.close();
+      if (first === 0) first = error.needed;
+      const next = facade.regrow(error, new AbortController().signal);
+      if (competitor !== undefined) (await competitor).close();
+      await next;
+      needs.push(facade.needBytes);
+      continue;
+    }
+    for (const grant of owned) grant.close();
+    (await competitor).close();
+  }
+  expect(done, `needs ${JSON.stringify(needs)}`).toBe(true);
+  expect(first).toBe((usable * 7) / 8);
+  expect(facade.attempts - 1).toBeLessThanOrEqual(Math.ceil(Math.log2(usable / first)) + 1);
+  expect(facade.attempts - 1).toBe(1);
+  facade.close();
+  expect(governor.usedBytes).toBe(0);
+});
+
+it("never asks for more than the usable capacity: lifetime holdings cap the doubling (review repro)", async () => {
+  const MiB = 1 << 20;
+  const governor = new Governor(16 * MiB);
+  // Lifetime holdings (never returned while the owner lives) leave usable = ordinary - 4 MiB.
+  const lifetime = governor.tryAdmit({
+    label: "lifetime",
+    minimumBytes: 4 * MiB,
+    spillable: false,
+  });
+  if (lifetime === null) throw new Error("lifetime");
+  // Lifetime holdings, as #11 will register them: the usable capacity is 4 MiB smaller.
+  const facade = new PreparationGovernor(governor);
+  vi.spyOn(facade, "usableCapacity").mockImplementation(
+    (progress = false) =>
+      (progress ? governor.capBytes : governor.capBytes - governor.reserveBytes) - 4 * MiB,
+  );
+  expect(facade.usableCapacity()).toBe(10 * MiB);
+  const wait = (needed: number) =>
+    new PreparationWouldWait("probe", MiB, false, needed - MiB, [
+      { label: "probe", minimumBytes: MiB, spillable: false },
+    ]);
+  const controller = new AbortController();
+  const signal = controller.signal;
+  await facade.regrow(wait(6 * MiB), signal);
+  // The next true need is 7 MiB; doubling (12 MiB) is capped at the usable 10 MiB and fits now.
+  const next = facade.regrow(wait(7 * MiB), signal);
+  const outcome = await Promise.race([
+    next.then(() => "admitted"),
+    new Promise((resolve) => setTimeout(() => resolve("still waiting"), 500)),
+  ]);
+  if (outcome !== "admitted") controller.abort(new Error("still waiting"));
+  await next.catch(() => undefined);
+  expect(outcome, `credit request ${String(facade.needBytes)} with 10 MiB usable`).toBe("admitted");
+  expect(facade.needBytes).toBe(10 * MiB);
+  expect(facade.credit?.held).toBe(10 * MiB);
+  // Above the usable capacity: the typed refusal, not a wait.
+  await expect(facade.regrow(wait(10 * MiB + 1), signal)).rejects.toMatchObject({
+    sqlState: "53200",
+  });
+  facade.close();
+  lifetime.close();
   expect(governor.usedBytes).toBe(0);
 });
 
