@@ -209,6 +209,7 @@ import {
   type GroupPageEntry,
 } from "../format/manifest-codec.js";
 import { manifestReader, MetadataReader, bindMetadataCaches } from "../format/metadata-reader.js";
+import { createDirectoryCache } from "../page/directory-cache.js";
 import { readRows } from "./rows.js";
 import { RunBuilder, RunReader, RUN_ENCODER_MINIMUM, type RunSummary } from "./runs.js";
 import { Sequences } from "./sequences.js";
@@ -754,6 +755,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     );
     const caches = {
       validatedRoots: true,
+      directories: createDirectoryCache(input.governor),
       groupRoots: new BlobCache<GroupRoot>(
         (cache) => input.governor.registerCache(cache),
         fullBlobKey,
@@ -765,7 +767,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
         input.governor.registerCache(cache),
       ),
     };
-    this.#metadataCaches = [caches.groupRoots, caches.groupPages, caches.groupIndexes];
+    this.#metadataCaches = [
+      caches.groupRoots,
+      caches.groupPages,
+      caches.groupIndexes,
+      caches.directories,
+    ];
     this.#metadata = new MetadataReader(input.space, caches);
     this.#governorCap = input.governor.capBytes;
     const merges = input.tuning?.merges;
@@ -3647,7 +3654,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#currentPin?.release();
       this.#currentPin = null;
       this.#unbindMetadataCaches();
-      for (const cache of this.#metadataCaches) cache.clear();
+      for (const cache of this.#metadataCaches) cache.close();
       this.#lists.close();
       for (const source of this.#pendingStagedSources) {
         source.queued = false;
@@ -3713,7 +3720,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#currentPin?.release();
     this.#currentPin = null;
     this.#unbindMetadataCaches();
-    for (const cache of this.#metadataCaches) cache.clear();
+    for (const cache of this.#metadataCaches) cache.close();
     this.#lists.close();
     this.#ftsPending = null;
     await this.#ftsMutations?.close();

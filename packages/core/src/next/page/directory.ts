@@ -31,7 +31,7 @@
 import { CONDITIONAL_FORMAT, DURABLE_FORMATS, requireHeader } from "../durable-format.js";
 import type { ByteCharge } from "../vector/varlen.js";
 import { validateSketch } from "./sketch.js";
-import type { PageEntry, StatValue } from "../format/manifest.js";
+import type { ChunkDirectory, PageEntry, StatValue } from "../format/manifest.js";
 import { PageEncoding } from "../format/manifest.js";
 import { NUMERIC_MAX_SCALE } from "../types.js";
 import { check, MIXED_SCALE, ValueTag, PageCorruptionError } from "./format.js";
@@ -42,22 +42,7 @@ const MAGIC = DURABLE_FORMATS.pageDirectory.magic; // "MPD1"
 export const MAX_DIRECTORY_BYTES = 1024 * 1024;
 const VERSION = DURABLE_FORMATS.pageDirectory.version;
 
-export interface ChunkDirectory {
-  readonly tag: number;
-  readonly rowCount: number;
-  /**
-   * Decimal chunks: the scale every coefficient is at, or null for a mixed-scale chunk (each page
-   * carries its scales; stored as `MIXED_SCALE`). 0 for other chunks.
-   */
-  readonly scale: number | null;
-  /** Decimal chunks: some value is NaN or ±Infinity (targets need a specials array). */
-  readonly hasSpecials: boolean;
-  readonly pages: readonly PageEntry[];
-  /** The dictionary page (`rowCount` = entries), or null. */
-  readonly dictionary: PageEntry | null;
-  /** The serialized distinct sketch (sketch.ts), or null. */
-  readonly sketch: Uint8Array | null;
-}
+export type { ChunkDirectory } from "../format/manifest.js";
 
 class Writer {
   readonly bytes: Uint8Array;

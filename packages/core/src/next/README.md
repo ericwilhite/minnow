@@ -1452,6 +1452,39 @@ The read-side pushdown the executor's scan uses; four calls and one helper:
   (`ChunkReadOptions.directories`, R15.7), the inflated-page cache (R15.5) and the
   `MetadataReader`'s group roots, pages and indexes, which are synchronous on a cache hit.
 
+#### Shared immutable column directories
+
+The write owner registers a parsed column-directory cache under the same governor as its other
+metadata. `page/directory-cache.ts` keys entries by the complete immutable reference, including
+the containing extent and checksum, and scopes the cache to that owner. Source sizing and scan
+execution pass the same cache through reader options before wrapping page IO. A cache hit keeps
+`ChunkReader.open`'s column-type and data-extent checks; a successful retaining parse can serve
+later queries. The first read still validates the directory and its HLL body, and invalid bytes
+are never recorded as an absent column.
+
+Non-retaining sizing and export readers use once pins: they may borrow existing cached entries
+without promoting them or admitting misses, including when coalesced windows are disabled or
+refused. Cache bytes remain charged and evictable. Owner close
+ends metadata-cache retention and unregisters it; a caller's pinned value stays charged to that
+caller until release, and a late unpin drops the entry instead of recharging a closed owner.
+Restore creates a new owner scope. Before parsing, the reader reserves descriptors plus
+an encoded-length allowance for copied HLL and byte-statistic payloads, including malformed
+inputs. After validation it releases the unused allowance and retains the exact copied-byte
+charge with the descriptors. No stored encoding or result type changes.
+
+`page/directory-cache.test.ts` checks metadata identities, bounds, refusal, once reads and close
+lifetimes with generated checksummed fixtures. `testing/directory-cache-native.test.ts` checks
+native repeated queries, changed roots, eviction, portable restore and a live lease at writer
+close against independent PostgreSQL rows. These work-count laws use `seedsFor` and declared
+reach; no elapsed-time assertion establishes cache correctness. The existing manifest suite
+also generates refused and throwing holder budgets: a failed hit returns its cache pin and
+preserves the original error before any caller credit is retained.
+
+`scripts/directory-cache-cpu.mts` isolates native source sizing over flushed groups. It uses
+independent processes, nine balanced CPU pairs and a preceding identical-build control, with
+full row and sizing verification outside the clock. A component gain must beat the full paired
+range and the control bias plus IQR. Whole-query acceptance remains a separate native run.
+
 ### Storage access (`access/`)
 
 The single read/write contract (ruling R1): the write path implements it; the executor, lowering
