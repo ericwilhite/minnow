@@ -1539,110 +1539,13 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           });
       }
       case "scan": {
-        if (!pageScan) {
-          const input = types(rel).slice(0, rel.columns.length),
-            filter = rel.filter;
-          // Only the terminal full-table export has no downstream consumer that may re-read.
-          // Other scans keep their selective/cache policy; TableScan also handles deletion,
-          // reader capability, memory refusal, pacing and cancellation fallbacks itself.
-          const terminal =
-            rel === terminalInput &&
-            filter === null &&
-            rel.runtimeFilters.length === 0 &&
-            !rel.emitLocator;
-          readSources.set(rel.id, {
-            id: rel.id,
-            tableId: rel.tableId,
-            columns: rel.columns,
-            types: input,
-            stagingBytes: memoryScanBufferBytes(input),
-            windowBytes: terminal ? 64 * 1024 * 1024 : 0,
-            rows: null,
-          });
-          const kernelBytes =
-            filter === null
-              ? 0
-              : measureCompilerBuffers(
-                  compilation,
-                  input,
-                  BATCH_ROWS,
-                  (context) => new FilterOperator(filter, context, DISCARD),
-                  (filter) => filter.abort(undefined),
-                );
-          fixed(rel, (cap) => kernelBytes + batchTargetFor(cap, 4) + BATCH_ROWS * 16);
-          return (runtime, downstream, stops, rowsNeeded) => {
-            if (stops.some((stop) => stop())) return downstream.finish();
-            const target = batchTargetFor(runtime.request.governor.capBytes, 4);
-            return instantiate(
-              runtime,
-              rel,
-              input,
-              kernelBytes + target + BATCH_ROWS * 16,
-              BATCH_ROWS,
-              (context, grant) => ({ context, grant }),
-              ({ context, grant }) =>
-                then(runtime.table(rel.tableId, grant), (table) => {
-                  const terminalFull =
-                    terminal &&
-                    rel.columns.length === table.columns.length &&
-                    rel.columns.every((id, k) => id === table.columns[k]?.id);
-                  const owner = terminalFull
-                    ? downstream instanceof ResultSink
-                      ? downstream
-                      : exportOwners.get(downstream)
-                    : undefined;
-                  const output = owner?.grant;
-                  const directories = directoryCacheFor(runtime.view.pages);
-                  const scan = new TableScan({
-                    table,
-                    pages: runtime.readPages(runtime.view.pages),
-                    reads: runtime.request.reads,
-                    ...(directories === undefined
-                      ? {}
-                      : { directories, directoryOnce: !runtime.sourceRetains(rel.id) }),
-                    budget: grant,
-                    columns: rel.columns,
-                    filter: rel.filter,
-                    emitLocator: rel.emitLocator,
-                    context,
-                    loans: { borrow: (bytes) => grant.borrow(bytes, runtime.signal) },
-                    // Larger batches remain restricted to explicit relinquishing export consumers.
-                    targetBytes: runtime.request.outputBuffers
-                      ? (owner?.terminalBatchTarget(2 * target) ?? target)
-                      : target,
-                    boundedMemory: true,
-                    readWindowBytes: terminalFull ? runtime.sourceWindow(rel.id) : 0,
-                    ...(output === undefined
-                      ? {}
-                      : {
-                          transferOutputs: "dictionary" as const,
-                          outputBudget: output,
-                          ...(runtime.request.outputBuffers
-                            ? { outputBuffers: runtime.request.outputBuffers }
-                            : {}),
-                          outputDictionary: (dictionary) =>
-                            owner?.admitDictionary(dictionary) ?? false,
-                          borrowOutputOnRefusal: true,
-                        }),
-                    ...(runtime.sourceBatchRows(rel.id) === undefined
-                      ? rowsNeeded === undefined
-                        ? {}
-                        : { rowsNeeded }
-                      : { rowsNeeded: () => Math.min(rowsNeeded?.() ?? BATCH_ROWS, 1) }),
-                  });
-                  const books = starBooks.get(runtime);
-                  const outputSink = books?.shape.columns.has(rel.id)
-                    ? starColumns((batch) => books.encode(rel.id, batch), downstream)
-                    : downstream;
-                  return fts.scan(runtime, rel, scan, counted(runtime, rel, outputSink), stops);
-                }),
-            );
-          };
-        }
+        // One recipe for both scan forms: a page-consuming parent (pageScan) selects encoded
+        // pages and page counting; otherwise ordinary batches. Both size their target from the
+        // bounded demand (sourceTarget), so the two forms cannot drift apart.
         const input = types(rel).slice(0, rel.columns.length),
           filter = rel.filter,
-          count = countedPages,
-          Scan = EncodedTableScan;
+          count = pageScan ? countedPages : counted,
+          Scan = pageScan ? EncodedTableScan : TableScan;
         // Only the terminal full-table export has no downstream consumer that may re-read.
         // Other scans keep their selective/cache policy; TableScan also handles deletion,
         // reader capability, memory refusal, pacing and cancellation fallbacks itself.
@@ -1703,7 +1606,8 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                   ? starColumns((batch) => books.encode(rel.id, batch), downstream)
                   : downstream;
                 const countedSink = count(runtime, rel, outputSink);
-                const pageConsumer = !fts.enabled && !books ? countedSink.pageConsumer : undefined;
+                const pageConsumer =
+                  pageScan && !fts.enabled && !books ? countedSink.pageConsumer : undefined;
                 const oneRow = runtime.sourceBatchRows(rel.id) !== undefined;
                 const demand = oneRow
                   ? () => Math.min(rowsNeeded?.() ?? BATCH_ROWS, 1)
