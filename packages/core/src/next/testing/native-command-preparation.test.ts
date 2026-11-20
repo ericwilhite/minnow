@@ -223,9 +223,9 @@ for (const seed of seedsFor("next-native-command-preparation", [49701, 49702]))
                 }
                 return grants;
               });
-              const completed = await executeNativeCommand({
-                transaction: tx,
-                rootId: 1,
+              const request = (transaction: NonNullable<typeof tx>, queryId: number) => ({
+                transaction,
+                rootId: queryId,
                 plan: lowered.plan,
                 parameters: [],
                 planner,
@@ -234,16 +234,21 @@ for (const seed of seedsFor("next-native-command-preparation", [49701, 49702]))
                 signal: stop.signal,
                 execution: {
                   reads: {
-                    open: (pages, chunk, options) => ChunkReader.open(pages, chunk, options),
+                    open: (
+                      pages: Parameters<typeof ChunkReader.open>[0],
+                      chunk: Parameters<typeof ChunkReader.open>[1],
+                      options: Parameters<typeof ChunkReader.open>[2],
+                    ) => ChunkReader.open(pages, chunk, options),
                   },
                   spill: core.spill,
-                  queryId: 1,
+                  queryId,
                   statementTime: 0n,
                   sequences: null,
                   sequenceSession: null,
-                  returning: "atExecuted",
+                  returning: "atExecuted" as const,
                 },
-              }).then(
+              });
+              const completed = await executeNativeCommand(request(tx, 1)).then(
                 (value) => ({ value }),
                 (error: unknown) => ({ error }),
               );
@@ -252,6 +257,8 @@ for (const seed of seedsFor("next-native-command-preparation", [49701, 49702]))
               preparing = false;
               vi.restoreAllMocks();
               expect(violations.join("\n"), "preparation admission laws").toBe("");
+              // At most one released attempt per statement: never a third reach.
+              expect(reaches).toBeLessThanOrEqual(2);
               const refusal =
                 "error" in completed && completed.error instanceof MemoryAdmissionError
                   ? completed.error
@@ -261,6 +268,8 @@ for (const seed of seedsFor("next-native-command-preparation", [49701, 49702]))
                 expect(refusal?.sqlState).toBe("53200");
                 expect(refusal?.bytes ?? 0).toBeGreaterThan(refusal?.capacity ?? Infinity);
                 expect(builds).toBe(0);
+                // Refused at the first admission, before even the reach is built.
+                expect(reaches).toBe(0);
                 tx.rollback();
                 tx = null;
                 reach.reach("above-cap refusal before building");
@@ -284,6 +293,25 @@ for (const seed of seedsFor("next-native-command-preparation", [49701, 49702]))
                 tx = null;
                 expect(builds).toBeGreaterThan(0);
                 reach.reach(mode === "release" ? "granted after release" : "no competing credit");
+                // The same plan shape admits its learned working set in one attempt.
+                tx = await core.harness.path.begin();
+                let again = 0;
+                const prepareAgain = NativeCommandReach.prepare.bind(NativeCommandReach);
+                vi.spyOn(NativeCommandReach, "prepare").mockImplementation(
+                  (view, root, charge, work) => {
+                    again++;
+                    return prepareAgain(view, root, charge, work);
+                  },
+                );
+                const second = await executeNativeCommand(request(tx, 2));
+                vi.restoreAllMocks();
+                expect(second.rowCount).toBe(rows);
+                expect(again).toBe(1);
+                await pg.exec(s.mutation);
+                const again2 = await tx.commit(null);
+                await again2.durable;
+                tx = null;
+                reach.reach("learned working set in one attempt");
               }
               if (waits > 0) reach.reach("admissions checked");
               if (reaches > 1) reach.reach("released and retried");

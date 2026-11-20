@@ -11664,6 +11664,20 @@ export const NATIVE_PREPARATION_BOUND_REACH = [
   "generated columns",
   "checks",
   "several bodies",
+  "multi-row VALUES",
+  "DEFAULT cells",
+  "large repeated default",
+  "DEFAULT VALUES",
+  "copies simpleCase",
+  "copies nestedCase",
+  "copies between",
+  "copies symmetric",
+  "copies rowEq",
+  "copies rowLt",
+  "copies rowIn",
+  "copies variance",
+  "copies groupRefs",
+  "copies usingJoin",
 ] as const;
 
 /** Native trigger preparation admits its whole bound before building and never waits holding it. */
@@ -11675,6 +11689,7 @@ export const NATIVE_COMMAND_PREPARATION_REACH = [
   "admissions checked",
   "released and retried",
   "above-cap refusal before building",
+  "learned working set in one attempt",
   "exact PG rows",
   "large body",
   "several triggers",

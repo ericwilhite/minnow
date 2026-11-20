@@ -19,7 +19,10 @@ keep FK creation order across decimal widths. Compiled producer workspace is cha
 per input phase; informational references read only their actual key fields. Trigger
 preparation admits a static bound for every rule program and body plan before building any
 of them, and never waits while holding preparation; a preparation whose bound exceeds the cap
-is refused with 53200 before anything is built. These
+is refused with 53200 before anything is built. The bound counts every copy the parser
+makes of one source subtree, such as an explicit DEFAULT cell or a simple CASE operand, and
+trigger bodies whose subqueries use GROUPING SETS, ROLLUP or CUBE are refused with 0A000
+before lowering. These
 changes keep the qualified SQL histories within 32 MiB. Unqualified native roots retain typed 0A000
 refusals. Public 0.x behavior, package entry points and stored formats are unchanged; no
 migration is required.

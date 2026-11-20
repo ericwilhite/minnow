@@ -40,12 +40,14 @@ import { NATIVE_INPUT_CAPTURE_BYTES } from "./native-input.js";
 import { PREPAID_QUERY_BYTES } from "./prepaid-query.js";
 import { retainedBytes } from "./rule-cache.js";
 import {
+  CLOCK_BOUND_BYTES,
+  closurePreparationBound,
+  containerPreparationBound,
   bodyPreparationBound,
   bodyRetainedBytes,
   rulePreparationBound,
   ruleRetainedBytes,
 } from "./native-preparation-bound.js";
-import { OBJECT_OVERHEAD_BYTES } from "../memory/governor.js";
 import type { StatementPlanner, PlannerContext } from "./planner.js";
 
 export interface NativeCommandRequest {
@@ -163,8 +165,6 @@ interface Prepared {
 /** The complete initial working set last needed by a cached root plan for one catalog. Lets
  * the next execution admit it at once instead of learning it by one released attempt. */
 const learnedWants = new WeakMap<PhysicalPlan, Want>();
-/** A zoned timestamp clock parameter: a small fixed object with one bigint. */
-const CLOCK_BOUND_BYTES = 1024;
 function exceeded(what: string, actual: number, bound: number): never {
   throw new TypeError(
     `Native ${what} preparation exceeded its static bound (${String(actual)} > ${String(bound)})`,
@@ -210,17 +210,24 @@ export async function executeNativeCommand(
     // built preparation can size (setup, rule and parameter workspaces) is checked without
     // waiting; if held credit does not cover it, every attempt object and charge is released
     // and the complete, now-known working set is admitted from nothing before building again.
+    // The first admission already covers the static bound of a reach superset, so only the
+    // built-size remainder can call for a second attempt, which admits the complete known
+    // amount. A second shortfall is a defect, never a loop; above the cap it is a typed 53200.
+    const closure = closurePreparationBound(catalog, (plan.root as { tableId: number }).tableId);
+    // Grouping sets copy their expressions once per set; they also never run natively.
+    if (closure.groupingSets) refuse("GROUPING SETS, ROLLUP or CUBE in a native trigger body");
     let want: Want = learnedWants.get(plan) ?? {
-      metadata: NATIVE_ROOT_CREDIT_BYTES + nativeCommandReachBytes(catalog),
+      metadata: NATIVE_ROOT_CREDIT_BYTES + nativeCommandReachBytes(catalog) + closure.bytes,
       rules: 0,
       parameters: needsParameterSizing(plan, request.parameters) ? PARAMETER_SIZING_BYTES : 0,
     };
     let prepared: Prepared | null = null;
-    while (!prepared) {
+    for (let attempt = 1; !prepared; attempt++) {
       signal.throwIfAborted();
       await paid.reserve(want, signal);
       const outcome = await prepareWithin(want);
       if ("retry" in outcome) {
+        if (attempt >= 2) throw new TypeError("Native preparation needed a third attempt");
         want = outcome.retry;
         paid.releaseAll();
       } else prepared = outcome;
@@ -267,24 +274,24 @@ export async function executeNativeCommand(
         let bodyCount = 0;
         for (const definition of prepared.triggers) bodyCount += definition.statements.length;
         // Preparation object, its arrays, one binding/trigger entry each, and array slots.
-        const containerBytes =
-          OBJECT_OVERHEAD_BYTES * (8 + 2 * tables.length + 2 * prepared.triggers.length) +
-          8 * (tables.length + prepared.triggers.length + bodyCount) +
-          CLOCK_BOUND_BYTES;
+        const containerBytes = containerPreparationBound(
+          tables.length,
+          prepared.triggers.length,
+          bodyCount,
+        );
         let bound = containerBytes;
-        for (const table of tables) bound += rulePreparationBound(table);
-        for (const definition of prepared.triggers)
-          for (const body of definition.statements) bound += bodyPreparationBound(body, catalog);
-        const base = NATIVE_ROOT_CREDIT_BYTES + reachBytes;
-        if (
-          paid.metadata.held - paid.metadata.allocated < bound ||
-          admitted.metadata < base + bound
-        ) {
-          release();
-          return {
-            retry: { ...admitted, metadata: Math.max(admitted.metadata, base + bound) },
-          };
+        for (const table of tables) {
+          if (!closure.tables.has(table.id)) exceeded("reach table", table.id, -1);
+          bound += rulePreparationBound(table);
         }
+        for (const definition of prepared.triggers) {
+          if (!closure.triggers.has(definition.id)) exceeded("reach trigger", definition.id, -1);
+          for (const body of definition.statements) bound += bodyPreparationBound(body, catalog);
+        }
+        const base = NATIVE_ROOT_CREDIT_BYTES + reachBytes;
+        // The admission covered the closure bound, a superset of this reach's bound.
+        if (paid.metadata.held - paid.metadata.allocated < bound)
+          exceeded("admitted", bound, paid.metadata.held - paid.metadata.allocated);
         const parameters = await prepareParameters(
           plan,
           request.parameters,
