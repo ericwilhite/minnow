@@ -27,7 +27,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: head-to-head
+  # One queue per ref and candidate: a candidate screen never replaces the nightly run.
+  group: head-to-head-${{ github.ref }}-${{ inputs.candidate || 'nightly' }}
   cancel-in-progress: false
 
 jobs:
