@@ -5228,36 +5228,43 @@ operands, BETWEEN, row predicates, statistical aggregates, alias and merged-colu
 grouping sets, repeated DEFAULT cells and per-join column lists in lowering) charge each node before
 copying it. Passes that copied every descendant's list again at each ancestor (top-level name
 resolution, correlated references), re-typed every subtree at each node (integer typing, and
-datetime typing, which every subtraction asks of both operands), or scanned every conjunct for every
-unit and step of inner-join ordering now do work linear in the shapes the scaling test below lowers
-(join ordering: in the conjuncts that touch each unit). The released engine installs no meter; it
-shares these passes, so its compile gives the same results with less work. When a charge does not
-fit, the attempt is abandoned: every attempt object and charge is released, and the reservation is
-admitted again from nothing at max(known need, min(2 x previous, cap)). A reservation the cap cannot
-grant beside the writer is reduced to the largest that fits, so only a known need above it is a
-typed 53200. Setup, rule and parameter workspaces, sized from the built preparation, take the same
-path. Attempts are at most ceil(log2(cap / first reservation)) + 1. A cached root plan learns its
-measured need, not the padding of the reservation that found it, so a later execution admits exactly
-that need in one attempt. Parameters are sized for every execution, in their own admission before
-the first attempt, because a reused plan can receive values of a different size (a NUMERIC beyond
-int64). Wide ROLLUP and CUBE charge every grouping-set array and every lowered reference to their
-columns before building them, and each grouping set's member block charges the parts it shares. The
-factor that covers a copy's lowered IR (`COPY_IR_FACTOR`, 8) is empirical: generated bodies retain
-at most about 0.6 of their charge. Three checks back this: the retained plan graph against the
-charge over generated bodies; heap growth after a wide ROLLUP's lowering aborts on its budget; and a
-scaling test (`testing/native-preparation-scaling.test.ts`) that lowers each shape it lists at N and
-8N: operator chains over int, numeric, text, boolean, comparison, date, timestamp and interval
-operands, date differences, nesting, CASE arms, IN and row IN lists, inner and USING join chains,
-grouping sets, DEFAULT rows and correlated subqueries. Array-builtin volume, and the bytes each JS
-function allocates (garbage included, sampled by V8's heap profiler, builtins counted in their
-caller), must grow no faster than the faster-growing part of the charge. Its limits: a shape it does
-not list is not judged; a join chain's metered charge is itself quadratic (each join lists its
-inputs' columns), so sites in join shapes are judged at quadratic order and an uncharged quadratic
-site there passes (a cubic one fails); a site allocating under 16 KiB at N is judged against 16 KiB;
-and it measures the interpreter and baseline tiers (TurboFan and Maglev are off while it samples, at
-fixed intervals), so the measure repeats exactly but does not see what optimized code would
-allocate. None of these checks proves that every allocation is charged, so a new kind of copy is
-caught when it changes scaling or retained size, not by construction.
+datetime typing, which every subtraction asks of both operands) now do work linear in the shapes the
+scaling test below lowers. Inner-join ordering no longer allocates closures per candidate conjunct
+or rescans the whole conjunct pool per unit and per step: it allocates in proportion to the
+conjuncts. Its greedy order still compares every remaining unit at each step, so its CPU is
+quadratic in the joined tables. The released engine installs no meter; it shares these passes, so
+its compile gives the same results with less work. When a charge does not fit, the attempt is
+abandoned: every attempt object and charge is released, and the reservation is admitted again from
+nothing at max(known need, min(2 x previous, cap)). A reservation the cap cannot grant beside the
+writer is reduced to the largest that fits, so only a known need above it is a typed 53200. Setup,
+rule and parameter workspaces, sized from the built preparation, take the same path. Attempts are at
+most ceil(log2(cap / first reservation)) + 1. A cached root plan learns its measured need, not the
+padding of the reservation that found it, so a later execution admits exactly that need in one
+attempt. After every body has run, the root takes one last native step with its idle minima dropped:
+the writer then funds the statement-end full-text step beside the root's bytes (only when a
+full-text index or pending full-text state exists), so ending never waits while the root holds
+credit; a native statement end that finds that minimum unfunded fails rather than wait. A body's
+query sizes its batches from what its root can afford beside the writer's protected floor (sizing
+only: admission and refusal still use the cap). Parameters are sized for every execution, in their
+own admission before the first attempt, because a reused plan can receive values of a different size
+(a NUMERIC beyond int64). Wide ROLLUP and CUBE charge every grouping-set array and every lowered
+reference to their columns before building them, and each grouping set's member block charges the
+parts it shares. The factor that covers a copy's lowered IR (`COPY_IR_FACTOR`, 8) is empirical:
+generated bodies retain at most about 0.6 of their charge. Three checks back this: the retained plan
+graph against the charge over generated bodies; heap growth after a wide ROLLUP's lowering aborts on
+its budget; and a scaling test (`testing/native-preparation-scaling.test.ts`) that lowers each shape
+it lists at N and 8N: operator chains over int, numeric, text, boolean, comparison, date, timestamp
+and interval operands, date differences, nesting, CASE arms, IN and row IN lists, inner and USING
+join chains, grouping sets, DEFAULT rows and correlated subqueries. Array-builtin volume, and the
+bytes each JS function allocates (garbage included, sampled by V8's heap profiler, builtins counted
+in their caller), must grow no faster than the faster-growing part of the charge. Its limits: a
+shape it does not list is not judged; a join chain's metered charge is itself quadratic (each join
+lists its inputs' columns), so sites in join shapes are judged at quadratic order and an uncharged
+quadratic site there passes (a cubic one fails); a site allocating under 16 KiB at N is judged
+against 16 KiB; and it measures the interpreter and baseline tiers (TurboFan and Maglev are off
+while it samples, at fixed intervals), so the measure repeats exactly but does not see what
+optimized code would allocate. None of these checks proves that every allocation is charged, so a
+new kind of copy is caught when it changes scaling or retained size, not by construction.
 
 The same funded/SQL histories run at 32 MiB with `MINNOW_TRIGGER_CAP_MIB=32` and at
 64 MiB by default. They compare PostgreSQL BEFORE/AFTER name order, RI and nested bodies,

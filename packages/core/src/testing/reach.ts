@@ -11745,6 +11745,14 @@ export const NATIVE_PREPARATION_SCALING_REACH = [
   "large size",
 ] as const;
 
+/** A native trigger statement on an FTS-indexed table ends without waiting. */
+export const NATIVE_COMMAND_FTS_END_REACH = [
+  "keyed delete ended",
+  "nothing deleted",
+  "published source",
+  "resident source",
+] as const;
+
 /** Two cold native preparations both grow while contending for the same governor. */
 export const NATIVE_COMMAND_CONTENTION_REACH = [
   "both roots waited at once holding nothing",

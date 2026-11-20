@@ -98,6 +98,13 @@ export class NativeRootCredits {
   get source(): Grant {
     return this.#grants.source;
   }
+  #sourceRoom: number | null = null;
+  /** The bytes a body query may size its working set for (its source), as of the last native
+   * step: capacity beside the writer's protected floor, less the root's other roles. Sizing
+   * only; null before the first step. */
+  get sourceRoom(): number | null {
+    return this.#sourceRoom;
+  }
   get rules(): Grant {
     return this.#grants.rules;
   }
@@ -177,6 +184,18 @@ export class NativeRootCredits {
     this.#wanted.rules = Math.max(this.#base.rules, checked(bytes));
     return this.#fund(signal);
   }
+  /** The root's last native step: no retained minimum outlives the run, so every role keeps only
+   * what is allocated (idle credit returns now); the writer then stabilizes the statement-end
+   * step beside those bytes. */
+  prepareEnd(signal: AbortSignal): Promise<void> {
+    this.#check();
+    for (const role of ROLES) {
+      this.#base[role] = role === "metadata" ? NATIVE_ROOT_CREDIT_BYTES : 0;
+      this.#wanted[role] = this.#base[role];
+    }
+    this.#reclaim();
+    return this.#fund(signal);
+  }
   /** Only an existing safe boundary calls this. Allocated buffers are always preserved. */
   releaseIdleStep(): void {
     this.#check();
@@ -213,6 +232,14 @@ export class NativeRootCredits {
         });
         let provisional: readonly Grant[] | null = null;
         const moved = [0, 0, 0, 0];
+        // What a source may size for until the next step: this step's capacity beside the
+        // writer's protected floor, less what the other roles take.
+        this.#sourceRoom = Math.max(
+          0,
+          boundary.capacityBytes -
+            boundary.protectedWriteBytes -
+            (total - (targets[ROLES.indexOf("source")] ?? 0)),
+        );
         try {
           boundary.check();
           if (missing === 0) {

@@ -118,6 +118,12 @@ export interface EvictableCache {
 
 export interface MemoryGovernor {
   readonly capBytes: number;
+  /**
+   * Optional: the capacity a query should size its working set for, when less than the cap is
+   * available to it (a native body query's root beside the writer). Sizing only; admission
+   * and refusal use the cap.
+   */
+  readonly sizingBytes?: number;
   readonly reserveBytes: number;
   readonly usedBytes: number;
   readonly peakBytes: number;
@@ -318,11 +324,67 @@ class GrantImpl implements Grant {
 }
 
 /** The reference governor: rules 1–8. */
+/** One holder in a stall report: the grants of one label, summed. */
+export interface StallHolder {
+  readonly label: string;
+  readonly held: number;
+  readonly allocated: number;
+  readonly spillable: boolean;
+}
+
+/**
+ * Thrown (test builds only, `Governor.stallAfterMs`) at a waiter that saw no governor progress
+ * for that long: no credit taken or returned and no request queued, served or withdrawn. Every
+ * waiter is then waiting on something no holder will release; this names the waiter and every
+ * holder instead of hanging.
+ */
+export class GovernorStallError extends Error {
+  readonly code = "MINNOW_GOVERNOR_STALL";
+  constructor(
+    readonly waiter: {
+      readonly label: string;
+      readonly bytes: number;
+      readonly includesProgress: boolean;
+    },
+    readonly capacity: number,
+    readonly usedBytes: number,
+    readonly queued: readonly string[],
+    readonly holders: readonly StallHolder[],
+    readonly afterMs: number,
+    /** Where the waiter queued (stack at admission). */
+    readonly waiterStack: string,
+  ) {
+    super(
+      `Governor stall: "${waiter.label}" waited ${String(afterMs)} ms for ${String(waiter.bytes)}B ` +
+        `(capacity ${String(capacity)}B, used ${String(usedBytes)}B) with no progress; holders: ` +
+        holders
+          .map(
+            (holder) =>
+              `${holder.label} ${String(holder.held)}B held/${String(holder.allocated)}B allocated`,
+          )
+          .join(", ") +
+        `; queued at:\n${waiterStack}`,
+    );
+    this.name = "GovernorStallError";
+  }
+}
+
 export class Governor implements MemoryGovernor {
+  /**
+   * Test builds only; null in production. When set, a queued request that sees no governor
+   * progress for this many milliseconds is rejected with a `GovernorStallError` naming every
+   * holder, so a wait nothing will ever release fails fast instead of hanging. Progress is any
+   * credit taken or returned and any request queued, served or withdrawn. It is a no-progress
+   * window, not a proof: a holder computing without touching the governor for longer than the
+   * window would also be reported.
+   */
+  static stallAfterMs: number | null = null;
   readonly capBytes: number;
   readonly reserveBytes: number;
   usedBytes = 0;
   peakBytes = 0;
+  /** Counts governor progress for `stallAfterMs`. */
+  #progress = 0;
   readonly #caches: EvictableCache[] = [];
   readonly #grants = new Set<GrantImpl>();
   readonly #idleCredit = new Set<GrantImpl>();
@@ -343,6 +405,7 @@ export class Governor implements MemoryGovernor {
   }
 
   #take(bytes: number): void {
+    this.#progress++;
     this.usedBytes += bytes;
     this.peakBytes = Math.max(this.peakBytes, this.usedBytes);
   }
@@ -507,6 +570,7 @@ export class Governor implements MemoryGovernor {
   }
 
   give(bytes: number): void {
+    this.#progress++;
     this.usedBytes -= bytes;
     this.#drain();
   }
@@ -517,6 +581,7 @@ export class Governor implements MemoryGovernor {
     for (const queue of [this.#loans, this.#reads, this.#admissions])
       for (const request of [...queue])
         if (request.grant === grant) {
+          this.#progress++;
           queue.splice(queue.indexOf(request), 1);
           request.detach();
           request.reject(new GrantClosedError(grant.label));
@@ -627,6 +692,7 @@ export class Governor implements MemoryGovernor {
       }
       // A callback may have cancelled or served the head while we asked for room.
       if (queue[0] !== request) continue;
+      this.#progress++;
       queue.shift();
       request.detach();
       const wanted = demand();
@@ -690,6 +756,7 @@ export class Governor implements MemoryGovernor {
       const cancel = () => {
         const index = queue.indexOf(entry);
         if (index >= 0) queue.splice(index, 1);
+        this.#progress++;
         entry.detach();
         reject(abortReason(signal));
         this.#drain();
@@ -709,13 +776,68 @@ export class Governor implements MemoryGovernor {
       };
       signal?.addEventListener("abort", cancel, { once: true });
       queue.push(entry);
+      this.#progress++;
+      this.#watchStall(queue, entry);
       this.#drain();
     });
+  }
+
+  /** Test builds: rejects `entry` once it has waited `stallAfterMs` with no progress. */
+  #watchStall(queue: Request[], entry: Request): void {
+    const afterMs = Governor.stallAfterMs;
+    if (afterMs === null) return;
+    const queuedAt = new Error().stack?.split("\n").slice(3, 16).join("\n") ?? "";
+    let seen = this.#progress,
+      since = Date.now();
+    const timer = setInterval(
+      () => {
+        if (!queue.includes(entry)) {
+          clearInterval(timer);
+          return;
+        }
+        if (this.#progress !== seen) {
+          seen = this.#progress;
+          since = Date.now();
+          return;
+        }
+        if (Date.now() - since < afterMs) return;
+        clearInterval(timer);
+        const holders = new Map<string, { held: number; allocated: number; spillable: boolean }>();
+        for (const grant of this.#grants) {
+          const holder = holders.get(grant.label) ?? {
+            held: 0,
+            allocated: 0,
+            spillable: grant.spillable,
+          };
+          holder.held += grant.held;
+          holder.allocated += grant.allocated;
+          holders.set(grant.label, holder);
+        }
+        this.#reject(
+          queue,
+          entry,
+          new GovernorStallError(
+            { label: entry.label, bytes: entry.bytes, includesProgress: entry.includesProgress },
+            entry.includesProgress ? this.capBytes : this.capBytes - this.reserveBytes,
+            this.usedBytes,
+            [...this.#loans, ...this.#reads, ...this.#admissions].map((request) => request.label),
+            [...holders]
+              .filter(([, holder]) => holder.held > 0)
+              .map(([label, holder]) => ({ label, ...holder })),
+            afterMs,
+            queuedAt,
+          ),
+        );
+      },
+      Math.max(10, afterMs / 4),
+    );
+    (timer as { unref?: () => void }).unref?.();
   }
 
   #reject(queue: Request[], request: Request, error: unknown): void {
     const at = queue.indexOf(request);
     if (at < 0) return;
+    this.#progress++;
     queue.splice(at, 1);
     request.detach();
     request.reject(error);

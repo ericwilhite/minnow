@@ -54,6 +54,13 @@ export interface NativeRootFunding {
   prepareSource(bytes: number, signal: AbortSignal): Promise<void>;
   prepareRules: NativeRowScope["prepareRules"];
   releaseIdleStep(): void;
+  /** The root's last native step, before its statement ends: returns idle credit, then lets the
+   * writer fund the statement-end work (FTS) beside the root's remaining bytes. A funding port
+   * without its own credit controller (a test root) omits it; the root then takes that step
+   * itself for the bytes its metadata and source grants hold. */
+  prepareEnd?(signal: AbortSignal): Promise<void>;
+  /** What a body query may size its working set for (sizing only); omitted: the cap. */
+  sourceRoom?(): number | null;
 }
 export interface NativeRootPreparation {
   readonly rootId: number;
@@ -371,6 +378,18 @@ export class NativeCommandRoot {
         } finally {
           this.scope.funding.releaseIdleStep();
         }
+        // Every body has run. The statement end that follows (FTS preparation) must find its
+        // work funded and never wait while this root holds credit, so take one last native step.
+        const funding = this.scope.funding;
+        if (funding.prepareEnd) await funding.prepareEnd(this.signal);
+        else {
+          const boundary = await this.scope.statement.prepareNativeStep(
+            funding.metadata.held + funding.source.held,
+            this.signal,
+            { includesProgress: true },
+          );
+          boundary.release();
+        }
       },
       closeRoot: () => this.#shutdownCommands(),
     });
@@ -484,6 +503,7 @@ export class NativeCommandRoot {
           signal,
           prepare: (n, s) => this.scope.funding.prepareSource(n, s),
           prepareMetadata: (n, s) => this.scope.funding.prepareMetadata(n, s),
+          sizingBytes: () => this.scope.funding.sourceRoom?.() ?? scope.governor.capBytes,
         },
         execution: scope.execution,
       }),

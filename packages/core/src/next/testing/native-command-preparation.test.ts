@@ -349,6 +349,13 @@ for (const seed of seedsFor("next-native-command-preparation", [49701, 49702]))
           seed,
           numRuns: 8,
           examples: [
+            // The smallest body: its preparation plus the writer's floor fits even at 32 MiB, so
+            // the free state is reached there; larger bodies may refuse, typed, above the cap.
+            [1, [[1]], 0, "free"],
+            // Seed 49701's statement-end deadlock (shrunk): the root held its preparation while
+            // the statement end's FTS minimum waited for the writer (hold-and-wait), at 32 MiB.
+            [1, [[243], [195]], 60, "free"],
+            [1, [[243], [195]], 60, "release"],
             [1, [[650]], 0, "free"],
             [2, [[300], [200]], 60, "release"],
             [3, [[200], [1], [300, 2]], 40, "cancel"],
@@ -361,3 +368,9 @@ for (const seed of seedsFor("next-native-command-preparation", [49701, 49702]))
       await pg.close();
     }
   }, 600000);
+
+// At 32 MiB the writer's next-step floor (19.5 MB: rows 4 MiB, commit buffers 6 MiB, merge
+// 4.73 MB, metadata headroom, fixed caches) beside a large generated body's preparation (14.5 MB)
+// exceeds the cap, so those histories refuse with 53200. Sizing the floor from the statement is
+// the writer-floors follow-up; then every generated free history fits at 32 MiB.
+it.todo("fits every generated free history at 32 MiB once writer floors are sized per statement");

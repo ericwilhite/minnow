@@ -31,15 +31,23 @@ per input phase; informational references read only their actual key fields. Tri
 preparation charges every rule program and body plan, and the known copies the parser, optimizer
 and lowering make of one source subtree (such as an explicit DEFAULT cell or a simple CASE
 operand), before allocating them. Compile passes that were quadratic in a chain's length
-(top-level name checks, correlated references, integer and datetime typing, and inner-join
-ordering) are now linear for the operator chains, nesting, lists and joins the preparation scaling
-test lowers. It grows its reservation by doubling and never waits while holding
+(top-level name checks, correlated references, integer and datetime typing) are now linear for the
+operator chains, nesting and lists the preparation scaling test lowers. Inner-join ordering no
+longer allocates per candidate conjunct or rescans the whole conjunct pool at each step, so its
+allocation is linear in the conjuncts; its greedy order still compares every remaining unit at
+each step, which is quadratic CPU in the number of joined tables. It grows its reservation by doubling and never waits while holding
 preparation; only a need above the memory cap is refused, with 53200. The released engine's
 parse and compile give the same results; its bundles grow by about 1.5 KiB raw for the inert
 copy hooks and the linear typing pass (main 1,182,025 raw / 354,678 gzip, OPFS
 1,594,462 / 461,614, IndexedDB worker 1,590,462 / 459,029, worker plus client 574,475 gzip,
-core tarball 1,029,643 bytes), and those caps rise once accordingly. These
-changes keep the qualified SQL histories within 32 MiB. Unqualified native roots retain typed 0A000
+core tarball 1,029,643 bytes), and those caps rise once accordingly. A native statement funds
+its statement-end work (the full-text publication step) in its last native step, beside the
+root's bytes, so ending never waits while the root holds credit; that step is reserved only when
+a full-text index or pending full-text state exists. A trigger body's query sizes its batches
+from what its root can afford beside the writer. These changes keep the qualified SQL histories
+within 32 MiB. At 32 MiB the largest generated preparation bodies are refused with 53200: the
+writer's next-step floor (19.5 MB) beside their preparation (about 14.5 MB) exceeds the cap.
+Unqualified native roots retain typed 0A000
 refusals. Public 0.x behavior, package entry points and stored formats are unchanged; no
 migration is required.
 

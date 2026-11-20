@@ -65,8 +65,13 @@ export default defineConfig({
             reachUnions,
           ],
           // `npm run test:packed`: every segment the engine can pack is packed.
-          setupFiles:
-            process.env.MINNOW_FORCE_PACKING === "1" ? ["scripts/forced-packing.setup.ts"] : [],
+          setupFiles: [
+            ...(process.env.MINNOW_FORCE_PACKING === "1"
+              ? ["scripts/forced-packing.setup.ts"]
+              : []),
+            // A governor wait with no progress for this long fails, naming every holder.
+            ...(process.env.MINNOW_GOVERNOR_STALL_MS ? ["scripts/governor-stall.setup.ts"] : []),
+          ],
           // Nonzero groups also preserve this order with Vitest's single-worker shortcut.
           sequence: { groupOrder: 1 },
         },

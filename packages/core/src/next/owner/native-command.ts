@@ -489,6 +489,8 @@ export async function executeNativeCommand(
         prepareSource: (n, s) => paid.prepareSource(n, s),
         prepareRules: (_table, _image, _phase, s) => paid.protectRules(prepared.ruleBytes, s),
         releaseIdleStep: () => paid.releaseIdleStep(),
+        prepareEnd: (s) => paid.prepareEnd(s),
+        sourceRoom: () => paid.sourceRoom,
       },
       checkpoint: async () => {
         signal.throwIfAborted();

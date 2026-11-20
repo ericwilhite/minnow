@@ -2258,6 +2258,44 @@ export class WritePathImpl implements WritePath, EngineHooks {
     capacity: number,
     signal: AbortSignal,
   ): Promise<void> {
+    // A native root's statement end must never wait while the root holds credit. Once the
+    // statement holds FTS-keyed undo, this compound step funds the statement-end FTS minimum
+    // beside the root's bytes, against the root's own capacity; ending then finds it held.
+    this.#checkNativeStep(owner);
+    const holder = owner.tx;
+    let funded = false;
+    if (!holder.ftsMutationPrepared && this.#ftsRelevant(holder.catalog)) {
+      const keyed = owner.needsFtsPreparation();
+      if (keyed instanceof Promise ? await keyed : keyed) {
+        holder.ftsMutationPrepared = funded = true;
+        this.#nativeSteps.changed(true);
+      }
+    }
+    try {
+      await this.#stabilizeNativeStepOnce(owner, rootBytes, capacity, signal);
+    } catch (error) {
+      if (funded) {
+        // A refused or cancelled step owns no future FTS step (as in prepareFtsMutation).
+        holder.ftsMutationPrepared = false;
+        this.#credits.retireMetadataHeadroom(
+          Math.max(
+            this.#minimumMetadata,
+            (this.#ftsMutations?.appliedLsn ?? 0) > this.#ftsCoveredLsn
+              ? FTS_PUBLICATION_MINIMUM_BYTES
+              : 0,
+          ),
+        );
+      }
+      throw error;
+    }
+  }
+
+  async #stabilizeNativeStepOnce(
+    owner: object,
+    rootBytes: number,
+    capacity: number,
+    signal: AbortSignal,
+  ): Promise<void> {
     for (;;) {
       this.#checkNativeStep(owner);
       signal.throwIfAborted();
@@ -2829,6 +2867,18 @@ export class WritePathImpl implements WritePath, EngineHooks {
     return false;
   }
 
+  /** Whether an FTS publication can follow this transaction's writes: an FTS index in the
+   * catalog, FTS state in the root, or FTS mutations not yet covered (writeStepMinimum's test). */
+  #ftsRelevant(catalog: Catalog): boolean {
+    const fts = this.#state.root.fts;
+    return (
+      catalog.fts.length > 0 ||
+      fts.checkpoint !== null ||
+      fts.staged !== null ||
+      (this.#ftsMutations?.appliedLsn ?? 0) > this.#ftsCoveredLsn
+    );
+  }
+
   /** Accepted keyed writes reserve their whole future publication phase before command end.
    * Check/source views have retired; no borrowed vector or second loan crosses this wait. */
   prepareFtsMutation(signal?: AbortSignal): MaybePromise<void> {
@@ -2837,6 +2887,14 @@ export class WritePathImpl implements WritePath, EngineHooks {
     if (this.#holder === null) throw new Error("FTS mutation without native writer");
     const tx = this.#holder,
       wasPrepared = tx.ftsMutationPrepared;
+    // Without an FTS index or FTS state, no publication can follow: nothing to reserve.
+    if (!this.#ftsRelevant(tx.catalog)) return undefined;
+    // A native root funded this minimum in its last native step (#stabilizeNativeStep); waiting
+    // here, while the root still holds its credit, would be hold-and-wait.
+    if (tx.nativeCommands && !wasPrepared)
+      throw new TransactionStateError(
+        "A native root's statement end found its FTS minimum unfunded",
+      );
     tx.ftsMutationPrepared = true;
     const refused = (error: unknown): never => {
       // A failed admission owns no future FTS step. Do not leave an unfunded minimum
@@ -2854,7 +2912,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
       throw error;
     };
     try {
-      const admission = this.#prepareMinimum(tx.catalog, signal);
+      // Native roots fund every step against the whole cap; so does their statement end.
+      const admission = this.#prepareMinimum(tx.catalog, signal, tx.nativeCommands);
       return admission instanceof Promise ? admission.catch(refused) : admission;
     } catch (error) {
       return refused(error);
