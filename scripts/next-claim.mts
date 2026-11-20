@@ -1,8 +1,14 @@
 /** The speed-claim protocol for next/: the one standard for any "faster" or "not slower" claim.
  *
- *   node scripts/next-claim.mts run --dataset W1M --control <built checkout>
- *        --candidate <built checkout> --targets a,b --output <dir> [--shard 0/6] [--pairs 15]
- *   node scripts/next-claim.mts report <claim-*.json>... > table.md
+ *   node scripts/next-claim.mts manifest --control <sha> --candidate <sha> --datasets W1M,S1
+ *        --shards 6 --pairs 15 --targets a,b [--only a,b,c] --output manifest.json
+ *   node scripts/next-claim.mts run --manifest manifest.json --dataset W1M --shard 0/6
+ *        --control <built checkout> --candidate <built checkout> --output <dir>
+ *   node scripts/next-claim.mts report --manifest manifest.json <claim-*.json>... > table.md
+ *
+ * The manifest, written at dispatch, declares the run: both SHAs, the datasets, shards, cells,
+ * targets and pairs. A table gives verdicts only when every declared shard and cell reported
+ * every pair; Holm runs over the declared screened family; one void A/A voids the whole run.
  *
  * Protocol (also in the testing reference, "Speed claims for the rebuild engine"):
  * 1. Each arm builds its own fixture once, with its own writer, and captures it as a native
@@ -21,6 +27,7 @@
  *    a flag needs the regression rule and a Holm-adjusted two-sided sign test p <= 0.05 across
  *    all screened cells of the run. Anything else is "no accepted difference", not equality.
  * Every sample records the runner's CPU model. Shards split the cells across jobs.
+ * Without --manifest, `run` declares a one-dataset manifest from its own arguments.
  */
 import { execFileSync } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -113,6 +120,8 @@ export interface CellRecord {
   readonly cell: string;
   readonly target?: boolean;
   readonly repeats: number;
+  /** Pairs with both arms timed. */
+  readonly completedPairs?: number;
   readonly acceptance?: Acceptance;
   /** Exact two-sided sign test p over this cell's pairs (before any correction). */
   readonly signP?: number;
@@ -136,6 +145,72 @@ export interface ClaimResult {
   readonly aa: CellRecord[];
   readonly ab: CellRecord[];
   readonly void: boolean;
+}
+
+/** The run declared at dispatch: what a complete run must report. */
+export interface ClaimManifest {
+  readonly control: string;
+  readonly candidate: string;
+  readonly pairs: number;
+  readonly targets: readonly string[];
+  readonly datasets: ReadonlyArray<{
+    readonly dataset: Dataset;
+    readonly shards: number;
+    readonly controls: readonly string[];
+    /** Every selected cell; shard i measures the cells whose index % shards === i. */
+    readonly cells: readonly string[];
+  }>;
+}
+
+export const shardCells = (cells: readonly string[], index: number, count: number): string[] =>
+  cells.filter((_, i) => i % count === index);
+
+const CELL = /^[A-Za-z0-9_]+$/u;
+const SHA = /^[0-9a-f]{40}$/u;
+
+/** Validates the dispatch inputs and declares the run. */
+export async function claimManifest(options: {
+  control: string;
+  candidate: string;
+  datasets: readonly string[];
+  shards: number;
+  pairs: number;
+  targets: readonly string[];
+  only: readonly string[];
+}): Promise<ClaimManifest> {
+  if (!SHA.test(options.control) || !SHA.test(options.candidate))
+    throw new Error("control and candidate must be full commit SHAs");
+  if (options.control === options.candidate)
+    throw new Error("A claim compares two different builds; an A/A run uses one build");
+  if (!Number.isSafeInteger(options.pairs) || options.pairs < 9 || options.pairs > 101)
+    throw new Error("pairs must be an integer from 9 to 101");
+  if (!Number.isSafeInteger(options.shards) || options.shards < 1 || options.shards > 32)
+    throw new Error("shards must be an integer from 1 to 32");
+  for (const name of [...options.targets, ...options.only])
+    if (!CELL.test(name)) throw new Error(`Invalid cell name ${JSON.stringify(name)}`);
+  if (options.datasets.length === 0) throw new Error("no datasets");
+  const only = new Set(options.only);
+  const datasets: Array<ClaimManifest["datasets"][number]> = [];
+  const known = new Set<string>();
+  for (const name of options.datasets) {
+    if (name !== "W1M" && name !== "S1") throw new Error(`Unknown dataset ${name}`);
+    const all = await gateBCells(name);
+    for (const cell of all) known.add(cell);
+    const cells = all.filter((id) => only.size === 0 || only.has(id));
+    if (cells.length === 0) throw new Error(`No ${name} cells selected`);
+    datasets.push({ dataset: name, shards: options.shards, controls: CONTROL_CELLS[name], cells });
+  }
+  for (const cell of only) if (!known.has(cell)) throw new Error(`Unknown cell ${cell}`);
+  for (const target of options.targets)
+    if (!datasets.some((entry) => entry.cells.includes(target)))
+      throw new Error(`Target ${target} is not a selected cell`);
+  return {
+    control: options.control,
+    candidate: options.candidate,
+    pairs: options.pairs,
+    targets: [...options.targets],
+    datasets,
+  };
 }
 
 /** Target rule: the paired gain/regression rule plus the minimum per-query effect. */
@@ -167,9 +242,11 @@ async function run(): Promise<void> {
       candidate: { type: "string" },
       output: { type: "string" },
       shard: { type: "string", default: "0/1" },
+      manifest: { type: "string" },
       pairs: { type: "string", default: "15" },
       targets: { type: "string", default: "" },
       seed: { type: "string", default: "" },
+      "verify-only": { type: "boolean", default: false },
       only: { type: "string", default: "" },
       rows: { type: "string", default: "1000000" },
       scale: { type: "string", default: "333" },
@@ -189,24 +266,35 @@ async function run(): Promise<void> {
     shardIndex >= shardCount
   )
     throw new Error("--shard must be i/n with 0 <= i < n");
-  const pairs = Number(values.pairs),
-    rows = Number(values.rows),
+  const rows = Number(values.rows),
     scale = Number(values.scale),
     seed = values.seed === "" ? Math.floor(Math.random() * 2 ** 31) : Number(values.seed);
-  if (!Number.isSafeInteger(pairs) || pairs < 9) throw new Error("--pairs must be at least 9");
-  const targets = values.targets.split(",").filter(Boolean);
+  if (!Number.isSafeInteger(seed)) throw new Error("--seed must be an integer");
   const roots = { control: resolve(values.control), candidate: resolve(values.candidate) };
   const revisionOf = (root: string) =>
     execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
   const revisions = { control: revisionOf(roots.control), candidate: revisionOf(roots.candidate) };
-  if (revisions.control === revisions.candidate)
-    throw new Error("A claim compares two different builds; an A/A run uses one build");
-  const only = new Set(values.only.split(",").filter(Boolean));
-  const all = (await gateBCells(dataset)).filter((id) => only.size === 0 || only.has(id));
-  for (const target of targets)
-    if (!all.includes(target)) throw new Error(`Target ${target} is not a selected cell`);
-  const cells = all.filter((_, index) => index % shardCount === shardIndex);
-  const controls = CONTROL_CELLS[dataset];
+  const manifest: ClaimManifest =
+    values.manifest === undefined
+      ? await claimManifest({
+          control: revisions.control,
+          candidate: revisions.candidate,
+          datasets: [dataset],
+          shards: shardCount,
+          pairs: Number(values.pairs),
+          targets: values.targets.split(",").filter(Boolean),
+          only: values.only.split(",").filter(Boolean),
+        })
+      : (JSON.parse(await readFile(resolve(values.manifest), "utf8")) as ClaimManifest);
+  if (manifest.control !== revisions.control || manifest.candidate !== revisions.candidate)
+    throw new Error("The built checkouts are not the manifest's control and candidate");
+  const entry = manifest.datasets.find((d) => d.dataset === dataset);
+  if (entry === undefined) throw new Error(`${dataset} is not in the manifest`);
+  if (entry.shards !== shardCount) throw new Error("--shard count differs from the manifest");
+  const pairs = manifest.pairs,
+    targets = [...manifest.targets];
+  const cells = shardCells(entry.cells, shardIndex, shardCount);
+  const controls = entry.controls;
   const needed = [...new Set([...controls, ...cells])];
   const catalogue = (await import(
     pathToFileURL(join(repository, "scripts/next-executor-workload/queries.mjs")).href
@@ -268,6 +356,52 @@ async function run(): Promise<void> {
     } satisfies HeadToHeadData,
     execArgv,
   });
+  if (values["verify-only"]) {
+    // Answers only: one fresh process per arm and cell, compared in full, no timing.
+    const lines = [
+      `## Answer check: control \`${revisions.control.slice(0, 10)}\` vs candidate \`${revisions.candidate.slice(0, 10)}\` (${dataset} shard ${values.shard})`,
+      "",
+      "| Cell | rows (control/candidate) | method | answers |",
+      "|---|---:|---|---|",
+    ];
+    let different = 0;
+    for (const cell of needed) {
+      const digests: Partial<Record<Role, AnswerDigest>> = {};
+      let failure = "";
+      for (const arm of ["control", "candidate"] as const) {
+        const handle = await startCPUWorker(spec(arm), {
+          arm,
+          cohort: -1,
+          workload: cell,
+          boundary: "frames",
+        });
+        try {
+          const checked = await handle.ask<Verification & { answer: AnswerDigest }>({
+            op: "verify",
+            workload: cell,
+          });
+          digests[arm] = checked.answer;
+        } catch (error) {
+          failure = `${arm}: ${brief(error)}`;
+        } finally {
+          await handle.close();
+        }
+      }
+      const a = digests.control,
+        b = digests.candidate;
+      const comparison =
+        a !== undefined && b !== undefined ? compareAnswers(a, b, ordered.has(cell)) : undefined;
+      if (comparison?.same !== true) different++;
+      lines.push(
+        `| ${dataset}/${cell} | ${String(a?.rows ?? "—")}/${String(b?.rows ?? "—")} | ${comparison?.method ?? "—"} | ${comparison === undefined ? `error: ${failure}` : comparison.same ? "same" : `**different** (${comparison.detail ?? ""})`} |`,
+      );
+      log({ phase: "verified", cell, comparison, failure });
+    }
+    lines.push("", `${String(different)} of ${String(needed.length)} cells differ or failed.`, "");
+    process.stdout.write(lines.join("\n"));
+    if (different > 0) process.exitCode = 1;
+    return;
+  }
   const measure = async (
     cell: string,
     candidate: CPUArm,
@@ -304,10 +438,12 @@ async function run(): Promise<void> {
       const per = (arm: string) =>
         medianOf(samples.filter((s) => s.arm === arm).map((s) => s.cpuMs)) / (repeats[cell] ?? 1);
       log({ phase: "cell", cell, purpose, seconds: (performance.now() - began) / 1000 });
+      const timed = (arm: string) => samples.filter((s) => s.arm === arm).length;
       return {
         cell,
         target: targets.includes(cell),
         repeats: repeats[cell] ?? 1,
+        completedPairs: Math.min(timed("control"), timed("candidate")),
         acceptance: record.acceptance,
         signP: signTestP(record.acceptance.favoursCandidate, record.acceptance.favoursControl),
         controlMedianMs: per("control"),
@@ -352,7 +488,7 @@ async function run(): Promise<void> {
     join(output, `claim-${dataset}-${String(shardIndex)}.json`),
     JSON.stringify(result, null, 2),
   );
-  process.stdout.write(report([result]));
+  process.stdout.write(report([result], manifest));
 }
 
 const fmt = (value: number | undefined, digits = 1) =>
@@ -363,53 +499,92 @@ const fmt = (value: number | undefined, digits = 1) =>
         minimumFractionDigits: digits,
       });
 
-/** One table across shards: Holm over every screened cell; a void shard voids the run. */
-export function report(results: readonly ClaimResult[]): string {
-  const first = results[0];
-  if (first === undefined) throw new Error("no claim results");
-  const voided = results.filter((r) => r.void);
-  // Every dataset must report every shard; a crashed shard leaves its cells unmeasured.
-  const missing: string[] = [];
-  for (const dataset of new Set(results.map((r) => r.dataset))) {
-    const shards = results.filter((r) => r.dataset === dataset);
-    const count = Number(shards[0]?.shard.split("/")[1] ?? 1);
-    const present = new Set(shards.map((r) => r.shard));
-    for (let i = 0; i < count; i++)
-      if (!present.has(`${String(i)}/${String(count)}`))
-        missing.push(`${dataset} ${String(i)}/${String(count)}`);
-  }
-  const screened = results.flatMap((result) =>
-    result.ab
-      .filter((r) => r.target !== true && r.signP !== undefined)
-      .map((r) => `${result.dataset}/${r.cell}`),
+/** Everything a complete run must report, checked against the manifest. */
+export function claimProblems(results: readonly ClaimResult[], manifest: ClaimManifest): string[] {
+  const problems: string[] = [];
+  const declared = new Set<string>();
+  for (const entry of manifest.datasets)
+    for (let index = 0; index < entry.shards; index++) {
+      const shard = `${String(index)}/${String(entry.shards)}`;
+      declared.add(`${entry.dataset} ${shard}`);
+      const found = results.filter((r) => r.dataset === entry.dataset && r.shard === shard);
+      if (found.length !== 1) {
+        problems.push(
+          `${entry.dataset} shard ${shard} ${found.length === 0 ? "missing" : "reported twice"}`,
+        );
+        continue;
+      }
+      const result = found[0] as ClaimResult;
+      if (
+        result.control.revision !== manifest.control ||
+        result.candidate.revision !== manifest.candidate
+      )
+        problems.push(`${entry.dataset} shard ${shard} measured other revisions`);
+      if (result.pairs !== manifest.pairs)
+        problems.push(`${entry.dataset} shard ${shard} ran ${String(result.pairs)} pairs`);
+      const check = (records: readonly CellRecord[], wanted: readonly string[], role: string) => {
+        for (const cell of wanted) {
+          const record = records.find((r) => r.cell === cell);
+          if (record === undefined) problems.push(`${entry.dataset}/${cell} ${role} missing`);
+          else if (record.error !== undefined)
+            problems.push(`${entry.dataset}/${cell} ${role} failed`);
+          else if (record.completedPairs !== manifest.pairs)
+            problems.push(
+              `${entry.dataset}/${cell} ${role} completed ${String(record.completedPairs ?? 0)}/${String(manifest.pairs)} pairs`,
+            );
+        }
+        for (const record of records)
+          if (!wanted.includes(record.cell))
+            problems.push(`${entry.dataset}/${record.cell} ${role} was not declared`);
+      };
+      check(result.aa, entry.controls, "A/A");
+      check(result.ab, shardCells(entry.cells, index, entry.shards), "A/B");
+    }
+  for (const result of results)
+    if (!declared.has(`${result.dataset} ${result.shard}`))
+      problems.push(`${result.dataset} shard ${result.shard} was not declared`);
+  return problems;
+}
+
+/** One table across shards: verdicts only for a complete run, never for a void one. */
+export function report(results: readonly ClaimResult[], manifest: ClaimManifest): string {
+  const problems = claimProblems(results, manifest);
+  const complete = problems.length === 0;
+  // One A/A control meeting the target rule (or failing) in any shard voids every verdict.
+  const voided = results.filter(
+    (r) => r.void || r.aa.some((a) => a.error !== undefined || targetVerdict(a) !== "none"),
+  );
+  // Holm runs over the declared screened family, not only the cells that reported.
+  const screened = manifest.datasets.flatMap((entry) =>
+    entry.cells
+      .filter((cell) => !manifest.targets.includes(cell))
+      .map((cell) => `${entry.dataset}/${cell}`),
   );
   const pOf = new Map<string, number>();
-  results.forEach((result) =>
-    result.ab.forEach((r) => {
-      if (r.target !== true && r.signP !== undefined)
-        pOf.set(`${result.dataset}/${r.cell}`, r.signP);
-    }),
-  );
+  for (const result of results)
+    for (const r of result.ab)
+      if (r.signP !== undefined) pOf.set(`${result.dataset}/${r.cell}`, r.signP);
   const adjusted = holm(screened.map((key) => pOf.get(key) ?? 1));
   const holmOf = new Map(screened.map((key, index) => [key, adjusted[index] ?? 1]));
+  const first = results[0];
   const lines = [
     `## Speed claim: candidate vs control (next/, frames boundary)`,
     "",
     '_Internal measurement protocol (testing reference, "Speed claims"), not a published benchmark._',
     "",
-    `control \`${first.control.revision.slice(0, 10)}\` · candidate \`${first.candidate.revision.slice(0, 10)}\` · Node ${first.node} · ${String(first.pairs)} fresh-process pairs per cell · seed ${String(first.seed)} · targets ${first.targets.join(", ") || "none"}`,
+    `control \`${manifest.control.slice(0, 10)}\` · candidate \`${manifest.candidate.slice(0, 10)}\` · Node ${first?.node ?? "—"} · ${String(manifest.pairs)} fresh-process pairs per cell · seed ${first === undefined ? "—" : String(first.seed)} · targets ${manifest.targets.join(", ") || "none"}`,
     "",
     voided.length > 0
-      ? `**VOID:** an A/A control met the target rule in shard(s) ${voided.map((r) => r.shard).join(", ")}; no verdict from this run may be cited.`
-      : "A/A controls neutral in every shard.",
-    ...(missing.length > 0
-      ? [
+      ? `**VOID:** an A/A control met the target rule or failed in shard(s) ${voided.map((r) => `${r.dataset} ${r.shard}`).join(", ")}; no verdict from this run may be cited.`
+      : "A/A controls neutral in every reported shard.",
+    ...(complete
+      ? []
+      : [
           "",
-          `**INCOMPLETE:** missing shard(s) ${missing.join(", ")}; their cells were not measured.`,
-        ]
-      : []),
+          `**INCOMPLETE:** no verdicts. ${problems.slice(0, 12).join("; ")}${problems.length > 12 ? `; and ${String(problems.length - 12)} more` : ""}.`,
+        ]),
     "",
-    `Per-query process CPU medians in ms; Δ is per bracket (candidate − control). Targets: a gain or regression needs |median Δ| > IQR, 7 of 9 pairs (scaled) one way and at least ${String(MIN_EFFECT * 100)}% of the control median. Other cells: a regression flag also needs a Holm-adjusted sign-test p ≤ 0.05 across all ${String(screened.length)} screened cells. Anything else is no accepted difference, not equality.`,
+    `Per-query process CPU medians in ms; Δ is per bracket (candidate − control). Targets: a gain or regression needs |median Δ| > IQR, 7 of 9 pairs (scaled) one way and at least ${String(MIN_EFFECT * 100)}% of the control median. Other cells: a regression flag also needs a Holm-adjusted sign-test p ≤ 0.05 across all ${String(screened.length)} declared screened cells. Anything else is no accepted difference, not equality.`,
     "",
     "| Cell | role | shard | control | candidate | Δ median | IQR | candidate faster | p (Holm for screen) | verdict | CPU |",
     "|---|---|---|---:|---:|---:|---:|---:|---:|---|---|",
@@ -417,7 +592,10 @@ export function report(results: readonly ClaimResult[]): string {
   for (const result of results) {
     const rows: Array<[string, CellRecord]> = [
       ...result.aa.map((r): [string, CellRecord] => ["A/A", r]),
-      ...result.ab.map((r): [string, CellRecord] => [r.target === true ? "target" : "screen", r]),
+      ...result.ab.map((r): [string, CellRecord] => [
+        manifest.targets.includes(r.cell) ? "target" : "screen",
+        r,
+      ]),
     ];
     for (const [role, r] of rows) {
       const key = `${result.dataset}/${r.cell}`;
@@ -426,17 +604,21 @@ export function report(results: readonly ClaimResult[]): string {
       const verdict =
         r.error !== undefined
           ? `error: ${r.error.replaceAll("|", "\\|").slice(0, 80)}`
-          : result.void && role !== "A/A"
-            ? "void"
-            : role === "screen"
-              ? tv === "regression" && (p ?? 1) <= 0.05
-                ? "**regression flag**"
-                : "no accepted difference"
-              : tv === "none"
-                ? role === "A/A"
-                  ? "neutral"
-                  : "no accepted difference"
-                : `**${tv}**`;
+          : role === "A/A"
+            ? tv === "none"
+              ? "neutral"
+              : `**${tv}** (voids the run)`
+            : !complete
+              ? "no verdict (incomplete run)"
+              : voided.length > 0
+                ? "void"
+                : role === "screen"
+                  ? tv === "regression" && (p ?? 1) <= 0.05
+                    ? "**regression flag**"
+                    : "no accepted difference"
+                  : tv === "none"
+                    ? "no accepted difference"
+                    : `**${tv}**`;
       const a = r.acceptance;
       lines.push(
         `| ${key} | ${role} | ${result.shard} | ${fmt(r.controlMedianMs, 2)} | ${fmt(r.candidateMedianMs, 2)} | ${fmt(a?.medianDeltaMs, 2)} | ${fmt(a?.iqrDeltaMs, 2)} | ${a === undefined ? "—" : `${String(a.favoursCandidate)}/${String(a.favoursCandidate + a.favoursControl)}`} | ${fmt(p, 4)} | ${verdict} | ${(r.cpus ?? []).join(", ")} |`,
@@ -451,11 +633,45 @@ const mode = process.argv[2];
 if (process.argv[1] !== undefined && resolve(process.argv[1]) !== fileURLToPath(import.meta.url)) {
   // Imported: expose the report and protocol functions only.
 } else if (mode === "run") await run();
-else if (mode === "report") {
-  const files = process.argv.slice(3);
-  if (files.length === 0) throw new Error("report needs claim result files");
-  const results = await Promise.all(
-    files.map(async (file) => JSON.parse(await readFile(resolve(file), "utf8")) as ClaimResult),
+else if (mode === "manifest") {
+  const { values } = parseArgs({
+    args: process.argv.slice(3),
+    options: {
+      control: { type: "string", default: "" },
+      candidate: { type: "string", default: "" },
+      datasets: { type: "string", default: "W1M,S1" },
+      shards: { type: "string", default: "6" },
+      pairs: { type: "string", default: "15" },
+      targets: { type: "string", default: "" },
+      only: { type: "string", default: "" },
+      output: { type: "string", default: "manifest.json" },
+    },
+  });
+  const manifest = await claimManifest({
+    control: values.control,
+    candidate: values.candidate,
+    datasets: values.datasets.split(",").filter(Boolean),
+    shards: Number(values.shards),
+    pairs: Number(values.pairs),
+    targets: values.targets.split(",").filter(Boolean),
+    only: values.only.split(",").filter(Boolean),
+  });
+  await writeFile(resolve(values.output), JSON.stringify(manifest, null, 2));
+  process.stdout.write(
+    `${JSON.stringify({ datasets: manifest.datasets.map((d) => d.dataset), shards: Array.from({ length: Number(values.shards) }, (_, i) => i) })}\n`,
   );
-  process.stdout.write(report(results));
-} else throw new Error("usage: next-claim.mts run|report ...");
+} else if (mode === "report") {
+  const { values, positionals } = parseArgs({
+    args: process.argv.slice(3),
+    options: { manifest: { type: "string" } },
+    allowPositionals: true,
+  });
+  if (values.manifest === undefined) throw new Error("report needs --manifest");
+  const manifest = JSON.parse(await readFile(resolve(values.manifest), "utf8")) as ClaimManifest;
+  const results = await Promise.all(
+    positionals.map(
+      async (file) => JSON.parse(await readFile(resolve(file), "utf8")) as ClaimResult,
+    ),
+  );
+  process.stdout.write(report(results, manifest));
+} else throw new Error("usage: next-claim.mts manifest|run|report ...");

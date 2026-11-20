@@ -3,12 +3,14 @@ import {
   AnswerCollector,
   INLINE_VALUES,
   checkFixtureRows,
+  columnKind,
   compareAnswers,
   normalize,
+  type ColumnKind,
 } from "./lib/answers.mts";
 
-const collect = (rows: unknown[][], ordered: boolean) => {
-  const collector = new AnswerCollector(ordered);
+const collect = (rows: unknown[][], ordered: boolean, kinds?: readonly ColumnKind[]) => {
+  const collector = new AnswerCollector(ordered, kinds);
   for (const row of rows) collector.add(row);
   return collector.finish();
 };
@@ -22,14 +24,75 @@ describe("head-to-head answer comparison", () => {
     expect(compareAnswers(a, collect([[1.0000001, "x"]], true), true).same).toBe(false);
   });
 
-  it("normalizes representations without losing exact text", () => {
-    expect(normalize("12.3400")).toBe(12.34);
-    expect(normalize(12n)).toBe(12);
-    expect(normalize(2n ** 63n - 1n)).toBe("b9223372036854775807");
-    expect(normalize("00123")).toBe("s00123");
-    expect(normalize(new Date(5))).toBe(5);
-    expect(normalize("2024-01-01")).toBe(Date.parse("2024-01-01T00:00:00Z"));
-    expect(normalize(true)).toBe(1);
+  it("normalizes by column kind, exactly and without losing text", () => {
+    expect(normalize("12.3400", "float")).toBe(12.34);
+    expect(normalize("12.3400", "numeric")).toBe("n12.3400");
+    expect(normalize("12.3400", "text")).toBe("s12.3400");
+    expect(normalize(12n, "integer")).toBe("i12");
+    expect(normalize(12, "integer")).toBe("i12");
+    expect(normalize("00123", "text")).toBe("s00123");
+    expect(normalize(new Date(5), "temporal")).toBe("t5");
+    expect(normalize("2024-01-01", "temporal")).toBe(
+      `t${String(Date.parse("2024-01-01T00:00:00Z"))}`,
+    );
+    expect(normalize(true, "bool")).toBe("b1");
+    expect(columnKind("int64")).toBe("integer");
+    expect(columnKind("decimal")).toBe("numeric");
+    expect(columnKind("float64")).toBe("float");
+  });
+
+  // Review of #12 (P2): each pair was reported equal by the earlier value-guessing normalizer.
+  it.each<[string, unknown, unknown, ColumnKind]>([
+    ["NULL vs undefined", null, undefined, "value"],
+    ["int8 max vs max - 1", "9223372036854775807", "9223372036854775806", "integer"],
+    ["int8 bigint vs neighbour", 2n ** 63n - 1n, 2n ** 63n - 2n, "integer"],
+    [
+      "distinct high-precision NUMERIC",
+      "1.000000000000000000001",
+      "1.000000000000000000002",
+      "numeric",
+    ],
+    ["text 1.0 vs 1.00", "1.0", "1.00", "text"],
+    ["JSON objects", { a: 1 }, { a: 2 }, "json"],
+    ["JSON objects of unknown kind", { a: 1 }, { a: 2 }, "value"],
+    ["bytes ff vs fe", Buffer.from([0xff]), Buffer.from([0xfe]), "bytes"],
+    ["bytes of unknown kind", Buffer.from([0xff]), Buffer.from([0xfe]), "value"],
+    ["NUMERIC 1.0 vs text 1.0", "1.0", "1.0", "numeric"],
+  ])("tells apart %s", (name, a, b, kind) => {
+    const other: ColumnKind = name.startsWith("NUMERIC 1.0 vs text") ? "text" : kind;
+    expect(
+      compareAnswers(collect([[a]], true, [kind]), collect([[b]], true, [other]), true).same,
+    ).toBe(false);
+  });
+
+  it.each<[string, unknown, unknown, ColumnKind]>([
+    ["the same int8 as bigint and decimal text", 2n ** 63n - 1n, "9223372036854775807", "integer"],
+    ["a safe integer as number and bigint", 42, 42n, "integer"],
+    ["JSON with keys in another order", { a: 1, b: [2] }, { b: [2], a: 1 }, "json"],
+    ["equal bytes", Buffer.from([1, 2]), new Uint8Array([1, 2]), "bytes"],
+  ])("treats as equal %s", (_name, a, b, kind) => {
+    expect(
+      compareAnswers(collect([[a]], true, [kind]), collect([[b]], true, [kind]), true).same,
+    ).toBe(true);
+  });
+
+  it("sorts unordered rows by an exact key before applying the tolerance", () => {
+    // Review of #12 (P2): a six-digit sort key tied these, so a reversal compared unequal.
+    const rows = [[1.0000001], [1.0000002]];
+    expect(
+      compareAnswers(
+        collect(rows, false, ["float"]),
+        collect([...rows].reverse(), false, ["float"]),
+        false,
+      ).same,
+    ).toBe(true);
+    expect(
+      compareAnswers(
+        collect([[1.0000001], [1.0000002]], false, ["float"]),
+        collect([[1.0000001], [1.0000003]], false, ["float"]),
+        false,
+      ).same,
+    ).toBe(false);
   });
 
   it("orders unordered inline results before comparing", () => {

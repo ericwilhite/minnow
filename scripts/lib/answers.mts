@@ -1,12 +1,21 @@
 /** Answer capture and comparison for engine head-to-head runs.
  *
- * Every value is normalized across representations: NUMERIC text, safe BIGINTs and
- * floats become numbers; DATE/TIMESTAMP become epoch milliseconds; booleans 1/0; other text
- * stays exact. Small results travel inline and compare value by value: numbers within an
- * explicit tolerance (|a - b| <= ABS + REL * max(|a|, |b|)), everything else exactly. Large
- * results (more than INLINE_VALUES values) are hashed exactly at full precision: in order
- * under a total ORDER BY, otherwise as a multiset (a sum of per-row digests), so every value
- * of every row is covered. Those cells return stored columns, not computed floats.
+ * Values normalize by their column's kind (`ColumnKind`, from the result's physical types),
+ * never by guessing from the value:
+ * - integer and NUMERIC compare exactly as decimal text; a bigint, a safe number and decimal
+ *   text of the same integer are equal, and nothing is rounded through a float;
+ * - floats compare within an explicit tolerance (|a - b| <= ABS + REL * max(|a|, |b|));
+ *   NaN and infinities compare exactly;
+ * - text, JSON and bytes are encoded losslessly (JSON objects with sorted keys, bytes as hex);
+ * - booleans, dates and timestamps compare exactly;
+ * - a value of an unknown kind is encoded losslessly by its JavaScript type.
+ * Every encoding carries a tag, so NULL, undefined, text "1.0" and NUMERIC 1.0 all differ.
+ *
+ * Small results travel inline and compare value by value. An unordered result is first sorted
+ * by an exact key, and only then compared pairwise with the tolerance. Large results (more than
+ * INLINE_VALUES values) are hashed exactly at full precision: in order under a total ORDER BY,
+ * otherwise as a multiset (a sum of per-row digests). Those cells return stored columns, not
+ * computed floats.
  */
 import { createHash } from "node:crypto";
 
@@ -15,11 +24,47 @@ export const REL_TOLERANCE = 1e-9;
 /** Results up to this many values compare inline with tolerance; larger ones hash exactly. */
 export const INLINE_VALUES = 2_000_000;
 
+export type ColumnKind =
+  "integer" | "numeric" | "float" | "text" | "json" | "bytes" | "bool" | "temporal" | "value";
+
+/** The comparison kind of a next/ physical type kind. */
+export function columnKind(physical: string): ColumnKind {
+  switch (physical) {
+    case "int32":
+    case "int64":
+      return "integer";
+    case "decimal":
+      return "numeric";
+    case "float32":
+    case "float64":
+      return "float";
+    case "text":
+    case "uuid":
+    case "enum":
+      return "text";
+    case "json":
+      return "json";
+    case "bytes":
+      return "bytes";
+    case "bool":
+      return "bool";
+    case "date":
+    case "timestamp":
+    case "time":
+      return "temporal";
+    default:
+      return "value";
+  }
+}
+
+/** A float is a number; every other value is tagged text; SQL NULL is null. */
 export type Normal = number | string | null;
 export type AnswerMethod = "inline" | "ordered-hash" | "multiset-hash" | "fixture";
 export interface AnswerDigest {
   readonly method: AnswerMethod;
   readonly rows: number;
+  /** The kinds the values were normalized by (unknown columns: "value"). */
+  readonly kinds?: readonly ColumnKind[];
   /** inline: normalized rows. */
   readonly values?: Normal[][];
   /** hashes: hex digest of every value of every row. */
@@ -33,37 +78,104 @@ export interface AnswerComparison {
   readonly detail?: string;
 }
 
-const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/u;
-const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}(:?\d{2})?)?$/u;
-const DECIMAL = /^-?(0|[1-9]\d*)(\.\d+)?$/u;
+const INTEGER = /^-?\d+$/u;
+const DECIMAL = /^-?(\d+(\.\d*)?|\.\d+)([eE][-+]?\d+)?$/u;
+const ISO = /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}:\d{2}(\.\d{1,3})?)?(Z|[+-]\d{2}(:?\d{2})?)?$/u;
 
-export function normalize(value: unknown): Normal {
-  if (value === null || value === undefined) return null;
-  if (typeof value === "number") return Number.isFinite(value) ? value : String(value);
-  if (typeof value === "bigint")
-    return value >= BigInt(Number.MIN_SAFE_INTEGER) && value <= BigInt(Number.MAX_SAFE_INTEGER)
-      ? Number(value)
-      : `b${String(value)}`;
-  if (typeof value === "boolean") return value ? 1 : 0;
-  if (value instanceof Date) return value.getTime();
-  if (typeof value === "string") {
-    if (DECIMAL.test(value)) {
-      const number = Number(value);
-      // Exact text beyond double precision stays text (compared exactly).
-      return Number.isFinite(number) && (Math.abs(number) < 2 ** 53 || !value.includes("."))
-        ? number
-        : `d${value}`;
-    }
-    if (ISO_DATE.test(value)) return Date.parse(`${value}T00:00:00Z`);
-    if (ISO_TIMESTAMP.test(value)) {
-      const time = Date.parse(
-        value.includes("T") || value.includes("Z") ? value : `${value.replace(" ", "T")}Z`,
-      );
-      if (!Number.isNaN(time)) return time;
-    }
-    return `s${value}`;
+const hex = (bytes: Uint8Array) =>
+  Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+
+/** JSON with object keys sorted, recursively; bigints as exact text. */
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    if (typeof value === "bigint") return `${String(value)}n`;
+    return JSON.stringify(value) ?? "undefined";
   }
-  return `?${String(value)}`;
+  if (value instanceof Uint8Array) return `"\\\\x${hex(value)}"`;
+  if (value instanceof Date) return JSON.stringify(value.toISOString());
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+    .join(",")}}`;
+}
+
+/** Lossless encoding by JavaScript type, for a value of an unknown kind or the wrong kind. */
+function byType(value: unknown): Normal {
+  if (value === null) return null;
+  if (value === undefined) return "u";
+  if (typeof value === "bigint") return `i${String(value)}`;
+  if (typeof value === "number") {
+    if (Number.isInteger(value)) return `i${BigInt(value).toString()}`;
+    return Number.isFinite(value) ? value : `f${String(value)}`;
+  }
+  if (typeof value === "string") return `s${value}`;
+  if (typeof value === "boolean") return value ? "b1" : "b0";
+  if (value instanceof Date) return `t${String(value.getTime())}`;
+  if (value instanceof Uint8Array) return `x${hex(value)}`;
+  return `j${canonicalJson(value)}`;
+}
+
+export function normalize(value: unknown, kind: ColumnKind = "value"): Normal {
+  if (value === null) return null;
+  if (value === undefined) return "u";
+  switch (kind) {
+    case "integer":
+      if (typeof value === "bigint") return `i${String(value)}`;
+      if (typeof value === "number" && Number.isInteger(value))
+        return `i${BigInt(value).toString()}`;
+      if (typeof value === "string" && INTEGER.test(value)) return `i${BigInt(value).toString()}`;
+      break;
+    case "numeric":
+      // Exact text, scale included: NUMERIC output keeps its scale. Integers are exact either way.
+      if (typeof value === "bigint") return `n${String(value)}`;
+      if (typeof value === "number" && Number.isFinite(value)) return `n${String(value)}`;
+      if (typeof value === "string" && (DECIMAL.test(value) || value === "NaN")) return `n${value}`;
+      break;
+    case "float":
+      if (typeof value === "number") return Number.isFinite(value) ? value : `f${String(value)}`;
+      if (typeof value === "bigint") return Number(value);
+      if (typeof value === "string" && (DECIMAL.test(value) || /^-?(Infinity|NaN)$/u.test(value))) {
+        const number = Number(value);
+        return Number.isFinite(number) ? number : `f${String(number)}`;
+      }
+      break;
+    case "text":
+      if (typeof value === "string") return `s${value}`;
+      break;
+    case "json":
+      return `j${typeof value === "string" ? value : canonicalJson(value)}`;
+    case "bytes":
+      if (value instanceof Uint8Array) return `x${hex(value)}`;
+      if (typeof value === "string" && /^\\x[0-9a-f]*$/iu.test(value))
+        return `x${value.slice(2).toLowerCase()}`;
+      break;
+    case "bool":
+      if (typeof value === "boolean") return value ? "b1" : "b0";
+      break;
+    case "temporal":
+      if (value instanceof Date) return `t${String(value.getTime())}`;
+      if (typeof value === "number") return `t${String(value)}`;
+      if (typeof value === "string") {
+        if (ISO.test(value)) {
+          const time = Date.parse(
+            value.length === 10
+              ? `${value}T00:00:00Z`
+              : /Z|[+-]\d{2}(:?\d{2})?$/u.test(value)
+                ? value.replace(" ", "T")
+                : `${value.replace(" ", "T")}Z`,
+          );
+          if (!Number.isNaN(time)) return `t${String(time)}`;
+        }
+        return `ts${value}`;
+      }
+      break;
+    case "value":
+      return byType(value);
+  }
+  // A value of an unexpected representation stays distinct and lossless.
+  return `?${kind}:${String(byType(value))}`;
 }
 
 export function closeEnough(a: Normal, b: Normal): boolean {
@@ -75,19 +187,43 @@ export function closeEnough(a: Normal, b: Normal): boolean {
   return a === b;
 }
 
+/** Exact total order of normalized values: NULL, then numbers by value, then text by code unit. */
+function compareNormal(a: Normal, b: Normal): number {
+  if (a === b) return 0;
+  if (a === null) return -1;
+  if (b === null) return 1;
+  if (typeof a === "number") return typeof b === "number" ? a - b : -1;
+  if (typeof b === "number") return 1;
+  return a < b ? -1 : 1;
+}
+function compareRows(x: readonly Normal[], y: readonly Normal[]): number {
+  for (let c = 0; c < Math.min(x.length, y.length); c++) {
+    const order = compareNormal(x[c] ?? null, y[c] ?? null);
+    if (order !== 0) return order;
+  }
+  return x.length - y.length;
+}
+
 /** Streams rows into an inline list or an exact hash, decided by the result's size. */
 export class AnswerCollector {
   readonly #ordered: boolean;
+  #kinds: readonly ColumnKind[] | undefined;
   #rows = 0;
   #inline: Normal[][] | null = [];
   #values = 0;
   readonly #ordinal = createHash("sha256");
   #multiset = 0n;
-  constructor(ordered: boolean) {
+  constructor(ordered: boolean, kinds?: readonly ColumnKind[]) {
     this.#ordered = ordered;
+    this.#kinds = kinds;
+  }
+  /** The kinds of the result's columns, when they are known only once rows arrive. */
+  setKinds(kinds: readonly ColumnKind[]): void {
+    if (this.#rows > 0) throw new Error("Column kinds must be known before the first row");
+    this.#kinds = kinds;
   }
   add(row: readonly unknown[]): void {
-    const normal = row.map(normalize);
+    const normal = row.map((value, c) => normalize(value, this.#kinds?.[c] ?? "value"));
     this.#rows++;
     this.#values += normal.length;
     const line = JSON.stringify(normal);
@@ -104,21 +240,19 @@ export class AnswerCollector {
     }
   }
   finish(): AnswerDigest {
-    if (this.#inline !== null) return { method: "inline", rows: this.#rows, values: this.#inline };
+    const kinds = this.#kinds === undefined ? {} : { kinds: [...this.#kinds] };
+    if (this.#inline !== null)
+      return { method: "inline", rows: this.#rows, ...kinds, values: this.#inline };
     return this.#ordered
-      ? { method: "ordered-hash", rows: this.#rows, hash: this.#ordinal.digest("hex") }
+      ? { method: "ordered-hash", rows: this.#rows, ...kinds, hash: this.#ordinal.digest("hex") }
       : {
           method: "multiset-hash",
           rows: this.#rows,
+          ...kinds,
           hash: `${String(this.#rows)}:${this.#multiset.toString(16)}`,
         };
   }
 }
-
-const sortKey = (row: readonly Normal[]) =>
-  JSON.stringify(
-    row.map((value) => (typeof value === "number" ? Number(value.toPrecision(6)) : value)),
-  );
 
 export function compareAnswers(
   a: AnswerDigest,
@@ -143,8 +277,8 @@ export function compareAnswers(
   const left = [...(a.values ?? [])],
     right = [...(b.values ?? [])];
   if (!ordered) {
-    left.sort((x, y) => (sortKey(x) < sortKey(y) ? -1 : sortKey(x) > sortKey(y) ? 1 : 0));
-    right.sort((x, y) => (sortKey(x) < sortKey(y) ? -1 : sortKey(x) > sortKey(y) ? 1 : 0));
+    left.sort(compareRows);
+    right.sort(compareRows);
   }
   for (let r = 0; r < left.length; r++) {
     const x = left[r] ?? [],
@@ -167,6 +301,7 @@ export function checkFixtureRows(
   rows: ReadonlyArray<Record<string, unknown>>,
   columns: readonly string[],
   expected: (id: number) => Record<string, unknown>,
+  kinds?: readonly ColumnKind[],
 ): AnswerDigest {
   const mismatches: string[] = [];
   const seen = new Set<number>();
@@ -178,11 +313,18 @@ export function checkFixtureRows(
     }
     seen.add(id);
     const want = expected(id);
-    for (const column of columns)
-      if (!closeEnough(normalize(row[column]), normalize(want[column]))) {
+    for (const [c, column] of columns.entries()) {
+      const kind = kinds?.[c] ?? "value";
+      if (!closeEnough(normalize(row[column], kind), normalize(want[column], kind))) {
         mismatches.push(`id ${String(id)} ${column}`);
         break;
       }
+    }
   }
-  return { method: "fixture", rows: rows.length, mismatches };
+  return {
+    method: "fixture",
+    rows: rows.length,
+    ...(kinds === undefined ? {} : { kinds: [...kinds] }),
+    mismatches,
+  };
 }

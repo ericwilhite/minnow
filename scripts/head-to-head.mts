@@ -262,6 +262,10 @@ async function run(): Promise<void> {
         const worker = workers[arm];
         if (worker === undefined) continue;
         try {
+          // 0.20 reports no result types: it normalizes by the next/ engine's column kinds.
+          const kinds = answers.next?.kinds;
+          if (arm === "shipped" && kinds !== undefined)
+            await worker.ask({ op: "command", name: "column-kinds", data: { id, kinds } });
           const checked = await worker.ask<Verification & { answer: AnswerDigest }>({
             op: "verify",
             workload: id,
@@ -426,6 +430,8 @@ export async function report(results: readonly HeadToHeadResult[]): Promise<stri
   const first = results[0];
   if (first === undefined) throw new Error("no results");
   const v = first.shipped.version.split(".").slice(0, 2).join(".");
+  // Every label names the measured ref, never "main" for a dispatched branch.
+  const base = baselineOf(first).ref;
   const lines = [
     `## Head-to-head: ${baselineOf(first).ref} vs published ${first.shipped.version}`,
     "",
@@ -476,7 +482,7 @@ export async function report(results: readonly HeadToHeadResult[]): Promise<stri
           const error = cell.errors[arm];
           return error === undefined
             ? []
-            : [`${arm === "next" ? "main" : v}: ${error.replaceAll("|", "\\|").slice(0, 80)}`];
+            : [`${arm === "next" ? base : v}: ${error.replaceAll("|", "\\|").slice(0, 80)}`];
         })
         .join("; ");
       lines.push(
@@ -484,16 +490,16 @@ export async function report(results: readonly HeadToHeadResult[]): Promise<stri
       );
     }
     perDataset.push(
-      `${result.dataset}: main/${v} ${datasetVersus.length === 0 ? "—" : `${format(geomean(datasetVersus), 2)}×`}, frames/target ${datasetTarget.length === 0 ? "—" : `${format(geomean(datasetTarget), 2)}×`}`,
+      `${result.dataset}: ${base}/${v} ${datasetVersus.length === 0 ? "—" : `${format(geomean(datasetVersus), 2)}×`}, frames/target ${datasetTarget.length === 0 ? "—" : `${format(geomean(datasetTarget), 2)}×`}`,
     );
   }
   lines.push(
     "",
-    `**Geomean** (${perDataset.join("; ")}) · all: main/${v} (rows CPU): ${versus.length === 0 ? "—" : `${format(geomean(versus), 2)}× over ${versus.length} cells`} · main frames/target (wall): ${toTarget.length === 0 ? "—" : `${format(geomean(toTarget), 2)}× over ${toTarget.length} cells`}`,
+    `**Geomean** (${perDataset.join("; ")}) · all: ${base}/${v} (rows CPU): ${versus.length === 0 ? "—" : `${format(geomean(versus), 2)}× over ${versus.length} cells`} · ${base} frames/target (wall): ${toTarget.length === 0 ? "—" : `${format(geomean(toTarget), 2)}× over ${toTarget.length} cells`}`,
     "",
     `**Slower than ${v} (${slower.length}):** ${slower.length === 0 ? "none" : slower.join(", ")}`,
     "",
-    `Fixture load: ${results.map((r) => `${r.dataset} main ${format(r.loadMs.next ?? null, 0)} ms, ${v} ${format(r.loadMs.shipped ?? null, 0)} ms`).join("; ")}.`,
+    `Fixture load: ${results.map((r) => `${r.dataset} ${base} ${format(r.loadMs.next ?? null, 0)} ms, ${v} ${format(r.loadMs.shipped ?? null, 0)} ms`).join("; ")}.`,
     "",
   );
   return lines.join("\n");

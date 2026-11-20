@@ -17,7 +17,7 @@ import { cpus } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { CPUWorkerContext, CPUWorkerHarness } from "./lib/independent-cpu.mts";
-import { AnswerCollector, checkFixtureRows } from "./lib/answers.mts";
+import { AnswerCollector, checkFixtureRows, columnKind, type ColumnKind } from "./lib/answers.mts";
 
 export interface HeadToHeadData {
   readonly engine: "next" | "shipped";
@@ -82,16 +82,18 @@ interface Star {
     scale: number,
   ): Record<string, unknown[]>;
 }
+/** Sees each materialized row; `kinds` are the result's column kinds when the engine knows them. */
+type Consume = (
+  columns: readonly string[],
+  row: Record<string, unknown>,
+  kinds?: readonly ColumnKind[],
+) => void;
+
 interface Engine {
   /** next only: capture the loaded fixture as a native image (fresh fixtures only). */
   capture?(directory: string, identity: string, signal: AbortSignal): Promise<unknown>;
   /** Runs one query to completion; `consume` sees each materialized row when given. */
-  run(
-    sql: string,
-    boundary: string,
-    signal: AbortSignal,
-    consume?: (columns: readonly string[], row: Record<string, unknown>) => void,
-  ): Promise<number>;
+  run(sql: string, boundary: string, signal: AbortSignal, consume?: Consume): Promise<number>;
   close(): Promise<void>;
 }
 
@@ -232,6 +234,7 @@ async function nextEngine(data: HeadToHeadData, signal: AbortSignal): Promise<En
       if (lowered.kind !== "query") throw new Error("expected a query");
       const prepared = core.executor.prepare(lowered.plan);
       const names = prepared.columns.map((column) => column.name);
+      const kinds = prepared.columns.map((column) => columnKind(column.type.kind));
       const run = core.start(prepared, [], querySignal);
       const dictionaries = new Map<
         number,
@@ -276,7 +279,7 @@ async function nextEngine(data: HeadToHeadData, signal: AbortSignal): Promise<En
               ],
             });
             rows += decoded.length;
-            if (consume !== undefined) for (const row of decoded) consume(names, row);
+            if (consume !== undefined) for (const row of decoded) consume(names, row, kinds);
           } finally {
             frame.release();
           }
@@ -420,6 +423,7 @@ export default async function create(context: CPUWorkerContext): Promise<CPUWork
   const started = performance.now();
   // The wide fixture's generator, for checking rows an unordered LIMIT may pick.
   let expectedRow: ((id: number) => Record<string, unknown>) | null = null;
+  const givenKinds = new Map<string, readonly ColumnKind[]>();
   if (data.dataset === "W1M") {
     const generator = (await import(
       pathToFileURL(join(workload, "gen.mjs")).href
@@ -437,11 +441,7 @@ export default async function create(context: CPUWorkerContext): Promise<CPUWork
       : await shippedEngine(data, context.signal);
   const loadMs = performance.now() - started;
   let active: AbortController | null = null;
-  const execute = async (
-    id: string,
-    boundary: string,
-    consume?: (columns: readonly string[], row: Record<string, unknown>) => void,
-  ) => {
+  const execute = async (id: string, boundary: string, consume?: Consume) => {
     const query = queries.get(id);
     if (query === undefined) throw new Error(`Unknown cell ${id}`);
     const controller = new AbortController();
@@ -484,19 +484,26 @@ export default async function create(context: CPUWorkerContext): Promise<CPUWork
         if (expectedRow === null) throw new Error(`No fixture check for ${id}`);
         const returned: Array<Record<string, unknown>> = [];
         let names: readonly string[] = [];
-        const rows = await execute(id, "rows", (columns, row) => {
+        let kinds = givenKinds.get(id);
+        const rows = await execute(id, "rows", (columns, row, rowKinds) => {
           names = columns;
+          kinds ??= rowKinds;
           returned.push(row);
         });
-        const answer = checkFixtureRows(returned, names, expectedRow);
+        const answer = checkFixtureRows(returned, names, expectedRow, kinds);
         return {
           fingerprint: `fixture:${String(rows)}:${String(answer.mismatches?.length ?? 0)}`,
           rows,
           answer,
         };
       }
-      const collector = new AnswerCollector(query?.ordered === true);
-      const rows = await execute(id, "rows", (columns, row) => {
+      // Kinds from this engine's result types, or (0.20, which has none) from the next/ engine.
+      const given = givenKinds.get(id);
+      const collector = new AnswerCollector(query?.ordered === true, given);
+      let first = true;
+      const rows = await execute(id, "rows", (columns, row, kinds) => {
+        if (first && given === undefined && kinds !== undefined) collector.setKinds(kinds);
+        first = false;
         collector.add(columns.map((column) => row[column]));
       });
       const answer = collector.finish();
@@ -516,6 +523,12 @@ export default async function create(context: CPUWorkerContext): Promise<CPUWork
         const { directory, identity } = value as { directory: string; identity: string };
         if (engine.capture === undefined) throw new Error("This engine cannot capture images");
         return engine.capture(directory, identity, context.signal);
+      }
+      if (name === "column-kinds") {
+        // The comparison kinds of a cell's columns, from the other engine's result types.
+        const { id, kinds } = value as { id: string; kinds: ColumnKind[] };
+        givenKinds.set(id, kinds);
+        return null;
       }
       if (name === "time-cells") {
         // One complete frames execution per cell, wall clock, to size brackets.

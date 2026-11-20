@@ -197,10 +197,20 @@ with `node scripts/head-to-head.mts run --dataset W1M --shipped <unpacked packag
 load its fixture does.
 
 Each cell's answers are compared in full, and the table names how
-(`scripts/lib/answers.mts`): results of up to two million values value by value, with floats equal
-within an absolute 1e-12 plus a relative 1e-9; larger results (the export and the full sorts of
-stored columns) by an exact hash of every value of every row, in order or as a multiset; an
-unordered `LIMIT`, which may return any rows, by checking each returned row against the generator.
+(`scripts/lib/answers.mts`). Values are compared by their column's type, taken from the `next/`
+engine's result types (0.20 reports none, so it uses the same ones):
+
+- **Integer and `NUMERIC`:** exactly, as decimal text. A `bigint` and decimal text of the same
+  integer are equal, and nothing is rounded through a float.
+- **Floats:** equal within an absolute 1e-12 plus a relative 1e-9.
+- **Text, JSON and bytes:** losslessly, so text `1.0` and `1.00` differ.
+- **SQL `NULL`:** differs from a missing value.
+
+Results of up to two million values compare value by value; an unordered result is first sorted
+by an exact key and only then compared with the tolerance. Larger results (the export and the full
+sorts of stored columns) compare by an exact hash of every value of every row, in order or as a
+multiset. An unordered `LIMIT`, which may return any rows, is checked row by row against the
+generator.
 
 With a `candidate` git ref (the workflow input, or `--candidate <built checkout>` locally) the lane
 becomes a **screen for leads**: it compares two `next/` builds at the columnar frames boundary and
@@ -1361,7 +1371,9 @@ same sequence, and a summary of the table is compared with SQLite's after each s
 ## Speed claims for the rebuild engine
 
 Any statement that `next/` is faster, or not slower, cites a run of
-`.github/workflows/next-claim.yml` (`scripts/next-claim.mts`), the one protocol for such claims:
+`.github/workflows/next-claim.yml` (`scripts/next-claim.mts`), the one protocol for such claims.
+At dispatch the workflow validates its inputs and declares the run in a manifest: both commit
+SHAs, the datasets, shards, cells, targets and pairs. Every later job reads the manifest.
 
 1. Each build (control and candidate) loads its own fixture once with its own writer and captures it
    as a native storage image. The control build times each cell once to size its bracket: a fixed
@@ -1372,14 +1384,17 @@ Any statement that `next/` is faster, or not slower, cites a run of
    answers, compared as above, or the cell has no verdict.
 3. A/A first: fixed control cells (W1M `scan_proj3_agg` and `agg_3dims_20aggs`, S1 `S_q3` and
    `S_q8`) run the control build against an independent control process in every shard. If any of
-   them meets the target rule, the whole run is void.
+   them meets the target rule or fails, the whole run is void: no shard's verdict stands.
 4. Target cells are declared before the run. A gain needs the median paired saving to exceed its
    IQR, at least seven of nine pairs (scaled to the pair count) favouring the candidate and at least
    2% of the control's per-query median; a regression is the reverse. Every other cell is screened
    for regressions, and a flag also needs a Holm-adjusted two-sided sign test p of at most 0.05
-   across all screened cells of the run. Nine pairs cannot pass that correction across 45 cells, so
-   the default is 15. Anything else is "no accepted difference", which is not proof of equality.
-5. Every sample records the runner's CPU model; a missing shard is reported, never silently skipped.
+   across every screened cell the manifest declares, including any that did not report. Nine pairs
+   cannot pass that correction across 45 cells, so the default is 15. Anything else is "no
+   accepted difference", which is not proof of equality.
+5. The table gives verdicts only when every declared shard and cell reported every pair. A missing
+   shard or dataset, a failed cell or a short cell marks the run **INCOMPLETE**, with no verdicts.
+   Every sample records the runner's CPU model.
 
 Cost, measured on hosted runners (AMD EPYC 9V74, validation run 44678818852): each job spends
 about 3 minutes installing and building both builds, and each W1M build takes about 100 s to

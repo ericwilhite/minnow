@@ -2,10 +2,15 @@ import { describe, expect, it } from "vitest";
 import {
   balancedOrders,
   bracketRepeats,
+  claimManifest,
   holm,
+  report,
   signTestP,
   targetVerdict,
   MIN_EFFECT,
+  type CellRecord,
+  type ClaimManifest,
+  type ClaimResult,
 } from "./next-claim.mts";
 
 describe("next/ speed-claim protocol arithmetic", () => {
@@ -55,5 +60,141 @@ describe("next/ speed-claim protocol arithmetic", () => {
     expect(targetVerdict({ ...base, acceptance: { ...base.acceptance, medianDeltaMs: -1 } })).toBe(
       "none",
     );
+  });
+});
+
+const A = "a".repeat(40),
+  B = "b".repeat(40);
+const neutral = (cell: string, pairs = 15): CellRecord => ({
+  cell,
+  repeats: 1,
+  completedPairs: pairs,
+  controlMedianMs: 100,
+  candidateMedianMs: 100,
+  signP: 1,
+  acceptance: {
+    medianDeltaMs: 0,
+    iqrDeltaMs: 5,
+    favoursCandidate: 7,
+    favoursControl: 8,
+    acceptedGain: false,
+    significantRegression: false,
+  },
+});
+const gain = (cell: string): CellRecord => ({
+  ...neutral(cell),
+  candidateMedianMs: 50,
+  signP: signTestP(15, 0),
+  acceptance: {
+    medianDeltaMs: -50,
+    iqrDeltaMs: 5,
+    favoursCandidate: 15,
+    favoursControl: 0,
+    acceptedGain: true,
+    significantRegression: false,
+  },
+});
+const manifest: ClaimManifest = {
+  control: A,
+  candidate: B,
+  pairs: 15,
+  targets: ["t"],
+  datasets: [
+    { dataset: "W1M", shards: 2, controls: ["aa"], cells: ["t", "s1", "s2"] },
+    { dataset: "S1", shards: 1, controls: ["qa"], cells: ["q1"] },
+  ],
+};
+const shard = (
+  dataset: "W1M" | "S1",
+  name: string,
+  aa: CellRecord[],
+  ab: CellRecord[],
+): ClaimResult => ({
+  dataset,
+  shard: name,
+  started: "",
+  finished: "",
+  control: { root: "", revision: A },
+  candidate: { root: "", revision: B },
+  node: "v24",
+  pairs: 15,
+  seed: 1,
+  targets: ["t"],
+  repeats: {},
+  aa,
+  ab,
+  void: false,
+});
+// W1M shard 0 holds t and s2, shard 1 holds s1; S1 has one shard.
+const complete = (): ClaimResult[] => [
+  shard("W1M", "0/2", [neutral("aa")], [gain("t"), neutral("s2")]),
+  shard("W1M", "1/2", [neutral("aa")], [neutral("s1")]),
+  shard("S1", "0/1", [neutral("qa")], [neutral("q1")]),
+];
+
+describe("next/ claim report", () => {
+  it("gives verdicts for a complete, neutral run", () => {
+    const text = report(complete(), manifest);
+    expect(text).not.toContain("INCOMPLETE");
+    expect(text).toMatch(/W1M\/t \| target .*\*\*gain\*\*/u);
+    expect(text).toContain("across all 3 declared screened cells");
+  });
+
+  it("voids every shard's verdicts when any shard's A/A control fails the rule", () => {
+    const results = complete();
+    results[1] = shard("W1M", "1/2", [gain("aa")], [neutral("s1")]);
+    const text = report(results, manifest);
+    expect(text).toContain("**VOID:**");
+    expect(text).toMatch(/W1M\/t \| target \| 0\/2 .*\| void \|/u);
+    expect(text).toContain("**gain** (voids the run)");
+    expect(text).not.toMatch(/\| (target|screen) \|[^\n]*\*\*gain\*\*/u);
+  });
+
+  it("gives no verdict when a shard, a dataset, a cell or pairs are missing", () => {
+    const cases: ClaimResult[][] = [
+      complete().slice(1),
+      complete().filter((r) => r.dataset !== "S1"),
+      [shard("W1M", "0/2", [neutral("aa")], [gain("t")]), ...complete().slice(1)],
+      [
+        shard("W1M", "0/2", [neutral("aa")], [{ ...gain("t"), completedPairs: 14 }, neutral("s2")]),
+        ...complete().slice(1),
+      ],
+      [...complete(), shard("W1M", "0/2", [neutral("aa")], [gain("t"), neutral("s2")])],
+    ];
+    for (const results of cases) {
+      const text = report(results, manifest);
+      expect(text).toContain("**INCOMPLETE:**");
+      expect(text).not.toContain("**gain**");
+    }
+    expect(report(complete().slice(0, 2), manifest)).toContain("S1 shard 0/1 missing");
+  });
+
+  it("corrects screened p-values over the declared family, not the reported cells", () => {
+    const results = complete();
+    const s2 = { ...neutral("s2"), signP: 0.01 };
+    results[0] = shard("W1M", "0/2", [neutral("aa")], [gain("t"), s2]);
+    // Three declared screened cells (s1, s2, q1): Holm multiplies the smallest p by 3.
+    expect(report(results, manifest)).toMatch(/W1M\/s2 \| screen .*\| 0\.0300 \|/u);
+    // Still 3 when S1 never reported: a missing cell does not shrink the family.
+    expect(report(results.slice(0, 2), manifest)).toMatch(/W1M\/s2 \| screen .*\| 0\.0300 \|/u);
+  });
+
+  it("validates dispatch inputs before declaring a run", async () => {
+    const base = {
+      control: A,
+      candidate: B,
+      datasets: ["W1M"],
+      shards: 6,
+      pairs: 15,
+      targets: [],
+      only: [],
+    };
+    await expect(claimManifest({ ...base, pairs: 8 })).rejects.toThrow(/pairs/u);
+    await expect(claimManifest({ ...base, shards: 0 })).rejects.toThrow(/shards/u);
+    await expect(claimManifest({ ...base, only: ["x;rm -rf /"] })).rejects.toThrow(/cell name/u);
+    await expect(claimManifest({ ...base, targets: ["no_such_cell"] })).rejects.toThrow(/Target/u);
+    await expect(claimManifest({ ...base, control: "main" })).rejects.toThrow(/SHA/u);
+    const declared = await claimManifest({ ...base, datasets: ["W1M", "S1"] });
+    expect(declared.datasets.map((d) => d.cells.length)).toEqual([29, 16]);
   });
 });
