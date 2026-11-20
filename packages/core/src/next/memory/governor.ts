@@ -164,6 +164,13 @@ export interface NativeGrantGroupOptions {
   readonly signal?: AbortSignal;
   /** The total includes private progress credit; its consumers never need the shared reserve. */
   readonly includesProgress?: boolean;
+  /**
+   * The caller holds credit it cannot release until this is served (a native root's retained
+   * base; the writer's floors inside a native step). Such holder growth is served before every
+   * queued new admission, as soon as it fits (FIFO among holders), so a holder never waits behind
+   * a request that only its own release could serve. Set explicitly; never inferred.
+   */
+  readonly holdsCredit?: boolean;
 }
 
 export class ValueTooLargeError extends Error {
@@ -394,6 +401,8 @@ export class Governor implements MemoryGovernor {
   readonly #loans: Request[] = [];
   readonly #reads: Request[] = [];
   readonly #admissions: Request[] = [];
+  /** Holder growth (`holdsCredit`): served before any queued new admission. */
+  readonly #holders: Request[] = [];
   #draining = false;
   #again = false;
   /** Bytes out on loans: they count against the cap, never against the admission limit. */
@@ -470,7 +479,12 @@ export class Governor implements MemoryGovernor {
   }
 
   grow(grant: GrantImpl, bytes: number): boolean {
-    if (this.#loans.length > 0 || this.#reads.length > 0 || this.#admissions.length > 0)
+    if (
+      this.#loans.length > 0 ||
+      this.#reads.length > 0 ||
+      this.#holders.length > 0 ||
+      this.#admissions.length > 0
+    )
       return false;
     if (!this.#room(bytes, false)) return false;
     this.#take(bytes);
@@ -578,7 +592,7 @@ export class Governor implements MemoryGovernor {
   forget(grant: GrantImpl): void {
     this.#idleCredit.delete(grant);
     this.#grants.delete(grant);
-    for (const queue of [this.#loans, this.#reads, this.#admissions])
+    for (const queue of [this.#loans, this.#reads, this.#holders, this.#admissions])
       for (const request of [...queue])
         if (request.grant === grant) {
           this.#progress++;
@@ -606,7 +620,12 @@ export class Governor implements MemoryGovernor {
         this.#serve(this.#loans, true);
         if (this.#loans.length === 0) {
           this.#serve(this.#reads, false);
-          if (this.#reads.length === 0) this.#serve(this.#admissions, false);
+          if (this.#reads.length === 0) {
+            // Holder growth first (GOVERNOR-WAIT-POLICY): new admissions wait while any holder
+            // request is queued, so none can take room a waiting holder needs.
+            this.#serve(this.#holders, false);
+            if (this.#holders.length === 0) this.#serve(this.#admissions, false);
+          }
         }
       } while (this.#releasedDuringDrain());
     } finally {
@@ -820,7 +839,9 @@ export class Governor implements MemoryGovernor {
             { label: entry.label, bytes: entry.bytes, includesProgress: entry.includesProgress },
             entry.includesProgress ? this.capBytes : this.capBytes - this.reserveBytes,
             this.usedBytes,
-            [...this.#loans, ...this.#reads, ...this.#admissions].map((request) => request.label),
+            [...this.#loans, ...this.#reads, ...this.#holders, ...this.#admissions].map(
+              (request) => request.label,
+            ),
             [...holders]
               .filter(([, holder]) => holder.held > 0)
               .map(([label, holder]) => ({ label, ...holder })),
@@ -906,7 +927,7 @@ export class Governor implements MemoryGovernor {
       return grants;
     }
     const admitted = await this.#enqueue(
-      this.#admissions,
+      options.holdsCredit === true ? this.#holders : this.#admissions,
       {
         bytes: total,
         loan: false,
@@ -970,6 +991,7 @@ export class Governor implements MemoryGovernor {
       this.#draining ||
       this.#loans.length > 0 ||
       this.#reads.length > 0 ||
+      this.#holders.length > 0 ||
       this.#admissions.length > 0
     )
       return null;
@@ -1013,7 +1035,12 @@ export class Governor implements MemoryGovernor {
         return true;
       },
       charge: (bytes: number): boolean => {
-        if (this.#loans.length > 0 || this.#reads.length > 0 || this.#admissions.length > 0)
+        if (
+          this.#loans.length > 0 ||
+          this.#reads.length > 0 ||
+          this.#holders.length > 0 ||
+          this.#admissions.length > 0
+        )
           return false;
         if (this.#missing(bytes, false) > 0) return false;
         this.#take(bytes);

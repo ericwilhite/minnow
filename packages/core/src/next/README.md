@@ -1594,6 +1594,17 @@ and the owner import it directly.
   resident-page space, downstream buffers, private progress credit, and one result frame.
   FIFO admission waits while holding no partial reservation. A minimum above the whole cap
   raises `MemoryAdmissionError`. See [the bounded read-step contract](memory/README.md).
+- Holder priority. New admissions (owners holding nothing) are served FIFO. Growth from an owner
+  that holds credit it cannot release (`holdsCredit`: a native root's retained base, the writer's
+  floors inside a native step) is served before every queued new admission as soon as it fits, FIFO
+  among holders, so a holder never waits behind a request only its own release could serve. New
+  admissions wait only while holder requests are queued; holders are finite and each finishes.
+  Holder priority changes order, never limits: still no refusal below the cap. Two holders cannot
+  wait on each other on current paths (one writer per governor; a native root queues its own step
+  only after the writer's step has settled). Policy: `holdsCredit` in `memory/governor.ts`; tests:
+  `memory/holder-priority.test.ts`, `testing/native-command-fifo.test.ts`. In test runs,
+  `MINNOW_GOVERNOR_STALL_MS` turns any wait without governor progress into a `GovernorStallError`
+  naming every holder.
 - A grant _holds_ bytes, and its operator _allocates_ buffers out of them, so a non-spillable
   operator works inside its admitted minimum.
 - Growth is charged before it happens, including the overlap while a buffer is copied.

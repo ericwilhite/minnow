@@ -559,6 +559,8 @@ export class WriteCredits {
       const credits = await this.governor.admitGroup({
         label: `complete grow ${grant.label}`,
         ...(includesProgress ? { includesProgress: true } : {}),
+        // Inside a native step the writer holds its floors and the root its retained base.
+        ...(nativeMinimum ? { holdsCredit: true } : {}),
         grants: accounts.map((account, i) => ({
           label: `write growth ${account.label}`,
           minimumBytes: Math.max(0, (desired[i] ?? 0) - account.held),

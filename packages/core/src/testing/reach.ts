@@ -11791,6 +11791,15 @@ export const NATIVE_PREPARATION_SCALING_REACH = [
   "large size",
 ] as const;
 
+/** Holder growth is served before queued new admissions; everyone eventually progresses. */
+export const GOVERNOR_HOLDER_PRIORITY_REACH = [
+  "holder served ahead of an earlier new admission",
+  "new admission served after waiting",
+  "holder with progress credit",
+  "holder without progress credit",
+  "new admission of almost all room",
+] as const;
+
 /** A native trigger statement on an FTS-indexed table ends without waiting. */
 export const NATIVE_COMMAND_FTS_END_REACH = [
   "keyed delete ended",
