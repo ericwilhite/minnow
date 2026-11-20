@@ -131,7 +131,7 @@ import {
   OrderedSetOperator,
 } from "./agg/ordered-set.js";
 import { UnsupportedPlanError } from "./errors.js";
-import { FilterOperator, ProjectOperator } from "./filter.js";
+import { FilterOperator, ProjectOperator, PageProjectOperator } from "./filter.js";
 import {
   HashJoin,
   hashJoinMinimumBytes,
@@ -146,6 +146,8 @@ import { ReservedGrant } from "./admission.js";
 import { LimitOperator } from "./limit.js";
 import { nullParameter, integerParameterBytes } from "./parameters.js";
 import { drive, isPromise, type BatchSource, type Operator } from "./pipeline.js";
+import type { ScanPageConsumer } from "./page-consumer.js";
+import { hasResidualFilter } from "./pushdown.js";
 import type { QueryRuntime, Program, OperatorIdentity } from "./run.js";
 import { lateSortShape, type LateSortShape } from "./late-sort.js";
 import { LateFetchOperator, ORDINAL_TYPE } from "./late-fetch.js";
@@ -160,7 +162,7 @@ import {
   remapWindowFunction,
   literalWindowAmount,
 } from "./window-input.js";
-import { TableScan, memoryScanBufferBytes } from "./table-scan.js";
+import { TableScan, EncodedTableScan, memoryScanBufferBytes } from "./table-scan.js";
 import {
   orderedSort,
   indexMinimums,
@@ -414,6 +416,40 @@ function counted(runtime: QueryRuntime, rel: OperatorIdentity, sink: Operator): 
   };
 }
 
+function countedPages(runtime: QueryRuntime, rel: OperatorIdentity, sink: Operator): Operator {
+  const profile = runtime.profile(rel);
+  const output: Operator & ScanPageConsumer = {
+    get pageConsumer() {
+      return sink.pageConsumer ? output : undefined;
+    },
+    canConsumePages(columns, rows, count, columnsMap) {
+      return sink.pageConsumer?.canConsumePages(columns, rows, count, columnsMap) ?? false;
+    },
+    consumePages(columns, rows, count, columnsMap) {
+      runtime.signal.throwIfAborted();
+      runtime.readBoundary();
+      profile.rowsOut += count;
+      profile.batchesOut++;
+      const consumer = sink.pageConsumer;
+      if (!consumer) throw new Error("Page consumer changed after preflight");
+      return consumer.consumePages(columns, rows, count, columnsMap);
+    },
+    get reclassifiesTransfers() {
+      return sink.reclassifiesTransfers === true;
+    },
+    push(batch, transfer) {
+      runtime.readBoundary();
+      profile.rowsOut += batch.selection?.count ?? batch.length;
+      profile.batchesOut++;
+      return sink.push(batch, transfer);
+    },
+    ready: () => sink.ready(),
+    finish: () => sink.finish(),
+    abort: (reason) => sink.abort(reason),
+  };
+  return output;
+}
+
 /** Add non-column keys once, preserving the original columns at their original positions. */
 function keyProjection(input: readonly PhysicalType[], expressions: readonly ScalarExpr[]) {
   const exprs = columns(input);
@@ -650,6 +686,50 @@ export interface CompileOptions {
   /** Parent control for literal-amount gather benchmarks. */
   readonly windowScalarArguments?: boolean;
 }
+// Page capability is selected at the aggregate recipe, then propagated only
+// through its proved direct-column projections. No ordinary scan/project
+// constructs page bindings, asks a capability getter or dispatches per batch.
+function pageSource(rel: Rel, ftsEnabled: boolean): boolean {
+  while (rel.op === "project") {
+    const input = types(rel.input);
+    if (
+      !rel.exprs.every((expr) => {
+        if (expr.op !== "column") return false;
+        const type = input[expr.index];
+        return type !== undefined && samePhysicalType(expr.type, type);
+      })
+    )
+      return false;
+    rel = rel.input;
+  }
+  return (
+    rel.op === "scan" &&
+    !rel.emitLocator &&
+    !ftsEnabled &&
+    !hasResidualFilter(rel.filter, types(rel))
+  );
+}
+function pageReduction(rel: Extract<Rel, { op: "aggregate" }>, ftsEnabled: boolean): boolean {
+  return (
+    rel.groupBy.length === 0 &&
+    rel.aggregates.length > 0 &&
+    (rel.groupingSets === null ||
+      (rel.groupingSets.length === 1 && rel.groupingSets[0]?.length === 0)) &&
+    rel.aggregates.every((call) => {
+      if (call.distinct || call.filter !== null || call.orderBy.length !== 0) return false;
+      if (call.fn === "count_star") return call.args.length === 0;
+      const arg = call.args[0];
+      if (call.args.length !== 1 || arg?.op !== "column") return false;
+      return (
+        call.fn === "count" ||
+        (arg.type.kind === "int32" && (call.fn === "sum" || call.fn === "avg")) ||
+        (arg.type.kind === "float64" && call.fn === "sum")
+      );
+    }) &&
+    pageSource(rel.input, ftsEnabled)
+  );
+}
+
 export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): Program {
   return compileRecipe(plan, options, false);
 }
@@ -939,7 +1019,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
     terminalInput.exprs.every((expr, k) => expr.op === "column" && expr.index === k)
   )
     terminalInput = terminalInput.input;
-  const prepare = (rel: Rel): Recipe => {
+  const prepare = (rel: Rel, pageScan = false): Recipe => {
     if (rel.op === "sort" && !rel.withTies && windowSuppliesOrder(rel.input, rel.keys))
       rel = { ...rel, op: "limit" };
 
@@ -1459,8 +1539,110 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           });
       }
       case "scan": {
+        if (!pageScan) {
+          const input = types(rel).slice(0, rel.columns.length),
+            filter = rel.filter;
+          // Only the terminal full-table export has no downstream consumer that may re-read.
+          // Other scans keep their selective/cache policy; TableScan also handles deletion,
+          // reader capability, memory refusal, pacing and cancellation fallbacks itself.
+          const terminal =
+            rel === terminalInput &&
+            filter === null &&
+            rel.runtimeFilters.length === 0 &&
+            !rel.emitLocator;
+          readSources.set(rel.id, {
+            id: rel.id,
+            tableId: rel.tableId,
+            columns: rel.columns,
+            types: input,
+            stagingBytes: memoryScanBufferBytes(input),
+            windowBytes: terminal ? 64 * 1024 * 1024 : 0,
+            rows: null,
+          });
+          const kernelBytes =
+            filter === null
+              ? 0
+              : measureCompilerBuffers(
+                  compilation,
+                  input,
+                  BATCH_ROWS,
+                  (context) => new FilterOperator(filter, context, DISCARD),
+                  (filter) => filter.abort(undefined),
+                );
+          fixed(rel, (cap) => kernelBytes + batchTargetFor(cap, 4) + BATCH_ROWS * 16);
+          return (runtime, downstream, stops, rowsNeeded) => {
+            if (stops.some((stop) => stop())) return downstream.finish();
+            const target = batchTargetFor(runtime.request.governor.capBytes, 4);
+            return instantiate(
+              runtime,
+              rel,
+              input,
+              kernelBytes + target + BATCH_ROWS * 16,
+              BATCH_ROWS,
+              (context, grant) => ({ context, grant }),
+              ({ context, grant }) =>
+                then(runtime.table(rel.tableId, grant), (table) => {
+                  const terminalFull =
+                    terminal &&
+                    rel.columns.length === table.columns.length &&
+                    rel.columns.every((id, k) => id === table.columns[k]?.id);
+                  const owner = terminalFull
+                    ? downstream instanceof ResultSink
+                      ? downstream
+                      : exportOwners.get(downstream)
+                    : undefined;
+                  const output = owner?.grant;
+                  const directories = directoryCacheFor(runtime.view.pages);
+                  const scan = new TableScan({
+                    table,
+                    pages: runtime.readPages(runtime.view.pages),
+                    reads: runtime.request.reads,
+                    ...(directories === undefined
+                      ? {}
+                      : { directories, directoryOnce: !runtime.sourceRetains(rel.id) }),
+                    budget: grant,
+                    columns: rel.columns,
+                    filter: rel.filter,
+                    emitLocator: rel.emitLocator,
+                    context,
+                    loans: { borrow: (bytes) => grant.borrow(bytes, runtime.signal) },
+                    // Larger batches remain restricted to explicit relinquishing export consumers.
+                    targetBytes: runtime.request.outputBuffers
+                      ? (owner?.terminalBatchTarget(2 * target) ?? target)
+                      : target,
+                    boundedMemory: true,
+                    readWindowBytes: terminalFull ? runtime.sourceWindow(rel.id) : 0,
+                    ...(output === undefined
+                      ? {}
+                      : {
+                          transferOutputs: "dictionary" as const,
+                          outputBudget: output,
+                          ...(runtime.request.outputBuffers
+                            ? { outputBuffers: runtime.request.outputBuffers }
+                            : {}),
+                          outputDictionary: (dictionary) =>
+                            owner?.admitDictionary(dictionary) ?? false,
+                          borrowOutputOnRefusal: true,
+                        }),
+                    ...(runtime.sourceBatchRows(rel.id) === undefined
+                      ? rowsNeeded === undefined
+                        ? {}
+                        : { rowsNeeded }
+                      : { rowsNeeded: () => Math.min(rowsNeeded?.() ?? BATCH_ROWS, 1) }),
+                  });
+                  const books = starBooks.get(runtime);
+                  const outputSink = books?.shape.columns.has(rel.id)
+                    ? starColumns((batch) => books.encode(rel.id, batch), downstream)
+                    : downstream;
+                  return fts.scan(runtime, rel, scan, counted(runtime, rel, outputSink), stops);
+                }),
+            );
+          };
+        }
         const input = types(rel).slice(0, rel.columns.length),
-          filter = rel.filter;
+          filter = rel.filter,
+          count = countedPages,
+          Scan = EncodedTableScan;
         // Only the terminal full-table export has no downstream consumer that may re-read.
         // Other scans keep their selective/cache policy; TableScan also handles deletion,
         // reader capability, memory refusal, pacing and cancellation fallbacks itself.
@@ -1516,7 +1698,23 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                   : undefined;
                 const output = owner?.grant;
                 const directories = directoryCacheFor(runtime.view.pages);
-                const scan = new TableScan({
+                const books = starBooks.get(runtime);
+                const outputSink = books?.shape.columns.has(rel.id)
+                  ? starColumns((batch) => books.encode(rel.id, batch), downstream)
+                  : downstream;
+                const countedSink = count(runtime, rel, outputSink);
+                const pageConsumer = !fts.enabled && !books ? countedSink.pageConsumer : undefined;
+                const oneRow = runtime.sourceBatchRows(rel.id) !== undefined;
+                const demand = oneRow
+                  ? () => Math.min(rowsNeeded?.() ?? BATCH_ROWS, 1)
+                  : rowsNeeded;
+                const scanDemand = pageConsumer
+                  ? () => {
+                      for (const stop of stops) if (stop()) return 0;
+                      return demand?.() ?? BATCH_ROWS;
+                    }
+                  : demand;
+                const scan = new Scan({
                   table,
                   pages: runtime.readPages(runtime.view.pages),
                   reads: runtime.request.reads,
@@ -1534,6 +1732,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                     ? (owner?.terminalBatchTarget(2 * target) ?? target)
                     : target,
                   boundedMemory: true,
+                  ...(pageConsumer === undefined ? {} : { pageConsumer }),
                   readWindowBytes: terminalFull ? runtime.sourceWindow(rel.id) : 0,
                   ...(output === undefined
                     ? {}
@@ -1547,17 +1746,9 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                           owner?.admitDictionary(dictionary) ?? false,
                         borrowOutputOnRefusal: true,
                       }),
-                  ...(runtime.sourceBatchRows(rel.id) === undefined
-                    ? rowsNeeded === undefined
-                      ? {}
-                      : { rowsNeeded }
-                    : { rowsNeeded: () => Math.min(rowsNeeded?.() ?? BATCH_ROWS, 1) }),
+                  ...(scanDemand === undefined ? {} : { rowsNeeded: scanDemand }),
                 });
-                const books = starBooks.get(runtime);
-                const outputSink = books?.shape.columns.has(rel.id)
-                  ? starColumns((batch) => books.encode(rel.id, batch), downstream)
-                  : downstream;
-                return fts.scan(runtime, rel, scan, counted(runtime, rel, outputSink), stops);
+                return fts.scan(runtime, rel, scan, countedSink, stops);
               }),
           );
         };
@@ -1589,7 +1780,10 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
       case "filter":
       case "project":
       case "limit": {
-        const originalChild = prepare(rel.input),
+        const encoded = pageScan && rel.op === "project",
+          count = encoded ? countedPages : counted,
+          Project = encoded ? PageProjectOperator : ProjectOperator,
+          originalChild = prepare(rel.input, encoded),
           input = types(rel.input);
         const targetColumn =
           inputOnly &&
@@ -1729,7 +1923,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                       },
                     },
                     types(rel),
-                    counted(runtime, rel, downstream),
+                    count(runtime, rel, downstream),
                   ),
                 (operator) => {
                   fts.borrow(runtime, rel.id, operator);
@@ -1784,7 +1978,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                     signal: runtime.signal,
                     stopped: () => stops.some((stop) => stop()),
                   },
-                  counted(runtime, rel, downstream),
+                  count(runtime, rel, downstream),
                 ),
               (operator) => {
                 fts.borrow(runtime, rel.id, operator);
@@ -1841,7 +2035,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
             (rel.op === "filter"
               ? new FilterOperator(actualExprs as ScalarExpr, context, sink)
               : rel.op === "project"
-                ? new ProjectOperator(actualExprs as readonly ScalarExpr[], context, sink, progress)
+                ? new Project(actualExprs as readonly ScalarExpr[], context, sink, progress)
                 : new LimitOperator(null, 0, context.arena, sink))
           );
         };
@@ -1878,7 +2072,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                 : exportOwners.get(downstream)
               : undefined;
           if (owner) {
-            const output = counted(runtime, rel, downstream);
+            const output = count(runtime, rel, downstream);
             exportOwners.set(output, owner);
             return child(runtime, output, stops, rowsNeeded);
           }
@@ -1894,9 +2088,9 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                     runtime.bounds(rel).limit,
                     runtime.bounds(rel).offset,
                     context.arena,
-                    counted(runtime, rel, downstream),
+                    count(runtime, rel, downstream),
                   )
-                : setup(context, counted(runtime, rel, downstream), runtime, grant, stops),
+                : setup(context, count(runtime, rel, downstream), runtime, grant, stops),
             (operator) => {
               runtime.onAbort((reason) => operator.abort(reason));
               const childStops =
@@ -1921,7 +2115,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
       }
       case "aggregate":
       case "distinct": {
-        const child = prepare(rel.input),
+        const child = prepare(rel.input, rel.op === "aggregate" && pageReduction(rel, fts.enabled)),
           input = types(rel.input);
         if (rel.op === "distinct" && input.length === 0) {
           // Empty tuples form one class only when at least one arrived. Scalar aggregation

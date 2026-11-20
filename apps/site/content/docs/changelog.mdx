@@ -10,6 +10,12 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The unexported 1.0 rebuild computes eligible scalar aggregates (`COUNT(*)`, `COUNT(column)`,
+`SUM`/`AVG` over INT and `SUM` over DOUBLE PRECISION, over plain columns of a table scan with no
+residual filter) straight from encoded column pages instead of building row batches. Every other
+query keeps its existing path unchanged. Results are unchanged; released 0.x behavior is unchanged;
+no stored-format change or migration is required.
+
 The Node SQL performance gate (`npm run benchmark:gate`) keys its regression thresholds by CPU
 model as well as OS, architecture and Node major version, and refuses a host whose CPU model
 has no calibrated profile instead of comparing it with another machine's thresholds. No package

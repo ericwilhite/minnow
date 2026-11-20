@@ -2008,10 +2008,30 @@ shipped-engine or stored-format change.
   only the pages the predicate cannot rule out; `refine` (after deletions or an earlier conjunct)
   loads every page its positions touch. The rest of the filter (the residual) runs on decoded
   values.
-- At or above 40 % of a range selected, every column decodes densely (residual columns too) and
+- On the ordinary batch route, at or above 40 % of a range selected, every column decodes densely (residual columns too) and
   keeps the selection, the residual then narrowing it. Below it only the selected positions are
   gathered; with a residual, its columns are gathered first and the others only for the rows it
   keeps.
+- The planner selects encoded-capable scan, project and profiling variants once for a supported
+  scalar reduction. Other plans retain the ordinary scan loop, projection layout and profiling
+  wrappers, with no page-capability discovery or dispatch per batch. A metadata-only filter
+  probe declines residual or mixed pushed/residual filters before building page bindings; it
+  does not convert constants or copy their payloads.
+- Restricted scalar scan/filter/reduce recipes can instead consume selected encoded pages
+  through `page/consume.ts` and `exec/page-consumer.ts`. COUNT reads validity without expanding
+  dictionary values; int32 SUM/AVG and ordered float8 SUM dispatch to prebuilt typed kernels.
+  Same-type column projections and profiling wrappers forward the capability through existing
+  binding maps, including duplicate-column packing, without new per-step mapping arrays. All needed
+  pages are loaded and validated before transitions, and complete-step eligibility precedes
+  any state change. Eligibility covers predicate-only columns too: dense steps preserve their
+  full decode span, while gathers inspect only selected pages. Unproven safe-number pages and
+  out-of-line regions retain ordinary loading and validation. A missing column, unsupported
+  page/operator, residual, memory segment, locator or refused optional descriptor workspace
+  keeps the ordinary batch route. No prefix
+  is replayed. The first implementation preserves 2,048-row transition and byte-sizing barriers,
+  including ordinary fallback prepayment; it does not remove full-source admission sizing.
+  Borrowed pages never cross an await or escape their kernel. Metadata remains accessible
+  before payload for a future independently validated exact-summary consumer.
 - Shape setup reuses only verified scalar header facts while endpoint pages remain resident;
   install/release/materialization invalidates them. Exact-range byte counts have a separate
   memo. `exec/column-shape.test.ts` compares against header queries with memoization disabled
