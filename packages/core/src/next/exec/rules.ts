@@ -27,6 +27,7 @@
  */
 import type { TableDef } from "../access/catalog.js";
 import type { TableRules } from "../access/modify.js";
+import { columnsRead } from "../ir/columns-read.js";
 import type { ScalarExpr } from "../ir/ir.js";
 import type { TableRuleExpressions } from "../ir/rules.js";
 import { samePhysicalType } from "../types.js";
@@ -44,50 +45,6 @@ export class RuleCompileError extends TypeError {
     super(`Table ${String(tableId)}: ${message}`);
     this.name = "RuleCompileError";
   }
-}
-
-function columnsRead(expr: ScalarExpr, into: Set<number>): Set<number> {
-  switch (expr.op) {
-    case "column":
-      into.add(expr.index);
-      break;
-    case "literal":
-    case "param":
-      break;
-    case "call":
-    case "and":
-    case "or":
-      for (const arg of expr.args) columnsRead(arg, into);
-      break;
-    case "cast":
-      columnsRead(expr.input, into);
-      break;
-    case "compare":
-    case "distinctFrom":
-      columnsRead(expr.left, into);
-      columnsRead(expr.right, into);
-      break;
-    case "not":
-    case "isNull":
-      columnsRead(expr.arg, into);
-      break;
-    case "case":
-      for (const branch of expr.branches) {
-        columnsRead(branch.when, into);
-        columnsRead(branch.then, into);
-      }
-      if (expr.otherwise !== null) columnsRead(expr.otherwise, into);
-      break;
-    case "inList":
-      columnsRead(expr.arg, into);
-      for (const item of expr.list) columnsRead(item, into);
-      break;
-    case "like":
-      columnsRead(expr.arg, into);
-      columnsRead(expr.pattern, into);
-      break;
-  }
-  return into;
 }
 
 function hasParam(expr: ScalarExpr): boolean {
@@ -162,9 +119,12 @@ export function compileTableRules(
     throw new RuleCompileError(table.id, `${message} (catalog version ${String(catalogVersion)})`);
   };
   const columns = table.columns;
+  // An expression the walker cannot classify reads every column.
+  const readsOf = (expr: ScalarExpr): Set<number> =>
+    columnsRead([expr]) ?? new Set(columns.map((_, index) => index));
   const validate = (expr: ScalarExpr, what: string): Set<number> => {
     if (hasParam(expr)) fail(`${what} uses a parameter slot`);
-    const read = columnsRead(expr, new Set());
+    const read = readsOf(expr);
     for (const index of read)
       if (!(index >= 0 && index < columns.length)) fail(`${what} reads column ${String(index)}`);
     return read;
@@ -218,7 +178,7 @@ export function compileTableRules(
             columnId: column.id,
             index,
             expr,
-            reads: new Set([...columnsRead(expr, new Set())].map((i) => columns[i]?.id ?? -1)),
+            reads: new Set([...readsOf(expr)].map((i) => columns[i]?.id ?? -1)),
           },
         ];
   });

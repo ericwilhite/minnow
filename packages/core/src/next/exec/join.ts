@@ -191,6 +191,11 @@ export interface HashJoinSpec {
   readonly filter?: VectorPredicate | null;
   /** Runtime filters to publish: filter id and key position (inner, semi and right only). */
   readonly publishes: ReadonlyArray<{ readonly id: number; readonly key: number }>;
+  /**
+   * Inner joins without a residual: build columns no consumer reads. They are never gathered
+   * for matched pairs and are emitted as typed NULL constants instead (output column demand).
+   */
+  readonly unusedBuild?: readonly number[];
 }
 
 export interface HashJoinContext {
@@ -203,6 +208,18 @@ export interface HashJoinContext {
   readonly relId?: number;
   /** Test seam: disable direct addressing. */
   readonly direct?: boolean;
+}
+
+/** Test observation of output demand; null in production (one null check, no allocation). */
+let gatherObserver: ((relId: number | undefined, gathered: readonly number[]) => void) | null =
+  null;
+
+/**
+ * Test-only: reports each join's gathered build columns, by plan id, until reset with null.
+ * It never changes what a join does.
+ */
+export function observeJoinGathers(observer: typeof gatherObserver): void {
+  gatherObserver = observer;
 }
 
 export interface HashJoinProfile {
@@ -355,6 +372,16 @@ function checkJoinSpec(spec: HashJoinSpec): { layout: KeyLayout; correlated: num
     throw new TypeError(
       `A ${spec.kind} join keeps its probe misses: it cannot publish runtime filters`,
     );
+  const unused = spec.unusedBuild ?? [];
+  if (unused.length > 0) {
+    if (spec.kind !== "inner" || spec.residual !== null || (spec.filter ?? null) !== null)
+      throw new TypeError("Only an inner join without a residual may omit build columns");
+    if (
+      new Set(unused).size !== unused.length ||
+      unused.some((c) => !Number.isSafeInteger(c) || c < 0 || c >= spec.buildTypes.length)
+    )
+      throw new RangeError("Unused build columns must be distinct build column indexes");
+  }
   const layout = new KeyLayout(keyTypes, spec.nullSafe);
   return { layout, correlated };
 }
@@ -409,6 +436,7 @@ class Shared {
    */
   readonly gatherColumns: readonly number[];
   readonly reuse: readonly number[];
+  readonly unused: ReadonlySet<number>;
   readonly buildPart: ColumnStore;
   readonly profile: HashJoinProfile = {
     rowsOut: 0,
@@ -500,7 +528,12 @@ class Shared {
         if ((reuse[column] ?? -1) < 0) reuse[column] = spec.probeKeys[i] ?? -1;
     });
     this.reuse = reuse;
-    this.gatherColumns = this.buildColumns.filter((c) => (reuse[c] ?? -1) < 0);
+    // Unread build columns are emitted as NULL constants, never gathered (output demand).
+    this.unused = new Set(spec.unusedBuild ?? []);
+    this.gatherColumns = this.buildColumns.filter(
+      (c) => (reuse[c] ?? -1) < 0 && !this.unused.has(c),
+    );
+    if (gatherObserver !== null) gatherObserver(context.relId, this.gatherColumns);
     this.buildPart = new ColumnStore(
       this.gatherColumns.map((c) => columnOf(spec.buildTypes, c)),
       this.pool,
@@ -508,13 +541,20 @@ class Shared {
     );
   }
 
-  /** Output build columns for matched rows: gathered ones, and probe key vectors for the rest. */
-  matchedBuildColumns(probeColumns: readonly Vector[]): Vector[] {
+  /** Output build columns for matched rows: gathered ones, probe key vectors for reused keys,
+   * and NULL constants for columns no consumer reads. */
+  matchedBuildColumns(probeColumns: readonly Vector[], length: number): Vector[] {
     const gathered = this.buildPart.vectors();
     let next = 0;
     return this.buildColumns.map((c) => {
       const probe = this.reuse[c] ?? -1;
-      return probe >= 0 ? columnOf(probeColumns, probe) : (gathered[next++] as Vector);
+      if (probe >= 0) return columnOf(probeColumns, probe);
+      if (this.unused.has(c)) {
+        const nulls = this.buildNulls[c];
+        if (nulls === undefined) throw new RangeError("Unused build column out of range");
+        return withLength(nulls, length);
+      }
+      return gathered[next++] as Vector;
     });
   }
 
@@ -1538,7 +1578,7 @@ class Prober {
         ...batch.columns,
         ...(outer
           ? store.vectors().slice(0, shared.spec.buildTypes.length)
-          : shared.matchedBuildColumns(batch.columns)),
+          : shared.matchedBuildColumns(batch.columns, batch.length)),
       ],
       selection: out,
     });
@@ -1613,7 +1653,7 @@ class Prober {
         ...probeColumns,
         ...(borrowBuild
           ? shared.buildColumns.map((c) => level.store.chunk(c, 0))
-          : shared.matchedBuildColumns(probeColumns)),
+          : shared.matchedBuildColumns(probeColumns, taken)),
       ],
       selection: null,
     };

@@ -10,6 +10,8 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The unexported 1.0 rebuild's inner joins skip gathering build-side columns that no consumer reads, when a projection sits directly over the join and the join has no residual condition. Results are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.
+
 The unexported 1.0 rebuild again sizes ordinary scans of small retained tables from their row count, as page-consuming scans already did, after a merge lost the change for ordinary scans. Results are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.
 
 The unexported 1.0 rebuild bounds the work of its short-key join dispatch and hashes short TEXT keys through an extraction-local view over the buffers it already holds. Results are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.

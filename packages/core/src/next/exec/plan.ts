@@ -60,6 +60,7 @@ import { rankingBounds } from "./window-topk-plan.js";
 import { Slice, runSliced, type SlicedJob } from "./slices.js";
 /** Immutable pipeline recipes; every execution instantiates its own operators and kernels. */
 import type { MaybePromise } from "../access/key-index.js";
+import { columnsRead } from "../ir/columns-read.js";
 import type { PhysicalPlan, Rel, ScalarExpr, SortKey } from "../ir/ir.js";
 import { ResultSink, resultRowStepBytes } from "./result-sink.js";
 import { aggregateProgressLayout, simpleAggregateType } from "./agg/parameter-copies.js";
@@ -778,6 +779,32 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
     loanSlots: number;
   }> = [];
   const compoundColumns = new Map<number, number>();
+  /** Join output columns its direct parent projection reads (absent: every column). */
+  const joinOutputDemand = new Map<number, ReadonlySet<number>>();
+  /**
+   * Build store columns an inner join need not gather: key-only columns it added past the
+   * build input, and input columns its parent projection never reads. Not for a residual,
+   * a filter, an outer/semi/mark join or a star-rewritten join (its outputs move).
+   */
+  const unusedBuildOf = (
+    join: Rel,
+    probeWidth: number,
+    buildWidth: number,
+    storeWidth: number,
+  ): { unusedBuild?: number[] } => {
+    if (
+      join.op !== "join" ||
+      (join.kind !== "inner" && join.kind !== "cross") ||
+      join.residual !== null ||
+      (join.filter ?? null) !== null
+    )
+      return {};
+    const read = joinOutputDemand.get(join.id);
+    const unused: number[] = [];
+    for (let c = 0; c < storeWidth; c++)
+      if (c >= buildWidth || (read !== undefined && !read.has(probeWidth + c))) unused.push(c);
+    return unused.length === 0 ? {} : { unusedBuild: unused };
+  };
   const compoundCopies = new Map<number, number>();
   const indexFetchOwners = new Set<number>();
   interface IndexWorkspace {
@@ -1703,6 +1730,12 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
       case "filter":
       case "project":
       case "limit": {
+        // A projection over a join reads only these join output columns (output demand).
+        // An expression the walker cannot classify leaves the join's full output demanded.
+        if (rel.op === "project" && rel.input.op === "join") {
+          const read = columnsRead(rel.exprs);
+          if (read !== null) joinOutputDemand.set(rel.input.id, read);
+        }
         const encoded = pageScan && rel.op === "project",
           count = encoded ? countedPages : counted,
           Project = encoded ? PageProjectOperator : ProjectOperator,
@@ -2940,6 +2973,8 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
             ),
             // Runtime filters are optional acceleration; scans still evaluate every predicate.
             publishes: [],
+            // A star rewrite moves output positions: only the planned join uses demand.
+            ...(actual === rel ? unusedBuildOf(actual, lt.length, rt.length, rk.types.length) : {}),
           };
           if (runtime === undefined || grant === null) validateHashJoinSpec(spec);
           const join =
