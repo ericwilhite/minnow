@@ -11,6 +11,34 @@ Nothing here ships yet:
 
 Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 
+The optional resident three-dimension star lookup path preserves the native join
+transition order. It requires three single-key inner joins to enforced dimension
+primary keys, direct text group keys, COUNT(*) and one direct float8 SUM. Local
+dictionaries use the existing charged query-wide IDs. It traverses fact keys once,
+stages each C-surviving payload once with charged A/B query-ID sidecars, and links
+bounded row-ID buckets after A is known. Source barriers remain C, facts, A, B;
+each B prefix reaches the existing aggregate before its next source read. This
+preserves demanded source and transition errors, as well as native SUM bits. Pending
+jobs retain their owner grant through cancellation settlement. Exact domain proofs
+bound all arrays; sparse domains and
+unsupported shapes retain native joins. Ordinary-owner normalized literals and explicit
+plain TEXT bindings can use this exact three-lookup route: at most four slots, each NULL or at most
+1024 UTF-16 units without NUL. The shared binder sizes them before optional domain
+proofs; invalid or unsupported bindings retain the original bind/error demand. The
+complete strategy decision includes every parameter and progress slot. The complete original admission still
+applies, including cancellable waits and spill fallback. No smaller cap is claimed.
+
+### Count-only text membership
+
+Scalar byte `COUNT(DISTINCT)` can represent one byte prefix of at most 16 bytes followed by
+canonical decimal suffixes using exact paged bitmaps. The first demanded non-NULL
+value selects the representation. Each observed 4096-value page costs 512 bytes;
+the optional policy permits at most 128 KiB of bits. Leading zeros, other prefixes
+and larger suffixes retain ordinary byte membership. Local dictionary codes are
+resolved through their own entries. Checkpoints write every original key exactly,
+so replay preserves membership before continuing the input. Growth certificates
+include page metadata and the actual half-full byte-table growth boundary.
+
 ## Module map
 
 | Module        | Owner track                      | What it is                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
@@ -1758,12 +1786,24 @@ with at least seven of nine pairs favouring control is an accepted regression. O
 profiles are outside the component timing; query materialization remains in whole timing.
 The report includes CPU samples, full spreads, checkpointed partial rounds, profiles and the
 actual transformed JS needed to interpret line-level ticks. No baseline is an executor path.
-Query-root `keyLookup` and `indexRange` IR remain behind the internal `keyOrder:true`
-diagnostic opt-in, including LIMIT zero. The general cursor/fetch recipe is available without
-that opt-in on the modification input's single-source path through unary operators. Its
-producer atomically reserves the complete DML cursor/fetch minimum. Cursors beneath join
-or set-operation branches retain the diagnostic gate: a MODIFY ancestor alone does not
-prove the branch minimum. This does not enable query-root index predicates. Ordinary SQL selects the admitted index recipe for a direct, complete
+Native `keyLookup` and `indexRange` inputs execute without a diagnostic option, at query
+roots and beneath filters, projections, joins, sorts, LIMIT and modification inputs.
+The whole query funds separate cursor/key and selected-row fetch workspaces before either
+opens. IN lists materialize one key at a time: up to sixteen complete query keys use bounded
+encoded-key duplicate checks; larger complete query lists use a charged bitmap with one
+spill file. Partial probes and multi-key modifications sort and deduplicate locators with spill,
+retaining physical target order for writes. Serial join and binary EXCEPT inputs reuse one
+prepaid cursor workspace after the preceding cursor has closed and repaid its loan; replay,
+recursive, window and volatile plans retain independent workspaces. Deterministic key casts
+are validated before the first probe, so LIMIT cannot hide an invalid later IN-list key. NULL keys never match; key casts must
+produce the indexed physical type, while widening comparisons retain a scan. Cursor and
+fetch inputs use the same pinned snapshot through staging, publication and concurrent writes.
+A satisfied streaming LIMIT stops fetching and evaluating later rows. SQL ordering still
+requires ORDER BY. Existing TEXT-to-integer cast-kernel refusals are independent of access
+path selection; integer inputs accept supported explicit numeric casts. Composite-prefix
+queries retain scans unless every indexed column is proven non-null by its schema or a
+strict predicate: native indexes omit tuples containing any NULL component.
+Ordinary SQL selects the admitted index recipe for a direct, complete
 primary-key ORDER BY with LIMIT or OFFSET, including OFFSET without LIMIT. The pinned
 catalog must certify the same unique key columns, byte collation and direction. Direct
 projections are supported; row-locking intent, filters, computed ordering, partial keys, mixed
@@ -1996,10 +2036,30 @@ shipped-engine or stored-format change.
   only the pages the predicate cannot rule out; `refine` (after deletions or an earlier conjunct)
   loads every page its positions touch. The rest of the filter (the residual) runs on decoded
   values.
-- At or above 40 % of a range selected, every column decodes densely (residual columns too) and
+- On the ordinary batch route, at or above 40 % of a range selected, every column decodes densely (residual columns too) and
   keeps the selection, the residual then narrowing it. Below it only the selected positions are
   gathered; with a residual, its columns are gathered first and the others only for the rows it
   keeps.
+- The planner selects encoded-capable scan, project and profiling variants once for a supported
+  scalar reduction. Other plans retain the ordinary scan loop, projection layout and profiling
+  wrappers, with no page-capability discovery or dispatch per batch. A metadata-only filter
+  probe declines residual or mixed pushed/residual filters before building page bindings; it
+  does not convert constants or copy their payloads.
+- Restricted scalar scan/filter/reduce recipes can instead consume selected encoded pages
+  through `page/consume.ts` and `exec/page-consumer.ts`. COUNT reads validity without expanding
+  dictionary values; int32 SUM/AVG and ordered float8 SUM dispatch to prebuilt typed kernels.
+  Same-type column projections and profiling wrappers forward the capability through existing
+  binding maps, including duplicate-column packing, without new per-step mapping arrays. All needed
+  pages are loaded and validated before transitions, and complete-step eligibility precedes
+  any state change. Eligibility covers predicate-only columns too: dense steps preserve their
+  full decode span, while gathers inspect only selected pages. Unproven safe-number pages and
+  out-of-line regions retain ordinary loading and validation. A missing column, unsupported
+  page/operator, residual, memory segment, locator or refused optional descriptor workspace
+  keeps the ordinary batch route. No prefix
+  is replayed. The first implementation preserves 2,048-row transition and byte-sizing barriers,
+  including ordinary fallback prepayment; it does not remove full-source admission sizing.
+  Borrowed pages never cross an await or escape their kernel. Metadata remains accessible
+  before payload for a future independently validated exact-summary consumer.
 - Shape setup reuses only verified scalar header facts while endpoint pages remain resident;
   install/release/materialization invalidates them. Exact-range byte counts have a separate
   memo. `exec/column-shape.test.ts` compares against header queries with memoization disabled
@@ -2111,6 +2171,10 @@ shipped-engine or stored-format change.
   tuple for several keys: direct-mapped (the value ids bit-packed into a slot of a table of at
   most 2^16) while the columns' value counts fit, hashed column by column past that. SQL GROUP BY equality: NULLs together, −0 = 0, NaN = NaN, NUMERIC by
   value.
+- A non-NULL flat text key column is interned in one loop per batch with the source's
+  DataView made once; keys of 16 to 64 bytes hash through it with the same XXH32, and byte
+  equality still resolves collisions. Storage grows on each new key exactly as the per-row
+  route grows it, so batch peaks are unchanged; the batch's complete growth is admitted first.
 - One int2/int4/date key whose range spans no more slots than the hash table would hold (twice
   its slots, at most 2^22 values) is direct-mapped instead: slot `key − base`, no hashing or
   probing, half the bytes. A key past the span widens it; a range too wide goes back to hashing;
@@ -2165,8 +2229,11 @@ shipped-engine or stored-format change.
   complete resident join/codebook/state/output grants, admitted together before input opens.
   A bounded proof scans plain keys when dictionary metadata cannot certify them. Proof
   grants close before whole admission. Unknown domains, excessive bounds, unproved uniqueness,
-  parameters, volatile/computed producers or insufficient whole-cap room retain the generic
-  route. All selected joins stay resident, preserving native per-group float transition order.
+  unsupported parameters, volatile/computed producers or insufficient whole-cap room retain the
+  generic route. At most four plain TEXT slots (NULL or <=1024 UTF-16 units, no NUL)
+  may enter the exact three-lookup family after shared binding validation and exact parameter-byte sizing. Other bound dictionary recipes retain their old fallback. The
+  per-execution check precedes proof reads and includes all parameter/progress bytes;
+  a cached plan does not reuse a previous binding certificate. All selected joins stay resident, preserving native per-group float transition order.
   Error-free dimension comparisons, AND/OR/NOT and NULL tests run on original vectors.
   Dimension TEXT attributes may be grouping keys. LEFT joins remain generic: null padding
   needs additional domain and uniqueness certification.
@@ -3744,10 +3811,10 @@ coalesced window; it does not skip the gzip/large-value sizing proof or raise th
 `npx vite-node scripts/read-retention-bench.mts --compare=REV` runs five interleaved frozen-parent/
 candidate component rounds, checks physical frame bytes (including masks, padding and dictionary
 deltas), and guards warm repeated reads plus real persisted SQL scans and point selections.
-The ordinary query executor refuses `keyLookup` without diagnostic opt-in; this query benchmark
-uses `id + 0` to exercise the supported scan path. DML's separately admitted input recipe is
-not a query-point-lookup path. The separate storage point-read guard is a direct single-blob
-cache hit. This benchmark does not claim indexed SQL point-lookup performance.
+This query benchmark uses `id + 0` to retain its forced-scan control. Ordinary indexed
+predicates now use the complete query cursor/fetch recipe. The separate storage point-read
+guard is a direct single-blob cache hit; this benchmark still does not measure indexed SQL
+point-lookup performance.
 
 `MINNOW_EXPORT_RETENTION_REFERENCE=REV` freezes the entire core at that Git revision on its
 ordinary module IDs for a control whole-owner campaign. It is bench-only; ordinary invocations

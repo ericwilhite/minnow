@@ -128,8 +128,10 @@ protocol survives it: every broker request is bounded and retried, and each brok
 announces an id so clients resend and owners register again;
 [the SharedWorker restart note](https://github.com/ericwilhite/minnow/blob/main/packages/core/src/next/owner/webkit-sharedworker.md) has the measurements and the repro.
 
-The merge gate and fast SQLLogicTest profile run in `.github/workflows/ci.yml` on every push and pull
-request, spread across parallel jobs. One job runs the format, type, lint, build, API contract,
+The merge gate and fast SQLLogicTest profile run in `.github/workflows/ci.yml` on every push to
+`main` and every pull request that is not a draft, spread across parallel jobs. Draft pull requests
+skip this gate, the release-readiness conformance and the performance gate; marking a draft ready
+for review runs them. One job runs the format, type, lint, build, API contract,
 SQLLogicTest, and heap-plateau checks. The unit suite runs under coverage in seven Vitest parts; a
 final job merges their results and coverage and enforces the coverage floors on the whole suite,
 exactly as `npm run test:coverage` does. The `Format, types, lint, build, unit tests` check requires
@@ -192,6 +194,45 @@ Xeon 6975P-C from five runs and Platinum 8573C from four. The Platinum 8370C pro
 single run and is provisional: recalibrate it once more runners of that model have been drawn.
 `.github/workflows/browser-performance.yml` runs the [browser performance lane](#browser-performance-lane)
 nightly, also off the merge path, and uploads its JSON lines and summary as an artifact.
+`.github/workflows/head-to-head.yml` is the 1.0 rebuild's progress lane, nightly and on demand and
+also off the merge path. It is an internal diagnostic, not a published benchmark. For the W1M and S1
+Gate B cells it runs the checked-out ref's rebuild engine (`next/`) and the published
+`@minnowdb/core@0.20.0` side by side on one runner, with alternating rounds, and writes one table
+per run to the run summary. The table names the measured ref and SHA, and gives each engine's time,
+the fixed DuckDB-Wasm target (a browser number, so only a trend here) and the ratios. Run it locally
+with `node scripts/head-to-head.mts run --dataset W1M --shipped <unpacked package> --output <dir>`
+(`--rows` and `--scale` shrink the fixtures). A timing never fails the lane; an engine that cannot
+load its fixture does.
+
+Each cell's answers are compared in full, and the table names how
+(`scripts/lib/answers.mts`). Values are compared by their column's type, taken from the `next/`
+engine's result types (0.20 reports none, so it uses the same ones):
+
+- **Integer and `NUMERIC`:** exactly, as decimal text. A `bigint` and decimal text of the same
+  integer are equal, and nothing is rounded through a float.
+- **Floats:** equal within an absolute 1e-12 plus a relative 1e-9.
+- **Text, JSON and bytes:** losslessly, so text `1.0` and `1.00` differ.
+- **SQL `NULL`:** differs from a missing value.
+- **Other types** (intervals, arrays): exactly, with no tolerance.
+
+A result whose column types are missing, incomplete or different on the two sides is
+"unverifiable" and never counts as the same.
+
+Results of up to two million values compare value by value. An unordered result is grouped by
+its exact (non-float) columns, and inside each group the float columns are paired within the
+tolerance: sorted pairing for one float column, and for several a search for a valid pairing in
+groups of up to 256 rows (a larger group is unverifiable). Larger results (the export and the full
+sorts of stored columns) compare by an exact hash of every value of every row, in order or as a
+multiset. An unordered `LIMIT`, which may return any rows, is checked row by row against the
+generator.
+
+With a `candidate` git ref (the workflow input, or `--candidate <built checkout>` locally) the lane
+becomes a **screen for leads**: it compares two `next/` builds at the columnar frames boundary and
+marks a cell as a lead only when every requested round completed (at least nine), the median paired
+difference exceeds its IQR and at least seven of nine rounds go the same way. A partial or failed
+cell shows how many rounds completed and why. A screen never supports a speed claim (see
+[speed claims](#speed-claims-for-the-rebuild-engine)): each engine
+runs in one long-lived process, and an A/A screen of two identical builds flagged 4 of 45 cells.
 
 Each browser runner owns its test directory, server, port, and build prerequisites. Shared browser
 defaults live in `playwright.shared.mjs`; runner-specific configuration stays in its named
@@ -1341,6 +1382,46 @@ over arguments built before timing, so these ratios compare like with like. The 
 database of its own, so its writes do not change what the other shapes read. Every engine runs the
 same sequence, and a summary of the table is compared with SQLite's after each shape.
 
+## Speed claims for the rebuild engine
+
+Any statement that `next/` is faster, or not slower, cites a run of
+`.github/workflows/next-claim.yml` (`scripts/next-claim.mts`), the one protocol for such claims.
+At dispatch the workflow validates its inputs and declares the run in a manifest: both commit
+SHAs, the datasets, shards, cells, mandatory A/A controls, targets and pairs. Every later job
+validates the manifest again and reads it, and every result carries the manifest's SHA-256: a
+result from a different manifest counts as missing.
+
+1. Each build (control and candidate) loads its own fixture once with its own writer and captures it
+   as a native storage image. The control build times each cell once to size its bracket: a fixed
+   number of complete queries, `ceil(1000 ms / one query)` between 1 and 10, the same for both builds.
+2. Every sample is a fresh process: it restores its build's image, opens, verifies the full answer,
+   times one bracket of process CPU (all threads, natural garbage collection) and verifies again.
+   Pairs run in a balanced AB/BA order shuffled from a recorded seed. Both builds must give the same
+   answers, compared as above, or the cell has no verdict.
+3. A/A first: fixed control cells (W1M `scan_proj3_agg` and `agg_3dims_20aggs`, S1 `S_q3` and
+   `S_q8`) run the control build against an independent control process in every shard. If any of
+   them meets the target rule or fails, the whole run is void: no shard's verdict stands.
+4. Target cells are declared before the run. A gain needs the median paired saving to exceed its
+   IQR, at least seven of nine pairs (scaled to the pair count) favouring the candidate and at least
+   2% of the control's per-query median; a regression is the reverse. Every other cell is screened
+   for regressions, and a flag also needs a Holm-adjusted two-sided sign test p of at most 0.05
+   across every screened cell the manifest declares, including any that did not report. Nine pairs
+   cannot pass that correction across 45 cells, so the default is 15. Anything else is "no
+   accepted difference", which is not proof of equality.
+5. The table gives verdicts only when every declared shard and cell reported every pair. A missing
+   shard or dataset, a failed cell or a short cell marks the run **INCOMPLETE**, with no verdicts.
+   Every sample records the runner's CPU model.
+
+Cost, measured on hosted runners (AMD EPYC 9V74, validation run 44678818852): each job spends
+about 3 minutes installing and building both builds, and each W1M build takes about 100 s to
+load and capture its image (a 1.1 GB image). One fresh-process sample takes about 4.5 to 5.6 s,
+most of it restoring and verifying. Every shard also runs the two A/A cells, so a cell costs
+about 2.5 minutes at 15 pairs. Gate B has 29 W1M and 16 S1 cells; over six jobs per dataset a
+full run is estimated at about 3.5 runner-hours (about 2.4 for W1M and 1.1 for S1, taking S1
+samples to cost no more than W1M's), and about 30 minutes of wall time when twelve runners are
+free. Reloading fixtures in every process instead
+would cost about 10 runner-hours of setup alone. It is dispatched for a claim, not run nightly.
+
 ## Update the performance-gate baseline
 
 After an intentional executor change, inspect the performance-gate output before updating its
@@ -1869,6 +1950,63 @@ class or introducing negative zero fails at the intended operation. Reversing an
 unordered result passes. Live subscriptions, concurrent openers, crash schedules,
 native browser storage and order-dependent floating aggregates remain outside this
 serial harness; their existing suites still own those checks.
+
+### Rebuild-core encoded selection component
+
+`scripts/next-selection-workspace-bench.mts` compares two separately built core roots. Save a
+parent build, then build the candidate and run:
+
+```bash
+mkdir -p "$HOME/.cache/minnow-bench-tmp"
+TMPDIR="$HOME/.cache/minnow-bench-tmp" node scripts/next-selection-workspace-bench.mts \
+  --control-root "$HOME/.cache/minnow-parent" \
+  --output "$HOME/.cache/minnow-selection"
+```
+
+The component measures the first encoded selection through reader close, including any
+predicate decode workspace it acquires and releases. Fixture construction, reader open, page
+loading, predicate compilation, output buffers and result checks are outside the clock. Both
+nullable and all-valid pages use production readers; every selected position is checked and
+every reader must release its charges. It takes nine interleaved AB/BA rounds of CPU across all
+Node threads, with natural GC, and records raw samples, code hashes, CPU affinity and paired
+median/IQR decisions. This isolates workspace cost; it does not establish a scan, aggregate,
+browser, I/O or spill speedup. Whole-query comparisons and generated/PGlite suites remain
+separate checks.
+
+### Rebuild-core encoded plan work
+
+`next/testing/executor-encoded-cost.test.ts` counts page-capability reads and encoded
+transitions through native plans. Generated ordinary scans, selective scans, grouped or
+unsupported reductions, residual or mixed filters and limited inputs must perform no
+encoded-capability work. Every
+history also runs an eligible COUNT on the same stored data and proves that encoded
+consumption remains active. PostgreSQL checks the ordinary results; cleanup checks governor
+and spill credit. This is a work-count law, independent of elapsed time or host load.
+`next/exec/pushdown-eligibility.test.ts` also checks the planning probe against the scan
+splitter over stored literal forms, nulls, collation and compound predicates, while proving
+that eligibility never reads or copies a literal payload.
+
+### Rebuild-core encoded reduction component
+
+`scripts/next-encoded-page-bench.mts` compares selection followed by ordinary decode/reduce
+with direct encoded-page consumption, using production readers and aggregate accumulators:
+
+```bash
+TMPDIR="$HOME/.cache/minnow-bench-tmp" node scripts/next-encoded-page-bench.mts \
+  --control-root "$HOME/.cache/minnow-parent" \
+  --output "$HOME/.cache/minnow-encoded-pages"
+```
+
+Run an A/A first with both roots set to the parent and `--candidate-mode decoded`. The runner
+uses nine interleaved CPU pairs and retains every sample. It sweeps 2,048, 8,192 and 32,768-row
+selection windows under a four-MiB component budget. Each window retains 2,048-row aggregate
+transition steps; this does not authorize wider error-demand steps in production. Both nullable
+and all-valid inputs check exact integer and ordered float sums and release every charge.
+
+The CPU bracket covers selection, decode where used, and reduction over already loaded pages.
+Fixture construction, loading, state allocation, final output and checks are untimed. The
+runner records code hashes, byte peaks and median/IQR decisions, including the full range as
+a diagnostic. Whole-query and PGlite/governor checks remain separate evidence.
 
 ### Rebuild-core write CPU comparisons
 

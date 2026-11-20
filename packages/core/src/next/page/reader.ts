@@ -73,6 +73,7 @@ import {
   type PageView,
 } from "./decode.js";
 import { partsOf } from "./large-value.js";
+import type { EncodedPageCheck, EncodedPageKernel, PageRows } from "./consume.js";
 import {
   compilePredicate,
   pageMayMatch,
@@ -1298,6 +1299,51 @@ export class ChunkReader {
       this.#options.directories?.unpin(this.#directoryPin, this.#pinning);
   }
 
+  /** Verified directory metadata, available without loading the value page. */
+  pageEntry(page: number): PageEntry {
+    this.#live();
+    if (!Number.isSafeInteger(page) || page < 0) throw new RangeError("Invalid page index");
+    return at_(this.directory.pages, page);
+  }
+
+  /** A prebuilt loaded-payload check before a complete step transitions. No normalization. */
+  checkPage(page: number, check: EncodedPageCheck): boolean {
+    const entry = this.pageEntry(page);
+    return check(this.#view(page), entry, this.chunk.type);
+  }
+
+  /** Synchronous borrowed raw input for one prebuilt kernel. No normalization or workspace.
+   * Range endpoints are page-local. Selection endpoints index ascending group positions;
+   * duplicates retain multiplicity. The caller funds kernel state/workspace before this call.
+   * Nothing borrowed may survive the call or be mutated. An empty span demands no payload.
+   */
+  consumePage<State>(
+    page: number,
+    rows: PageRows | null,
+    from: number,
+    to: number,
+    state: State,
+    kernel: EncodedPageKernel<State>,
+  ): void {
+    const entry = this.pageEntry(page);
+    if (
+      !Number.isSafeInteger(from) ||
+      !Number.isSafeInteger(to) ||
+      from < 0 ||
+      to < from ||
+      to > (rows === null ? entry.rowCount : rows.length)
+    )
+      throw new RangeError("Invalid page consumption span");
+    if (from === to) return;
+    if (
+      rows !== null &&
+      ((rows[from] ?? -1) < entry.firstRow ||
+        (rows[to - 1] ?? Infinity) >= entry.firstRow + entry.rowCount)
+    )
+      throw new RangeError("Selected row outside the page");
+    kernel(state, this.#view(page), entry, this.chunk.type, this.#dictionaryVector, rows, from, to);
+  }
+
   // ── Predicates on encoded pages (predicate.ts, select.ts) ─────────────────────────────
 
   /**
@@ -1422,13 +1468,17 @@ export class ChunkReader {
         this.#codes.set(compiled, codes);
       }
     }
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- the getter's receiver is the context, not its owning reader
+    const reader = this;
     return {
       view,
       entry,
       compiled,
       codes,
       dictionary: this.#dictionary,
-      scratch: this.#selectScratch(),
+      get scratch() {
+        return reader.#selectScratch();
+      },
       values: this.#resolver(view, entry),
       type: this.chunk.type,
     };

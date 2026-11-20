@@ -41,10 +41,17 @@ export interface AccessPath {
   readonly rows: number;
 }
 
-/** A constant usable as a key: a literal (not NULL), a parameter, or a text constant parsed once. */
+/** Parameter keys may include explicit pure casts. */
+function parameterKey(expr: ScalarExpr): boolean {
+  return (
+    expr.op === "param" ||
+    (expr.op === "cast" && expr.assignment !== true && parameterKey(expr.input))
+  );
+}
+/** A key input is a non-null literal, a parameter, or a supported pure cast. */
 function isKey(expr: ScalarExpr): boolean {
   if (expr.op === "literal") return expr.value.validity === null;
-  if (expr.op === "param") return true;
+  if (parameterKey(expr)) return true;
   return (
     expr.op === "cast" &&
     expr.assignment !== true &&
@@ -64,20 +71,41 @@ interface Bound {
 
 /** What the conjuncts say about each read position. */
 interface Facts {
+  readonly nonNull: Set<number>;
   readonly equal: Map<number, { readonly key: ScalarExpr; readonly conjunct: number }>;
   readonly lists: Map<number, { readonly keys: readonly ScalarExpr[]; readonly conjunct: number }>;
   readonly lower: Map<number, Bound>;
   readonly upper: Map<number, Bound>;
 }
 
+/**
+ * Whether a comparison under `collation` is byte comparison, the only order and equality the
+ * index keys encode (C8). This is exactly the executor's accepted set (exec/kernels/compare.ts
+ * `checkComparable`, exec/kernels/compile.ts IN): a predicate under any other collation stays
+ * in place, so the index never consumes it and the executor reports its typed refusal.
+ */
+function byteCollation(collation: string | null): boolean {
+  return collation === null || collation === "C" || collation === "default";
+}
+
 function factsOf(conjuncts: readonly Typed[]): Facts {
-  const facts: Facts = { equal: new Map(), lists: new Map(), lower: new Map(), upper: new Map() };
+  const facts: Facts = {
+    nonNull: new Set(),
+    equal: new Map(),
+    lists: new Map(),
+    lower: new Map(),
+    upper: new Map(),
+  };
   for (const [index, conjunct] of conjuncts.entries()) {
     const expr = conjunct.expr;
+    if (expr.op === "isNull" && expr.negated && expr.arg.op === "column")
+      facts.nonNull.add(expr.arg.index);
     if (expr.op === "inList" && !expr.negated && expr.arg.op === "column") {
       const position = expr.arg.index;
+      if (expr.list.length > 0) facts.nonNull.add(position);
       if (
         expr.list.length > 0 &&
+        byteCollation(expr.collation) &&
         expr.list.every((item) => isKey(item) && sameBaseKind(item, expr.arg))
       )
         if (!facts.lists.has(position))
@@ -85,6 +113,8 @@ function factsOf(conjuncts: readonly Typed[]): Facts {
       continue;
     }
     if (expr.op !== "compare") continue;
+    if (expr.left.op === "column") facts.nonNull.add(expr.left.index);
+    if (expr.right.op === "column") facts.nonNull.add(expr.right.index);
     const flip = { "<": ">", "<=": ">=", ">": "<", ">=": "<=", "=": "=", "<>": "<>" } as const;
     const [columnSide, keySide, cmp] =
       expr.left.op === "column" && isKey(expr.right)
@@ -94,13 +124,13 @@ function factsOf(conjuncts: readonly Typed[]): Facts {
           : [null, null, null];
     if (columnSide === null) continue;
     if (!sameBaseKind(columnSide, keySide)) continue;
+    // Byte equality and order are index equality and order only under a byte collation (C8).
+    if (!byteCollation(expr.collation)) continue;
     const position = columnSide.index;
     if (cmp === "=") {
       if (!facts.equal.has(position)) facts.equal.set(position, { key: keySide, conjunct: index });
       continue;
     }
-    // Byte order is index order only under the default collation (C8).
-    if (expr.collation !== null && expr.collation !== "C") continue;
     if (cmp === ">" || cmp === ">=") {
       if (!facts.lower.has(position))
         facts.lower.set(position, { key: keySide, inclusive: cmp === ">=", conjunct: index });
@@ -246,6 +276,20 @@ export function accessPath(
   let best: { index: IndexDef; fraction: number; rel: Rel; used: Set<number> } | null = null;
   for (const index of table.indexes) {
     if (index.kind !== "ordered" || index.invalid === true) continue;
+    // Native indexes omit a tuple with ANY null component. A prefix/range may
+    // therefore cover the predicate only when every indexed column is either
+    // declared NOT NULL or constrained by a strict comparison, IN, or IS NOT NULL.
+    // A residual conjunct supplies the same proof even outside the chosen bounds.
+    if (
+      index.columnIds.some((id) => {
+        const column = table.columns.find((candidate) => candidate.id === id);
+        const position = positionOf(id);
+        return (
+          column?.nullable !== false && (position === undefined || !facts.nonNull.has(position))
+        );
+      })
+    )
+      continue;
     const prefix: ScalarExpr[] = [];
     const used = new Set<number>();
     let fraction = 1;

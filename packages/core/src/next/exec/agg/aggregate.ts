@@ -56,6 +56,7 @@ import type { StateRow, StateReader } from "./state-row.js";
 import { PackedAverages } from "./packed-averages.js";
 import { TypedLayout, typedLayoutCalls } from "./typed-layout.js";
 import { PackedIntegers, packedIntegerCalls } from "./packed-integers.js";
+import type { PageColumnMap, ScanPageColumn } from "../page-consumer.js";
 import { accumulatorFor, fusedSums, updateGroupedPair, type Accumulator } from "./states.js";
 
 type AggregateRel = Extract<Rel, { op: "aggregate" }>;
@@ -216,6 +217,7 @@ export class AggregateOperator implements Operator {
   /** The charged bytes of the output batch downstream still holds. */
   #outputHeld = 0;
   #closed = false;
+  #acceptsPageScan = false;
   readonly #signal: AbortSignal | null;
   /** Set by `abort`: a later or resumed `finish` rejects with the reason. */
   #aborted = false;
@@ -366,6 +368,26 @@ export class AggregateOperator implements Operator {
         this.#takeArena(context, 8 * this.#fused.length);
         this.#fusedTotals = new Float64Array(this.#fused.length);
       }
+      this.#acceptsPageScan =
+        this.#groups === null &&
+        this.#aggregates.every((aggregate, k) => {
+          const call = this.rel.aggregates[k],
+            kind = aggregate.argument?.type.kind;
+          const supported =
+            call?.fn === "count_star" ||
+            call?.fn === "count" ||
+            (kind === "int32" && (call?.fn === "sum" || call?.fn === "avg")) ||
+            (kind === "float64" && call?.fn === "sum");
+          return (
+            supported &&
+            aggregate.filter === null &&
+            aggregate.distinct === null &&
+            !aggregate.fusable &&
+            call.orderBy.length === 0 &&
+            (aggregate.sourceColumn !== null ||
+              (call.fn === "count_star" && call.args.length === 0))
+          );
+        });
     } catch (error) {
       this.#close();
       context.arena.give(this.#arenaBytes);
@@ -503,6 +525,85 @@ export class AggregateOperator implements Operator {
     }
     return this.#gids;
   }
+  /** Initial S1 recipe: direct scalar columns, no independent FILTER/DISTINCT or fused exact
+   * pass. Its ordinary path remains available for every unsupported unconsumed step.
+   */
+  get pageConsumer(): this | undefined {
+    return this.acceptsPageScan ? this : undefined;
+  }
+  get acceptsPageScan(): boolean {
+    return this.#acceptsPageScan;
+  }
+
+  canConsumePages(
+    columns: readonly ScanPageColumn[],
+    rows: Uint16Array,
+    count: number,
+    columnsMap?: PageColumnMap,
+  ): boolean {
+    if (!this.acceptsPageScan || count === 0) return false;
+    for (const aggregate of this.#aggregates) {
+      if (!aggregate.updates) continue;
+      if (aggregate.sourceColumn === null) {
+        if (aggregate.accumulator.addPageRows === undefined) return false;
+        continue;
+      }
+      const pages =
+          columns[columnsMap?.pageColumn(aggregate.sourceColumn) ?? aggregate.sourceColumn]?.pages,
+        type = aggregate.argument?.type;
+      if (!pages?.pageEntry || !pages.consumePage || type === undefined) return false;
+      const [first, stop] = pages.pagesInRange(rows[0] ?? 0, (rows[count - 1] ?? 0) + 1);
+      let k = 0;
+      for (let page = first; page < stop && k < count; page++) {
+        const entry = pages.pageEntry(page),
+          end = entry.firstRow + entry.rowCount;
+        const start = k;
+        while (k < count && (rows[k] ?? 0) < end) k++;
+        if (k === start) continue;
+        if (!aggregate.accumulator.pageKernel?.(type, entry)) return false;
+        const check = aggregate.accumulator.pageCheck;
+        if (check && !pages.checkPage?.(page, check)) return false;
+      }
+    }
+    return true;
+  }
+
+  /** Same aggregate/row order as pushPrepared. No allocation/IO/eligibility failure can
+   * replay a prefix; the source calls this only after the complete step's preflight.
+   */
+  consumePages(
+    columns: readonly ScanPageColumn[],
+    rows: Uint16Array,
+    count: number,
+    columnsMap?: PageColumnMap,
+  ): undefined {
+    for (const aggregate of this.#aggregates) {
+      if (!aggregate.updates) continue;
+      if (aggregate.sourceColumn === null) {
+        aggregate.accumulator.addPageRows?.(count);
+        continue;
+      }
+      const pages =
+          columns[columnsMap?.pageColumn(aggregate.sourceColumn) ?? aggregate.sourceColumn]?.pages,
+        type = aggregate.argument?.type;
+      if (!pages?.pageEntry || !pages.consumePage || type === undefined)
+        throw new Error("Page consumer used without preflight");
+      const [first, stop] = pages.pagesInRange(rows[0] ?? 0, (rows[count - 1] ?? 0) + 1);
+      let k = 0;
+      for (let page = first; page < stop && k < count; page++) {
+        const entry = pages.pageEntry(page),
+          end = entry.firstRow + entry.rowCount;
+        const start = k;
+        while (k < count && (rows[k] ?? 0) < end) k++;
+        if (k === start) continue;
+        const kernel = aggregate.accumulator.pageKernel?.(type, entry);
+        if (!kernel) throw new Error("Page capability changed after preflight");
+        pages.consumePage(page, rows, start, k, aggregate.accumulator, kernel);
+      }
+    }
+    return undefined;
+  }
+
   push(batch: Batch): PushResult {
     this.assignGroups(batch);
     return this.pushPrepared(batch, this.#gids, this.groupCount);

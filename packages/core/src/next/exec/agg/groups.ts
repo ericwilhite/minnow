@@ -37,7 +37,7 @@
  * `keyBytes` bounds what `emitKey` will allocate, so the
  * operator charges an output batch before building it.
  */
-import { xxHash32 } from "../../hash/xxhash32.js";
+import { xxHash32, xxHash32View } from "../../hash/xxhash32.js";
 import { KeyBatch, encodeKeyBatch } from "../../keys/key-encoding.js";
 import type { PhysicalType } from "../../types.js";
 import { layoutOf } from "../../types.js";
@@ -1095,7 +1095,16 @@ class ByteKeys implements KeyColumn {
   }
   #id(source: Uint8Array, start: number, end: number): number {
     const view = this.#viewOf(source);
-    const h = xxHash32(source, 0, start, end) | 0;
+    return this.#intern(source, view, start, end);
+  }
+  #intern(source: Uint8Array, view: DataView, start: number, end: number): number {
+    // The existing view also reads short keys a word at a time. Its XXH32 is
+    // identical to the ordinary byte checksum; no view or key copy is created.
+    const length = end - start;
+    const h =
+      (length >= 16 && length <= 64
+        ? xxHash32View(view, 0, start, end)
+        : xxHash32(source, 0, start, end)) | 0;
     const slots = this.#slots;
     const slotIds = slots.ids;
     const slotHashes = slots.hashes;
@@ -1118,6 +1127,26 @@ class ByteKeys implements KeyColumn {
     if (slots.full(this.count))
       slots.grow(this.#idColumns.hashes, this.count, this.#idColumns.outside);
     return id;
+  }
+  /**
+   * Flat non-NULL input: `#intern` per row with the batch's view made once. Storage grows on
+   * each new key exactly as the per-row route grows it, so batch peaks match it.
+   */
+  #flat(
+    source: Uint8Array,
+    offsets: Int32Array,
+    length: number,
+    selection: Selection | null,
+    ids: Int32Array,
+  ): void {
+    const count = selection === null ? length : selection.count;
+    if (count === 0) return;
+    const view = this.#viewOf(source);
+    const rows = selection === null ? IDENTITY : selection.rows;
+    for (let k = 0; k < count; k++) {
+      const row = rows[k] ?? 0;
+      ids[row] = this.#intern(source, view, offsets[row] ?? 0, offsets[row + 1] ?? 0);
+    }
   }
   #slotId(data: VectorData, slot: number): number {
     if (data.layout === "varlen")
@@ -1199,6 +1228,10 @@ class ByteKeys implements KeyColumn {
       return;
     }
     const data = flatOf(key).data;
+    if (key.form === "flat" && data.layout === "varlen" && key.validity === null) {
+      this.#flat(data.bytes, data.offsets, length, selection, ids);
+      return;
+    }
     const constant = key.form === "constant";
     const validity = constant ? key.value.validity : key.validity;
     for (let k = 0; k < count; k++) {
