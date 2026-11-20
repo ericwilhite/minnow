@@ -11753,9 +11753,9 @@ export const NATIVE_COMMAND_FTS_END_REACH = [
   "resident source",
 ] as const;
 
-/** Two cold native preparations both grow while contending for the same governor. */
+/** A cold native preparation and a foreign governor client grow while contending. */
 export const NATIVE_COMMAND_CONTENTION_REACH = [
-  "both roots waited at once holding nothing",
+  "root and foreign client waited at once holding nothing",
   "copies grew the need",
   "large body",
   "zero ownership",
@@ -11764,7 +11764,7 @@ export const NATIVE_COMMAND_CONTENTION_REACH = [
 export const NATIVE_COMMAND_REUSE_REACH = [
   "reuse in one attempt",
   "parameter sizing changed on reuse",
-  "two statements growing at once",
+  "statement and foreign client growing at once",
   "reuse with memory full after admission",
   "large NUMERIC parameter",
   "large body",

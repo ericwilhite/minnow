@@ -1,7 +1,8 @@
 /** Reuse and concurrency of metered native trigger preparation. One cached plan runs several
  * times with NUMERIC parameters whose sizing changes between runs; a learned entry is the plan's
- * measured need and reuse admits exactly that, in one attempt. Two statements on two writers
- * that share one governor grow their reservations at the same time. At every reservation a
+ * measured need and reuse admits exactly that, in one attempt. A statement and a foreign governor
+ * client grow their reservations at the same time on one governor (one write engine per
+ * governor, write admission #9; the client is any other lawful user of it). At every reservation a
  * root makes while preparing, it holds nothing of its preparation; total reserved bytes across
  * a statement's attempts stay within twice its final reservation; refusals only above the cap.
  * Rows are compared with PostgreSQL. */
@@ -26,6 +27,7 @@ import { Governor, MemoryAdmissionError, type Grant } from "../memory/governor.j
 import { ChunkReader } from "../page/reader.js";
 import type { PhysicalPlan } from "../ir/ir.js";
 import { StorageCore } from "./storage-core.js";
+import { yieldTask } from "../task.js";
 import { oracleRows } from "./differential-adapter.js";
 
 /** NUMERIC parameters whose binding sizes differ: 1 and 2^64 (the review's repro). */
@@ -75,11 +77,59 @@ interface Root {
 interface Pressure {
   armed: number;
   applied: number;
-  /** Contention: hold roots at open until this many exist, then fill once. */
+  /** Contention: fill once, after the root's first preparation reservation. */
   barrier?: number;
-  /** Release the foreign grant only once two root admissions are waiting together. */
+  /** Release the foreign grant only once a root-side admission and a client admission are
+   * waiting together. */
   overlap?: boolean;
   overlapped?: boolean;
+}
+
+const CLIENT = "foreign client";
+
+/** A lawful foreign governor client on the same governor: it grows its request by doubling (to a
+ * quarter of the cap, then from 64 KiB again) and closes each grant before asking again, so it
+ * holds nothing while it waits. Stopped by `stop`, which waits for its last admission to end. */
+function foreignClient(governor: Governor): {
+  readonly admissions: number;
+  stop(): Promise<void>;
+} {
+  const stop = new AbortController(),
+    stopped = () => stop.signal.aborted;
+  let admissions = 0;
+  const done = (async () => {
+    let size = 64 << 10;
+    while (!stopped()) {
+      let grants: readonly Grant[] = [];
+      try {
+        grants = await governor.admitGroup({
+          label: CLIENT,
+          grants: [{ label: CLIENT, minimumBytes: size, spillable: false }],
+          signal: stop.signal,
+        });
+        admissions++;
+        if (!grants[0]?.allocate(size)) throw new Error("Missing foreign client credit");
+        await yieldTask();
+      } catch (error) {
+        if (!stopped()) throw error;
+      } finally {
+        for (const grant of grants) {
+          if (grant.allocated) grant.free(grant.allocated);
+          grant.close();
+        }
+      }
+      size = size * 2 > governor.capBytes / 4 ? 64 << 10 : size * 2;
+    }
+  })();
+  return {
+    get admissions() {
+      return admissions;
+    },
+    stop: async () => {
+      stop.abort();
+      await done;
+    },
+  };
 }
 function watchRoots(
   violations: string[],
@@ -88,6 +138,7 @@ function watchRoots(
 ): { roots: Root[]; restore: () => void } {
   let foreign: Grant | null = null,
     waiting = 0,
+    clientWaiting = 0,
     opened = 0,
     arrived: () => void = () => undefined;
   const barrier = new Promise<void>((resolve) => {
@@ -95,7 +146,8 @@ function watchRoots(
   });
   const admit = governor.admitGroup.bind(governor);
   const admitSpy = vi.spyOn(governor, "admitGroup").mockImplementation((request) => {
-    const root = request.label !== "foreign";
+    const client = request.label === CLIENT,
+      root = request.label !== "foreign" && !client;
     const pending = admit(request);
     if (root) {
       waiting++;
@@ -104,7 +156,14 @@ function watchRoots(
         () => waiting--,
       );
     }
-    if (foreign && root && (!pressure.overlap || waiting >= 2)) {
+    if (client) {
+      clientWaiting++;
+      void pending.then(
+        () => clientWaiting--,
+        () => clientWaiting--,
+      );
+    }
+    if (foreign && (root || client) && (!pressure.overlap || (waiting > 0 && clientWaiting > 0))) {
       if (pressure.overlap) pressure.overlapped = true;
       const grant = foreign;
       foreign = null;
@@ -148,12 +207,15 @@ function watchRoots(
   ) {
     const root = roots.find((candidate) => candidate.credits === this);
     if (root?.preparing) {
+      // Held credit, not just allocations: idle credit kept across a retry is unavailable to
+      // every other governor user while this root waits (hold-and-wait).
       const held =
-        this.metadata.allocated -
+        this.metadata.held -
         NATIVE_ROOT_CREDIT_BYTES +
-        this.rules.allocated +
-        this.parameters.allocated;
-      if (held !== 0) violations.push(`reservation began holding ${String(held)}B`);
+        this.rules.held +
+        this.parameters.held +
+        this.source.held;
+      if (held !== 0) violations.push(`reservation began holding ${String(held)}B of credit`);
     }
     // Count what was actually reserved: a reservation refused above the cap holds nothing.
     return reserve.call(this, minimum, signal).then(async () => {
@@ -254,35 +316,35 @@ for (const seed of seedsFor("next-native-command-reuse", [49731, 49732]))
           async (values, terms, concurrent, squeezed, arms) => {
             reach.beginHistory();
             const governor = new Governor(128 << 20),
-              cores = [new StorageCore(64), new StorageCore(64)].slice(0, concurrent ? 2 : 1),
+              core = new StorageCore(64),
               violations: string[] = [],
               s = schema(terms, arms);
-            for (const core of cores) {
-              Object.defineProperty(core.harness, "governor", { value: governor });
-              await core.open();
-            }
+            Object.defineProperty(core.harness, "governor", { value: governor });
+            await core.open();
             const pressure: Pressure = { armed: 0, applied: 0 };
             const watch = watchRoots(violations, governor, pressure);
+            let grew = false;
             try {
               await pg.exec("DROP TABLE IF EXISTS p, log CASCADE; DROP FUNCTION IF EXISTS r()");
               for (const sql of s.postgres) await pg.exec(sql);
-              for (const core of cores) for (const sql of s.native) await core.execute(sql);
-              const plans = cores.map((core) => {
-                const lowered = core.lowerer.lower(MUTATION, core.context());
-                if (lowered.kind !== "modify") throw new TypeError("modify plan required");
-                return lowered.plan;
-              });
+              for (const sql of s.native) await core.execute(sql);
+              const lowered = core.lowerer.lower(MUTATION, core.context());
+              if (lowered.kind !== "modify") throw new TypeError("modify plan required");
+              const plan = lowered.plan,
+                plans = [plan];
               for (const [step, value] of values.entries()) {
                 // Reuse under pressure: memory is full right after the first reservation.
                 pressure.armed = squeezed && step > 0 ? 2 : 0;
                 const before = watch.roots.length;
-                const outcomes = await Promise.all(
-                  cores.map((core, i) => {
-                    const plan = plans[i];
-                    if (!plan) throw new TypeError("Missing plan");
-                    return run(core, governor, plan, value, step * 2 + i + 1);
-                  }),
-                );
+                // Concurrently, a foreign client grows on the same governor.
+                const client = concurrent ? foreignClient(governor) : null;
+                let outcomes: Array<Awaited<ReturnType<typeof run>>>;
+                try {
+                  outcomes = [await run(core, governor, plan, value, step + 1)];
+                } finally {
+                  await client?.stop();
+                }
+                if ((client?.admissions ?? 0) > 0) grew = true;
                 await pg.query(MUTATION, [value]);
                 for (const outcome of outcomes) {
                   if ("error" in outcome) {
@@ -313,26 +375,22 @@ for (const seed of seedsFor("next-native-command-reuse", [49731, 49732]))
                   reach.reach("parameter sizing changed on reuse");
               }
               expect(violations).toEqual([]);
-              for (const [i, core] of cores.entries()) {
-                for (const sql of [
-                  "SELECT * FROM p ORDER BY id",
-                  "SELECT * FROM log ORDER BY id, v",
-                ]) {
-                  const actual = await core.execute(sql);
-                  if (!("batches" in actual)) throw new Error("rows required");
-                  expect(oracleRows(actual), `${sql} on writer ${String(i)}`).toEqual(
-                    (await pg.query(sql)).rows,
-                  );
-                }
+              for (const sql of [
+                "SELECT * FROM p ORDER BY id",
+                "SELECT * FROM log ORDER BY id, v",
+              ]) {
+                const actual = await core.execute(sql);
+                if (!("batches" in actual)) throw new Error("rows required");
+                expect(oracleRows(actual), sql).toEqual((await pg.query(sql)).rows);
               }
               reach.reach("exact PG rows");
-              if (concurrent) reach.reach("two statements growing at once");
+              if (grew) reach.reach("statement and foreign client growing at once");
               if (pressure.applied > 0) reach.reach("reuse with memory full after admission");
               if (values.includes(LARGE)) reach.reach("large NUMERIC parameter");
               if (terms >= 400) reach.reach("large body");
             } finally {
               watch.restore();
-              for (const core of cores) await core.close();
+              await core.close();
               expect(governor.usedBytes).toBe(0);
             }
             reach.reach("zero ownership");
@@ -367,7 +425,7 @@ it("learns a plan's measured need, never its reservation padding", () => {
 });
 
 for (const seed of seedsFor("next-native-command-contention", [49751, 49752]))
-  it(`two cold preparations grow while contending (${String(seed)})`, async () => {
+  it(`a cold preparation and a foreign client grow while contending (${String(seed)})`, async () => {
     const reach = createReach("native command contention", NATIVE_COMMAND_CONTENTION_REACH);
     await fc.assert(
       fc.asyncProperty(
@@ -376,43 +434,41 @@ for (const seed of seedsFor("next-native-command-contention", [49751, 49752]))
         async (terms, arms) => {
           reach.beginHistory();
           const governor = new Governor(128 << 20),
-            cores = [new StorageCore(64), new StorageCore(64)],
+            core = new StorageCore(64),
             violations: string[] = [],
             s = schema(terms, arms);
-          for (const core of cores) {
-            Object.defineProperty(core.harness, "governor", { value: governor });
-            await core.open();
-          }
-          // Hold both roots at open until both exist, then take all free memory: each
-          // preparation falls short, must release and wait, and the waits overlap before
-          // the foreign grant is returned.
-          const pressure: Pressure = { armed: 0, applied: 0, barrier: 2, overlap: true };
+          Object.defineProperty(core.harness, "governor", { value: governor });
+          await core.open();
+          // After the root's first preparation reservation, take all free memory: the root
+          // falls short, must release and wait, and the foreign client (one lawful user of the
+          // same governor) waits too; the filler is returned only once both wait at once.
+          const pressure: Pressure = { armed: 0, applied: 0, barrier: 1, overlap: true };
           let settled = false;
           const watch = watchRoots(violations, governor, pressure);
+          let client: ReturnType<typeof foreignClient> | null = null;
           try {
-            for (const core of cores) for (const sql of s.native) await core.execute(sql);
-            const outcomes = await Promise.all(
-              cores.map((core, i) => {
-                const lowered = core.lowerer.lower(MUTATION, core.context());
-                if (lowered.kind !== "modify") throw new TypeError("modify plan required");
-                return run(core, governor, lowered.plan, SMALL, i + 1);
-              }),
-            );
-            for (const outcome of outcomes) {
-              if ("error" in outcome) throw outcome.error;
-              expect(outcome.rows).toBe(2);
-            }
+            for (const sql of s.native) await core.execute(sql);
+            const lowered = core.lowerer.lower(MUTATION, core.context());
+            if (lowered.kind !== "modify") throw new TypeError("modify plan required");
+            client = foreignClient(governor);
+            const outcome = await run(core, governor, lowered.plan, SMALL, 1);
+            await client.stop();
+            client = null;
+            if ("error" in outcome) throw outcome.error;
+            expect(outcome.rows).toBe(2);
             expect(violations).toEqual([]);
-            // Both roots needed more credit while the foreign grant held the rest.
+            // The root needed more credit while the filler held the rest, and the root and the
+            // client waited at once.
             expect(pressure.overlapped).toBe(true);
             expect(watch.roots.every((root) => root.attempts >= 2)).toBe(true);
-            reach.reach("both roots waited at once holding nothing");
+            reach.reach("root and foreign client waited at once holding nothing");
             settled = true;
             if (arms > 0) reach.reach("copies grew the need");
             if (terms >= 200) reach.reach("large body");
           } finally {
+            await client?.stop();
             watch.restore();
-            for (const core of cores) await core.close();
+            await core.close();
             // After a settled history only: an earlier failure must surface, not its leak.
             if (settled) expect(governor.usedBytes).toBe(0);
           }
