@@ -11,6 +11,17 @@ Nothing here ships yet:
 
 Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 
+### Count-only text membership
+
+Scalar byte `COUNT(DISTINCT)` can represent one byte prefix of at most 16 bytes followed by
+canonical decimal suffixes using exact paged bitmaps. The first demanded non-NULL
+value selects the representation. Each observed 4096-value page costs 512 bytes;
+the optional policy permits at most 128 KiB of bits. Leading zeros, other prefixes
+and larger suffixes retain ordinary byte membership. Local dictionary codes are
+resolved through their own entries. Checkpoints write every original key exactly,
+so replay preserves membership before continuing the input. Growth certificates
+include page metadata and the actual half-full byte-table growth boundary.
+
 ## Module map
 
 | Module        | Owner track                      | What it is                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |

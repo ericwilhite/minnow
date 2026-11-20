@@ -17,6 +17,52 @@
  * (`packages/db/tests/oracle-reach.ts`). Like ./seeds.ts, this module is excluded from the
  * published tarball.
  */
+export const B9_DECIMAL_SUFFIX_REACH = [
+  "flat",
+  "dictionary",
+  "constant",
+  "PG first rows",
+  "bitmap",
+  "sparse pages",
+  "generic first",
+  "members",
+  "restored",
+  "NULL",
+  "leading zero fallback",
+  "large suffix fallback",
+  "other prefix fallback",
+  "dictionary identity",
+  "selection",
+  "owned prefix",
+  "funded growth",
+  "empty prefix",
+  "UTF8 prefix",
+  "released",
+] as const;
+
+export const B9_DECIMAL_SUFFIX_PRESSURE_REACH = [
+  "checkpoint",
+  "no holdings between phases",
+  "PG count",
+  "membership before suffix",
+  "local dictionaries",
+  "selection",
+  "16 MiB",
+  "released",
+] as const;
+/** Scalar exact DISTINCT funds the actual slot-load boundary before allocating. */
+export const B9_SCALAR_DISTINCT_GROWTH_REACH = [
+  "first slot growth",
+  "later slot growth",
+  "flat",
+  "dictionary",
+  "NULL",
+  "selection",
+  "PostgreSQL count",
+  "bounded charge",
+  "released",
+] as const;
+
 export const EXECUTION_RETIREMENT_REACH = [
   "task-yield cancellation",
   "IO cancellation",
