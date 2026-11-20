@@ -1038,6 +1038,7 @@ class ComposedSession implements EngineSession {
     if (this.#state === "open" && this.#tx !== null) {
       const tx = this.#tx;
       const statement = tx.statement({
+        readOnly: true,
         rules: this.#rules(() => statement.catalog),
         signal: context.signal,
       });

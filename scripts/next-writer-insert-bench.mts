@@ -15,6 +15,7 @@ const option = (name: string, fallback = "") => {
 const shapes = {
   narrow: { rows: 8192, width: 8 },
   wide: { rows: 4096, width: 96 },
+  wide_text: { rows: 4096, width: 96, text: true },
 };
 type Shape = keyof typeof shapes;
 interface Sample {
@@ -29,7 +30,9 @@ if (process.argv.includes("--worker")) {
   const native = (await import(
     pathToFileURL(join(runtime, "packages/core/dist/next/write/test-support.js")).href
   )) as typeof import("../packages/core/src/next/write/test-support.js");
-  const { rows, width } = shapes[shape];
+  const specification = shapes[shape];
+  const { rows, width } = specification;
+  const text = "text" in specification && specification.text;
   let cpuMs = 0,
     wallMs = 0;
   for (let round = 0; round < 3; round++) {
@@ -42,7 +45,7 @@ if (process.argv.includes("--worker")) {
           table: native.tableInput(
             "ordinary",
             Array.from({ length: width }, (_, c) =>
-              native.column(`c${String(c)}`, native.INT, false),
+              native.column(`c${String(c)}`, text ? native.TEXT : native.INT, false),
             ),
             { primaryKey: null },
           ),
@@ -51,7 +54,11 @@ if (process.argv.includes("--worker")) {
       await path.quiesce();
       const input = native.batch(
         ...Array.from({ length: width }, (_, c) =>
-          native.ints(Array.from({ length: rows }, (_, r) => (r * 31 + c * 997) % 10007)),
+          text
+            ? native.texts(
+                Array.from({ length: rows }, (_, r) => `row:${String(r % 97)}:c${String(c)}`),
+              )
+            : native.ints(Array.from({ length: rows }, (_, r) => (r * 31 + c * 997) % 10007)),
         ),
       );
       const cpu = process.cpuUsage(),
@@ -67,7 +74,10 @@ if (process.argv.includes("--worker")) {
         if (output.length !== rows) throw new Error("Insert row count differs");
         for (let r = 0; r < rows; r++)
           for (let c = 0; c < width; c++)
-            if (output[r]?.[c] !== (r * 31 + c * 997) % 10007)
+            if (
+              output[r]?.[c] !==
+              (text ? `row:${String(r % 97)}:c${String(c)}` : (r * 31 + c * 997) % 10007)
+            )
               throw new Error("Insert value differs");
       } finally {
         pin.release();

@@ -3,7 +3,7 @@ import fc from "fast-check";
 import { expect, it } from "vitest";
 import { createReach, PREPARED_ROW_CREDIT_REACH } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
-import { Governor } from "../memory/governor.js";
+import { Governor, type Grant } from "../memory/governor.js";
 import { yieldTask } from "../task.js";
 import { WriteCredits, WRITE_ROW_STEP_BYTES } from "./credits.js";
 const KiB = 1024;
@@ -23,6 +23,7 @@ it.each(seedsFor("next-prepared-row-credit", [0xb5eb]))(
             credits = await WriteCredits.open(governor, minimum);
           let step: ReturnType<WriteCredits["protectRows"]> | null = null,
             holder: Awaited<ReturnType<Governor["admit"]>> | null = null;
+          const otherBuffers = new Map<Grant, Uint8Array>();
           try {
             expect(credits.rows.tryGrow(1024 * KiB)).toBe(true);
             expect(credits.rows.allocate(live)).toBe(true);
@@ -49,6 +50,15 @@ it.each(seedsFor("next-prepared-row-credit", [0xb5eb]))(
             credits.reclaimRows();
             expect(credits.rows.held).toBe(floor);
             reach.reach("merge keeps floor");
+            // Dormant WAL/merge forecasts are revocable under governor rules2/4/7.
+            // Own real buffers here so growth must wait rather than legally
+            // taking those estimates instead of the prepared row's credit.
+            for (const account of [credits.commits, credits.merge]) {
+              const bytes = account.held;
+              expect(account.allocate(bytes)).toBe(true);
+              otherBuffers.set(account, new Uint8Array(bytes).fill(43));
+            }
+            reach.reach("other accounts own actual buffers");
             // A metadata transfer may not steal the writer's next step while all other capacity is live.
             const spare = governor.capBytes - governor.reserveBytes - governor.usedBytes;
             holder = await governor.admit({
@@ -74,6 +84,7 @@ it.each(seedsFor("next-prepared-row-credit", [0xb5eb]))(
             await yieldTask();
             expect(settled).toBe(false);
             expect(credits.rows.held).toBe(floor);
+            for (const buffer of otherBuffers.values()) expect(buffer.at(-1)).toBe(43);
             reach.reach("metadata transfer keeps floor");
             stop.abort(new Error("cancel competing metadata request"));
             expect(await pending).toBeInstanceOf(Error);
@@ -104,6 +115,12 @@ it.each(seedsFor("next-prepared-row-credit", [0xb5eb]))(
           } finally {
             step?.release();
             holder?.close();
+            for (const [account, buffer] of otherBuffers) {
+              const bytes = buffer.byteLength;
+              expect(buffer.at(-1)).toBe(43);
+              otherBuffers.delete(account);
+              account.free(bytes);
+            }
             credits.close();
           }
           expect(governor.usedBytes).toBe(0);
