@@ -90,6 +90,36 @@ test.describe("rebuild core storage on OPFS", () => {
     }
   });
 
+  test("reports where a stalled verification stopped, with locks before termination", async ({
+    page,
+  }) => {
+    test.setTimeout(120_000);
+    // The stall report's own check: a verifier that never returns from "audit".
+    const result = await page.evaluate(async (url) => {
+      return ((await import(url)) as Run).runKillDuringPublish(3, 0x6b11, {
+        stallAt: "audit",
+        verifyStallMs: 5_000,
+      });
+    }, RUN);
+    const failure = result.failure;
+    expect(failure).not.toBeNull();
+    if (!failure) return;
+    expect(failure.iteration).toBe(0);
+    expect(failure.stage).toMatch(/^verifying after the kill in round /u);
+    expect(failure.error).toBe("the verification did not finish in 5000 ms");
+    expect(failure.steps.at(-1)).toMatch(/ms: audit$/u);
+    // The stalled verifier still owned the store: its lock shows only before termination.
+    const before = failure.locksBeforeTermination as { held: string[]; pending: string[] };
+    expect(before.held.length).toBeGreaterThan(0);
+    const after = failure.afterTermination as {
+      held: string[];
+      pending: string[];
+      files: Record<string, string>;
+    };
+    expect(after.held).toEqual([]);
+    expect(Object.values(after.files).every((outcome) => outcome.startsWith("free"))).toBe(true);
+  });
+
   test("survives the owner's tab closing during publish", async ({ context, page }) => {
     test.setTimeout(120_000);
     for (let attempt = 0; attempt < 3; attempt++) {

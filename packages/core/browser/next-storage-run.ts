@@ -46,7 +46,7 @@ interface StorageWorker {
 }
 
 /** How many traced steps a worker keeps for a stall report. */
-const TRACE_KEEP = 12;
+const TRACE_KEEP = 40;
 
 async function spawn(): Promise<StorageWorker> {
   const worker = new Worker(new URL("./next-storage-worker.ts", import.meta.url), {
@@ -224,18 +224,57 @@ export interface KillFailure {
   readonly error: string;
   /** The last steps the waited-on worker traced (the verifier's platform calls, for example). */
   readonly steps: readonly string[];
-  /** After a stalled verification: this store's locks and each file's sync handle, probed alone. */
-  readonly diagnosis: unknown;
+  /**
+   * A stalled verification only. Its locks are snapshot BEFORE the verifier is terminated:
+   * termination releases a worker's locks and withdraws its pending requests, so afterwards
+   * they would prove nothing. Then, after termination, a fresh worker's view: the locks again
+   * and each file's sync handle opened alone until free (its streamed steps if it stalls too).
+   */
+  readonly locksBeforeTermination: unknown;
+  readonly afterTermination: unknown;
 }
 
 /**
- * Per stage of one iteration, the longest the page waits before it reports a stall. Hosted
- * Firefox completes a whole iteration in about 1 s (reopen 38-232 ms, two CI runs on
- * 2026-11-20); a loaded 8-core host, in about 5 s. A verification beyond 30 s is a stall.
+ * How long the page waits for one verification before it reports a stall. Measured: hosted
+ * Firefox completes a whole iteration in about 1 s (two CI runs, 2026-11-20); 480 local
+ * iterations under 6 parallel Firefoxes and a vitest load took median 1,775 ms, p95 2,944 ms,
+ * max 12,393 ms per verification. 30 s is about 2.4 times that maximum.
  */
 const VERIFY_STALL_MS = 30_000;
 /** How long the stall diagnosis probes each file's sync handle for release. */
 const DIAGNOSIS_PROBE_MS = 10_000;
+
+/** This store's held and pending Web Locks, from the page, bounded (2 s). */
+async function lockSnapshot(dir: string): Promise<unknown> {
+  const ours = (list: readonly LockInfo[] | undefined) =>
+    (list ?? [])
+      .filter((info) => info.name?.includes(`next-test:${dir}`) === true)
+      .map((info) => `${info.name ?? ""} (${info.mode ?? ""})`);
+  try {
+    const query = await within(navigator.locks.query(), 2_000, "locks.query");
+    return { held: ours(query.held), pending: ours(query.pending) };
+  } catch (error) {
+    return String(error);
+  }
+}
+
+/** After termination: a fresh worker's lock view and handle probes, terminated by the page on
+ * its deadline; if it stalls, the steps it streamed so far. */
+async function diagnoseAfterTermination(dir: string): Promise<unknown> {
+  let worker: StorageWorker | null = null;
+  try {
+    worker = await spawn();
+    return await within(
+      worker.call({ op: "diagnose-opfs", dir, probeMs: DIAGNOSIS_PROBE_MS }),
+      DIAGNOSIS_PROBE_MS * 2 + 20_000,
+      "the OPFS diagnosis",
+    );
+  } catch (error) {
+    return { error: String(error), steps: [...(worker?.steps ?? [])] };
+  } finally {
+    worker?.terminate();
+  }
+}
 
 /** `work`, or a rejection naming `what` once `ms` have passed. */
 async function within<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
@@ -262,7 +301,20 @@ async function within<T>(work: Promise<T>, ms: number, what: string): Promise<T>
  * before, every blob of both verifies, the free map is exact (`audit`), and the next owner keeps
  * writing. Each phase is the target of every third iteration.
  */
-export async function runKillDuringPublish(iterations: number, seed: number): Promise<KillResult> {
+export interface KillOptions {
+  /** Trace the verifier's steps and platform calls (default true; false to measure overhead). */
+  readonly trace?: boolean;
+  /** Test hook: the verifier never returns from this step (the stall report's own check). */
+  readonly stallAt?: string;
+  /** The verification deadline (default `VERIFY_STALL_MS`). */
+  readonly verifyStallMs?: number;
+}
+
+export async function runKillDuringPublish(
+  iterations: number,
+  seed: number,
+  options: KillOptions = {},
+): Promise<KillResult> {
   let state = seed >>> 0;
   const random = () => {
     state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
@@ -276,21 +328,14 @@ export async function runKillDuringPublish(iterations: number, seed: number): Pr
     const warmup = 2 + Math.floor(random() * 4);
     const started = performance.now();
     let stage = "spawning the writer";
-    let waited: StorageWorker | null = null;
+    let waited: StorageWorker | null = null,
+      locksBeforeTermination: unknown = null;
     const stop = async (error: unknown, diagnose: boolean): Promise<KillResult> => {
       const steps = waited?.steps ?? [];
       waited?.terminate();
-      // The diagnosis probes OPFS sync handles; the IndexedDB runs have none.
-      const diagnosis =
-        diagnose && store === "opfs"
-          ? await within(
-              withWorker((worker) =>
-                worker.call({ op: "diagnose-opfs", dir, probeMs: DIAGNOSIS_PROBE_MS }),
-              ),
-              DIAGNOSIS_PROBE_MS * 2 + 20_000,
-              "the OPFS diagnosis",
-            ).catch((failure: unknown) => String(failure))
-          : null;
+      // The handle probes are OPFS sync handles; the IndexedDB runs have none.
+      const afterTermination =
+        diagnose && store === "opfs" ? await diagnoseAfterTermination(dir) : null;
       return {
         iterations: results,
         failure: {
@@ -300,7 +345,8 @@ export async function runKillDuringPublish(iterations: number, seed: number): Pr
           elapsedMs: Math.round(performance.now() - started),
           error: error instanceof Error ? error.message : String(error),
           steps: [...steps],
-          diagnosis,
+          locksBeforeTermination,
+          afterTermination,
         },
       };
     };
@@ -332,10 +378,20 @@ export async function runKillDuringPublish(iterations: number, seed: number): Pr
       stage = `verifying after the kill in round ${String(killedRound)}`;
       try {
         verified = await within(
-          verifier.call({ op: "verify", dir, minAcked: acked }),
-          VERIFY_STALL_MS,
+          verifier.call({
+            op: "verify",
+            dir,
+            minAcked: acked,
+            ...(options.trace === false ? { trace: false } : {}),
+            ...(options.stallAt === undefined ? {} : { stallAt: options.stallAt }),
+          }),
+          options.verifyStallMs ?? VERIFY_STALL_MS,
           "the verification",
         );
+      } catch (error) {
+        // Before termination releases the verifier's locks and withdraws its requests.
+        locksBeforeTermination = await lockSnapshot(dir);
+        throw error;
       } finally {
         verifier.terminate();
       }
