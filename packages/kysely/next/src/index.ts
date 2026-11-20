@@ -1,6 +1,6 @@
+import { NativeKyselyAdapter as Adapter } from "./adapter.js";
 /** Internal native dialect qualification. No package export points at this entry. */
 import {
-  DialectAdapterBase,
   type ColumnMetadata,
   type DatabaseIntrospector,
   type DatabaseMetadataOptions,
@@ -69,24 +69,10 @@ class Introspector implements DatabaseIntrospector {
     return tables.sort((a, b) => a.name.localeCompare(b.name));
   }
 }
-class Adapter extends DialectAdapterBase {
-  override get supportsMultipleConnections() {
-    return true;
-  }
-  override get supportsReturning() {
-    return true;
-  }
-  acquireMigrationLock(): Promise<void> {
-    return Promise.resolve();
-  }
-  releaseMigrationLock(): Promise<void> {
-    return Promise.resolve();
-  }
-}
 export class NativeMinnowDialect implements Dialect {
   constructor(readonly config: NativeDialectConfig) {}
   createAdapter() {
-    return new Adapter();
+    return new Adapter(this.config.resultDecoding);
   }
   createDriver() {
     return new NativeKyselyDriver(this.config.driver, this.config.resultDecoding);
@@ -98,7 +84,4 @@ export class NativeMinnowDialect implements Dialect {
     return new Introspector(this.config);
   }
 }
-/** B8's live runtime owns execution/subscription; this binding must not emulate it. */
-export function nativeLiveQuery(): never {
-  throw new Error("Native Kysely live queries are not yet bound");
-}
+export { nativeLiveQuery } from "./live.js";

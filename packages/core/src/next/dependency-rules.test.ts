@@ -24,7 +24,7 @@ const ALLOWED: Readonly<Record<string, readonly string[]>> = {
   format: [".", "hash", "storage", "memory"],
   page: [".", "hash", "vector", "keys", "storage", "format", "memory"],
   spill: ["hash", "storage"],
-  memory: ["vector"],
+  memory: [".", "vector"],
   keys: [".", "hash", "vector", "memory"],
   ir: [".", "vector"],
   // Storage access contracts (track B3): the write path implements them; the executor, lowering
@@ -35,7 +35,7 @@ const ALLOWED: Readonly<Record<string, readonly string[]>> = {
   write: [".", "hash", "vector", "keys", "storage", "format", "memory", "access", "page"],
   lower: [".", "ir", "vector", "access"],
   // B8 is an owner-adjacent consumer; owner references here are contracts only.
-  live: ["access", "memory", "storage", "owner"],
+  live: [".", "access", "memory", "storage", "owner"],
   owner: [
     "live",
     ".",
