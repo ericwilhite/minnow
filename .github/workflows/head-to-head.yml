@@ -14,8 +14,8 @@ on:
   workflow_dispatch:
     inputs:
       rounds:
-        description: "Alternating timed rounds per cell"
-        default: "5"
+        description: "Alternating timed rounds per cell (default 5; 9 for a candidate screen)"
+        default: ""
       shipped:
         description: "Published @minnowdb/core version to compare against"
         default: "0.20.0"
@@ -28,12 +28,14 @@ permissions:
 
 concurrency:
   # One queue per ref and candidate: a candidate screen never replaces the nightly run.
-  group: head-to-head-${{ github.ref }}-${{ inputs.candidate || 'nightly' }}
+  # Group names are case-insensitive: separate schedule from dispatch, and a candidate screen
+  # (keyed by its ref) from the published-engine table, so no pending run replaces another.
+  group: head-to-head-${{ github.event_name }}-${{ github.ref }}-${{ inputs.candidate != '' && format('candidate-{0}', inputs.candidate) || 'published' }}
   cancel-in-progress: false
 
 jobs:
   measure:
-    name: ${{ matrix.dataset }} main vs ${{ inputs.candidate || inputs.shipped || '0.20.0' }}
+    name: ${{ matrix.dataset }} ${{ github.ref_name }} vs ${{ inputs.candidate || inputs.shipped || '0.20.0' }}
     runs-on: ubuntu-latest
     # Measured locally at full size: W1M loads both engines in about five minutes and runs its 29
     # cells in about half an hour; a hosted runner is slower. S1 is much smaller.
@@ -44,7 +46,8 @@ jobs:
         dataset: [W1M, S1]
     env:
       SHIPPED: ${{ inputs.shipped || '0.20.0' }}
-      ROUNDS: ${{ inputs.rounds || '5' }}
+      # The published table reports ratios (5 rounds); a candidate screen's leads need 9 pairs.
+      ROUNDS: ${{ inputs.rounds || (inputs.candidate != '' && '9' || '5') }}
       CANDIDATE: ${{ inputs.candidate || '' }}
     steps:
       - uses: actions/checkout@v5

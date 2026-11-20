@@ -18,9 +18,10 @@ import { execFileSync } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { cpus, totalmem } from "node:os";
 import { join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 import { startCPUWorker, type CPUValue, type Verification } from "./lib/independent-cpu.mts";
+import { compareAnswers, type AnswerComparison, type AnswerDigest } from "./lib/answers.mts";
 import type { HeadToHeadData } from "./head-to-head-worker.mts";
 
 type Dataset = "W1M" | "S1";
@@ -34,7 +35,10 @@ interface Sample {
 }
 interface Cell {
   readonly id: string;
+  /** Rows and fingerprint per arm; the full answers are compared at run time, not stored. */
   readonly verification: Partial<Record<Arm, Verification | { error: string }>>;
+  /** Both arms' complete answers compared (lib/answers.mts); absent when an arm failed. */
+  answers?: AnswerComparison;
   readonly samples: Sample[];
   readonly errors: Partial<Record<Arm, string>>;
 }
@@ -43,6 +47,8 @@ export interface HeadToHeadResult {
   readonly started: string;
   readonly finished: string;
   readonly revision: string;
+  /** The baseline actually measured: the checked-out ref (not necessarily main). */
+  readonly baseline: { ref: string; revision: string };
   readonly shipped: { version: string; root: string; integrity: string | null };
   /** Set in candidate mode: the second arm is this checkout's next/ engine, not a package. */
   readonly candidate?: { root: string; revision: string };
@@ -58,6 +64,31 @@ export interface HeadToHeadResult {
 }
 
 const repository = resolve(import.meta.dirname, "..");
+interface QueryInfo {
+  readonly id: string;
+  readonly ordered?: boolean;
+}
+const INTERNAL =
+  "_Internal diagnostic, not a published benchmark: Node over memory storage on a shared hosted runner._";
+/** Results written before the baseline record named their ref as the checkout. */
+const baselineOf = (result: HeadToHeadResult) =>
+  (result as Partial<HeadToHeadResult>).baseline ?? {
+    ref: "unknown ref",
+    revision: result.revision,
+  };
+const METHOD_LABEL: Record<AnswerComparison["method"], string> = {
+  inline: "every value, floats ±1e-9 rel",
+  "ordered-hash": "every value, exact",
+  "multiset-hash": "every value, exact",
+  fixture: "unordered LIMIT: each row checked against the fixture",
+};
+/** Answer status with its method; an arm that failed has no comparison. */
+const answerText = (cell: Cell): string =>
+  cell.answers === undefined
+    ? "—"
+    : cell.answers.same
+      ? `same (${METHOD_LABEL[cell.answers.method]})`
+      : `**differ** (${cell.answers.method}${cell.answers.detail === undefined ? "" : `: ${cell.answers.detail.replaceAll("|", "\\|").slice(0, 60)}`})`;
 const ERROR_TEXT = 300;
 const brief = (error: unknown): string =>
   (error instanceof Error ? error.message : String(error))
@@ -66,7 +97,7 @@ const brief = (error: unknown): string =>
     .slice(0, ERROR_TEXT);
 
 /** Gate B cells, from the committed browser-lane baseline so the two lanes name the same set. */
-async function gateBCells(dataset: Dataset): Promise<string[]> {
+export async function gateBCells(dataset: Dataset): Promise<string[]> {
   const baseline = JSON.parse(
     await readFile(join(repository, "packages/core/browser-perf-baseline.json"), "utf8"),
   ) as { targets: Record<string, { gate?: string }> };
@@ -129,12 +160,27 @@ async function run(): Promise<void> {
       : { version: `candidate ${candidateRevision.slice(0, 10)}` };
   const only = new Set(values.only.split(",").filter(Boolean));
   const cells = (await gateBCells(dataset)).filter((id) => only.size === 0 || only.has(id));
+  const catalogue = (await import(
+    pathToFileURL(join(repository, "scripts/next-executor-workload/queries.mjs")).href
+  )) as { W_QUERIES: QueryInfo[]; S_QUERIES: QueryInfo[] };
+  const orderedCells = new Set(
+    [...catalogue.W_QUERIES, ...catalogue.S_QUERIES]
+      .filter((query) => query.ordered === true)
+      .map((query) => query.id),
+  );
   if (cells.length === 0) throw new Error("no cells selected");
   await mkdir(output, { recursive: true });
   const revision = execFileSync("git", ["rev-parse", "HEAD"], {
     cwd: repository,
     encoding: "utf8",
   }).trim();
+  // A dispatched branch is not main: name the ref that was actually checked out.
+  const baselineRef =
+    process.env.GITHUB_REF_NAME ??
+    execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
+      cwd: repository,
+      encoding: "utf8",
+    }).trim();
   let integrity: string | null = null;
   try {
     integrity = (await readFile(join(shippedRoot, "..", "integrity.txt"), "utf8")).trim();
@@ -189,6 +235,7 @@ async function run(): Promise<void> {
       started,
       finished,
       revision,
+      baseline: { ref: baselineRef, revision },
       shipped: { version: shippedPackage.version, root: shippedRoot, integrity },
       ...(candidateRevision === null || candidateRoot === null
         ? {}
@@ -209,17 +256,28 @@ async function run(): Promise<void> {
   try {
     for (const id of cells) {
       const cell: Cell = { id, verification: {}, samples: [], errors: { ...startupErrors } };
+      const answers: Partial<Record<Arm, AnswerDigest>> = {};
       results.push(cell);
       for (const arm of ["next", "shipped"] as const) {
         const worker = workers[arm];
         if (worker === undefined) continue;
         try {
-          cell.verification[arm] = await worker.ask<Verification>({ op: "verify", workload: id });
+          const checked = await worker.ask<Verification & { answer: AnswerDigest }>({
+            op: "verify",
+            workload: id,
+          });
+          answers[arm] = checked.answer;
+          cell.verification[arm] = {
+            fingerprint: checked.fingerprint,
+            ...(checked.rows === undefined ? {} : { rows: checked.rows }),
+          };
         } catch (error) {
           cell.errors[arm] = brief(error);
           cell.verification[arm] = { error: cell.errors[arm] };
         }
       }
+      if (answers.next !== undefined && answers.shipped !== undefined)
+        cell.answers = compareAnswers(answers.next, answers.shipped, orderedCells.has(id));
       log({ id, phase: "verified", verification: cell.verification });
       for (let round = 0; round < rounds; round++) {
         const order: Arm[] = round % 2 === 0 ? ["next", "shipped"] : ["shipped", "next"];
@@ -282,17 +340,20 @@ function reportCandidate(results: readonly HeadToHeadResult[]): string {
   const first = results[0];
   if (first?.candidate === undefined) throw new Error("not a candidate run");
   const lines = [
-    `## Candidate vs main (next/ engine, frames boundary)`,
+    `## Candidate screen: ${first.candidate.revision.slice(0, 10)} vs ${baselineOf(first).ref} (next/ engine, frames boundary)`,
     "",
-    `main \`${first.revision.slice(0, 10)}\` · candidate \`${first.candidate.revision.slice(0, 10)}\` · Node ${first.node} · ${first.cpu ?? "unknown CPU"} · ${first.rounds} alternating rounds · 256 MiB on both`,
+    INTERNAL,
     "",
-    "Process CPU in ms. Δ = candidate − main per round; a gain or regression needs |median Δ| above its IQR and at least 7 of 9 rounds the same way (the paired-CPU rule), otherwise it is inconclusive. One shared runner, one process per arm: an A/A run of identical builds (run 44670745106) flagged 4 of 45 cells, so read a single verdict as a lead to check with the paired probe, never as acceptance. Identical answers are the dependable part.",
+    `baseline \`${baselineOf(first).ref}\` \`${first.revision.slice(0, 10)}\` · candidate \`${first.candidate.revision.slice(0, 10)}\` · Node ${first.node} · ${first.cpu ?? "unknown CPU"} · ${first.rounds} alternating rounds · 256 MiB on both`,
     "",
-    "| Cell | main | candidate | Δ median | IQR | candidate faster | verdict | answers |",
-    "|---|---:|---:|---:|---:|---:|---|---|",
+    "**A screen for leads, never a speed claim** (claims use `scripts/next-claim.mts`). One long-lived process per arm biases cells: an A/A run of identical builds (run 44670745106) flagged 4 of 45. Process CPU in ms; Δ = candidate − baseline per round. A lead needs every requested pair, at least nine, |median Δ| above the IQR and at least 7 of 9 rounds the same way; fewer complete pairs show as insufficient.",
+    "",
+    "| Cell | baseline | candidate | Δ median | IQR | candidate faster | lead | answers | failures |",
+    "|---|---:|---:|---:|---:|---:|---|---|---|",
   ];
   const regressions: string[] = [],
-    gains: string[] = [];
+    gains: string[] = [],
+    insufficient: string[] = [];
   for (const result of results)
     for (const cell of result.cells) {
       const by = (arm: Arm) =>
@@ -308,39 +369,50 @@ function reportCandidate(results: readonly HeadToHeadResult[]): string {
         .map((round) => (candidate.get(round) ?? NaN) - (main.get(round) ?? NaN))
         .sort((a, b) => a - b);
       const name = `${result.dataset}/${cell.id}`;
-      const a = cell.verification.next,
-        b = cell.verification.shipped;
-      const answers =
-        a === undefined || b === undefined || "error" in a || "error" in b
-          ? "—"
-          : a.fingerprint === b.fingerprint && a.rows === b.rows
-            ? "same"
-            : "**differ**";
-      if (deltas.length === 0) {
-        lines.push(`| ${name} | — | — | — | — | — | error | ${answers} |`);
+      const answers = answerText(cell);
+      const failures = (["next", "shipped"] as const)
+        .flatMap((arm) => {
+          const error = cell.errors[arm];
+          return error === undefined
+            ? []
+            : [
+                `${arm === "next" ? "baseline" : "candidate"}: ${error.replaceAll("|", "\\|").slice(0, 60)}`,
+              ];
+        })
+        .join("; ");
+      // A lead needs every requested pair and at least nine (the 7-of-9 rule); a partial or
+      // failed cell shows how many pairs completed and why, never a verdict.
+      const complete = deltas.length === result.rounds && result.rounds >= 9;
+      if (!complete) {
+        insufficient.push(name);
+        lines.push(
+          `| ${name} | — | — | — | — | ${String(deltas.length)}/${String(result.rounds)} | insufficient pairs | ${answers} | ${failures} |`,
+        );
         continue;
       }
       const middle = quantile(deltas, 0.5),
         iqr = quantile(deltas, 0.75) - quantile(deltas, 0.25),
         faster = deltas.filter((delta) => delta < 0).length,
-        need = Math.ceil((7 / 9) * deltas.length);
+        need = Math.ceil((7 / 9) * result.rounds);
       const verdict =
         Math.abs(middle) > iqr && middle < 0 && faster >= need
-          ? "gain"
+          ? "lead: faster"
           : Math.abs(middle) > iqr && middle > 0 && deltas.length - faster >= need
-            ? "**regression**"
-            : "inconclusive";
-      if (verdict === "gain") gains.push(name);
-      if (verdict !== "gain" && verdict !== "inconclusive") regressions.push(name);
+            ? "**lead: slower**"
+            : "no lead";
+      if (verdict === "lead: faster") gains.push(name);
+      if (verdict === "**lead: slower**") regressions.push(name);
       lines.push(
-        `| ${name} | ${format(median([...main.values()]))} | ${format(median([...candidate.values()]))} | ${format(middle, 2)} | ${format(iqr, 2)} | ${String(faster)}/${String(deltas.length)} | ${verdict} | ${answers} |`,
+        `| ${name} | ${format(median([...main.values()]))} | ${format(median([...candidate.values()]))} | ${format(middle, 2)} | ${format(iqr, 2)} | ${String(faster)}/${String(deltas.length)} | ${verdict} | ${answers} | ${failures} |`,
       );
     }
   lines.push(
     "",
-    `**Gains (${String(gains.length)}):** ${gains.join(", ") || "none"}`,
+    `**Leads, faster (${String(gains.length)}):** ${gains.join(", ") || "none"}`,
     "",
-    `**Regressions (${String(regressions.length)}):** ${regressions.join(", ") || "none"}`,
+    `**Leads, slower (${String(regressions.length)}):** ${regressions.join(", ") || "none"}`,
+    "",
+    `**Insufficient pairs (${String(insufficient.length)}):** ${insufficient.join(", ") || "none"}`,
     "",
   );
   return lines.join("\n");
@@ -355,15 +427,17 @@ export async function report(results: readonly HeadToHeadResult[]): Promise<stri
   if (first === undefined) throw new Error("no results");
   const v = first.shipped.version.split(".").slice(0, 2).join(".");
   const lines = [
-    `## Head-to-head: main vs published ${first.shipped.version}`,
+    `## Head-to-head: ${baselineOf(first).ref} vs published ${first.shipped.version}`,
     "",
-    `main \`${first.revision.slice(0, 10)}\` · \`@minnowdb/core@${first.shipped.version}\` · Node ${first.node} · ${first.cpu ?? "unknown CPU"} · ${Math.round(first.memoryBytes / 2 ** 30)} GiB · ${first.rounds} alternating rounds · 256 MiB execution budget on both`,
+    INTERNAL,
     "",
-    "Medians in ms. **Rows** materializes every result row on both engines (matched boundary); **frames** stops at main's columnar result frames. CPU is process user+system; target is the fixed DuckDB-Wasm warm wall time from the 1.0 proposal, compared here with main's frames wall time. Ratios above 1 mean main is slower. Shared hosted runner: read trends, not single cells.",
+    `baseline \`${baselineOf(first).ref}\` \`${first.revision.slice(0, 10)}\` · \`@minnowdb/core@${first.shipped.version}\` · Node ${first.node} · ${first.cpu ?? "unknown CPU"} · ${Math.round(first.memoryBytes / 2 ** 30)} GiB · ${first.rounds} alternating rounds · 256 MiB execution budget on both`,
+    "",
+    "Medians in ms. **Rows** materializes every result row on both engines (matched boundary); **frames** stops at the baseline's columnar result frames. CPU is process user+system; target is the fixed DuckDB-Wasm warm wall time from the 1.0 proposal, a browser number compared here with a Node frames wall time, so only a trend. Ratios above 1 mean the baseline is slower. Shared hosted runner: read trends, not single cells.",
     "",
     `Fixtures: ${results.map((r) => (r.dataset === "W1M" ? `W1M ${r.rows.toLocaleString("en-US")} rows × 200 columns` : `S1 star scale ${r.scale}`)).join(", ")}.`,
     "",
-    `| Cell | main rows CPU | ${v} rows CPU | main/${v} | main frames wall | target | frames/target | answers | note |`,
+    `| Cell | baseline rows CPU | ${v} rows CPU | baseline/${v} | baseline frames wall | target | frames/target | answers | note |`,
     "|---|---:|---:|---:|---:|---:|---:|---|---|",
   ];
   const versus: number[] = [],
@@ -396,14 +470,7 @@ export async function report(results: readonly HeadToHeadResult[]): Promise<stri
         datasetTarget.push(tt);
       }
       if (vs !== null && vs > 1) slower.push(`${result.dataset}/${cell.id}`);
-      const a = cell.verification.next,
-        b = cell.verification.shipped;
-      const answers =
-        a === undefined || b === undefined || "error" in a || "error" in b
-          ? "—"
-          : a.fingerprint === b.fingerprint && a.rows === b.rows
-            ? "same"
-            : `**differ** (${a.rows ?? "?"}/${b.rows ?? "?"} rows)`;
+      const answers = answerText(cell);
       const note = (["next", "shipped"] as const)
         .flatMap((arm) => {
           const error = cell.errors[arm];

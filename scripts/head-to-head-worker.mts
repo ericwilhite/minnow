@@ -13,10 +13,11 @@
  * verification and IPC are outside the clock.
  */
 import { createHash } from "node:crypto";
+import { cpus } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { CPUWorkerContext, CPUWorkerHarness } from "./lib/independent-cpu.mts";
-import { canonicalValue } from "./browser-perf/page/canonical.ts";
+import { AnswerCollector, checkFixtureRows } from "./lib/answers.mts";
 
 export interface HeadToHeadData {
   readonly engine: "next" | "shipped";
@@ -28,6 +29,12 @@ export interface HeadToHeadData {
   readonly capBytes: number;
   readonly deadlineMs: number;
   readonly workloads: readonly string[];
+  /** next only: restore this captured fixture image instead of building the fixture. */
+  readonly image?: string;
+  /** next only: the image's identity; restore refuses an image written for another one. */
+  readonly imageIdentity?: string;
+  /** Complete executions per timed bracket, per cell (default 1). Same for both arms. */
+  readonly repeats?: Readonly<Record<string, number>>;
 }
 interface Query {
   readonly id: string;
@@ -76,6 +83,8 @@ interface Star {
   ): Record<string, unknown[]>;
 }
 interface Engine {
+  /** next only: capture the loaded fixture as a native image (fresh fixtures only). */
+  capture?(directory: string, identity: string, signal: AbortSignal): Promise<unknown>;
   /** Runs one query to completion; `consume` sees each materialized row when given. */
   run(
     sql: string,
@@ -122,89 +131,101 @@ async function nextEngine(data: HeadToHeadData, signal: AbortSignal): Promise<En
   if (core.harness.governor.capBytes !== data.capBytes)
     (core.harness as { governor: InstanceType<GovernorModule["Governor"]> }).governor =
       new governor.Governor(data.capBytes);
+  const images = await import("./lib/native-storage-image.mts");
+  // A restored image skips the load; a fresh load records file capacities for its capture.
+  const monitor =
+    data.image === undefined ? images.monitorNativeCapacity(core.harness.backend) : null;
+  if (data.image !== undefined)
+    await images.restoreNativeImage(
+      core.harness.backend,
+      data.image,
+      data.imageIdentity ?? "",
+      signal,
+    );
   await core.open();
-  try {
-    const load = async (
-      name: string,
-      batches: (start: number, count: number) => object,
-      total: number,
-    ) => {
-      const table = core.harness.path.catalog.tableByName(name);
-      if (table === undefined) throw new Error(`${name} was not created`);
-      const grant = await core.harness.governor.admit({
-        label: `head-to-head/input/${name}`,
-        minimumBytes: 8 * 1024 * 1024,
-        spillable: true,
-      });
-      try {
-        for (let start = 0; start < total; start += vector.BATCH_ROWS) {
-          signal.throwIfAborted();
-          const count = Math.min(vector.BATCH_ROWS, total - start);
-          const batch = input.inputBatch(table, batches(start, count) as never, grant);
-          try {
-            await core.insertVectors(table, batch.batch);
-          } finally {
-            batch.close();
+  if (data.image === undefined)
+    try {
+      const load = async (
+        name: string,
+        batches: (start: number, count: number) => object,
+        total: number,
+      ) => {
+        const table = core.harness.path.catalog.tableByName(name);
+        if (table === undefined) throw new Error(`${name} was not created`);
+        const grant = await core.harness.governor.admit({
+          label: `head-to-head/input/${name}`,
+          minimumBytes: 8 * 1024 * 1024,
+          spillable: true,
+        });
+        try {
+          for (let start = 0; start < total; start += vector.BATCH_ROWS) {
+            signal.throwIfAborted();
+            const count = Math.min(vector.BATCH_ROWS, total - start);
+            const batch = input.inputBatch(table, batches(start, count) as never, grant);
+            try {
+              await core.insertVectors(table, batch.batch);
+            } finally {
+              batch.close();
+            }
           }
+        } finally {
+          grant.close();
         }
-      } finally {
-        grant.close();
-      }
-    };
-    if (data.dataset === "W1M") {
-      const generator = (await import(
-        pathToFileURL(join(workload, "gen.mjs")).href
-      )) as WideGenerator;
-      const spec = generator.wideSpec(200);
-      await core.execute(
-        `CREATE TABLE events_wide (${spec.map((c) => `${c.name} ${c.pg}`).join(",")})`,
-      );
-      await load(
-        "events_wide",
-        (start, count) => generator.wideBatch(spec, start, count, data.rows),
-        data.rows,
-      );
-      for (const dimension of generator.dimTables()) {
-        await core.execute(`CREATE TABLE ${dimension.name} ${WIDE_DDL_DIM}`);
-        await core.writeBatch(
-          "insertBatch",
-          dimension.name,
-          dimension.rows.map((row) => ({
-            k: row.key,
-            label: row.label,
-            tier: row.tier,
-            weight: row.weight,
-            active: row.active,
-          })),
-        );
-      }
-    } else {
-      const star = (await import(
-        pathToFileURL(join(repository, "apps/site/bench/benchmark.ts")).href
-      )) as Star;
-      const catalogue = (await import(
-        pathToFileURL(join(workload, "queries.mjs")).href
-      )) as Catalogue;
-      for (const entity of star.commerceEntities.filter((e) =>
-        catalogue.S_TABLES.includes(e.name),
-      )) {
-        const count = entity.rows(data.scale);
+      };
+      if (data.dataset === "W1M") {
+        const generator = (await import(
+          pathToFileURL(join(workload, "gen.mjs")).href
+        )) as WideGenerator;
+        const spec = generator.wideSpec(200);
         await core.execute(
-          `CREATE TABLE ${entity.name} (${entity.columns.map((c) => `${c.name} ${SQL_TYPES[c.type]}${c.name === entity.primaryKey ? " PRIMARY KEY" : ""}`).join(",")})`,
+          `CREATE TABLE events_wide (${spec.map((c) => `${c.name} ${c.pg}`).join(",")})`,
         );
         await load(
-          entity.name,
-          (start, n) => star.generateEntityBatch(entity, start, n, count, data.scale),
-          count,
+          "events_wide",
+          (start, count) => generator.wideBatch(spec, start, count, data.rows),
+          data.rows,
         );
+        for (const dimension of generator.dimTables()) {
+          await core.execute(`CREATE TABLE ${dimension.name} ${WIDE_DDL_DIM}`);
+          await core.writeBatch(
+            "insertBatch",
+            dimension.name,
+            dimension.rows.map((row) => ({
+              k: row.key,
+              label: row.label,
+              tier: row.tier,
+              weight: row.weight,
+              active: row.active,
+            })),
+          );
+        }
+      } else {
+        const star = (await import(
+          pathToFileURL(join(repository, "apps/site/bench/benchmark.ts")).href
+        )) as Star;
+        const catalogue = (await import(
+          pathToFileURL(join(workload, "queries.mjs")).href
+        )) as Catalogue;
+        for (const entity of star.commerceEntities.filter((e) =>
+          catalogue.S_TABLES.includes(e.name),
+        )) {
+          const count = entity.rows(data.scale);
+          await core.execute(
+            `CREATE TABLE ${entity.name} (${entity.columns.map((c) => `${c.name} ${SQL_TYPES[c.type]}${c.name === entity.primaryKey ? " PRIMARY KEY" : ""}`).join(",")})`,
+          );
+          await load(
+            entity.name,
+            (start, n) => star.generateEntityBatch(entity, start, n, count, data.scale),
+            count,
+          );
+        }
       }
+      await core.harness.path.recycleLog();
+      await core.harness.path.quiesce();
+    } catch (error) {
+      await core.close();
+      throw error;
     }
-    await core.harness.path.recycleLog();
-    await core.harness.path.quiesce();
-  } catch (error) {
-    await core.close();
-    throw error;
-  }
   return {
     async run(sql, boundary, querySignal, consume) {
       const lowered = core.lowerer.lower(sql, core.context());
@@ -271,7 +292,21 @@ async function nextEngine(data: HeadToHeadData, signal: AbortSignal): Promise<En
         run.release();
       }
     },
-    close: () => core.close(),
+    async capture(directory, identity, captureSignal) {
+      if (monitor === null) throw new Error("Only a freshly loaded fixture can be captured");
+      await core.harness.path.quiesce();
+      return images.captureNativeLease(
+        monitor.lease,
+        directory,
+        identity,
+        captureSignal,
+        monitor.stop(),
+      );
+    },
+    close: async () => {
+      monitor?.stop();
+      await core.close();
+    },
   };
 }
 
@@ -383,6 +418,19 @@ export default async function create(context: CPUWorkerContext): Promise<CPUWork
   );
   for (const id of data.workloads) if (!queries.has(id)) throw new Error(`Unknown cell ${id}`);
   const started = performance.now();
+  // The wide fixture's generator, for checking rows an unordered LIMIT may pick.
+  let expectedRow: ((id: number) => Record<string, unknown>) | null = null;
+  if (data.dataset === "W1M") {
+    const generator = (await import(
+      pathToFileURL(join(workload, "gen.mjs")).href
+    )) as WideGenerator;
+    const spec = generator.wideSpec(200);
+    expectedRow = (id) => {
+      // Row index i carries id i + 1.
+      const batch = generator.wideBatch(spec, id - 1, 1, data.rows);
+      return Object.fromEntries(Object.entries(batch).map(([name, values]) => [name, values[0]]));
+    };
+  }
   const engine =
     data.engine === "next"
       ? await nextEngine(data, context.signal)
@@ -420,37 +468,66 @@ export default async function create(context: CPUWorkerContext): Promise<CPUWork
       engine: data.engine,
       root: data.root,
       dataset: data.dataset,
+      image: data.image ?? null,
+      cpu: cpus()[0]?.model ?? "unknown",
       loadMs,
       memoryAfterLoad: process.memoryUsage(),
     },
     workloads: data.workloads,
     boundaries: data.engine === "next" ? ["rows", "frames"] : ["rows"],
     async verify(id) {
-      // One canonical fingerprint over the full result: order-sensitive only under a total
-      // ORDER BY. An unordered LIMIT compares its count; the export compares the committed
-      // benchmark digest (rows, SUM(id), non-null x00), as the browser lane does.
+      // Every value of the full result (lib/answers.mts): inline with tolerance when small,
+      // an exact ordered or multiset hash when large. An unordered LIMIT may return any rows,
+      // so each returned row is checked against the generator instead.
       const query = queries.get(id);
-      const hash = createHash("sha256"),
-        unordered: string[] = [];
-      let sum = 0,
-        present = 0;
+      if (query?.check === "count") {
+        if (expectedRow === null) throw new Error(`No fixture check for ${id}`);
+        const returned: Array<Record<string, unknown>> = [];
+        let names: readonly string[] = [];
+        const rows = await execute(id, "rows", (columns, row) => {
+          names = columns;
+          returned.push(row);
+        });
+        const answer = checkFixtureRows(returned, names, expectedRow);
+        return {
+          fingerprint: `fixture:${String(rows)}:${String(answer.mismatches?.length ?? 0)}`,
+          rows,
+          answer,
+        };
+      }
+      const collector = new AnswerCollector(query?.ordered === true);
       const rows = await execute(id, "rows", (columns, row) => {
-        if (query?.check === "count") return;
-        if (query?.kind === "export") {
-          sum += Number(row.id);
-          present += row.x00 === null || row.x00 === undefined ? 0 : 1;
-          return;
-        }
-        const line = JSON.stringify(columns.map((column) => canonicalValue(row[column])));
-        if (query?.ordered === true) hash.update(line);
-        else unordered.push(line);
+        collector.add(columns.map((column) => row[column]));
       });
-      for (const line of unordered.sort()) hash.update(line);
-      if (query?.kind === "export") hash.update(JSON.stringify([rows, sum, present]));
-      return { fingerprint: hash.digest("hex"), rows };
+      const answer = collector.finish();
+      const fingerprint =
+        answer.hash ?? createHash("sha256").update(JSON.stringify(answer.values)).digest("hex");
+      return { fingerprint, rows, answer };
     },
     async run(id, boundary) {
-      return { rows: await execute(id, boundary) };
+      // One bracket: a fixed number of complete executions, identical for both arms.
+      const repeats = data.repeats?.[id] ?? 1;
+      let rows = 0;
+      for (let k = 0; k < repeats; k++) rows = await execute(id, boundary);
+      return { rows, detail: { repeats } };
+    },
+    async command(name, value) {
+      if (name === "capture-image") {
+        const { directory, identity } = value as { directory: string; identity: string };
+        if (engine.capture === undefined) throw new Error("This engine cannot capture images");
+        return engine.capture(directory, identity, context.signal);
+      }
+      if (name === "time-cells") {
+        // One complete frames execution per cell, wall clock, to size brackets.
+        const times: Record<string, number> = {};
+        for (const id of data.workloads) {
+          const started = performance.now();
+          await execute(id, "frames");
+          times[id] = performance.now() - started;
+        }
+        return times;
+      }
+      throw new Error(`Unknown worker command ${name}`);
     },
     cancel(reason) {
       active?.abort(reason);

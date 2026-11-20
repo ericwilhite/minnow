@@ -1,0 +1,156 @@
+# Speed claims for the rebuild engine (next/): the protocol in scripts/next-claim.mts and the
+# testing reference's "Speed claims" section. Dispatch only; any claim that next/ is faster, or
+# not slower, cites one of these runs. Both refs are resolved to SHAs before anything is built,
+# and every table names them.
+name: next/ speed claim
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate:
+        description: "Candidate git ref (branch, tag or SHA)"
+        required: true
+      control:
+        description: "Control git ref"
+        default: "main"
+      targets:
+        description: "Comma-separated target cells the claim is about (all others are screened)"
+        default: ""
+      datasets:
+        description: "Datasets"
+        default: "both"
+        type: choice
+        options: [both, W1M, S1]
+      pairs:
+        description: "Fresh-process pairs per cell (at least 9; 15 lets the 45-cell screen pass Holm)"
+        default: "15"
+      only:
+        description: "Optional comma-separated subset of cells (default: every Gate B cell)"
+        default: ""
+      shards:
+        description: "Jobs per dataset"
+        default: "6"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: next-claim-${{ inputs.control }}-${{ inputs.candidate }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve refs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      control: ${{ steps.refs.outputs.control }}
+      candidate: ${{ steps.refs.outputs.candidate }}
+      datasets: ${{ steps.refs.outputs.datasets }}
+      shards: ${{ steps.refs.outputs.shards }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: refs
+        shell: bash
+        env:
+          CONTROL: ${{ inputs.control }}
+          CANDIDATE: ${{ inputs.candidate }}
+          DATASETS: ${{ inputs.datasets }}
+          SHARDS: ${{ inputs.shards }}
+        run: |
+          resolve() { git rev-parse --verify "origin/$1^{commit}" 2>/dev/null || git rev-parse --verify "$1^{commit}"; }
+          echo "control=$(resolve "$CONTROL")" >> "$GITHUB_OUTPUT"
+          echo "candidate=$(resolve "$CANDIDATE")" >> "$GITHUB_OUTPUT"
+          case "$DATASETS" in
+            both) echo 'datasets=["W1M","S1"]' >> "$GITHUB_OUTPUT" ;;
+            *) echo "datasets=[\"$DATASETS\"]" >> "$GITHUB_OUTPUT" ;;
+          esac
+          echo "shards=$(node -p "JSON.stringify(Array.from({length: Number(process.env.SHARDS)}, (_, i) => i))")" >> "$GITHUB_OUTPUT"
+
+  measure:
+    name: ${{ matrix.dataset }} shard ${{ matrix.shard }}
+    needs: resolve
+    runs-on: ubuntu-latest
+    # Measured: see the testing reference for the per-shard budget behind six W1M shards.
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        dataset: ${{ fromJSON(needs.resolve.outputs.datasets) }}
+        shard: ${{ fromJSON(needs.resolve.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: bash scripts/ci-install.sh
+      - name: Build control and candidate
+        shell: bash
+        env:
+          CONTROL: ${{ needs.resolve.outputs.control }}
+          CANDIDATE: ${{ needs.resolve.outputs.candidate }}
+        run: |
+          for arm in control candidate; do
+            ref=$([ "$arm" = control ] && echo "$CONTROL" || echo "$CANDIDATE")
+            git worktree add --detach "$RUNNER_TEMP/$arm" "$ref"
+            (cd "$RUNNER_TEMP/$arm" && npm ci --ignore-scripts --no-audit --no-fund && npx tsc -b packages/core)
+          done
+      - name: Measure
+        shell: bash
+        run: >-
+          mkdir -p claim &&
+          node scripts/next-claim.mts run
+          --dataset ${{ matrix.dataset }}
+          --shard ${{ matrix.shard }}/${{ inputs.shards }}
+          --only "${{ inputs.only }}"
+          --pairs "${{ inputs.pairs }}"
+          --targets "${{ inputs.targets }}"
+          --seed "${{ github.run_id }}"
+          --control "$RUNNER_TEMP/control"
+          --candidate "$RUNNER_TEMP/candidate"
+          --output "$RUNNER_TEMP/claim"
+          2> >(tee claim/${{ matrix.dataset }}-${{ matrix.shard }}.log >&2)
+          | tee claim/${{ matrix.dataset }}-${{ matrix.shard }}.md
+          && cp "$RUNNER_TEMP"/claim/claim-*.json claim/
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: claim-${{ matrix.dataset }}-${{ matrix.shard }}
+          path: claim/
+          retention-days: 90
+
+  report:
+    name: Claim table
+    needs: measure
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: claim-*
+          path: results
+          merge-multiple: true
+      - name: Write the table
+        shell: bash
+        run: |
+          files=$(ls results/claim-*.json 2>/dev/null || true)
+          if [ -z "$files" ]; then
+            echo "No claim results were produced." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          node scripts/next-claim.mts report $files | tee claim.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: claim-table
+          path: claim.md
+          retention-days: 90
