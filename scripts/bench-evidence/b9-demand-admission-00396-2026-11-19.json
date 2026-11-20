@@ -1,0 +1,3281 @@
+{
+  "status": "local component and intended rejects; hosted whole-cell and full gate pending",
+  "base": "00396b0f13a95e6ad504a62b19022af9dc9ebcc4",
+  "law": "Governor complete minimum, charge before allocation, optional grant/cancellable wait/spill, no hold-and-wait. PostgreSQL exact ordered INT/TEXT/NUMERIC results. Actual full physical-chunk coverage authorizes an output bound; declared widths choose enforced targets only. Captured source arrays remain charged until all pending work settles.",
+  "component": {
+    "kind": "small recipe component; not hosted whole-cell",
+    "rows": 2,
+    "limit": 1,
+    "capBytes": 67108864,
+    "warmups": 4,
+    "rounds": 9,
+    "repeats": 32,
+    "runtimes": [
+      "/home/eric/.cache/minnow-b9-prototypes/demand-cursor-current/parent",
+      "/home/eric/.cache/minnow-b9-prototypes/demand-cursor-current/candidate"
+    ],
+    "pairs": [
+      {
+        "round": 0,
+        "order": ["parent", "candidate"],
+        "values": [
+          {
+            "arm": "parent",
+            "cpuMs": 2.87659375,
+            "minimumBytes": 44170556
+          },
+          {
+            "arm": "candidate",
+            "cpuMs": 2.8919375,
+            "minimumBytes": 1222874
+          }
+        ]
+      },
+      {
+        "round": 1,
+        "order": ["candidate", "parent"],
+        "values": [
+          {
+            "arm": "candidate",
+            "cpuMs": 2.2365625,
+            "minimumBytes": 1222874
+          },
+          {
+            "arm": "parent",
+            "cpuMs": 3.16209375,
+            "minimumBytes": 44170556
+          }
+        ]
+      },
+      {
+        "round": 2,
+        "order": ["parent", "candidate"],
+        "values": [
+          {
+            "arm": "parent",
+            "cpuMs": 2.15965625,
+            "minimumBytes": 44170556
+          },
+          {
+            "arm": "candidate",
+            "cpuMs": 2.22,
+            "minimumBytes": 1222874
+          }
+        ]
+      },
+      {
+        "round": 3,
+        "order": ["candidate", "parent"],
+        "values": [
+          {
+            "arm": "candidate",
+            "cpuMs": 3.43159375,
+            "minimumBytes": 1222874
+          },
+          {
+            "arm": "parent",
+            "cpuMs": 2.44240625,
+            "minimumBytes": 44170556
+          }
+        ]
+      },
+      {
+        "round": 4,
+        "order": ["parent", "candidate"],
+        "values": [
+          {
+            "arm": "parent",
+            "cpuMs": 1.82853125,
+            "minimumBytes": 44170556
+          },
+          {
+            "arm": "candidate",
+            "cpuMs": 2.88815625,
+            "minimumBytes": 1222874
+          }
+        ]
+      },
+      {
+        "round": 5,
+        "order": ["candidate", "parent"],
+        "values": [
+          {
+            "arm": "candidate",
+            "cpuMs": 1.773625,
+            "minimumBytes": 1222874
+          },
+          {
+            "arm": "parent",
+            "cpuMs": 1.7165625,
+            "minimumBytes": 44170556
+          }
+        ]
+      },
+      {
+        "round": 6,
+        "order": ["parent", "candidate"],
+        "values": [
+          {
+            "arm": "parent",
+            "cpuMs": 1.9141875,
+            "minimumBytes": 44170556
+          },
+          {
+            "arm": "candidate",
+            "cpuMs": 2.4621875,
+            "minimumBytes": 1222874
+          }
+        ]
+      },
+      {
+        "round": 7,
+        "order": ["candidate", "parent"],
+        "values": [
+          {
+            "arm": "candidate",
+            "cpuMs": 2.170875,
+            "minimumBytes": 1222874
+          },
+          {
+            "arm": "parent",
+            "cpuMs": 2.67025,
+            "minimumBytes": 44170556
+          }
+        ]
+      },
+      {
+        "round": 8,
+        "order": ["parent", "candidate"],
+        "values": [
+          {
+            "arm": "parent",
+            "cpuMs": 2.97275,
+            "minimumBytes": 44170556
+          },
+          {
+            "arm": "candidate",
+            "cpuMs": 2.46503125,
+            "minimumBytes": 1222874
+          }
+        ]
+      }
+    ]
+  },
+  "componentSummary": {
+    "base": "00396b0f13a95e6ad504a62b19022af9dc9ebcc4",
+    "rounds": 9,
+    "parentMinimums": [44170556],
+    "candidateMinimums": [1222874],
+    "parentCpuMedianMs": 2.44240625,
+    "candidateCpuMedianMs": 2.4621875,
+    "pairedCandidateMinusParentMedianMs": 0.057062500000000016,
+    "pairedIqrMs": 1.047375,
+    "rangeMs": 1.9851562500000004,
+    "candidateFavorable": 3,
+    "cpuVerdict": "inconclusive"
+  },
+  "REDAndMutants": [
+    {
+      "name": "mutant-no-delta-lease",
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "--maxWorkers=2",
+        "packages/core/src/next/write/range-resident.test.ts"
+      ],
+      "exit": 1,
+      "intendedReject": true,
+      "expected": "to be greater than 0",
+      "log": "/home/eric/.cache/minnow-b9-logs/demand-current-mutants/demand-cursor-mutant-no-delta-lease.log"
+    },
+    {
+      "name": "actual-parent-red",
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "--maxWorkers=2",
+        "packages/core/src/next/testing/executor-demand-admission.test.ts",
+        "-t",
+        "native key-order demand"
+      ],
+      "exit": 1,
+      "intendedReject": true,
+      "expected": "to be less than or equal",
+      "log": "/home/eric/.cache/minnow-b9-logs/demand-current-mutants/demand-cursor-actual-parent-red.log"
+    },
+    {
+      "name": "mutant-no-resident",
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "--maxWorkers=2",
+        "packages/core/src/next/testing/executor-demand-admission.test.ts",
+        "-t",
+        "native key-order demand"
+      ],
+      "exit": 1,
+      "intendedReject": true,
+      "expected": "to be less than or equal",
+      "log": "/home/eric/.cache/minnow-b9-logs/demand-current-mutants/demand-cursor-mutant-no-resident.log"
+    },
+    {
+      "name": "mutant-target-floor",
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "--maxWorkers=2",
+        "packages/core/src/next/page/read-bounds-native-demand.test.ts"
+      ],
+      "exit": 1,
+      "intendedReject": true,
+      "expected": "to be",
+      "log": "/home/eric/.cache/minnow-b9-logs/demand-current-mutants/demand-cursor-mutant-target-floor.log"
+    },
+    {
+      "name": "mutant-partial-coverage",
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "--maxWorkers=2",
+        "packages/core/src/next/page/read-bounds-native-demand.test.ts"
+      ],
+      "exit": 1,
+      "intendedReject": true,
+      "expected": "to be greater than or equal",
+      "log": "/home/eric/.cache/minnow-b9-logs/demand-current-mutants/demand-cursor-mutant-partial-coverage.log"
+    },
+    {
+      "name": "mutant-wholebatch-rowloan",
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "--maxWorkers=2",
+        "packages/core/src/next/testing/executor-demand-admission.test.ts",
+        "-t",
+        "native key-order demand"
+      ],
+      "exit": 1,
+      "intendedReject": true,
+      "expected": "A prepaid sort row could not be stored",
+      "log": "/home/eric/.cache/minnow-b9-logs/demand-current-mutants/demand-cursor-mutant-wholebatch-rowloan.log"
+    },
+    {
+      "name": "mutant-early-retire",
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "--maxWorkers=2",
+        "packages/core/src/next/testing/executor-demand-admission.test.ts",
+        "-t",
+        "retains the sized resident"
+      ],
+      "exit": 1,
+      "intendedReject": true,
+      "expected": "The chunk reader needs",
+      "log": "/home/eric/.cache/minnow-b9-logs/demand-current-mutants/demand-cursor-mutant-early-retire.log"
+    },
+    {
+      "name": "mutant-early-cancel-release",
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "--maxWorkers=2",
+        "packages/core/src/next/write/range-resident.test.ts"
+      ],
+      "exit": 1,
+      "intendedReject": true,
+      "expected": "to be greater than 0",
+      "log": "/home/eric/.cache/minnow-b9-logs/demand-current-mutants/demand-cursor-mutant-early-cancel-release.log"
+    },
+    {
+      "name": "mutant-no-input-preflight",
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "--maxWorkers=2",
+        "packages/core/src/next/testing/executor-key-order-budget.test.ts"
+      ],
+      "exit": 1,
+      "intendedReject": true,
+      "expected": "a non-fitting optional strategy keeps its generic recipe",
+      "log": "/home/eric/.cache/minnow-b9-logs/demand-current-mutants/demand-cursor-mutant-no-input-preflight.log"
+    },
+    {
+      "name": "mutant-diagnostic-underreserved",
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "--maxWorkers=2",
+        "packages/core/src/next/testing/executor-demand-admission.test.ts",
+        "-t",
+        "diagnostic cursor requests"
+      ],
+      "exit": 1,
+      "intendedReject": true,
+      "expected": "operator request must fit its completely reserved capacity",
+      "log": "/home/eric/.cache/minnow-b9-logs/demand-current-mutants/demand-cursor-mutant-diagnostic-underreserved.log"
+    },
+    {
+      "name": "demand-allocated-actual-parent-red",
+      "exit": 1,
+      "intendedReject": true,
+      "reason": "to be less than or equal",
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "--maxWorkers=2",
+        "packages/core/src/next/testing/executor-demand-admission.test.ts",
+        "-t",
+        "native key-order demand"
+      ]
+    },
+    {
+      "name": "demand-meter-group-blind-mutant",
+      "exit": 1,
+      "intendedReject": true,
+      "reason": "expected +0 to be 4096",
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "--maxWorkers=2",
+        "packages/core/src/next/testing/executor-demand-admission.test.ts",
+        "-t",
+        "peak meter observes native group"
+      ]
+    },
+    {
+      "name": "demand-meter-unused-loan-mutant",
+      "exit": 1,
+      "intendedReject": true,
+      "reason": "unused loan credit is not allocated buffer memory",
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "--maxWorkers=2",
+        "packages/core/src/next/testing/executor-demand-admission.test.ts",
+        "-t",
+        "peak meter excludes unused"
+      ]
+    }
+  ],
+  "reach": "seedsFor b9e01/02 admission, b9e11/12 native live, b9e21/22 physical-hint coverage, b9e31/32 publication, b9e41/42 captured cursor cancellation; committed Reach obligations. No run, cap or ratio relaxation. Additional diagnostic capability seedsFor b9e51/52,12histories each, request/reservation ledger and exact PG rows.",
+  "limits": "Current prototype overlays every committedbc9\u219200396 and working-source runtime change. Ordinary hosted emissions must match58 parent/66 candidate module hashes before timing. No hosted whole-cell/full-gate acceptance or mergeable engine commit. Old8c evidence is historical only, preserved separately; allocated-only current histories are collected independently. Writer fixture keeps its original separate governor for query-only8MiB; native live owner remains64MiB.",
+  "GREEN": "Current00396 six affected suites22 PASS plus eight existing-path/generated suites99 PASS;112 distinct registered checks after removing the9-check replay overlap. Fresh48 allocation-only histories retain original seeds/runs/caps/minimum<=4*peak+1MiB law. Native64MiB live, query-only8MiB, replacement/publication/cancellation, read/scan/index regression checks all pass.",
+  "fixtureChanges": "Budget suite uses BATCH_ROWS finite bound instead of3 because the new small-bound cursor minimum is below its generic alternative; computes near-cap boundary from enforced target. Original run count, exact PG results, non-fitting-reader witness and unused-input refusal assertions remain. Small bound3-neighbor2/7,1/0/NULL retained in new generated dimension. Publication-wide cursor fixture hides optional prepareRead capability; new retained-source publication generator covers specialization.",
+  "priorComponents": [
+    {
+      "version": 1,
+      "pairs": {
+        "kind": "small recipe component; not hosted whole-cell",
+        "rows": 2,
+        "limit": 1,
+        "capBytes": 67108864,
+        "warmups": 4,
+        "rounds": 9,
+        "repeats": 32,
+        "runtimes": [
+          "/home/eric/.cache/minnow-b9-prototypes/demand-cursor/parent",
+          "/home/eric/.cache/minnow-b9-prototypes/demand-cursor/candidate"
+        ],
+        "pairs": [
+          {
+            "round": 0,
+            "order": ["parent", "candidate"],
+            "values": [
+              {
+                "arm": "parent",
+                "cpuMs": 3.61921875,
+                "minimumBytes": 44170556
+              },
+              {
+                "arm": "candidate",
+                "cpuMs": 3.71571875,
+                "minimumBytes": 1222874
+              }
+            ]
+          },
+          {
+            "round": 1,
+            "order": ["candidate", "parent"],
+            "values": [
+              {
+                "arm": "candidate",
+                "cpuMs": 2.76959375,
+                "minimumBytes": 1222874
+              },
+              {
+                "arm": "parent",
+                "cpuMs": 3.373875,
+                "minimumBytes": 44170556
+              }
+            ]
+          },
+          {
+            "round": 2,
+            "order": ["parent", "candidate"],
+            "values": [
+              {
+                "arm": "parent",
+                "cpuMs": 4.2031875,
+                "minimumBytes": 44170556
+              },
+              {
+                "arm": "candidate",
+                "cpuMs": 5.29146875,
+                "minimumBytes": 1222874
+              }
+            ]
+          },
+          {
+            "round": 3,
+            "order": ["candidate", "parent"],
+            "values": [
+              {
+                "arm": "candidate",
+                "cpuMs": 7.4378125,
+                "minimumBytes": 1222874
+              },
+              {
+                "arm": "parent",
+                "cpuMs": 2.2475,
+                "minimumBytes": 44170556
+              }
+            ]
+          },
+          {
+            "round": 4,
+            "order": ["parent", "candidate"],
+            "values": [
+              {
+                "arm": "parent",
+                "cpuMs": 2.76975,
+                "minimumBytes": 44170556
+              },
+              {
+                "arm": "candidate",
+                "cpuMs": 6.69028125,
+                "minimumBytes": 1222874
+              }
+            ]
+          },
+          {
+            "round": 5,
+            "order": ["candidate", "parent"],
+            "values": [
+              {
+                "arm": "candidate",
+                "cpuMs": 2.38565625,
+                "minimumBytes": 1222874
+              },
+              {
+                "arm": "parent",
+                "cpuMs": 2.10615625,
+                "minimumBytes": 44170556
+              }
+            ]
+          },
+          {
+            "round": 6,
+            "order": ["parent", "candidate"],
+            "values": [
+              {
+                "arm": "parent",
+                "cpuMs": 4.48228125,
+                "minimumBytes": 44170556
+              },
+              {
+                "arm": "candidate",
+                "cpuMs": 4.40809375,
+                "minimumBytes": 1222874
+              }
+            ]
+          },
+          {
+            "round": 7,
+            "order": ["candidate", "parent"],
+            "values": [
+              {
+                "arm": "candidate",
+                "cpuMs": 2.5665,
+                "minimumBytes": 1222874
+              },
+              {
+                "arm": "parent",
+                "cpuMs": 2.60196875,
+                "minimumBytes": 44170556
+              }
+            ]
+          },
+          {
+            "round": 8,
+            "order": ["parent", "candidate"],
+            "values": [
+              {
+                "arm": "parent",
+                "cpuMs": 2.8403125,
+                "minimumBytes": 44170556
+              },
+              {
+                "arm": "candidate",
+                "cpuMs": 2.24290625,
+                "minimumBytes": 1222874
+              }
+            ]
+          }
+        ]
+      },
+      "summary": {
+        "validThreeFieldProtocol": true,
+        "cpuMedianMs": {
+          "parent": 2.8403125,
+          "candidate": 3.71571875
+        },
+        "pairedMedianDeltaMs": 0.09650000000000025,
+        "pairedIqrMs": 1.1624687499999995,
+        "pairedRangeMs": 5.794593749999999,
+        "candidateFavorable": 4,
+        "bytes": {
+          "parent": 44170556,
+          "candidate": 1222874
+        }
+      }
+    },
+    {
+      "version": 2,
+      "pairs": {
+        "kind": "small recipe component; not hosted whole-cell",
+        "rows": 2,
+        "limit": 1,
+        "capBytes": 67108864,
+        "warmups": 4,
+        "rounds": 9,
+        "repeats": 32,
+        "runtimes": [
+          "/home/eric/.cache/minnow-b9-prototypes/demand-cursor-v2/parent",
+          "/home/eric/.cache/minnow-b9-prototypes/demand-cursor-v2/candidate"
+        ],
+        "pairs": [
+          {
+            "round": 0,
+            "order": ["parent", "candidate"],
+            "values": [
+              {
+                "arm": "parent",
+                "cpuMs": 4.2355625,
+                "minimumBytes": 44170556
+              },
+              {
+                "arm": "candidate",
+                "cpuMs": 3.8315625,
+                "minimumBytes": 1222874
+              }
+            ]
+          },
+          {
+            "round": 1,
+            "order": ["candidate", "parent"],
+            "values": [
+              {
+                "arm": "candidate",
+                "cpuMs": 4.25275,
+                "minimumBytes": 1222874
+              },
+              {
+                "arm": "parent",
+                "cpuMs": 3.6355625,
+                "minimumBytes": 44170556
+              }
+            ]
+          },
+          {
+            "round": 2,
+            "order": ["parent", "candidate"],
+            "values": [
+              {
+                "arm": "parent",
+                "cpuMs": 2.51778125,
+                "minimumBytes": 44170556
+              },
+              {
+                "arm": "candidate",
+                "cpuMs": 2.96,
+                "minimumBytes": 1222874
+              }
+            ]
+          },
+          {
+            "round": 3,
+            "order": ["candidate", "parent"],
+            "values": [
+              {
+                "arm": "candidate",
+                "cpuMs": 5.9019375,
+                "minimumBytes": 1222874
+              },
+              {
+                "arm": "parent",
+                "cpuMs": 2.21153125,
+                "minimumBytes": 44170556
+              }
+            ]
+          },
+          {
+            "round": 4,
+            "order": ["parent", "candidate"],
+            "values": [
+              {
+                "arm": "parent",
+                "cpuMs": 2.391875,
+                "minimumBytes": 44170556
+              },
+              {
+                "arm": "candidate",
+                "cpuMs": 3.12340625,
+                "minimumBytes": 1222874
+              }
+            ]
+          },
+          {
+            "round": 5,
+            "order": ["candidate", "parent"],
+            "values": [
+              {
+                "arm": "candidate",
+                "cpuMs": 1.72721875,
+                "minimumBytes": 1222874
+              },
+              {
+                "arm": "parent",
+                "cpuMs": 1.869,
+                "minimumBytes": 44170556
+              }
+            ]
+          },
+          {
+            "round": 6,
+            "order": ["parent", "candidate"],
+            "values": [
+              {
+                "arm": "parent",
+                "cpuMs": 2.1546875,
+                "minimumBytes": 44170556
+              },
+              {
+                "arm": "candidate",
+                "cpuMs": 2.5260625,
+                "minimumBytes": 1222874
+              }
+            ]
+          },
+          {
+            "round": 7,
+            "order": ["candidate", "parent"],
+            "values": [
+              {
+                "arm": "candidate",
+                "cpuMs": 2.37265625,
+                "minimumBytes": 1222874
+              },
+              {
+                "arm": "parent",
+                "cpuMs": 2.868375,
+                "minimumBytes": 44170556
+              }
+            ]
+          },
+          {
+            "round": 8,
+            "order": ["parent", "candidate"],
+            "values": [
+              {
+                "arm": "parent",
+                "cpuMs": 3.081125,
+                "minimumBytes": 44170556
+              },
+              {
+                "arm": "candidate",
+                "cpuMs": 1.9261875,
+                "minimumBytes": 1222874
+              }
+            ]
+          }
+        ]
+      },
+      "summary": {
+        "parentMedianMs": 2.51778125,
+        "candidateMedianMs": 2.96,
+        "pairedDeltaMs": 0.371375,
+        "pairedIQRMs": 1.0211875000000004,
+        "pairedRangeMs": 4.84534375,
+        "favorable": 4,
+        "parentMinimum": [44170556],
+        "candidateMinimum": [1222874]
+      }
+    },
+    {
+      "version": 3,
+      "pairs": {
+        "kind": "small recipe component; not hosted whole-cell",
+        "rows": 2,
+        "limit": 1,
+        "capBytes": 67108864,
+        "warmups": 4,
+        "rounds": 9,
+        "repeats": 32,
+        "runtimes": [
+          "/home/eric/.cache/minnow-b9-prototypes/demand-cursor-v3/parent",
+          "/home/eric/.cache/minnow-b9-prototypes/demand-cursor-v3/candidate"
+        ],
+        "pairs": [
+          {
+            "round": 0,
+            "order": ["parent", "candidate"],
+            "values": [
+              {
+                "arm": "parent",
+                "cpuMs": 3.15940625,
+                "minimumBytes": 44170556
+              },
+              {
+                "arm": "candidate",
+                "cpuMs": 3.10896875,
+                "minimumBytes": 1222874
+              }
+            ]
+          },
+          {
+            "round": 1,
+            "order": ["candidate", "parent"],
+            "values": [
+              {
+                "arm": "candidate",
+                "cpuMs": 2.597375,
+                "minimumBytes": 1222874
+              },
+              {
+                "arm": "parent",
+                "cpuMs": 2.15121875,
+                "minimumBytes": 44170556
+              }
+            ]
+          },
+          {
+            "round": 2,
+            "order": ["parent", "candidate"],
+            "values": [
+              {
+                "arm": "parent",
+                "cpuMs": 2.3375625,
+                "minimumBytes": 44170556
+              },
+              {
+                "arm": "candidate",
+                "cpuMs": 3.18428125,
+                "minimumBytes": 1222874
+              }
+            ]
+          },
+          {
+            "round": 3,
+            "order": ["candidate", "parent"],
+            "values": [
+              {
+                "arm": "candidate",
+                "cpuMs": 2.26434375,
+                "minimumBytes": 1222874
+              },
+              {
+                "arm": "parent",
+                "cpuMs": 2.27934375,
+                "minimumBytes": 44170556
+              }
+            ]
+          },
+          {
+            "round": 4,
+            "order": ["parent", "candidate"],
+            "values": [
+              {
+                "arm": "parent",
+                "cpuMs": 2.62228125,
+                "minimumBytes": 44170556
+              },
+              {
+                "arm": "candidate",
+                "cpuMs": 1.74425,
+                "minimumBytes": 1222874
+              }
+            ]
+          },
+          {
+            "round": 5,
+            "order": ["candidate", "parent"],
+            "values": [
+              {
+                "arm": "candidate",
+                "cpuMs": 1.65534375,
+                "minimumBytes": 1222874
+              },
+              {
+                "arm": "parent",
+                "cpuMs": 2.0275625,
+                "minimumBytes": 44170556
+              }
+            ]
+          },
+          {
+            "round": 6,
+            "order": ["parent", "candidate"],
+            "values": [
+              {
+                "arm": "parent",
+                "cpuMs": 6.568875,
+                "minimumBytes": 44170556
+              },
+              {
+                "arm": "candidate",
+                "cpuMs": 1.68996875,
+                "minimumBytes": 1222874
+              }
+            ]
+          },
+          {
+            "round": 7,
+            "order": ["candidate", "parent"],
+            "values": [
+              {
+                "arm": "candidate",
+                "cpuMs": 2.0656875,
+                "minimumBytes": 1222874
+              },
+              {
+                "arm": "parent",
+                "cpuMs": 2.474125,
+                "minimumBytes": 44170556
+              }
+            ]
+          },
+          {
+            "round": 8,
+            "order": ["parent", "candidate"],
+            "values": [
+              {
+                "arm": "parent",
+                "cpuMs": 2.068375,
+                "minimumBytes": 44170556
+              },
+              {
+                "arm": "candidate",
+                "cpuMs": 2.36615625,
+                "minimumBytes": 1222874
+              }
+            ]
+          }
+        ]
+      },
+      "summary": {
+        "parentMedianMs": 2.3375625,
+        "candidateMedianMs": 2.26434375,
+        "pairedDeltaMs": -0.050437500000000135,
+        "pairedIQRMs": 0.7062187499999997,
+        "pairedRangeMs": 5.725625,
+        "favorable": 6,
+        "parentMinimum": [44170556],
+        "candidateMinimum": [1222874]
+      }
+    }
+  ],
+  "prototypeProvenance": {
+    "source": "/home/eric/.cache/minnow-b9-demand-current",
+    "head": "00396b0f13a95e6ad504a62b19022af9dc9ebcc4",
+    "base": "/home/eric/.cache/minnow-b9-baseline-bc9/packages/core/dist",
+    "kind": "transpileModule prototype on ordinary bc9; hosted ordinary hashes required",
+    "typescript": "5.9.3",
+    "node": "v26.12.0",
+    "arms": {
+      "parent": {
+        "root": "/home/eric/.cache/minnow-b9-prototypes/demand-cursor-current/parent",
+        "overlays": {
+          "next/access/changes.js": "90cd8771af7b9187ecf5dae5352acc21ee291958477d4977aa383fbee507a88e",
+          "next/access/write-path.js": "51c44f553a2c2bae2d8f8d1e041e2f316f27a7251ef607c2fc733c2a9f96fd53",
+          "next/durable-format.js": "b7ce3109f2fc50ba8150a7f7b10f4d4aa734c2ef5bc09288e282b53735cefc5c",
+          "next/errors.js": "c0a5486f2f7274d2fa166644ccb41bb91b240411b4cb43e5049b75914c025fa7",
+          "next/exec/admission.js": "cd9ea344a4fbae007e2e158e558d927128e058cffb6dc4eed8ec4ee85ffe0ee9",
+          "next/exec/deferred-grant.js": "bb0ed78f608288acc6894d0c10b074e5cc421abd04f5cfb7910917a90936e1ba",
+          "next/exec/executor.js": "db812b5830acebc8ea466941fa107c0941c5712ece257314ff21709487d96dd9",
+          "next/exec/result-sink.js": "2d75ee95b23c36969fc2160ea6b7057756419c5544bf468d6496c291b2c1155d",
+          "next/exec/result.js": "83370a90f65479c93db9d992b896f137cfc9abcc8c8fea9d897a24523857739b",
+          "next/exec/run.js": "f4650851abb792a2a490e59b5af9cfdd143398e08dbef9760d4176033e8b3c1f",
+          "next/format/database-identity.js": "8e67421bd539d09d4d4cd1040dbb973180f4b8a5036c0b87d2ebeefb6002facb",
+          "next/format/log-frame.js": "86ccae58c78a5b7b704f902319644bddac090e3ef3cc897daee431b9519c1bbf",
+          "next/format/manifest-codec.js": "f46f2428dbf4d27cdbb3b9d9eedc7ab20a2690013e695777f0c1d6896792d257",
+          "next/format/manifest.js": "fb86945bd8a35d7477ea7b825479a6870b0ad41ae02d3e039d19a8383597328d",
+          "next/format/snapshot.js": "0ec541a419ec5617ae9bf3f88a0f018c360df41c91d4bb8c917534476cdd6f04",
+          "next/hash/xxhash32.js": "77efc74b34833fd0e3bfaf7f5a7cb240ad930ea76519443793ab873251dbc03b",
+          "next/live/constants.js": "cad988863cb005de3c4faffe792d98f9abcfe32ebef4ca210d50c5d58466d1e3",
+          "next/live/errors.js": "37a6f0d701e0b6df27ec66974ec385c2ec5c95383cfe11e11d9deeba9c014c49",
+          "next/live/rows.js": "99e72b2f4597c96db51a5559257be5d4f950337f5ed72d4b4532e796cd0a5b4a",
+          "next/live/runtime.js": "1e91c2d24b7c97666ef2beab66f572b0bbbc66efc2e255891503d360b224e3a2",
+          "next/live/state.js": "437e62f0d928551a160749297352c558048480189cdb3d701235ee61091b1b13",
+          "next/owner/api.js": "4db2b5928fcfb7f717506d7685181738377a552e4f14bde40974c5cc9e9139ba",
+          "next/owner/client.js": "80809715fd6457c8d3eb1c0cf4d4b7c890fad01c59fd2a3b268957f97bd28b2a",
+          "next/owner/compose.js": "2bfba0b221bbf1a7b07219be4307ba27852e95c50169dfe636f2a0f77999b51a",
+          "next/owner/connector.js": "aaab8686392867f7de1b81fc5a7e876965c595438d029dadbc0ccb8545e4f148",
+          "next/owner/election.js": "32b7f9f859c4559abe49a2347960fe693b821d679512c519d17c5dded767c1a7",
+          "next/owner/engine.js": "f441cfa4259d8c549b1c2e0620c814e7270b519ac2bf50350e17757151e8f6c0",
+          "next/owner/errors.js": "7ec036fe091842824396e1b328a810ec79a72b7603cc26d5aa50e2aca1e98e25",
+          "next/owner/host.js": "55b9c9cb03841af2a22583104f61f623d0ef693b29786e81d3fbff361ea07221",
+          "next/owner/native.js": "559a9d77cb95cb2e834001b7b9e6333f8db792aae1515cf4226876c470bee5ac",
+          "next/owner/protocol.js": "b09eb2b90d7700a7005b20bb5f011ccccb78238f103883a95b90e2ad5f3afa61",
+          "next/owner/sequence.js": "1fb04c23ac35b47288a3dfc4c70239740868aa3f8f748cd5f06c8b8ccd5c427d",
+          "next/owner/server.js": "5af5174ce320ea05beec9ef1a942b71be5d70b17a32fbc4249dece4446daaaa0",
+          "next/owner/snapshot-api.js": "5af7cf30af8b486c2da67f0c006207ffb2d55e66a0063145931804058203ea4c",
+          "next/owner/snapshot-connection.js": "0d6970c70ee7beb5deb5f5b59e7e3ae312aa243fd7e7759daa186c8fa0179ed2",
+          "next/page/read-bounds.js": "b622f04c7abb032f9ae7a9083cb9fc869c9abc593a4888ae2f1c834398025e86",
+          "next/snapshot-errors.js": "00778967279f700877321e1ded4f556dfeb3680547118bbf7fd96de38bd49079",
+          "next/storage/extent-list.js": "c529a5252be239d014ee669f5328c2019c1bbc67aa98c614eacf3be5e8516313",
+          "next/storage/extents.js": "efb7aab77fddd952d4900e2a573a10432b1ba8be7caec2195cb87da657414bb1",
+          "next/storage/idb-bytes.js": "6183e24a54528771f8ad2f799eb9012f37021ed2ee743584f827c27903172da3",
+          "next/storage/native-extent-list.js": "3b31df5a2173209b3466c294b45ea2488468c34fead6ba5488718f4272ba7bf6",
+          "next/storage/select.js": "11dea6b32e873629e2a1daa75ad7bbaf3fe0d731c27e442aa786d82e0c3d085b",
+          "next/storage/space.js": "0a63184a07c26bacb800077291772b062120e0438ad1b0f21584eedd6af65248",
+          "next/store-name.js": "9ebd0cf0614d59096536bec3c66b970fb98f05a94ee1101cd9e03133b58b557e",
+          "next/testing/closed-disk-fixture.test-support.js": "9a88a5e60228ded600422a0aab705b251f3d726a65bcbb5273605d6d4f7c2c6b",
+          "next/testing/durable-inventory.js": "c97fba94ac8d61fcee0ac805b0100247172e4cb7db6b366ac5c48007fe2c43eb",
+          "next/testing/live-runtime.test-support.js": "c7e61697a9c0c4400798b3fc54cbde9097f3a16572041eb38b5c78454bdfc036",
+          "next/testing/owner-harness.js": "18faff226c573b301433feb8ca91f10e45fb4df96e3c986f7b8b93ec09a246ae",
+          "next/testing/owner-standins.js": "35fc97e652bb54bccec71a387501748f94137703b7172da2643fea259851bc59",
+          "next/testing/snapshot-owner-support.js": "e812c4067fd187a95a8d8817ce9052e55733705a908456769a69b2b2fdfc11b8",
+          "next/write/directory-current.test-support.js": "6fa95cdef9c7746f953ac4387dcd9d9bf71a12f06a0535846f7331e41f8878ff",
+          "next/write/engine.js": "f267dc47deb221c3b861f816c016d10a9f931158e20542ce2fc7f46bd9c42237",
+          "next/write/live-rekeys.js": "acb88a917c31aa430c639e66090f88c8460a7385515cd87e4bf243e0cded0da7",
+          "next/write/snapshot-export.js": "d83dea5197fdac3982360b5237a24291da89089cfaadf973a76889e860ddf97e",
+          "next/write/snapshot-load.js": "d878716ab7b6321c6d4cac569265f9ed498bae67905286d4ba97ae22c52de8ee",
+          "next/write/snapshot-source.js": "9407012812dd866c74759fe450c1e9656589be3d0ce07fc55e9d4d48bfea9484",
+          "next/write/transaction.js": "81ee2aa902f1c4d5165c82c1af0b7d405337652de43663744cd445e0887acfa7",
+          "testing/reach.js": "a96fb72d18ca13fda45e4ec7548f22871fa0399278de1525544d2467720a59ef"
+        }
+      },
+      "candidate": {
+        "root": "/home/eric/.cache/minnow-b9-prototypes/demand-cursor-current/candidate",
+        "overlays": {
+          "next/access/changes.js": "90cd8771af7b9187ecf5dae5352acc21ee291958477d4977aa383fbee507a88e",
+          "next/access/write-path.js": "51c44f553a2c2bae2d8f8d1e041e2f316f27a7251ef607c2fc733c2a9f96fd53",
+          "next/durable-format.js": "b7ce3109f2fc50ba8150a7f7b10f4d4aa734c2ef5bc09288e282b53735cefc5c",
+          "next/errors.js": "c0a5486f2f7274d2fa166644ccb41bb91b240411b4cb43e5049b75914c025fa7",
+          "next/exec/admission.js": "cd9ea344a4fbae007e2e158e558d927128e058cffb6dc4eed8ec4ee85ffe0ee9",
+          "next/exec/deferred-grant.js": "bb0ed78f608288acc6894d0c10b074e5cc421abd04f5cfb7910917a90936e1ba",
+          "next/exec/executor.js": "db812b5830acebc8ea466941fa107c0941c5712ece257314ff21709487d96dd9",
+          "next/exec/result-sink.js": "2d75ee95b23c36969fc2160ea6b7057756419c5544bf468d6496c291b2c1155d",
+          "next/exec/result.js": "83370a90f65479c93db9d992b896f137cfc9abcc8c8fea9d897a24523857739b",
+          "next/exec/run.js": "ce2336c6e00df7c3a5f2a017bad3c704b28d586cf2bc56fb6b29928d7653bd3e",
+          "next/format/database-identity.js": "8e67421bd539d09d4d4cd1040dbb973180f4b8a5036c0b87d2ebeefb6002facb",
+          "next/format/log-frame.js": "86ccae58c78a5b7b704f902319644bddac090e3ef3cc897daee431b9519c1bbf",
+          "next/format/manifest-codec.js": "f46f2428dbf4d27cdbb3b9d9eedc7ab20a2690013e695777f0c1d6896792d257",
+          "next/format/manifest.js": "fb86945bd8a35d7477ea7b825479a6870b0ad41ae02d3e039d19a8383597328d",
+          "next/format/snapshot.js": "0ec541a419ec5617ae9bf3f88a0f018c360df41c91d4bb8c917534476cdd6f04",
+          "next/hash/xxhash32.js": "77efc74b34833fd0e3bfaf7f5a7cb240ad930ea76519443793ab873251dbc03b",
+          "next/live/constants.js": "cad988863cb005de3c4faffe792d98f9abcfe32ebef4ca210d50c5d58466d1e3",
+          "next/live/errors.js": "37a6f0d701e0b6df27ec66974ec385c2ec5c95383cfe11e11d9deeba9c014c49",
+          "next/live/rows.js": "99e72b2f4597c96db51a5559257be5d4f950337f5ed72d4b4532e796cd0a5b4a",
+          "next/live/runtime.js": "1e91c2d24b7c97666ef2beab66f572b0bbbc66efc2e255891503d360b224e3a2",
+          "next/live/state.js": "437e62f0d928551a160749297352c558048480189cdb3d701235ee61091b1b13",
+          "next/owner/api.js": "4db2b5928fcfb7f717506d7685181738377a552e4f14bde40974c5cc9e9139ba",
+          "next/owner/client.js": "80809715fd6457c8d3eb1c0cf4d4b7c890fad01c59fd2a3b268957f97bd28b2a",
+          "next/owner/compose.js": "2bfba0b221bbf1a7b07219be4307ba27852e95c50169dfe636f2a0f77999b51a",
+          "next/owner/connector.js": "aaab8686392867f7de1b81fc5a7e876965c595438d029dadbc0ccb8545e4f148",
+          "next/owner/election.js": "32b7f9f859c4559abe49a2347960fe693b821d679512c519d17c5dded767c1a7",
+          "next/owner/engine.js": "f441cfa4259d8c549b1c2e0620c814e7270b519ac2bf50350e17757151e8f6c0",
+          "next/owner/errors.js": "7ec036fe091842824396e1b328a810ec79a72b7603cc26d5aa50e2aca1e98e25",
+          "next/owner/host.js": "55b9c9cb03841af2a22583104f61f623d0ef693b29786e81d3fbff361ea07221",
+          "next/owner/native.js": "559a9d77cb95cb2e834001b7b9e6333f8db792aae1515cf4226876c470bee5ac",
+          "next/owner/protocol.js": "b09eb2b90d7700a7005b20bb5f011ccccb78238f103883a95b90e2ad5f3afa61",
+          "next/owner/sequence.js": "1fb04c23ac35b47288a3dfc4c70239740868aa3f8f748cd5f06c8b8ccd5c427d",
+          "next/owner/server.js": "5af5174ce320ea05beec9ef1a942b71be5d70b17a32fbc4249dece4446daaaa0",
+          "next/owner/snapshot-api.js": "5af7cf30af8b486c2da67f0c006207ffb2d55e66a0063145931804058203ea4c",
+          "next/owner/snapshot-connection.js": "0d6970c70ee7beb5deb5f5b59e7e3ae312aa243fd7e7759daa186c8fa0179ed2",
+          "next/page/read-bounds.js": "658dc98138ff0638f0abfcf75f64fcec14f9b4cea6939b63b172af1be80e5337",
+          "next/snapshot-errors.js": "00778967279f700877321e1ded4f556dfeb3680547118bbf7fd96de38bd49079",
+          "next/storage/extent-list.js": "c529a5252be239d014ee669f5328c2019c1bbc67aa98c614eacf3be5e8516313",
+          "next/storage/extents.js": "efb7aab77fddd952d4900e2a573a10432b1ba8be7caec2195cb87da657414bb1",
+          "next/storage/idb-bytes.js": "6183e24a54528771f8ad2f799eb9012f37021ed2ee743584f827c27903172da3",
+          "next/storage/native-extent-list.js": "3b31df5a2173209b3466c294b45ea2488468c34fead6ba5488718f4272ba7bf6",
+          "next/storage/select.js": "11dea6b32e873629e2a1daa75ad7bbaf3fe0d731c27e442aa786d82e0c3d085b",
+          "next/storage/space.js": "0a63184a07c26bacb800077291772b062120e0438ad1b0f21584eedd6af65248",
+          "next/store-name.js": "9ebd0cf0614d59096536bec3c66b970fb98f05a94ee1101cd9e03133b58b557e",
+          "next/testing/closed-disk-fixture.test-support.js": "9a88a5e60228ded600422a0aab705b251f3d726a65bcbb5273605d6d4f7c2c6b",
+          "next/testing/durable-inventory.js": "c97fba94ac8d61fcee0ac805b0100247172e4cb7db6b366ac5c48007fe2c43eb",
+          "next/testing/live-runtime.test-support.js": "c7e61697a9c0c4400798b3fc54cbde9097f3a16572041eb38b5c78454bdfc036",
+          "next/testing/owner-harness.js": "18faff226c573b301433feb8ca91f10e45fb4df96e3c986f7b8b93ec09a246ae",
+          "next/testing/owner-standins.js": "35fc97e652bb54bccec71a387501748f94137703b7172da2643fea259851bc59",
+          "next/testing/snapshot-owner-support.js": "e812c4067fd187a95a8d8817ce9052e55733705a908456769a69b2b2fdfc11b8",
+          "next/write/directory-current.test-support.js": "6fa95cdef9c7746f953ac4387dcd9d9bf71a12f06a0535846f7331e41f8878ff",
+          "next/write/engine.js": "f267dc47deb221c3b861f816c016d10a9f931158e20542ce2fc7f46bd9c42237",
+          "next/write/live-rekeys.js": "acb88a917c31aa430c639e66090f88c8460a7385515cd87e4bf243e0cded0da7",
+          "next/write/snapshot-export.js": "d83dea5197fdac3982360b5237a24291da89089cfaadf973a76889e860ddf97e",
+          "next/write/snapshot-load.js": "d878716ab7b6321c6d4cac569265f9ed498bae67905286d4ba97ae22c52de8ee",
+          "next/write/snapshot-source.js": "9407012812dd866c74759fe450c1e9656589be3d0ce07fc55e9d4d48bfea9484",
+          "next/write/transaction.js": "81ee2aa902f1c4d5165c82c1af0b7d405337652de43663744cd445e0887acfa7",
+          "testing/reach.js": "cc70a4b24af6d912d6504bb4ccffdd7b9181d6cacb8977ada1bf49132d66e07b",
+          "next/access/key-index.js": "db2b789df909960138815ec2eaf2464111caf38153489afd510fd4f9e8f01c22",
+          "next/exec/key-order.js": "ba8e0cf5e0c5452c7eb85105c72663aeb7f028596b409f6e47ab3615bb1d2b1a",
+          "next/exec/plan.js": "f5a06891e9b9c0f98fa331696e06846ce5282827780366200c4aeb5edd5ed714",
+          "next/exec/sort.js": "7cdfbcea329060460135c05ae9f5faa8c7f646e985e0bd1c8d39088180afcb22",
+          "next/write/range-cursor.js": "8d1bf145b889529eb15ef61b4813d50f15dd2fe67117ec15a87c8b8cfaa12d1c",
+          "next/write/range-input.js": "22f2927da60187bb8ea3c4ee580cd01ed26bc2a7bbb07485ce7bde13e8d87756",
+          "next/write/range-plan.js": "c98a117e38a6301c822efaa22cc108088a9baeba92e857c01e95b248617b3793",
+          "next/write/view.js": "2a8d945e099dfd43c2607e1c0405e0e80bd8db8708284e07422caa295e3426d8"
+        }
+      }
+    }
+  },
+  "diagnosticLaw": "CompileOptions.keyOrder:true explicitly allows the legacy benchmark-control cursor. Its operator requests must fit their complete reserved capacities; keep the old full-batch minimum and fitting generic alternative. Two generated seeds fail the wrong demand-sized reservation (69632 requested versus4128 reserved) and pass restored source. Initial zero-opens fixture expectation was incorrect and excluded, as was an accidental unmatched test filter.",
+  "profileShare": "Baseline B8 fixed-buffer attribution: late-fetch project27066264 of44170556B (61.28%); this is reserved-memory attribution, not CPU profile share. W1M/S1 CPU profiles collected by hosted probe; no CPU gain claimed for this admission fix.",
+  "excludedPrototypeV4": {
+    "excluded": true,
+    "reason": "Builder used unstaged git diff after candidate had been staged; candidate overlay omitted staged modules. No v4 component timings accepted. Source Vitest20 tests pass independently of compiled prototype; compiler check unaffected. Correct builder compares working source against HEAD including staged changes.",
+    "expectedCandidateOverlays": 35,
+    "actualCandidateOverlays": 28
+  },
+  "finalVerification": {
+    "currentUniqueAffectedTests": 112,
+    "scopedTypescript": "PASS",
+    "currentIntendedMutants": 11,
+    "currentActualParentRED": "PASS: intended ratio failure",
+    "currentRuntimeModuleEmission": "10 source changes covered exactly;58 parent/66 candidate overlay hashes",
+    "hostedWholeCell": "pending",
+    "hostedFullGates": "pending"
+  },
+  "supersededPeakEvidence": [
+    {
+      "seed": 761345,
+      "histories": [
+        {
+          "columns": 2,
+          "width": 1,
+          "count": 3,
+          "limit": 1,
+          "descending": true,
+          "declared": false,
+          "nulls": false,
+          "minimumBytes": 1260276,
+          "chargedPeakBytes": 139074,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 4,
+          "width": 4096,
+          "count": 7,
+          "limit": 7,
+          "descending": false,
+          "declared": false,
+          "nulls": true,
+          "minimumBytes": 4704178,
+          "chargedPeakBytes": 2502051,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 3,
+          "width": 17,
+          "count": 12,
+          "limit": null,
+          "descending": true,
+          "declared": false,
+          "nulls": true,
+          "minimumBytes": 4567098,
+          "chargedPeakBytes": 2019767,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 3,
+          "width": 1,
+          "count": 10,
+          "limit": 1,
+          "descending": false,
+          "declared": false,
+          "nulls": true,
+          "minimumBytes": 1298474,
+          "chargedPeakBytes": 157577,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 1,
+          "width": 1,
+          "count": 26,
+          "limit": 2,
+          "descending": true,
+          "declared": true,
+          "nulls": false,
+          "minimumBytes": 4381112,
+          "chargedPeakBytes": 2015780,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 1,
+          "width": 65535,
+          "count": 25,
+          "limit": null,
+          "descending": false,
+          "declared": false,
+          "nulls": false,
+          "minimumBytes": 4514280,
+          "chargedPeakBytes": 2155838,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 2,
+          "width": 17,
+          "count": 4,
+          "limit": 0,
+          "descending": false,
+          "declared": true,
+          "nulls": true,
+          "minimumBytes": 512,
+          "chargedPeakBytes": 512,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 4,
+          "width": 17,
+          "count": 12,
+          "limit": null,
+          "descending": false,
+          "declared": true,
+          "nulls": false,
+          "minimumBytes": 4654824,
+          "chargedPeakBytes": 2050844,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 3,
+          "width": 17,
+          "count": 28,
+          "limit": 1,
+          "descending": true,
+          "declared": true,
+          "nulls": false,
+          "minimumBytes": 1296144,
+          "chargedPeakBytes": 156340,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 3,
+          "width": 65535,
+          "count": 29,
+          "limit": null,
+          "descending": true,
+          "declared": false,
+          "nulls": false,
+          "minimumBytes": 5091384,
+          "chargedPeakBytes": 2601851,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 3,
+          "width": 4096,
+          "count": 25,
+          "limit": null,
+          "descending": false,
+          "declared": true,
+          "nulls": false,
+          "minimumBytes": 7617658,
+          "chargedPeakBytes": 2807975,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 2,
+          "width": 17,
+          "count": 18,
+          "limit": 7,
+          "descending": false,
+          "declared": false,
+          "nulls": false,
+          "minimumBytes": 4477236,
+          "chargedPeakBytes": 2101210,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 2,
+          "width": 65535,
+          "count": 2,
+          "limit": null,
+          "descending": false,
+          "declared": false,
+          "nulls": true,
+          "minimumBytes": 4866888,
+          "chargedPeakBytes": 2467073,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 2,
+          "width": 0,
+          "count": 20,
+          "limit": null,
+          "descending": true,
+          "declared": true,
+          "nulls": true,
+          "minimumBytes": 4471520,
+          "chargedPeakBytes": 1964252,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 1,
+          "width": 17,
+          "count": 5,
+          "limit": 2,
+          "descending": false,
+          "declared": true,
+          "nulls": false,
+          "minimumBytes": 4379424,
+          "chargedPeakBytes": 2015084,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 2,
+          "width": 65535,
+          "count": 14,
+          "limit": 2,
+          "descending": false,
+          "declared": true,
+          "nulls": true,
+          "minimumBytes": 13902620,
+          "chargedPeakBytes": 4228740,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 3,
+          "width": 4096,
+          "count": 13,
+          "limit": 1,
+          "descending": true,
+          "declared": false,
+          "nulls": true,
+          "minimumBytes": 1330198,
+          "chargedPeakBytes": 208593,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 1,
+          "width": 65535,
+          "count": 13,
+          "limit": 0,
+          "descending": true,
+          "declared": true,
+          "nulls": false,
+          "minimumBytes": 512,
+          "chargedPeakBytes": 512,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 1,
+          "width": 65535,
+          "count": 25,
+          "limit": 7,
+          "descending": false,
+          "declared": false,
+          "nulls": false,
+          "minimumBytes": 4514268,
+          "chargedPeakBytes": 2155826,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 3,
+          "width": 4096,
+          "count": 9,
+          "limit": 0,
+          "descending": false,
+          "declared": true,
+          "nulls": true,
+          "minimumBytes": 512,
+          "chargedPeakBytes": 512,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 1,
+          "width": 0,
+          "count": 6,
+          "limit": 1,
+          "descending": true,
+          "declared": false,
+          "nulls": true,
+          "minimumBytes": 1223196,
+          "chargedPeakBytes": 121090,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 2,
+          "width": 65535,
+          "count": 26,
+          "limit": 1,
+          "descending": false,
+          "declared": false,
+          "nulls": true,
+          "minimumBytes": 1653456,
+          "chargedPeakBytes": 528004,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 2,
+          "width": 17,
+          "count": 4,
+          "limit": 0,
+          "descending": true,
+          "declared": false,
+          "nulls": true,
+          "minimumBytes": 512,
+          "chargedPeakBytes": 512,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 3,
+          "width": 0,
+          "count": 3,
+          "limit": 2,
+          "descending": true,
+          "declared": true,
+          "nulls": true,
+          "minimumBytes": 4560466,
+          "chargedPeakBytes": 2150125,
+          "capBytes": 67108864
+        }
+      ]
+    },
+    {
+      "seed": 761346,
+      "histories": [
+        {
+          "columns": 4,
+          "width": 4096,
+          "count": 2,
+          "limit": 1,
+          "descending": false,
+          "declared": true,
+          "nulls": false,
+          "minimumBytes": 1486328,
+          "chargedPeakBytes": 240919,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 3,
+          "width": 17,
+          "count": 29,
+          "limit": 1,
+          "descending": true,
+          "declared": true,
+          "nulls": true,
+          "minimumBytes": 1295820,
+          "chargedPeakBytes": 156174,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 1,
+          "width": 65535,
+          "count": 5,
+          "limit": 2,
+          "descending": true,
+          "declared": false,
+          "nulls": true,
+          "minimumBytes": 4514100,
+          "chargedPeakBytes": 2276918,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 3,
+          "width": 4096,
+          "count": 7,
+          "limit": null,
+          "descending": false,
+          "declared": false,
+          "nulls": false,
+          "minimumBytes": 4597154,
+          "chargedPeakBytes": 2178688,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 1,
+          "width": 4096,
+          "count": 29,
+          "limit": 1,
+          "descending": false,
+          "declared": false,
+          "nulls": true,
+          "minimumBytes": 1231174,
+          "chargedPeakBytes": 130982,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 2,
+          "width": 0,
+          "count": 21,
+          "limit": 7,
+          "descending": true,
+          "declared": false,
+          "nulls": false,
+          "minimumBytes": 4475706,
+          "chargedPeakBytes": 2099719,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 3,
+          "width": 65535,
+          "count": 2,
+          "limit": 2,
+          "descending": true,
+          "declared": false,
+          "nulls": false,
+          "minimumBytes": 5089278,
+          "chargedPeakBytes": 2601839,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 1,
+          "width": 1,
+          "count": 28,
+          "limit": 1,
+          "descending": true,
+          "declared": true,
+          "nulls": true,
+          "minimumBytes": 1216944,
+          "chargedPeakBytes": 117876,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 1,
+          "width": 4096,
+          "count": 13,
+          "limit": 7,
+          "descending": true,
+          "declared": false,
+          "nulls": true,
+          "minimumBytes": 4391286,
+          "chargedPeakBytes": 2168119,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 4,
+          "width": 4096,
+          "count": 20,
+          "limit": null,
+          "descending": false,
+          "declared": true,
+          "nulls": false,
+          "minimumBytes": 8526376,
+          "chargedPeakBytes": 2981708,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 2,
+          "width": 17,
+          "count": 4,
+          "limit": 1,
+          "descending": false,
+          "declared": false,
+          "nulls": false,
+          "minimumBytes": 1260768,
+          "chargedPeakBytes": 139316,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 1,
+          "width": 4096,
+          "count": 3,
+          "limit": 0,
+          "descending": false,
+          "declared": false,
+          "nulls": true,
+          "minimumBytes": 512,
+          "chargedPeakBytes": 512,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 1,
+          "width": 65535,
+          "count": 6,
+          "limit": 1,
+          "descending": false,
+          "declared": true,
+          "nulls": true,
+          "minimumBytes": 1407128,
+          "chargedPeakBytes": 243550,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 3,
+          "width": 1,
+          "count": 24,
+          "limit": 2,
+          "descending": true,
+          "declared": true,
+          "nulls": true,
+          "minimumBytes": 4563110,
+          "chargedPeakBytes": 2151379,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 3,
+          "width": 1,
+          "count": 24,
+          "limit": 0,
+          "descending": true,
+          "declared": false,
+          "nulls": false,
+          "minimumBytes": 512,
+          "chargedPeakBytes": 512,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 2,
+          "width": 17,
+          "count": 22,
+          "limit": 2,
+          "descending": false,
+          "declared": true,
+          "nulls": true,
+          "minimumBytes": 4473616,
+          "chargedPeakBytes": 2084538,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 1,
+          "width": 1,
+          "count": 26,
+          "limit": 2,
+          "descending": false,
+          "declared": true,
+          "nulls": false,
+          "minimumBytes": 4381112,
+          "chargedPeakBytes": 2015780,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 1,
+          "width": 0,
+          "count": 18,
+          "limit": 0,
+          "descending": true,
+          "declared": false,
+          "nulls": false,
+          "minimumBytes": 512,
+          "chargedPeakBytes": 512,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 4,
+          "width": 0,
+          "count": 8,
+          "limit": 1,
+          "descending": true,
+          "declared": true,
+          "nulls": true,
+          "minimumBytes": 1327376,
+          "chargedPeakBytes": 171468,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 1,
+          "width": 4096,
+          "count": 2,
+          "limit": 2,
+          "descending": true,
+          "declared": true,
+          "nulls": true,
+          "minimumBytes": 4415884,
+          "chargedPeakBytes": 2035294,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 4,
+          "width": 65535,
+          "count": 21,
+          "limit": 7,
+          "descending": false,
+          "declared": false,
+          "nulls": false,
+          "minimumBytes": 6492492,
+          "chargedPeakBytes": 2890381,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 1,
+          "width": 65535,
+          "count": 5,
+          "limit": 1,
+          "descending": false,
+          "declared": false,
+          "nulls": false,
+          "minimumBytes": 1353868,
+          "chargedPeakBytes": 247648,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 2,
+          "width": 1,
+          "count": 5,
+          "limit": 2,
+          "descending": false,
+          "declared": true,
+          "nulls": false,
+          "minimumBytes": 4470008,
+          "chargedPeakBytes": 2082610,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 2,
+          "width": 0,
+          "count": 7,
+          "limit": null,
+          "descending": false,
+          "declared": true,
+          "nulls": true,
+          "minimumBytes": 4470194,
+          "chargedPeakBytes": 1963641,
+          "capBytes": 67108864
+        }
+      ]
+    }
+  ],
+  "supersededPeakEvidenceNote": "Old counter added loan credit and missed asynchronous native group grants. Superseded entirely by the fresh allocation-only histories. Component CPU/minimum records did not use that counter and remain unchanged.",
+  "minimumVersusChargedPeak": [
+    {
+      "seed": 761345,
+      "histories": [
+        {
+          "columns": 2,
+          "width": 1,
+          "count": 3,
+          "limit": 1,
+          "descending": true,
+          "declared": false,
+          "nulls": false,
+          "minimumBytes": 1260276,
+          "chargedPeakBytes": 139074,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 4,
+          "width": 4096,
+          "count": 7,
+          "limit": 7,
+          "descending": false,
+          "declared": false,
+          "nulls": true,
+          "minimumBytes": 4704178,
+          "chargedPeakBytes": 2502051,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 3,
+          "width": 17,
+          "count": 12,
+          "limit": null,
+          "descending": true,
+          "declared": false,
+          "nulls": true,
+          "minimumBytes": 4567098,
+          "chargedPeakBytes": 2019767,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 3,
+          "width": 1,
+          "count": 10,
+          "limit": 1,
+          "descending": false,
+          "declared": false,
+          "nulls": true,
+          "minimumBytes": 1298474,
+          "chargedPeakBytes": 157577,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 1,
+          "width": 1,
+          "count": 26,
+          "limit": 2,
+          "descending": true,
+          "declared": true,
+          "nulls": false,
+          "minimumBytes": 4381112,
+          "chargedPeakBytes": 2015780,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 1,
+          "width": 65535,
+          "count": 25,
+          "limit": null,
+          "descending": false,
+          "declared": false,
+          "nulls": false,
+          "minimumBytes": 4514280,
+          "chargedPeakBytes": 2155838,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 2,
+          "width": 17,
+          "count": 4,
+          "limit": 0,
+          "descending": false,
+          "declared": true,
+          "nulls": true,
+          "minimumBytes": 512,
+          "chargedPeakBytes": 512,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 4,
+          "width": 17,
+          "count": 12,
+          "limit": null,
+          "descending": false,
+          "declared": true,
+          "nulls": false,
+          "minimumBytes": 4654824,
+          "chargedPeakBytes": 2050844,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 3,
+          "width": 17,
+          "count": 28,
+          "limit": 1,
+          "descending": true,
+          "declared": true,
+          "nulls": false,
+          "minimumBytes": 1296144,
+          "chargedPeakBytes": 156340,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 3,
+          "width": 65535,
+          "count": 29,
+          "limit": null,
+          "descending": true,
+          "declared": false,
+          "nulls": false,
+          "minimumBytes": 5091384,
+          "chargedPeakBytes": 2601851,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 3,
+          "width": 4096,
+          "count": 25,
+          "limit": null,
+          "descending": false,
+          "declared": true,
+          "nulls": false,
+          "minimumBytes": 7617658,
+          "chargedPeakBytes": 2807975,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 2,
+          "width": 17,
+          "count": 18,
+          "limit": 7,
+          "descending": false,
+          "declared": false,
+          "nulls": false,
+          "minimumBytes": 4477236,
+          "chargedPeakBytes": 2101210,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 2,
+          "width": 65535,
+          "count": 2,
+          "limit": null,
+          "descending": false,
+          "declared": false,
+          "nulls": true,
+          "minimumBytes": 4866888,
+          "chargedPeakBytes": 2467073,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 2,
+          "width": 0,
+          "count": 20,
+          "limit": null,
+          "descending": true,
+          "declared": true,
+          "nulls": true,
+          "minimumBytes": 4471520,
+          "chargedPeakBytes": 1964252,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 1,
+          "width": 17,
+          "count": 5,
+          "limit": 2,
+          "descending": false,
+          "declared": true,
+          "nulls": false,
+          "minimumBytes": 4379424,
+          "chargedPeakBytes": 2015084,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 2,
+          "width": 65535,
+          "count": 14,
+          "limit": 2,
+          "descending": false,
+          "declared": true,
+          "nulls": true,
+          "minimumBytes": 13902620,
+          "chargedPeakBytes": 4228740,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 3,
+          "width": 4096,
+          "count": 13,
+          "limit": 1,
+          "descending": true,
+          "declared": false,
+          "nulls": true,
+          "minimumBytes": 1330198,
+          "chargedPeakBytes": 206969,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 1,
+          "width": 65535,
+          "count": 13,
+          "limit": 0,
+          "descending": true,
+          "declared": true,
+          "nulls": false,
+          "minimumBytes": 512,
+          "chargedPeakBytes": 512,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 1,
+          "width": 65535,
+          "count": 25,
+          "limit": 7,
+          "descending": false,
+          "declared": false,
+          "nulls": false,
+          "minimumBytes": 4514268,
+          "chargedPeakBytes": 2155826,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 3,
+          "width": 4096,
+          "count": 9,
+          "limit": 0,
+          "descending": false,
+          "declared": true,
+          "nulls": true,
+          "minimumBytes": 512,
+          "chargedPeakBytes": 512,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 1,
+          "width": 0,
+          "count": 6,
+          "limit": 1,
+          "descending": true,
+          "declared": false,
+          "nulls": true,
+          "minimumBytes": 1223196,
+          "chargedPeakBytes": 121090,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 2,
+          "width": 65535,
+          "count": 26,
+          "limit": 1,
+          "descending": false,
+          "declared": false,
+          "nulls": true,
+          "minimumBytes": 1653456,
+          "chargedPeakBytes": 528004,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 2,
+          "width": 17,
+          "count": 4,
+          "limit": 0,
+          "descending": true,
+          "declared": false,
+          "nulls": true,
+          "minimumBytes": 512,
+          "chargedPeakBytes": 512,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 3,
+          "width": 0,
+          "count": 3,
+          "limit": 2,
+          "descending": true,
+          "declared": true,
+          "nulls": true,
+          "minimumBytes": 4560466,
+          "chargedPeakBytes": 2150125,
+          "capBytes": 67108864
+        }
+      ]
+    },
+    {
+      "seed": 761346,
+      "histories": [
+        {
+          "columns": 4,
+          "width": 4096,
+          "count": 2,
+          "limit": 1,
+          "descending": false,
+          "declared": true,
+          "nulls": false,
+          "minimumBytes": 1486328,
+          "chargedPeakBytes": 240919,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 3,
+          "width": 17,
+          "count": 29,
+          "limit": 1,
+          "descending": true,
+          "declared": true,
+          "nulls": true,
+          "minimumBytes": 1295820,
+          "chargedPeakBytes": 156174,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 1,
+          "width": 65535,
+          "count": 5,
+          "limit": 2,
+          "descending": true,
+          "declared": false,
+          "nulls": true,
+          "minimumBytes": 4514100,
+          "chargedPeakBytes": 2276918,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 3,
+          "width": 4096,
+          "count": 7,
+          "limit": null,
+          "descending": false,
+          "declared": false,
+          "nulls": false,
+          "minimumBytes": 4597154,
+          "chargedPeakBytes": 2178688,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 1,
+          "width": 4096,
+          "count": 29,
+          "limit": 1,
+          "descending": false,
+          "declared": false,
+          "nulls": true,
+          "minimumBytes": 1231174,
+          "chargedPeakBytes": 130982,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 2,
+          "width": 0,
+          "count": 21,
+          "limit": 7,
+          "descending": true,
+          "declared": false,
+          "nulls": false,
+          "minimumBytes": 4475706,
+          "chargedPeakBytes": 2099719,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 3,
+          "width": 65535,
+          "count": 2,
+          "limit": 2,
+          "descending": true,
+          "declared": false,
+          "nulls": false,
+          "minimumBytes": 5089278,
+          "chargedPeakBytes": 2601839,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 1,
+          "width": 1,
+          "count": 28,
+          "limit": 1,
+          "descending": true,
+          "declared": true,
+          "nulls": true,
+          "minimumBytes": 1216944,
+          "chargedPeakBytes": 117876,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 1,
+          "width": 4096,
+          "count": 13,
+          "limit": 7,
+          "descending": true,
+          "declared": false,
+          "nulls": true,
+          "minimumBytes": 4391286,
+          "chargedPeakBytes": 2168119,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 4,
+          "width": 4096,
+          "count": 20,
+          "limit": null,
+          "descending": false,
+          "declared": true,
+          "nulls": false,
+          "minimumBytes": 8526376,
+          "chargedPeakBytes": 2981708,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 2,
+          "width": 17,
+          "count": 4,
+          "limit": 1,
+          "descending": false,
+          "declared": false,
+          "nulls": false,
+          "minimumBytes": 1260768,
+          "chargedPeakBytes": 139316,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 1,
+          "width": 4096,
+          "count": 3,
+          "limit": 0,
+          "descending": false,
+          "declared": false,
+          "nulls": true,
+          "minimumBytes": 512,
+          "chargedPeakBytes": 512,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 1,
+          "width": 65535,
+          "count": 6,
+          "limit": 1,
+          "descending": false,
+          "declared": true,
+          "nulls": true,
+          "minimumBytes": 1407128,
+          "chargedPeakBytes": 243550,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 3,
+          "width": 1,
+          "count": 24,
+          "limit": 2,
+          "descending": true,
+          "declared": true,
+          "nulls": true,
+          "minimumBytes": 4563110,
+          "chargedPeakBytes": 2151379,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 3,
+          "width": 1,
+          "count": 24,
+          "limit": 0,
+          "descending": true,
+          "declared": false,
+          "nulls": false,
+          "minimumBytes": 512,
+          "chargedPeakBytes": 512,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 2,
+          "width": 17,
+          "count": 22,
+          "limit": 2,
+          "descending": false,
+          "declared": true,
+          "nulls": true,
+          "minimumBytes": 4473616,
+          "chargedPeakBytes": 2084538,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 1,
+          "width": 1,
+          "count": 26,
+          "limit": 2,
+          "descending": false,
+          "declared": true,
+          "nulls": false,
+          "minimumBytes": 4381112,
+          "chargedPeakBytes": 2015780,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 1,
+          "width": 0,
+          "count": 18,
+          "limit": 0,
+          "descending": true,
+          "declared": false,
+          "nulls": false,
+          "minimumBytes": 512,
+          "chargedPeakBytes": 512,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 4,
+          "width": 0,
+          "count": 8,
+          "limit": 1,
+          "descending": true,
+          "declared": true,
+          "nulls": true,
+          "minimumBytes": 1327376,
+          "chargedPeakBytes": 171468,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 1,
+          "width": 4096,
+          "count": 2,
+          "limit": 2,
+          "descending": true,
+          "declared": true,
+          "nulls": true,
+          "minimumBytes": 4415884,
+          "chargedPeakBytes": 2035294,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 4,
+          "width": 65535,
+          "count": 21,
+          "limit": 7,
+          "descending": false,
+          "declared": false,
+          "nulls": false,
+          "minimumBytes": 6492492,
+          "chargedPeakBytes": 2890381,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 1,
+          "width": 65535,
+          "count": 5,
+          "limit": 1,
+          "descending": false,
+          "declared": false,
+          "nulls": false,
+          "minimumBytes": 1353868,
+          "chargedPeakBytes": 247648,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 2,
+          "width": 1,
+          "count": 5,
+          "limit": 2,
+          "descending": false,
+          "declared": true,
+          "nulls": false,
+          "minimumBytes": 4470008,
+          "chargedPeakBytes": 2082610,
+          "capBytes": 67108864
+        },
+        {
+          "columns": 2,
+          "width": 0,
+          "count": 7,
+          "limit": null,
+          "descending": false,
+          "declared": true,
+          "nulls": true,
+          "minimumBytes": 4470194,
+          "chargedPeakBytes": 1963641,
+          "capBytes": 67108864
+        }
+      ]
+    }
+  ],
+  "peakCounterLaw": "Grant.allocated means allocated buffer bytes; Grant.loaned is outstanding held credit. Count allocated only, including every native admitGroup return. Calibration excludes unused1MiB loan and1MiB held minimum, counts4096B buffer once; group-blind mutant rejects0 vs4096. Actual8c parent RED reproduced with this meter; same48-case property GREEN, unchanged caps/runs/bound.",
+  "prior8cEvidence": {
+    "base": "8c8385b84948cfe1ea87cd53a6aa2cfc745384b1",
+    "component": {
+      "kind": "small recipe component; not hosted whole-cell",
+      "rows": 2,
+      "limit": 1,
+      "capBytes": 67108864,
+      "warmups": 4,
+      "rounds": 9,
+      "repeats": 32,
+      "runtimes": [
+        "/home/eric/.cache/minnow-b9-prototypes/demand-cursor-v5/parent",
+        "/home/eric/.cache/minnow-b9-prototypes/demand-cursor-v5/candidate"
+      ],
+      "pairs": [
+        {
+          "round": 0,
+          "order": ["parent", "candidate"],
+          "values": [
+            {
+              "arm": "parent",
+              "cpuMs": 3.25728125,
+              "minimumBytes": 44170556
+            },
+            {
+              "arm": "candidate",
+              "cpuMs": 3.0873125,
+              "minimumBytes": 1222874
+            }
+          ]
+        },
+        {
+          "round": 1,
+          "order": ["candidate", "parent"],
+          "values": [
+            {
+              "arm": "candidate",
+              "cpuMs": 2.126375,
+              "minimumBytes": 1222874
+            },
+            {
+              "arm": "parent",
+              "cpuMs": 2.90096875,
+              "minimumBytes": 44170556
+            }
+          ]
+        },
+        {
+          "round": 2,
+          "order": ["parent", "candidate"],
+          "values": [
+            {
+              "arm": "parent",
+              "cpuMs": 2.2293125,
+              "minimumBytes": 44170556
+            },
+            {
+              "arm": "candidate",
+              "cpuMs": 2.218125,
+              "minimumBytes": 1222874
+            }
+          ]
+        },
+        {
+          "round": 3,
+          "order": ["candidate", "parent"],
+          "values": [
+            {
+              "arm": "candidate",
+              "cpuMs": 3.40953125,
+              "minimumBytes": 1222874
+            },
+            {
+              "arm": "parent",
+              "cpuMs": 2.203625,
+              "minimumBytes": 44170556
+            }
+          ]
+        },
+        {
+          "round": 4,
+          "order": ["parent", "candidate"],
+          "values": [
+            {
+              "arm": "parent",
+              "cpuMs": 1.67540625,
+              "minimumBytes": 44170556
+            },
+            {
+              "arm": "candidate",
+              "cpuMs": 2.7984375,
+              "minimumBytes": 1222874
+            }
+          ]
+        },
+        {
+          "round": 5,
+          "order": ["candidate", "parent"],
+          "values": [
+            {
+              "arm": "candidate",
+              "cpuMs": 1.69059375,
+              "minimumBytes": 1222874
+            },
+            {
+              "arm": "parent",
+              "cpuMs": 1.69521875,
+              "minimumBytes": 44170556
+            }
+          ]
+        },
+        {
+          "round": 6,
+          "order": ["parent", "candidate"],
+          "values": [
+            {
+              "arm": "parent",
+              "cpuMs": 1.67140625,
+              "minimumBytes": 44170556
+            },
+            {
+              "arm": "candidate",
+              "cpuMs": 2.7515625,
+              "minimumBytes": 1222874
+            }
+          ]
+        },
+        {
+          "round": 7,
+          "order": ["candidate", "parent"],
+          "values": [
+            {
+              "arm": "candidate",
+              "cpuMs": 2.47109375,
+              "minimumBytes": 1222874
+            },
+            {
+              "arm": "parent",
+              "cpuMs": 2.54671875,
+              "minimumBytes": 44170556
+            }
+          ]
+        },
+        {
+          "round": 8,
+          "order": ["parent", "candidate"],
+          "values": [
+            {
+              "arm": "parent",
+              "cpuMs": 2.90121875,
+              "minimumBytes": 44170556
+            },
+            {
+              "arm": "candidate",
+              "cpuMs": 2.06596875,
+              "minimumBytes": 1222874
+            }
+          ]
+        }
+      ]
+    },
+    "componentSummary": {
+      "parentMedianMs": 2.2293125,
+      "candidateMedianMs": 2.47109375,
+      "pairedDeltaMs": -0.011187499999999684,
+      "pairedIQRMs": 1.2501250000000002,
+      "pairedRangeMs": 2.04115625,
+      "favorable": 6,
+      "parentMinimum": [44170556],
+      "candidateMinimum": [1222874]
+    },
+    "REDAndMutants": [
+      {
+        "name": "mutant-no-delta-lease",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "--maxWorkers=2",
+          "packages/core/src/next/write/range-resident.test.ts"
+        ],
+        "exit": 1,
+        "intendedReject": true,
+        "expected": "to be greater than 0",
+        "log": "/home/eric/.cache/minnow-b9-logs/demand-cursor-mutant-no-delta-lease.log"
+      },
+      {
+        "name": "actual-parent-red",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "--maxWorkers=2",
+          "packages/core/src/next/testing/executor-demand-admission.test.ts",
+          "-t",
+          "native key-order demand"
+        ],
+        "exit": 1,
+        "intendedReject": true,
+        "expected": "to be less than or equal",
+        "log": "/home/eric/.cache/minnow-b9-logs/demand-cursor-actual-parent-red.log"
+      },
+      {
+        "name": "mutant-no-resident",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "--maxWorkers=2",
+          "packages/core/src/next/testing/executor-demand-admission.test.ts",
+          "-t",
+          "native key-order demand"
+        ],
+        "exit": 1,
+        "intendedReject": true,
+        "expected": "to be less than or equal",
+        "log": "/home/eric/.cache/minnow-b9-logs/demand-cursor-mutant-no-resident.log"
+      },
+      {
+        "name": "mutant-target-floor",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "--maxWorkers=2",
+          "packages/core/src/next/page/read-bounds-native-demand.test.ts"
+        ],
+        "exit": 1,
+        "intendedReject": true,
+        "expected": "to be",
+        "log": "/home/eric/.cache/minnow-b9-logs/demand-cursor-mutant-target-floor.log"
+      },
+      {
+        "name": "mutant-partial-coverage",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "--maxWorkers=2",
+          "packages/core/src/next/page/read-bounds-native-demand.test.ts"
+        ],
+        "exit": 1,
+        "intendedReject": true,
+        "expected": "to be greater than or equal",
+        "log": "/home/eric/.cache/minnow-b9-logs/demand-cursor-mutant-partial-coverage.log"
+      },
+      {
+        "name": "mutant-wholebatch-rowloan",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "--maxWorkers=2",
+          "packages/core/src/next/testing/executor-demand-admission.test.ts",
+          "-t",
+          "native key-order demand"
+        ],
+        "exit": 1,
+        "intendedReject": true,
+        "expected": "A prepaid sort row could not be stored",
+        "log": "/home/eric/.cache/minnow-b9-logs/demand-cursor-mutant-wholebatch-rowloan.log"
+      },
+      {
+        "name": "mutant-early-retire",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "--maxWorkers=2",
+          "packages/core/src/next/testing/executor-demand-admission.test.ts",
+          "-t",
+          "retains the sized resident"
+        ],
+        "exit": 1,
+        "intendedReject": true,
+        "expected": "The chunk reader needs",
+        "log": "/home/eric/.cache/minnow-b9-logs/demand-cursor-mutant-early-retire.log"
+      },
+      {
+        "name": "mutant-early-cancel-release",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "--maxWorkers=2",
+          "packages/core/src/next/write/range-resident.test.ts"
+        ],
+        "exit": 1,
+        "intendedReject": true,
+        "expected": "to be greater than 0",
+        "log": "/home/eric/.cache/minnow-b9-logs/demand-cursor-mutant-early-cancel-release.log"
+      },
+      {
+        "name": "mutant-no-input-preflight",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "--maxWorkers=2",
+          "packages/core/src/next/testing/executor-key-order-budget.test.ts"
+        ],
+        "exit": 1,
+        "intendedReject": true,
+        "expected": "a non-fitting optional strategy keeps its generic recipe",
+        "log": "/home/eric/.cache/minnow-b9-logs/demand-cursor-mutant-no-input-preflight.log"
+      },
+      {
+        "name": "mutant-diagnostic-underreserved",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "--maxWorkers=2",
+          "packages/core/src/next/testing/executor-demand-admission.test.ts",
+          "-t",
+          "diagnostic cursor requests"
+        ],
+        "exit": 1,
+        "intendedReject": true,
+        "expected": "operator request must fit its completely reserved capacity",
+        "log": "/home/eric/.cache/minnow-b9-logs/demand-cursor-mutant-diagnostic-underreserved.log"
+      },
+      {
+        "name": "demand-allocated-actual-parent-red",
+        "exit": 1,
+        "intendedReject": true,
+        "reason": "to be less than or equal",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "--maxWorkers=2",
+          "packages/core/src/next/testing/executor-demand-admission.test.ts",
+          "-t",
+          "native key-order demand"
+        ]
+      },
+      {
+        "name": "demand-meter-group-blind-mutant",
+        "exit": 1,
+        "intendedReject": true,
+        "reason": "expected +0 to be 4096",
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "--maxWorkers=2",
+          "packages/core/src/next/testing/executor-demand-admission.test.ts",
+          "-t",
+          "peak meter observes native group"
+        ]
+      },
+      {
+        "name": "unused-loan-overcount",
+        "command": "vitest run packages/core/src/next/testing/executor-demand-admission.test.ts -t \"peak meter excludes\" --maxWorkers=2",
+        "intendedReject": true,
+        "reason": "unused loan credit is not allocated buffer memory;1048576 expected0",
+        "log": "/home/eric/.cache/minnow-b9-logs/demand-allocated-meter-red.log"
+      }
+    ],
+    "GREEN": "63 unique affected-path tests pass across the16-file batch, retargeted fixture replay and final diagnostic ledger generator; full scoped TS/lint/format and hosted gate status recorded in candidate manifest. No runtime cap/run-count/peak-bound relaxation.",
+    "minimumVersusChargedPeak": [
+      {
+        "seed": 761345,
+        "histories": [
+          {
+            "columns": 2,
+            "width": 1,
+            "count": 3,
+            "limit": 1,
+            "descending": true,
+            "declared": false,
+            "nulls": false,
+            "minimumBytes": 1260276,
+            "chargedPeakBytes": 139074,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 4,
+            "width": 4096,
+            "count": 7,
+            "limit": 7,
+            "descending": false,
+            "declared": false,
+            "nulls": true,
+            "minimumBytes": 4704178,
+            "chargedPeakBytes": 2502051,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 3,
+            "width": 17,
+            "count": 12,
+            "limit": null,
+            "descending": true,
+            "declared": false,
+            "nulls": true,
+            "minimumBytes": 4567098,
+            "chargedPeakBytes": 2019767,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 3,
+            "width": 1,
+            "count": 10,
+            "limit": 1,
+            "descending": false,
+            "declared": false,
+            "nulls": true,
+            "minimumBytes": 1298474,
+            "chargedPeakBytes": 157577,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 1,
+            "width": 1,
+            "count": 26,
+            "limit": 2,
+            "descending": true,
+            "declared": true,
+            "nulls": false,
+            "minimumBytes": 4381112,
+            "chargedPeakBytes": 2015780,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 1,
+            "width": 65535,
+            "count": 25,
+            "limit": null,
+            "descending": false,
+            "declared": false,
+            "nulls": false,
+            "minimumBytes": 4514280,
+            "chargedPeakBytes": 2155838,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 2,
+            "width": 17,
+            "count": 4,
+            "limit": 0,
+            "descending": false,
+            "declared": true,
+            "nulls": true,
+            "minimumBytes": 512,
+            "chargedPeakBytes": 512,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 4,
+            "width": 17,
+            "count": 12,
+            "limit": null,
+            "descending": false,
+            "declared": true,
+            "nulls": false,
+            "minimumBytes": 4654824,
+            "chargedPeakBytes": 2050844,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 3,
+            "width": 17,
+            "count": 28,
+            "limit": 1,
+            "descending": true,
+            "declared": true,
+            "nulls": false,
+            "minimumBytes": 1296144,
+            "chargedPeakBytes": 156340,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 3,
+            "width": 65535,
+            "count": 29,
+            "limit": null,
+            "descending": true,
+            "declared": false,
+            "nulls": false,
+            "minimumBytes": 5091384,
+            "chargedPeakBytes": 2601851,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 3,
+            "width": 4096,
+            "count": 25,
+            "limit": null,
+            "descending": false,
+            "declared": true,
+            "nulls": false,
+            "minimumBytes": 7617658,
+            "chargedPeakBytes": 2807975,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 2,
+            "width": 17,
+            "count": 18,
+            "limit": 7,
+            "descending": false,
+            "declared": false,
+            "nulls": false,
+            "minimumBytes": 4477236,
+            "chargedPeakBytes": 2101210,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 2,
+            "width": 65535,
+            "count": 2,
+            "limit": null,
+            "descending": false,
+            "declared": false,
+            "nulls": true,
+            "minimumBytes": 4866888,
+            "chargedPeakBytes": 2467073,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 2,
+            "width": 0,
+            "count": 20,
+            "limit": null,
+            "descending": true,
+            "declared": true,
+            "nulls": true,
+            "minimumBytes": 4471520,
+            "chargedPeakBytes": 1964252,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 1,
+            "width": 17,
+            "count": 5,
+            "limit": 2,
+            "descending": false,
+            "declared": true,
+            "nulls": false,
+            "minimumBytes": 4379424,
+            "chargedPeakBytes": 2015084,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 2,
+            "width": 65535,
+            "count": 14,
+            "limit": 2,
+            "descending": false,
+            "declared": true,
+            "nulls": true,
+            "minimumBytes": 13902620,
+            "chargedPeakBytes": 4228740,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 3,
+            "width": 4096,
+            "count": 13,
+            "limit": 1,
+            "descending": true,
+            "declared": false,
+            "nulls": true,
+            "minimumBytes": 1330198,
+            "chargedPeakBytes": 195214,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 1,
+            "width": 65535,
+            "count": 13,
+            "limit": 0,
+            "descending": true,
+            "declared": true,
+            "nulls": false,
+            "minimumBytes": 512,
+            "chargedPeakBytes": 512,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 1,
+            "width": 65535,
+            "count": 25,
+            "limit": 7,
+            "descending": false,
+            "declared": false,
+            "nulls": false,
+            "minimumBytes": 4514268,
+            "chargedPeakBytes": 2155826,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 3,
+            "width": 4096,
+            "count": 9,
+            "limit": 0,
+            "descending": false,
+            "declared": true,
+            "nulls": true,
+            "minimumBytes": 512,
+            "chargedPeakBytes": 512,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 1,
+            "width": 0,
+            "count": 6,
+            "limit": 1,
+            "descending": true,
+            "declared": false,
+            "nulls": true,
+            "minimumBytes": 1223196,
+            "chargedPeakBytes": 121090,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 2,
+            "width": 65535,
+            "count": 26,
+            "limit": 1,
+            "descending": false,
+            "declared": false,
+            "nulls": true,
+            "minimumBytes": 1653456,
+            "chargedPeakBytes": 528004,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 2,
+            "width": 17,
+            "count": 4,
+            "limit": 0,
+            "descending": true,
+            "declared": false,
+            "nulls": true,
+            "minimumBytes": 512,
+            "chargedPeakBytes": 512,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 3,
+            "width": 0,
+            "count": 3,
+            "limit": 2,
+            "descending": true,
+            "declared": true,
+            "nulls": true,
+            "minimumBytes": 4560466,
+            "chargedPeakBytes": 2150125,
+            "capBytes": 67108864
+          }
+        ]
+      },
+      {
+        "seed": 761346,
+        "histories": [
+          {
+            "columns": 4,
+            "width": 4096,
+            "count": 2,
+            "limit": 1,
+            "descending": false,
+            "declared": true,
+            "nulls": false,
+            "minimumBytes": 1486328,
+            "chargedPeakBytes": 240919,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 3,
+            "width": 17,
+            "count": 29,
+            "limit": 1,
+            "descending": true,
+            "declared": true,
+            "nulls": true,
+            "minimumBytes": 1295820,
+            "chargedPeakBytes": 156174,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 1,
+            "width": 65535,
+            "count": 5,
+            "limit": 2,
+            "descending": true,
+            "declared": false,
+            "nulls": true,
+            "minimumBytes": 4514100,
+            "chargedPeakBytes": 2276918,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 3,
+            "width": 4096,
+            "count": 7,
+            "limit": null,
+            "descending": false,
+            "declared": false,
+            "nulls": false,
+            "minimumBytes": 4597154,
+            "chargedPeakBytes": 2178688,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 1,
+            "width": 4096,
+            "count": 29,
+            "limit": 1,
+            "descending": false,
+            "declared": false,
+            "nulls": true,
+            "minimumBytes": 1231174,
+            "chargedPeakBytes": 130982,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 2,
+            "width": 0,
+            "count": 21,
+            "limit": 7,
+            "descending": true,
+            "declared": false,
+            "nulls": false,
+            "minimumBytes": 4475706,
+            "chargedPeakBytes": 2099719,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 3,
+            "width": 65535,
+            "count": 2,
+            "limit": 2,
+            "descending": true,
+            "declared": false,
+            "nulls": false,
+            "minimumBytes": 5089278,
+            "chargedPeakBytes": 2601839,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 1,
+            "width": 1,
+            "count": 28,
+            "limit": 1,
+            "descending": true,
+            "declared": true,
+            "nulls": true,
+            "minimumBytes": 1216944,
+            "chargedPeakBytes": 117876,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 1,
+            "width": 4096,
+            "count": 13,
+            "limit": 7,
+            "descending": true,
+            "declared": false,
+            "nulls": true,
+            "minimumBytes": 4391286,
+            "chargedPeakBytes": 2168119,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 4,
+            "width": 4096,
+            "count": 20,
+            "limit": null,
+            "descending": false,
+            "declared": true,
+            "nulls": false,
+            "minimumBytes": 8526376,
+            "chargedPeakBytes": 2981708,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 2,
+            "width": 17,
+            "count": 4,
+            "limit": 1,
+            "descending": false,
+            "declared": false,
+            "nulls": false,
+            "minimumBytes": 1260768,
+            "chargedPeakBytes": 139316,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 1,
+            "width": 4096,
+            "count": 3,
+            "limit": 0,
+            "descending": false,
+            "declared": false,
+            "nulls": true,
+            "minimumBytes": 512,
+            "chargedPeakBytes": 512,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 1,
+            "width": 65535,
+            "count": 6,
+            "limit": 1,
+            "descending": false,
+            "declared": true,
+            "nulls": true,
+            "minimumBytes": 1407128,
+            "chargedPeakBytes": 243550,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 3,
+            "width": 1,
+            "count": 24,
+            "limit": 2,
+            "descending": true,
+            "declared": true,
+            "nulls": true,
+            "minimumBytes": 4563110,
+            "chargedPeakBytes": 2151379,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 3,
+            "width": 1,
+            "count": 24,
+            "limit": 0,
+            "descending": true,
+            "declared": false,
+            "nulls": false,
+            "minimumBytes": 512,
+            "chargedPeakBytes": 512,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 2,
+            "width": 17,
+            "count": 22,
+            "limit": 2,
+            "descending": false,
+            "declared": true,
+            "nulls": true,
+            "minimumBytes": 4473616,
+            "chargedPeakBytes": 2084538,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 1,
+            "width": 1,
+            "count": 26,
+            "limit": 2,
+            "descending": false,
+            "declared": true,
+            "nulls": false,
+            "minimumBytes": 4381112,
+            "chargedPeakBytes": 2015780,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 1,
+            "width": 0,
+            "count": 18,
+            "limit": 0,
+            "descending": true,
+            "declared": false,
+            "nulls": false,
+            "minimumBytes": 512,
+            "chargedPeakBytes": 512,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 4,
+            "width": 0,
+            "count": 8,
+            "limit": 1,
+            "descending": true,
+            "declared": true,
+            "nulls": true,
+            "minimumBytes": 1327376,
+            "chargedPeakBytes": 171468,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 1,
+            "width": 4096,
+            "count": 2,
+            "limit": 2,
+            "descending": true,
+            "declared": true,
+            "nulls": true,
+            "minimumBytes": 4415884,
+            "chargedPeakBytes": 2035294,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 4,
+            "width": 65535,
+            "count": 21,
+            "limit": 7,
+            "descending": false,
+            "declared": false,
+            "nulls": false,
+            "minimumBytes": 6492492,
+            "chargedPeakBytes": 2890381,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 1,
+            "width": 65535,
+            "count": 5,
+            "limit": 1,
+            "descending": false,
+            "declared": false,
+            "nulls": false,
+            "minimumBytes": 1353868,
+            "chargedPeakBytes": 247648,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 2,
+            "width": 1,
+            "count": 5,
+            "limit": 2,
+            "descending": false,
+            "declared": true,
+            "nulls": false,
+            "minimumBytes": 4470008,
+            "chargedPeakBytes": 2082610,
+            "capBytes": 67108864
+          },
+          {
+            "columns": 2,
+            "width": 0,
+            "count": 7,
+            "limit": null,
+            "descending": false,
+            "declared": true,
+            "nulls": true,
+            "minimumBytes": 4470194,
+            "chargedPeakBytes": 1963641,
+            "capBytes": 67108864
+          }
+        ]
+      }
+    ],
+    "prototypeProvenance": {
+      "source": "/home/eric/.cache/minnow-b9-demand-cursor",
+      "head": "8c8385b84948cfe1ea87cd53a6aa2cfc745384b1",
+      "base": "/home/eric/.cache/minnow-b9-baseline-bc9/packages/core/dist",
+      "kind": "transpileModule prototype on ordinary bc9; hosted ordinary hashes required",
+      "typescript": "5.9.3",
+      "node": "v26.12.0",
+      "arms": {
+        "parent": {
+          "root": "/home/eric/.cache/minnow-b9-prototypes/demand-cursor-v5/parent",
+          "overlays": {
+            "next/access/changes.js": "90cd8771af7b9187ecf5dae5352acc21ee291958477d4977aa383fbee507a88e",
+            "next/access/write-path.js": "51c44f553a2c2bae2d8f8d1e041e2f316f27a7251ef607c2fc733c2a9f96fd53",
+            "next/exec/admission.js": "cd9ea344a4fbae007e2e158e558d927128e058cffb6dc4eed8ec4ee85ffe0ee9",
+            "next/exec/deferred-grant.js": "bb0ed78f608288acc6894d0c10b074e5cc421abd04f5cfb7910917a90936e1ba",
+            "next/exec/executor.js": "db812b5830acebc8ea466941fa107c0941c5712ece257314ff21709487d96dd9",
+            "next/exec/result-sink.js": "2d75ee95b23c36969fc2160ea6b7057756419c5544bf468d6496c291b2c1155d",
+            "next/exec/result.js": "83370a90f65479c93db9d992b896f137cfc9abcc8c8fea9d897a24523857739b",
+            "next/exec/run.js": "f4650851abb792a2a490e59b5af9cfdd143398e08dbef9760d4176033e8b3c1f",
+            "next/live/constants.js": "cad988863cb005de3c4faffe792d98f9abcfe32ebef4ca210d50c5d58466d1e3",
+            "next/live/errors.js": "37a6f0d701e0b6df27ec66974ec385c2ec5c95383cfe11e11d9deeba9c014c49",
+            "next/live/rows.js": "99e72b2f4597c96db51a5559257be5d4f950337f5ed72d4b4532e796cd0a5b4a",
+            "next/live/runtime.js": "1e91c2d24b7c97666ef2beab66f572b0bbbc66efc2e255891503d360b224e3a2",
+            "next/live/state.js": "437e62f0d928551a160749297352c558048480189cdb3d701235ee61091b1b13",
+            "next/owner/client.js": "ccc2e0e8e60438a35dc875470730ae64157a175931bdf90835838910ce1cbd2b",
+            "next/owner/compose.js": "2de755391f777e7cfbcc6e8d6977377bc60c71a9b9c03cab3f65cc39e07b8f5d",
+            "next/owner/connector.js": "507e0eae47aa59d4d34f6a9b0a0f0fde6bf2e64a6aefb8dbdd31f6d47fdec140",
+            "next/owner/election.js": "32b7f9f859c4559abe49a2347960fe693b821d679512c519d17c5dded767c1a7",
+            "next/owner/engine.js": "f441cfa4259d8c549b1c2e0620c814e7270b519ac2bf50350e17757151e8f6c0",
+            "next/owner/protocol.js": "ea92da322e9895f51ac021e86661c0cf3901619e3fa20d35be940036d3675f9d",
+            "next/owner/server.js": "4d7d1a7b38c777538e94fa17c84020b606ebb71a2f428d5149f7ee0621d6e994",
+            "next/page/read-bounds.js": "aea17f5903bbb2876cec9d4898488b226ca3552354d008725ae3fbeba2487e40",
+            "next/testing/live-runtime.test-support.js": "c7e61697a9c0c4400798b3fc54cbde9097f3a16572041eb38b5c78454bdfc036",
+            "next/write/engine.js": "b40cc5dd0b0c6e1fa83c28e121b008286de6e4bddf2a5c1c2fbbc1cb763318c9",
+            "next/write/live-rekeys.js": "acb88a917c31aa430c639e66090f88c8460a7385515cd87e4bf243e0cded0da7",
+            "next/write/snapshot-load.js": "b323d3645fd549cc1bad959d8b46698c2769924539673ee8ae6ef85a64a7c63f",
+            "next/write/transaction.js": "81ee2aa902f1c4d5165c82c1af0b7d405337652de43663744cd445e0887acfa7",
+            "testing/reach.js": "46aeb8d4794dd87c50aa0306138c4688d8ff069f58d5a081dd5c574905d60aa2"
+          }
+        },
+        "candidate": {
+          "root": "/home/eric/.cache/minnow-b9-prototypes/demand-cursor-v5/candidate",
+          "overlays": {
+            "next/access/changes.js": "90cd8771af7b9187ecf5dae5352acc21ee291958477d4977aa383fbee507a88e",
+            "next/access/write-path.js": "51c44f553a2c2bae2d8f8d1e041e2f316f27a7251ef607c2fc733c2a9f96fd53",
+            "next/exec/admission.js": "cd9ea344a4fbae007e2e158e558d927128e058cffb6dc4eed8ec4ee85ffe0ee9",
+            "next/exec/deferred-grant.js": "bb0ed78f608288acc6894d0c10b074e5cc421abd04f5cfb7910917a90936e1ba",
+            "next/exec/executor.js": "db812b5830acebc8ea466941fa107c0941c5712ece257314ff21709487d96dd9",
+            "next/exec/result-sink.js": "2d75ee95b23c36969fc2160ea6b7057756419c5544bf468d6496c291b2c1155d",
+            "next/exec/result.js": "83370a90f65479c93db9d992b896f137cfc9abcc8c8fea9d897a24523857739b",
+            "next/exec/run.js": "ce2336c6e00df7c3a5f2a017bad3c704b28d586cf2bc56fb6b29928d7653bd3e",
+            "next/live/constants.js": "cad988863cb005de3c4faffe792d98f9abcfe32ebef4ca210d50c5d58466d1e3",
+            "next/live/errors.js": "37a6f0d701e0b6df27ec66974ec385c2ec5c95383cfe11e11d9deeba9c014c49",
+            "next/live/rows.js": "99e72b2f4597c96db51a5559257be5d4f950337f5ed72d4b4532e796cd0a5b4a",
+            "next/live/runtime.js": "1e91c2d24b7c97666ef2beab66f572b0bbbc66efc2e255891503d360b224e3a2",
+            "next/live/state.js": "437e62f0d928551a160749297352c558048480189cdb3d701235ee61091b1b13",
+            "next/owner/client.js": "ccc2e0e8e60438a35dc875470730ae64157a175931bdf90835838910ce1cbd2b",
+            "next/owner/compose.js": "2de755391f777e7cfbcc6e8d6977377bc60c71a9b9c03cab3f65cc39e07b8f5d",
+            "next/owner/connector.js": "507e0eae47aa59d4d34f6a9b0a0f0fde6bf2e64a6aefb8dbdd31f6d47fdec140",
+            "next/owner/election.js": "32b7f9f859c4559abe49a2347960fe693b821d679512c519d17c5dded767c1a7",
+            "next/owner/engine.js": "f441cfa4259d8c549b1c2e0620c814e7270b519ac2bf50350e17757151e8f6c0",
+            "next/owner/protocol.js": "ea92da322e9895f51ac021e86661c0cf3901619e3fa20d35be940036d3675f9d",
+            "next/owner/server.js": "4d7d1a7b38c777538e94fa17c84020b606ebb71a2f428d5149f7ee0621d6e994",
+            "next/page/read-bounds.js": "b1d0d0c73ba2b421d5ebe52f6e65aeded1a73302961c7c602cfe6460c3ae6b3d",
+            "next/testing/live-runtime.test-support.js": "c7e61697a9c0c4400798b3fc54cbde9097f3a16572041eb38b5c78454bdfc036",
+            "next/write/engine.js": "b40cc5dd0b0c6e1fa83c28e121b008286de6e4bddf2a5c1c2fbbc1cb763318c9",
+            "next/write/live-rekeys.js": "acb88a917c31aa430c639e66090f88c8460a7385515cd87e4bf243e0cded0da7",
+            "next/write/snapshot-load.js": "b323d3645fd549cc1bad959d8b46698c2769924539673ee8ae6ef85a64a7c63f",
+            "next/write/transaction.js": "81ee2aa902f1c4d5165c82c1af0b7d405337652de43663744cd445e0887acfa7",
+            "testing/reach.js": "2f8207046070eee4364fb30f3b759d5157eb25e805f2e21455c6d47039ffcfa7",
+            "next/access/key-index.js": "db2b789df909960138815ec2eaf2464111caf38153489afd510fd4f9e8f01c22",
+            "next/exec/key-order.js": "ba8e0cf5e0c5452c7eb85105c72663aeb7f028596b409f6e47ab3615bb1d2b1a",
+            "next/exec/plan.js": "f5a06891e9b9c0f98fa331696e06846ce5282827780366200c4aeb5edd5ed714",
+            "next/exec/sort.js": "7cdfbcea329060460135c05ae9f5faa8c7f646e985e0bd1c8d39088180afcb22",
+            "next/write/range-cursor.js": "8d1bf145b889529eb15ef61b4813d50f15dd2fe67117ec15a87c8b8cfaa12d1c",
+            "next/write/range-input.js": "22f2927da60187bb8ea3c4ee580cd01ed26bc2a7bbb07485ce7bde13e8d87756",
+            "next/write/range-plan.js": "c98a117e38a6301c822efaa22cc108088a9baeba92e857c01e95b248617b3793",
+            "next/write/view.js": "2a8d945e099dfd43c2607e1c0405e0e80bd8db8708284e07422caa295e3426d8"
+          }
+        }
+      }
+    },
+    "finalVerification": {
+      "replay": "Allocation-only admission suite9 PASS; other13 affected-suite final tests unchanged/PASS;65 unique relevant checks. Fresh48 allocation-only peak histories saved.",
+      "typescript": "full scoped source/tests/component PASS after final runtime lint fixes",
+      "lint": "all changed source lint followed by3-file targeted repair PASS",
+      "memoryPeakEvidence": "Fresh48 allocation-only histories from final runtime; predecessor counter records retained only as superseded evidence.",
+      "prototype": "all10 changed runtime modules covered by the final35-module candidate overlay; parent27-module overlay; ordinary hosted emission checks required"
+    },
+    "limits": "Local component is a TypeScript transpileModule prototype over ordinary bc9 outputs with all intervening 8c runtime changes overlaid. Hosted ordinary emitted hashes must match before whole-cell evidence is accepted. CPU delta is inconclusive; this piece fixes inflated admission. Writer retention is B7. Cursor unit invokes the real replaceDeltas boundary plus real publication, not a complete writer staging workload."
+  },
+  "historicalStatus": "00396 qualified proposal; not84d evidence"
+}

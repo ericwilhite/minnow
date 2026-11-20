@@ -30,6 +30,15 @@ no stored-format change or migration is required.
 The writer may finish a prepaid publication before waiting for the next phase's memory;
 published state keeps its owning charge, and provisional work must be fully settled first.
 
+The private 1.0 executor sizes small ordered reads from a retained native input and bounded
+read batches. A two-row INT/TEXT/NUMERIC query no longer reserves a maximum publication
+workspace for its late fetch. A retained resident index delta keeps the fast cursor path,
+and LIMIT one omits the unused physical-order restore. Narrow LIMITs still fund
+full-batch physical fetch buffers, including the scan placeholder. Complete-source hint unions bound their
+actual output, and sort retries respect the one-row scope of a progress loan. Complete query admission and oversized-value
+accounting remain required. No stored-format change or migration is required; released 0.x
+behavior is unchanged.
+
 After recovery finishes, the private writer returns its unused WAL scan reservation
 before accepting queries. Reopened databases keep their row workspace and live buffers
 funded without blocking a query behind completed recovery work. Released 0.x behavior is
