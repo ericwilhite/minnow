@@ -1,4 +1,5 @@
 import { armRequestGate, type RequestKind } from "./next-storage-gate.js";
+import { OPFS_FILE_NAMES } from "../src/next/storage/opfs.js";
 /**
  * Page side of the rebuild core's storage browser suite (browser-tests/next-storage.spec.ts):
  * spawns next-storage-worker.ts workers, kills them mid-publish, and verifies from fresh ones.
@@ -241,8 +242,10 @@ export interface KillFailure {
  * max 12,393 ms per verification. 30 s is about 2.4 times that maximum.
  */
 const VERIFY_STALL_MS = 30_000;
-/** How long the stall diagnosis probes each file's sync handle for release. */
-const DIAGNOSIS_PROBE_MS = 10_000;
+/** How long the stall diagnosis probes each file's sync handle for release (per file). */
+const DIAGNOSIS_PROBE_MS = 5_000;
+/** The page's diagnosis deadline: every file's probe budget plus lock query and spawn slack. */
+const DIAGNOSIS_DEADLINE_MS = DIAGNOSIS_PROBE_MS * OPFS_FILE_NAMES.length + 20_000;
 
 /** This store's held and pending Web Locks, from the page, bounded (2 s). */
 async function lockSnapshot(dir: string): Promise<unknown> {
@@ -266,7 +269,7 @@ async function diagnoseAfterTermination(dir: string): Promise<unknown> {
     worker = await spawn();
     return await within(
       worker.call({ op: "diagnose-opfs", dir, probeMs: DIAGNOSIS_PROBE_MS }),
-      DIAGNOSIS_PROBE_MS * 2 + 20_000,
+      DIAGNOSIS_DEADLINE_MS,
       "the OPFS diagnosis",
     );
   } catch (error) {

@@ -941,7 +941,8 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
     }
     case "diagnose-opfs": {
       // Where a reopen is stuck on OPFS: the lock manager's view of this store's locks, then each
-      // file's sync handle opened and closed alone, retried until free or `probeMs` has passed.
+      // file's sync handle opened and closed alone, each file retried until free or its own
+      // `probeMs` budget has passed (the page's diagnosis deadline bounds the whole probe).
       // Each step is streamed to the page as it starts and ends: a synchronous call that never
       // returns (a close, say) blocks this worker's timers, so the page keeps the deadline.
       const step = traceStep;
@@ -955,9 +956,9 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
         `locks after termination: held ${JSON.stringify(ours(query.held))}, pending ${JSON.stringify(ours(query.pending))}`,
       );
       const dir = await directory(request.dir, step);
-      const started = performance.now();
       const files: Record<string, string> = {};
       for (const name of OPFS_FILE_NAMES) {
+        const started = performance.now();
         let outcome: string;
         for (;;) {
           const attempt = await Promise.race([
