@@ -219,7 +219,7 @@ export type TransactionState = "idle" | "open" | "failed" | "timedOut";
 export const DEFAULT_TRANSACTION_IDLE_TIMEOUT_MS = 30_000;
 
 /** Bumped by every change to a message in this file or in frame.ts. */
-export const PROTOCOL_VERSION = 10;
+export const PROTOCOL_VERSION = 11;
 
 /** The owner sends `alive` at least this often while a client has requests in flight. */
 export const ALIVE_INTERVAL_MS = 1_000;
@@ -422,6 +422,8 @@ export interface SubscribeRequest extends RequestHeader {
 /** Catalog and administration calls whose reply is a structured-clone `value`. */
 export interface AdminRequest extends RequestHeader {
   readonly t: "admin";
+  /** Inspection is bound to a SQL session; legacy session-free administration omits it. */
+  readonly session?: number;
   readonly op: AdminOp;
   readonly args: readonly WireValue[];
 }
@@ -432,6 +434,8 @@ export interface AdminRequest extends RequestHeader {
  */
 export type AdminOp =
   | SnapshotOp
+  | "describeCatalog"
+  | "explain"
   | "catalog"
   | "storageStats"
   | "memoryStats"

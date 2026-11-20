@@ -5,6 +5,7 @@ import {
   isSnapshotOp,
   type OwnerSnapshotOperations,
 } from "./snapshot-connection.js";
+import { OwnedAdminReply } from "./admin-reply.js";
 /**
  * The owner's protocol server: connections, request admission and outcomes, per-session ordering,
  * the idle-transaction timeout, result streaming with release windows, cancellation, liveness and
@@ -410,6 +411,10 @@ class Connection {
   readonly #queued = new Map<number, { cancelled: boolean; close: boolean }>();
   readonly #streams = new Map<number, Stream>();
   readonly #live = new Map<number, LiveHandle>();
+  readonly #inspectionReplies = new Map<
+    number,
+    { reply: OwnedAdminReply<unknown>; live: boolean; postedAt: number }
+  >();
   #aliveTimer: ReturnType<typeof setInterval> | null = null;
   #lastPostAt = 0;
   #sweepTimer: ReturnType<typeof setInterval> | null = null;
@@ -612,6 +617,8 @@ class Connection {
         this.#livenessHeld = message.held;
         for (const running of this.#running.values()) running.live = message.held;
         for (const stream of this.#streams.values()) stream.live = message.held;
+        for (const reply of this.#inspectionReplies.values()) reply.live = message.held;
+        if (this.#inspectionReplies.size !== 0) this.#sweepIfNeeded();
         this.#watchIfNeeded();
         return;
       case "liveAck":
@@ -856,6 +863,21 @@ class Connection {
       });
       return;
     }
+    if (
+      request.t === "admin" &&
+      (request.op === "describeCatalog" || request.op === "explain") !== (session !== null)
+    ) {
+      this.post({
+        t: "error",
+        seq: request.seq,
+        error: toWireError(
+          new ProtocolError(
+            "Inspection requires a SQL session; other administration is session-free",
+          ),
+        ),
+      });
+      return;
+    }
     const ending = request.t === "commit" || request.t === "rollback";
     if (
       ending &&
@@ -875,7 +897,7 @@ class Connection {
     if (
       (request.t === "prepare" && session === null) ||
       request.t === "subscribe" ||
-      request.t === "admin"
+      (request.t === "admin" && request.op !== "describeCatalog" && request.op !== "explain")
     ) {
       // Session-free requests do not wait behind a session.
       void this.#serveOne(request, null);
@@ -957,7 +979,7 @@ class Connection {
     }
     const before = session?.transaction ?? "idle";
     const scope = ledgerScope({
-      kind: request.t,
+      kind: request.t === "admin" && request.session !== undefined ? "statement" : request.t,
       control: planned?.control ?? null,
       before,
       retry: request.retry,
@@ -1271,13 +1293,47 @@ class Connection {
           finish();
           return;
         case "admin":
+          this.#releaseInspection(request.seq);
           goAsync();
           return engine
-            .admin(request.op, request.args, context)
+            .admin(request.op, request.args, context, session ?? undefined)
             .then(
               (value) => {
                 engine.ledger.settle(this.clientId, request.seq);
-                this.post({ t: "value", seq: request.seq, value });
+                const owned = value instanceof OwnedAdminReply ? value : null;
+                // Admission may have completed before cancellation or connection teardown,
+                // while its promise handler is still queued. Never resurrect that ownership.
+                if (
+                  owned !== null &&
+                  (this.#state === "closed" || running.cancelled || abort.signal.aborted)
+                ) {
+                  owned.close();
+                  this.post({
+                    t: "error",
+                    seq: request.seq,
+                    error: toWireError(this.#mapError(new CancelledError(), running)),
+                  });
+                  return;
+                }
+                if (owned !== null) {
+                  this.#inspectionReplies.set(request.seq, {
+                    reply: owned,
+                    live: running.live,
+                    postedAt: server.now(),
+                  });
+                  this.#sweepIfNeeded();
+                  this.#watchIfNeeded();
+                }
+                try {
+                  this.post({
+                    t: "value",
+                    seq: request.seq,
+                    value: owned === null ? value : owned.value,
+                  });
+                } catch (error) {
+                  this.#releaseInspection(request.seq);
+                  throw error;
+                }
               },
               (error: unknown) => {
                 engine.ledger.settle(this.clientId, request.seq);
@@ -1752,6 +1808,7 @@ class Connection {
       queued.close ||= close;
       return;
     }
+    this.#releaseInspection(target);
     const running = this.#running.get(target);
     if (running === undefined) {
       // Finished: closing it frees the frames the client will never take.
@@ -1775,7 +1832,17 @@ class Connection {
     this.#streams.get(target)?.results.cancel(new CancelledError());
   }
 
+  #releaseInspection(target: number): void {
+    const owned = this.#inspectionReplies.get(target);
+    if (owned === undefined) return;
+    this.#inspectionReplies.delete(target);
+    owned.reply.close();
+    this.#sweepIfNeeded();
+    this.#watchIfNeeded();
+  }
+
   #release(target: number, through: number): void {
+    if (through >= 0 && this.#inspectionReplies.size !== 0) this.#releaseInspection(target);
     const stream = this.#streams.get(target);
     if (stream === undefined) return;
     stream.lastActivityMs = this.#server.now();
@@ -1815,6 +1882,8 @@ class Connection {
   #livenessNeeded(): boolean {
     if (this.#livenessHeld && this.#live.size > 0) return true;
     if (this.#livenessHeld && this.#snapshots?.active === true) return true;
+    if (this.#inspectionReplies.size !== 0)
+      for (const reply of this.#inspectionReplies.values()) if (reply.live) return true;
     for (const running of this.#running.values()) if (running.live) return true;
     // Frames posted to a live client hold the executor's charge: keep watching until released.
     for (const stream of this.#streams.values())
@@ -1883,7 +1952,8 @@ class Connection {
     const limit = this.#server.options.abandonedStreamMs ?? ABANDONED_STREAM_MS;
     const hasNonLive =
       (this.#snapshots?.active === true && !this.#livenessHeld) ||
-      [...this.#streams.values()].some((stream) => !stream.live && stream.posted.length > 0);
+      [...this.#streams.values()].some((stream) => !stream.live && stream.posted.length > 0) ||
+      [...this.#inspectionReplies.values()].some((reply) => !reply.live);
     if (hasNonLive && this.#sweepTimer === null) {
       this.#sweepTimer = setInterval(
         () => {
@@ -1913,6 +1983,8 @@ class Connection {
       });
       void this.#snapshotClosing.catch(() => undefined);
     }
+    for (const [seq, reply] of this.#inspectionReplies)
+      if (!reply.live && now - reply.postedAt >= limit) this.#releaseInspection(seq);
     for (const [seq, stream] of this.#streams) {
       if (stream.live || stream.posted.length === 0 || now - stream.lastActivityMs < limit)
         continue;
@@ -1951,6 +2023,8 @@ class Connection {
     }
     this.#returns?.close();
     this.#returns = null;
+    for (const reply of this.#inspectionReplies.values()) reply.reply.close();
+    this.#inspectionReplies.clear();
     void reason;
     // Requests past the commit boundary complete (their frames are released as they come).
     for (const running of this.#running.values()) {
