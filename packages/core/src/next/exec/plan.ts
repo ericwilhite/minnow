@@ -51,6 +51,7 @@ import { rankingBounds } from "./window-topk-plan.js";
 import { Slice, runSliced, type SlicedJob } from "./slices.js";
 /** Immutable pipeline recipes; every execution instantiates its own operators and kernels. */
 import type { MaybePromise } from "../access/key-index.js";
+import { columnsRead } from "../ir/columns-read.js";
 import type { PhysicalPlan, Rel, ScalarExpr, SortKey } from "../ir/ir.js";
 import { ResultSink, resultRowStepBytes } from "./result-sink.js";
 import { aggregateProgressLayout, simpleAggregateType } from "./agg/parameter-copies.js";
@@ -392,20 +393,6 @@ function counted(runtime: QueryRuntime, rel: OperatorIdentity, sink: Operator): 
     finish: () => sink.finish(),
     abort: (reason) => sink.abort(reason),
   };
-}
-
-/** Every input column a scalar expression reads: only `column` references its input. */
-function readColumns(expr: ScalarExpr, into: Set<number>): void {
-  if (expr.op === "column") {
-    into.add(expr.index);
-    return;
-  }
-  const visit = (value: unknown): void => {
-    if (Array.isArray(value)) for (const item of value) visit(item);
-    else if (value !== null && typeof value === "object" && "op" in value)
-      readColumns(value as ScalarExpr, into);
-  };
-  for (const value of Object.values(expr)) visit(value);
 }
 
 /** Add non-column keys once, preserving the original columns at their original positions. */
@@ -1535,10 +1522,10 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
       case "project":
       case "limit": {
         // A projection over a join reads only these join output columns (output demand).
+        // An expression the walker cannot classify leaves the join's full output demanded.
         if (rel.op === "project" && rel.input.op === "join") {
-          const read = new Set<number>();
-          for (const expr of rel.exprs) readColumns(expr, read);
-          joinOutputDemand.set(rel.input.id, read);
+          const read = columnsRead(rel.exprs);
+          if (read !== null) joinOutputDemand.set(rel.input.id, read);
         }
         const originalChild = prepare(rel.input),
           input = types(rel.input);
