@@ -4041,7 +4041,8 @@ copies a bounded scalar window and drops native read buffers/progress loans befo
 continuations, so a callback can append or run a nested producer without hold-and-wait.
 Close fences pending appends, reads and continuations before closing files or freeing scratch;
 cleanup attempts both epochs and surfaces close failures. This is a verified runtime component;
-SQL firing still needs the joint controller, compiled body-source host and native Statement.end hooks.
+SQL firing composes it with the joint controller, compiled body-source host and native
+Statement.end hooks (see "Ordinary native SQL row triggers").
 
 TriggerBindingProgram compiles stable (OLD/NEW, column ID) dependencies once. Repeated textual
 parameters alias one owned typed scalar; no Date/Number/JS-row or public raw-parameter rebinding
@@ -4297,8 +4298,8 @@ workspace. Encode scratch is prepaid before capture. Release clears vector array
 refunding them; close cancels progress waits and fences payload I/O and active leases.
 
 These image components use the frozen consumer ABI and pass through the real typed trigger
-binding copier in component tests. They still do not install a native statement provider or
-turn on SQL firing. The caller supplies admitted scope/progress and immutable table metadata;
+binding copier in component tests. They do not install a native statement provider
+themselves; the ordinary owner does (see "Ordinary native SQL row triggers"). The caller supplies admitted scope/progress and immutable table metadata;
 statement/command ownership, row rules, accepted-write hooks and deferred RI execution are
 separate integration responsibilities.
 
@@ -4307,7 +4308,7 @@ records, without reading scalar payloads or creating an image lease. The root ca
 writer growth from these exact sizes before borrowing OLD/NEW values. NULL and fixed-width
 cells need no variable payload credit. Metadata cancellation and close fence pending backing
 reads before returning the registry's fixed charge. Real native primary tests use this path;
-it does not supply the compiled body host or enable SQL firing.
+it does not supply the compiled body host itself.
 
 `owner/registry-commands.ts` records command/frame ownership, accepted native row IDs and
 immutable RI descriptors in the shared directory. Its fixed frame slots retain separate
@@ -4334,7 +4335,7 @@ An already checked command token never covers a later action's accepted rows; ob
 versions do not produce reference failures. A private fixed account also returns provisional
 key buffers when construction fails. Generated tests compare real native key checks against
 PGlite and shipped success/failure, including published sources and successive accepted writes.
-This checker is a provider component; it does not execute RI actions or install SQL firing.
+This checker is a provider component; it does not execute RI actions itself.
 
 `write/credits.ts` also provides a prepared-row reservation for the forthcoming native
 primary adapter. The root funds writer growth first, then protects that already admitted
@@ -4361,8 +4362,8 @@ Accepted native-primary UPDATE/DELETE calls preserve the same FTS mutation notif
 funded row undo and atomic WAL history as legacy writers. Ordinary INSERT keeps insert deltas;
 rollback and savepoints retire this history with the rows.
 Its initial preflight refuses auto-increment and wide/variable indexed domains before writes.
-No SQL path installs it yet. A compiled body-input host now consumes this continuation;
-production admission and SQL dispatch remain separate integration work.
+The ordinary owner's native SQL dispatch installs it, and the compiled body-input host
+consumes this continuation (see "Ordinary native SQL row triggers").
 
 `owner/command-execution.ts` assembles the native command boundary over those image,
 command and constraint components. Direct RI entries are compared with the canonical
@@ -4372,7 +4373,7 @@ reference checks retire command slots for reuse. Callback slots are fixed by the
 frame bound, cancellation listeners retire after each operation, and close fences callbacks
 and undelivered image leases before returning component credit. The root supplies a real
 child-capture/action executor and closes shared scratch/pins afterward. The compiled body host
-uses this boundary, while generic SQL enablement remains guarded.
+and the ordinary owner's SQL dispatch use this boundary.
 
 `NativeCommandChecks.captureChildren` seals an OLD parent key's complete child identity
 range through the prepaid native support-index cursor and shared spilled directory. It
@@ -4385,8 +4386,8 @@ helper alone does not enable FK/trigger scheduling.
 
 Native command records keep independent accepted-row checkpoints for uniqueness,
 original follow-input preparation and reference checks. Completing one phase cannot
-suppress another phase or later writes on the same token. This is bookkeeping for
-the guarded provider; no SQL path installs its follow preparation/action executor yet.
+suppress another phase or later writes on the same token. The ordinary owner's
+SQL dispatch installs its follow preparation and action executor.
 
 ### Concrete native RI continuations
 
@@ -4427,9 +4428,9 @@ adapter in the per-action uniqueness test is synthetic, not a compiled-body proo
 primary preflight still refuses auto-increment and wide/variable indexed domains. Native
 sequence defaults retain their kernel refusal; RI assignments to generated FK columns also
 refuse rather than silently recomputing away the assignment. The compiled COMPLETE-MODIFY body host
-is exercised with actual native RI and user-body ordering; owner admission/dispatch and
-SQL enablement remain unfinished. SQL firing and advanced-RI refusal guards remain in place.
-No stored format changes.
+is exercised with actual native RI and user-body ordering. Owner admission and SQL dispatch
+are enabled for qualified commands; the typed refusals that remain are listed under
+"Ordinary native SQL row triggers". No stored format changes.
 
 The source ordinary minimum includes the fixed native decoder/IO workspace. A wider point
 read first closes its decoder, arena and pin, returns unused producer credit, then funds the
@@ -4446,8 +4447,8 @@ mutation routes in a charged catalog-sized matrix. It tracks root/body budgets1/
 keeps RI in its containing frame, includes generated rekeys and informational follow,
 and counts one row's queue scratch. Terminal matching triggers remain runtime errors;
 their unreachable bodies are not compiled. Its preparation charge retires after pending
-task work unwinds. This is owner-admission groundwork, not SQL enablement or a complete
-root working-set minimum.
+task work unwinds. It is one part of the owner's initial reservation, not a complete root
+working-set minimum.
 
 ### Portable snapshot load
 
@@ -4811,8 +4812,8 @@ Caller-owned rule bindings, preparation and grants remain caller-owned.
 
 `nativeCommandRootSetupBytes` measures this assembler's setup bound. It excludes caller
 preparation/bindings and complete source, image, binding and writer progress. The funding ports
-must supply that complete admitted work; this helper is not an execution minimum. Owner admission
-and SQL dispatch still keep their guards. Generated PG traces/errors, an actual compiled follow
+must supply that complete admitted work; this helper is not an execution minimum. The ordinary owner
+adds those parts (see "Ordinary native SQL row triggers"). Generated PG traces/errors, an actual compiled follow
 observer, foreign-scope/cancellation fences and competing-credit64MiB roots exercise the assembler.
 The initial SUM observer probe hit the existing initPlan refusal; no initPlan capability was added.
 
@@ -4951,12 +4952,13 @@ PGlite runner accepts a `TriggerOrderingFactory`: an adapter runs that history a
 cleanup before the next one starts. An unsupported native operation must reject, never become
 an empty trace or an accepted skip. The original campaign uses the real controller with an explicitly synthetic source/row/RI
 fixture. The separate native factory described below now qualifies B5b's concrete command
-provider. Production owner admission and SQL dispatch still need their own enablement evidence.
+provider. Production owner admission and SQL dispatch have their own evidence under
+"Ordinary native SQL row triggers".
 The generated histories vary row counts (including zero and spill-sized queues), before/after
 names, UTF8 boundaries, creation order, event and body-command count. Existing controller
 contract seeds and run counts stay intact in their separate suite.
 
-### Concrete native trigger ordering consumer (qualification, not SQL enablement)
+### Concrete native trigger ordering consumer (qualification)
 
 `testing/native-trigger-ordering.test.ts` supplies the reusable campaign with the real
 `NativeCommandRoot`/compiled body host, accepted primary writes and native RI executor.
@@ -4969,7 +4971,7 @@ counts unchanged. Native histories additionally vary resident/published source s
 The consumer checks accepted root count and reads actual stored trace data after native
 statement completion/commit. Fixture close fences the graph, grants, rules and spill files.
 The fixture is an already-funded component caller; its spare workspace is not a production
-admission recipe. SQL dispatch/firing guards and unsupported provider forms remain unchanged.
+admission recipe. Production admission and dispatch are described under "Ordinary native SQL row triggers".
 
 The native campaign replays the identical seed/arbitraries/four examples in two bounded
 case groups, assigning each history by row parity. A ledger audit checks equal generated
@@ -5039,7 +5041,7 @@ The shared pipeline observes even an already-cancelled wait's producer promise, 
 later producer rejection cannot escape as an unhandled rejection. This does not wait
 for the producer before reporting cancellation; native source and image cleanup still
 fence outstanding borrows separately. Owner cancel-versus-commit and lost-reply policy
-remain separate qualification work; this does not enable SQL firing.
+remain separate qualification work; the campaign itself does not dispatch SQL.
 
 The native owner funding controller uses the real statement's protected-step witness and
 the same governor. It reserves retained root metadata, parameters, rule workspace and the
@@ -5048,8 +5050,8 @@ funding alone; it never retries SQL or a default/generated expression. Rule cred
 protected while image metadata is funded. Source/image producers and progress loans must
 retire before a fresh wait. Premature root-account close refuses to uncharge live callers.
 Generated histories cover both existing admission modes, invalidation, competing grants,
-cancellation and cleanup on the real native boundary. This controller alone does not wire
-owner SQL dispatch or enable trigger firing.
+cancellation and cleanup on the real native boundary. The ordinary owner's SQL dispatch
+uses this controller.
 
 ### Ordinary native SQL row triggers
 
@@ -5057,6 +5059,15 @@ The internal ordinary owner dispatches qualified INSERT/UPDATE/DELETE commands t
 `owner/native-command.ts`, the real graph, writer, governor and spill service. Root/image
 and row-rule funding stay separate. Graph I/O and leases retire before rules and credit.
 There is no public override, package-entry change or default-engine switch.
+
+Preparation is admitted step by step (`preparedStep`). Each table rule program and each
+trigger body plan is lowered as one planning step, measured, and charged to the root's
+metadata account before the next step or any wait. If held credit cannot cover a step, its
+result is dropped first, the account grows through the root's cancellable boundary, and the
+step is planned again from the same immutable catalog. No uncharged plan is held across a wait.
+Only one step's planning is in flight uncharged, the same policy as planning a root statement.
+A text-based size bound would be unsound: view expansion and long expression chains make the
+lowered size grow much faster than the stored SQL.
 
 The same funded/SQL histories run at 32 MiB with `MINNOW_TRIGGER_CAP_MIB=32` and at
 64 MiB by default. They compare PostgreSQL BEFORE/AFTER name order, RI and nested bodies,

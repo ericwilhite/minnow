@@ -16,8 +16,10 @@ statement-atomic rollback. Enclosing savepoints recover failed statements. The s
 one-further-level cascade limit remains; a deeper matching trigger fails with 54001.
 FOR EACH STATEMENT and transaction control inside bodies remain refused. Internal RI IDs
 keep FK creation order across decimal widths. Compiled producer workspace is charged once
-per input phase; informational references read only their actual key fields. These changes
-keep the qualified SQL histories within 32 MiB. Unqualified native roots retain typed 0A000
+per input phase; informational references read only their actual key fields. Each lowered
+rule program and trigger body plan is charged before the next preparation step or any wait;
+a step that does not fit is dropped and planned again after its credit is granted. These
+changes keep the qualified SQL histories within 32 MiB. Unqualified native roots retain typed 0A000
 refusals. Public 0.x behavior, package entry points and stored formats are unchanged; no
 migration is required.
 
