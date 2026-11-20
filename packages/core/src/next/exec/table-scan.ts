@@ -32,6 +32,13 @@ import type { ChunkReadOptions } from "../page/reader.js";
  *   or at once when the residual rejected the row (before the scan moves on or borrows again).
  * - A column the group predates reads `ColumnDef.missing` (a constant).
  *
+ * ## Direct selected-page consumers
+ * Restricted scalar reductions may consume a completely selected stored step through
+ * `pageConsumer`, without intermediate output vectors. Eligibility for every argument and
+ * optional descriptor credit precede all transitions. Unsupported steps retain the ordinary
+ * batch path. Existing byte sizing and 2048-row transition barriers remain unchanged; the
+ * source's task pacing, read boundaries, abort and close still own every borrowed page.
+ *
  * ## Memory segments
  * Read through `MemorySegmentScan` (exec/memory-scan.ts: one borrowed chunk at a time, zero copy
  * while resident); the whole filter is the residual there.
@@ -79,7 +86,8 @@ import {
 import type { ByteBudget, SpaceReader } from "../access/space.js";
 import type { ScalarExpr } from "../ir/ir.js";
 import type { Loan } from "../memory/governor.js";
-import type { PhysicalType } from "../types.js";
+import { layoutOf, type PhysicalType } from "../types.js";
+import type { EncodedPageCheck } from "../page/consume.js";
 import { LOCATOR_POSITIONS } from "../vector/locator.js";
 import { allocateSelection } from "../vector/validity.js";
 import {
@@ -121,6 +129,7 @@ import {
   type PushedPredicate,
 } from "./pushdown.js";
 import type { ChunkPages, ChunkReads } from "./scan.js";
+import { PAGE_CONSUMER_METADATA_BYTES, type ScanPageConsumer } from "./page-consumer.js";
 
 /** Fixed staging needed when a scan reaches a resident or re-pointed memory segment.
  * The executor reserves this before keeping other breaker buffers resident. */
@@ -207,6 +216,11 @@ export interface TableScanOptions {
    * Filtered/deleted groups stay selective. Refusal shrinks the window, then falls back.
    */
   readonly readWindowBytes?: number;
+  /** EncodedTableScan only: direct reduction of selected stored pages.
+   * Residuals, locators, missing/unsupported
+   * pages and memory segments retain the ordinary bounded batch route.
+   */
+  readonly pageConsumer?: ScanPageConsumer;
   readonly table: TableSnapshot;
   readonly pages: SpaceReader;
   readonly reads: ChunkReads;
@@ -280,6 +294,12 @@ interface OpenGroup {
   /** The pending positions are the whole selection of their range (nothing emitted yet). */
   fresh: boolean;
 }
+
+/** Skipping a source decode cannot hide its demanded safe-number checks. The source
+ * retains its original dense/gather spec; this certificate inspects no scalar values.
+ */
+const DECODE_HEADER_PROVES_SAFE: EncodedPageCheck = (view) =>
+  view.allNull || !view.safe || view.boundSafe;
 
 /**
  * Memory charged through the scan's budget: its own buffers (`take`) and, as the `ByteBudget` its
@@ -1202,7 +1222,7 @@ export class TableScan implements BatchSource {
     const owned = group.owned ? ([] as OwnedColumn[]) : undefined;
     let published = false;
     try {
-      const item = yield* this.#emitReserved(group, from, to, owned);
+      const item = yield* this.emitReserved(group, from, to, owned);
       if (item === null || owned === undefined || owned.length === 0) return item;
       const buffers = new Set<ArrayBuffer>();
       let bytes = 0;
@@ -1252,7 +1272,68 @@ export class TableScan implements BatchSource {
     };
   }
 
-  *#emitReserved(
+  #consumePages(
+    group: OpenGroup,
+    rows: Uint16Array,
+    count: number,
+    denseFrom?: number,
+    denseTo?: number,
+  ): boolean {
+    const consumer = this.#options.pageConsumer;
+    if (!consumer || this.#residual !== null || this.#options.emitLocator || group.owned)
+      return false;
+    // Optional acceleration never raises the complete minimum: refusal keeps the ordinary
+    // route before any transition. This credit covers one transient borrowed metadata view.
+    if (!this.#memory.prepay(PAGE_CONSUMER_METADATA_BYTES)) return false;
+    this.#memory.take(PAGE_CONSUMER_METADATA_BYTES);
+    try {
+      // The ordinary source decodes every source column, including predicate-only fields
+      // hidden by a later projection. Preserve that demand before any argument transitions.
+      for (let c = 0; c < group.columns.length; c++) {
+        const pages = group.columns[c]?.pages,
+          type = this.#types[c];
+        if (!pages || !type) return false;
+        const layout = layoutOf(type);
+        // Other layouts finish their relevant validation during the existing page load.
+        if (
+          layout !== "int64" &&
+          layout !== "decimal" &&
+          layout !== "interval" &&
+          layout !== "varlen"
+        )
+          continue;
+        if (!pages.pageEntry || (layout !== "varlen" && !pages.checkPage)) return false;
+        const [first, stop] = pages.pagesInRange(
+          denseFrom ?? rows[0] ?? 0,
+          denseTo ?? (rows[count - 1] ?? 0) + 1,
+        );
+        let k = 0;
+        for (let page = first; page < stop; page++) {
+          const entry = pages.pageEntry(page);
+          if (denseFrom === undefined) {
+            const begin = k,
+              end = entry.firstRow + entry.rowCount;
+            while (k < count && (rows[k] ?? 0) < end) k++;
+            if (begin === k) continue;
+          }
+          // Values outside a dense selection are still demanded by its full range decode.
+          // A sparse gather must not inspect a wholly unselected page instead.
+          if (
+            entry.largeRegion !== undefined ||
+            (layout !== "varlen" && !pages.checkPage?.(page, DECODE_HEADER_PROVES_SAFE))
+          )
+            return false;
+        }
+      }
+      if (!consumer.canConsumePages(group.columns, rows, count)) return false;
+      consumer.consumePages(group.columns, rows, count);
+      return true;
+    } finally {
+      this.#memory.give(PAGE_CONSUMER_METADATA_BYTES);
+    }
+  }
+
+  protected *emitReserved(
     group: OpenGroup,
     from: number,
     to: number,
@@ -1328,6 +1409,103 @@ export class TableScan implements BatchSource {
     positions.copyWithin(0, consumed, count);
     group.pendingCount = count - consumed;
     if (kept === 0) return null;
+    yield* this.#decode(group, specForRows(survivors, kept), all, columns, owned);
+    this.stats.gatherBatches += 1;
+    return {
+      batch: this.#withLocators(
+        { length: kept, columns, selection: null },
+        group,
+        (k) => survivors[k] ?? 0,
+      ),
+    };
+  }
+
+  protected *emitEncodedReserved(
+    group: OpenGroup,
+    from: number,
+    to: number,
+    owned?: OwnedColumn[],
+  ): Step<SourceItem | null> {
+    const span = to - from;
+    const all = this.#all;
+    const count = group.pendingCount;
+    const positions = this.#pending;
+    // Dense when enough of the range is selected and the whole range fits the byte target.
+    const fresh = group.fresh;
+    group.fresh = false;
+    const wanted = this.#rowsNeeded();
+    let dense = fresh && count >= span * DENSE_SELECTION && count <= wanted;
+    if (dense) {
+      // Sizing reads page headers: the range's pages first (no values yet).
+      yield* this.#loadPages(group, { from, to });
+      dense =
+        this.#bytesFor(group, { from, to }) <= this.#target &&
+        (yield* this.#prepay(group, { from, to }));
+    }
+    if (dense && this.#consumePages(group, positions, count, from, to)) {
+      group.pendingCount = 0;
+      this.stats.denseBatches++;
+      return null;
+    }
+    if (dense) {
+      const columns: Vector[] = new Array<Vector>(this.#defs.length);
+      yield* this.#decode(group, { from, to }, all, columns, owned);
+      let selection: Selection | null = null;
+      if (count < span) {
+        const s = this.#selection;
+        for (let k = 0; k < count; k++) s.rows[k] = (positions[k] ?? 0) - from;
+        s.count = count;
+        selection = s;
+      }
+      group.pendingCount = 0;
+      let batch: Batch = { length: span, columns, selection };
+      if (this.#residual !== null) {
+        const rows = this.#residual.select(batch);
+        this.stats.residualBatches += 1;
+        if (rows.count === 0) return null;
+        batch = { ...batch, selection: rows.count === span ? null : rows };
+      }
+      this.stats.denseBatches += 1;
+      return { batch: this.#withLocators(batch, group, (k) => from + k) };
+    }
+    let take = this.#residual === null ? Math.min(count, wanted) : count;
+    yield* this.#loadPages(group, specForRows(positions, take));
+    // Gather: a prefix of the positions that fits the byte target (at least one row), then the
+    // grant (halving until it holds the prefix's working set, or one row under a loan).
+    for (;;) {
+      if (take <= 1) break;
+      const bytes = this.#bytesFor(group, specForRows(positions, take));
+      if (bytes <= this.#target) break;
+      take = Math.max(1, Math.min(take - 1, Math.floor((take * this.#target) / bytes)));
+    }
+    while (!(yield* this.#prepay(group, specForRows(positions, take))))
+      take = Math.max(1, Math.floor(take / 2));
+    if (take < count) this.stats.splits += 1;
+    // The taken positions move to `#survivors` before `pending` is shifted (below).
+    const survivors = this.#survivors;
+    survivors.set(positions.subarray(0, take));
+    let kept = take;
+    let consumed = take;
+    if (this.#residual !== null) {
+      // Residual columns first, for the candidates; the rest only for the survivors.
+      const first = all.filter((c) => this.#residualColumns.has(c));
+      const probe: Vector[] = all.map(() => this.#placeholder);
+      yield* this.#decode(group, specForRows(survivors, take), first, probe);
+      const rows = this.#residual.select({ length: take, columns: probe, selection: null });
+      this.stats.residualBatches += 1;
+      kept = Math.min(rows.count, wanted);
+      if (rows.count > kept) consumed = (rows.rows[kept - 1] ?? 0) + 1;
+      for (let k = 0; k < kept; k++) survivors[k] = survivors[rows.rows[k] ?? 0] ?? 0;
+    }
+    // Consume the taken positions; keep the rest for the next batch.
+    positions.copyWithin(0, consumed, count);
+    group.pendingCount = count - consumed;
+    if (kept === 0) return null;
+    if (this.#consumePages(group, survivors, kept)) {
+      this.stats.gatherBatches++;
+      return null;
+    }
+    const columns: Vector[] = new Array<Vector>(this.#defs.length);
     yield* this.#decode(group, specForRows(survivors, kept), all, columns, owned);
     this.stats.gatherBatches += 1;
     return {
@@ -1456,5 +1634,19 @@ function columnsOf(expr: ScalarExpr): number[] {
       return [...columnsOf(expr.arg), ...expr.list.flatMap(columnsOf)];
     case "like":
       return [...columnsOf(expr.arg), ...columnsOf(expr.pattern)];
+  }
+}
+
+/** The planner selects this class once for an eligible reduction. Ordinary scans
+ * execute the predecessor's emission loop, with no encoded dispatch per batch.
+ */
+export class EncodedTableScan extends TableScan {
+  protected override emitReserved(
+    group: OpenGroup,
+    from: number,
+    to: number,
+    owned?: OwnedColumn[],
+  ): Step<SourceItem | null> {
+    return this.emitEncodedReserved(group, from, to, owned);
   }
 }

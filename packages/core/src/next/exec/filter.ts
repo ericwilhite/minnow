@@ -16,7 +16,8 @@
  *   downstream is ready, then release it.
  */
 import type { ScalarExpr } from "../ir/ir.js";
-import type { PhysicalType } from "../types.js";
+import { samePhysicalType, type PhysicalType } from "../types.js";
+import type { PageColumnMap, ScanPageColumn } from "./page-consumer.js";
 import type { Batch, Selection, Vector } from "../vector/vector.js";
 import { compileExpr, selectTrue, type CompileContext } from "./kernels/compile.js";
 import type { Compiled } from "./kernels/vectors.js";
@@ -202,6 +203,12 @@ export class ProjectOperator implements Operator {
     context.ownOperator?.(this);
   }
   readonly #context: CompileContext;
+  /** End an ordinary borrow before an encoded subclass consumes the next step. */
+  protected retireInput(): void {
+    this.#check();
+    this.#pending = null;
+    this.#columns.length = 0;
+  }
   get reclassifiesTransfers(): boolean {
     return this.#columnsOnly !== null && this.downstream.reclassifiesTransfers === true;
   }
@@ -338,5 +345,71 @@ export class ProjectOperator implements Operator {
     this.#reason = reason;
     this.#hold.abort();
     this.downstream.abort(reason);
+  }
+}
+
+/** Created only on a preselected encoded reduction path. Ordinary projects retain
+ * their original instance layout and never inspect page capability or bindings.
+ */
+export class PageProjectOperator extends ProjectOperator {
+  readonly #pageColumnsOnly: boolean;
+  readonly #pageExprs: readonly ScalarExpr[];
+  #pageInputMap: PageColumnMap | undefined;
+  constructor(
+    exprs: readonly ScalarExpr[],
+    context: CompileContext,
+    downstream: Operator,
+    progress?: { available(): number; readonly signal: AbortSignal },
+  ) {
+    super(exprs, context, downstream, progress);
+    this.#pageColumnsOnly = exprs.every((expr) => {
+      if (expr.op !== "column") return false;
+      const input = context.input[expr.index];
+      return input !== undefined && samePhysicalType(expr.type, input);
+    });
+    this.#pageExprs = exprs;
+  }
+  get pageConsumer(): this | undefined {
+    return this.#pageColumnsOnly && this.downstream.pageConsumer ? this : undefined;
+  }
+  pageColumn(index: number): number {
+    const expr = this.#pageExprs[index];
+    const input = expr?.op === "column" ? expr.index : undefined;
+    if (input === undefined) throw new RangeError("Page projection column outside its bindings");
+    return this.#pageInputMap?.pageColumn(input) ?? input;
+  }
+  canConsumePages(
+    columns: readonly ScanPageColumn[],
+    rows: Uint16Array,
+    count: number,
+    columnsMap?: PageColumnMap,
+  ): boolean {
+    if (!this.#pageColumnsOnly) return false;
+    const previous = this.#pageInputMap;
+    this.#pageInputMap = columnsMap;
+    try {
+      return this.downstream.pageConsumer?.canConsumePages(columns, rows, count, this) ?? false;
+    } finally {
+      this.#pageInputMap = previous;
+    }
+  }
+  consumePages(
+    columns: readonly ScanPageColumn[],
+    rows: Uint16Array,
+    count: number,
+    columnsMap?: PageColumnMap,
+  ): undefined {
+    this.retireInput();
+    const consumer = this.downstream.pageConsumer;
+    if (!this.#pageColumnsOnly || !consumer) throw new Error("Unsupported page projection");
+    // A previous ordinary batch has expired. Do not keep its borrowed payload alive while
+    // subsequent stored steps use the encoded route. The next push fills every slot again.
+    const previous = this.#pageInputMap;
+    this.#pageInputMap = columnsMap;
+    try {
+      return consumer.consumePages(columns, rows, count, this);
+    } finally {
+      this.#pageInputMap = previous;
+    }
   }
 }
