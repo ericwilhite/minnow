@@ -1758,12 +1758,24 @@ with at least seven of nine pairs favouring control is an accepted regression. O
 profiles are outside the component timing; query materialization remains in whole timing.
 The report includes CPU samples, full spreads, checkpointed partial rounds, profiles and the
 actual transformed JS needed to interpret line-level ticks. No baseline is an executor path.
-Query-root `keyLookup` and `indexRange` IR remain behind the internal `keyOrder:true`
-diagnostic opt-in, including LIMIT zero. The general cursor/fetch recipe is available without
-that opt-in on the modification input's single-source path through unary operators. Its
-producer atomically reserves the complete DML cursor/fetch minimum. Cursors beneath join
-or set-operation branches retain the diagnostic gate: a MODIFY ancestor alone does not
-prove the branch minimum. This does not enable query-root index predicates. Ordinary SQL selects the admitted index recipe for a direct, complete
+Native `keyLookup` and `indexRange` inputs execute without a diagnostic option, at query
+roots and beneath filters, projections, joins, sorts, LIMIT and modification inputs.
+The whole query funds separate cursor/key and selected-row fetch workspaces before either
+opens. IN lists materialize one key at a time: up to sixteen complete query keys use bounded
+encoded-key duplicate checks; larger complete query lists use a charged bitmap with one
+spill file. Partial probes and multi-key modifications sort and deduplicate locators with spill,
+retaining physical target order for writes. Serial join and binary EXCEPT inputs reuse one
+prepaid cursor workspace after the preceding cursor has closed and repaid its loan; replay,
+recursive, window and volatile plans retain independent workspaces. Deterministic key casts
+are validated before the first probe, so LIMIT cannot hide an invalid later IN-list key. NULL keys never match; key casts must
+produce the indexed physical type, while widening comparisons retain a scan. Cursor and
+fetch inputs use the same pinned snapshot through staging, publication and concurrent writes.
+A satisfied streaming LIMIT stops fetching and evaluating later rows. SQL ordering still
+requires ORDER BY. Existing TEXT-to-integer cast-kernel refusals are independent of access
+path selection; integer inputs accept supported explicit numeric casts. Composite-prefix
+queries retain scans unless every indexed column is proven non-null by its schema or a
+strict predicate: native indexes omit tuples containing any NULL component.
+Ordinary SQL selects the admitted index recipe for a direct, complete
 primary-key ORDER BY with LIMIT or OFFSET, including OFFSET without LIMIT. The pinned
 catalog must certify the same unique key columns, byte collation and direction. Direct
 projections are supported; row-locking intent, filters, computed ordering, partial keys, mixed
@@ -3744,10 +3756,10 @@ coalesced window; it does not skip the gzip/large-value sizing proof or raise th
 `npx vite-node scripts/read-retention-bench.mts --compare=REV` runs five interleaved frozen-parent/
 candidate component rounds, checks physical frame bytes (including masks, padding and dictionary
 deltas), and guards warm repeated reads plus real persisted SQL scans and point selections.
-The ordinary query executor refuses `keyLookup` without diagnostic opt-in; this query benchmark
-uses `id + 0` to exercise the supported scan path. DML's separately admitted input recipe is
-not a query-point-lookup path. The separate storage point-read guard is a direct single-blob
-cache hit. This benchmark does not claim indexed SQL point-lookup performance.
+This query benchmark uses `id + 0` to retain its forced-scan control. Ordinary indexed
+predicates now use the complete query cursor/fetch recipe. The separate storage point-read
+guard is a direct single-blob cache hit; this benchmark still does not measure indexed SQL
+point-lookup performance.
 
 `MINNOW_EXPORT_RETENTION_REFERENCE=REV` freezes the entire core at that Git revision on its
 ordinary module IDs for a control whole-owner campaign. It is bench-only; ordinary invocations
