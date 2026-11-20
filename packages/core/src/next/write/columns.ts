@@ -75,6 +75,8 @@ export function isNullAt(vector: Vector, row: number): boolean {
 type DecimalData = Extract<VectorData, { layout: "decimal" }>;
 
 /** One column's slots for one chunk of rows. */
+import { LARGE_VALUE_BYTES, partCount, pointerBytes } from "../page/large-value.js";
+
 export class ColumnChunk {
   readonly type: PhysicalType;
   readonly layout: ReturnType<typeof layoutOf>;
@@ -105,6 +107,11 @@ export class ColumnChunk {
   readonly #charge: Charge;
   /** Bytes charged for this chunk's arrays. */
   chargedBytes = 0;
+  #pageBoundsValid = false;
+  #pageBytes = 0;
+  #pageMaximum = 0;
+  #dictionaryBytes = 0;
+  #largeValues = 0;
 
   /** `charge` pays for every array before it is allocated (memtables pass their counter). */
   constructor(type: PhysicalType, charge: Charge = UNCHARGED) {
@@ -244,6 +251,7 @@ export class ColumnChunk {
         offsets[at + 1] = offsets[at] ?? 0;
       }
       this.length = at + 1;
+      this.#pageBoundsValid = false;
       return;
     }
     this.#setValid(at);
@@ -283,6 +291,7 @@ export class ColumnChunk {
         break;
     }
     this.length = at + 1;
+    this.#pageBoundsValid = false;
   }
 
   #putInt64(at: number, values: Int64Values, index: number): void {
@@ -375,6 +384,7 @@ export class ColumnChunk {
   }
 
   #putBytes(at: number, source: Uint8Array, start: number, end: number): void {
+    this.#pageBoundsValid = false;
     const offsets = need(this.offsets);
     const used = offsets[at] ?? 0;
     const total = used + (end - start);
@@ -406,6 +416,7 @@ export class ColumnChunk {
       this.nullCount -= removed;
     }
     this.length = length;
+    this.#pageBoundsValid = false;
   }
 
   /** A view of slots `0 … length − 1` (or fewer): immutable for its length. */
@@ -457,6 +468,47 @@ export class ColumnChunk {
           micros: this.#int64(),
         };
     }
+  }
+
+  /** Allocation-free page bounds, cached until append/truncate. One chunk is <=2048 slots. */
+  #pageBounds(): void {
+    if (this.#pageBoundsValid) return;
+    let total = 0,
+      maximum = 0,
+      dictionary = 0,
+      large = 0;
+    const offsets = this.offsets;
+    if (offsets !== null)
+      for (let row = 0; row < this.length; row++) {
+        const length = (offsets[row + 1] ?? 0) - (offsets[row] ?? 0);
+        const bytes = length > LARGE_VALUE_BYTES ? pointerBytes(partCount(length)) : length;
+        total += bytes;
+        maximum = Math.max(maximum, bytes);
+        if (length <= LARGE_VALUE_BYTES) dictionary += length;
+        else large++;
+      }
+    this.#pageBytes = total;
+    this.#pageMaximum = maximum;
+    this.#dictionaryBytes = dictionary;
+    this.#largeValues = large;
+    this.#pageBoundsValid = true;
+  }
+  get pageValueBytes(): number {
+    this.#pageBounds();
+    return this.#pageBytes;
+  }
+  get maxPageValueBytes(): number {
+    this.#pageBounds();
+    return this.#pageMaximum;
+  }
+  get dictionaryValueBytes(): number {
+    this.#pageBounds();
+    return this.#dictionaryBytes;
+  }
+
+  get largeValueCount(): number {
+    this.#pageBounds();
+    return this.#largeValues;
   }
 
   /** UTF-8 bytes of the values in slots `[0, length)` (varlen), for statistics. */

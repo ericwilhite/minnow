@@ -6,9 +6,10 @@
  *
  * Each query's full sampled minnow/engine time-ratio range must move above the checked-in
  * threshold in packages/core/perf-baseline.json before it is called a regression. Thresholds pin
- * the current ratios with headroom, separately for each OS/architecture/Node-major profile, so
- * the gate catches regressions rather than host differences. Run with --update to add or rewrite
- * the current runtime's thresholds after an intentional change.
+ * the current ratios with headroom, separately for each OS/architecture/Node-major/CPU-model
+ * profile, so the gate catches regressions rather than host differences. A host whose CPU model
+ * has no profile is refused before any timing. Run with --update to add or rewrite the current
+ * runtime's thresholds after an intentional change.
  */
 import { availableParallelism, cpus, loadavg } from "node:os";
 import { performanceMode, performanceIdDeclaration } from "./lib/performance-schema.mts";
@@ -60,7 +61,7 @@ const update = process.argv.includes("--update");
 const mode = performanceMode(process.argv.slice(2));
 const idDeclaration = performanceIdDeclaration(mode);
 const profile = runtimePerformanceProfile();
-// Runtime profiles group CPU models together; retain the host context before any timed work.
+// The profile names the CPU model; retain the full host context before any timed work.
 console.log(
   "Performance host:",
   JSON.stringify({

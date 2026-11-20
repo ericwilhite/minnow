@@ -287,6 +287,14 @@ export interface IndependentCPUOptions {
   readonly signal?: AbortSignal;
   readonly onEvent?: (event: unknown) => void;
   readonly onSample?: (sample: unknown) => void;
+  /** Arm order per pair; default alternates AB/BA. Supply a balanced randomized sequence. */
+  readonly orders?: ReadonlyArray<readonly [Arm, Arm]>;
+  /** Answer equivalence across arms; default requires equal fingerprints and row counts. */
+  /** True, or a comparison whose detail explains why the outputs are not accepted as equal. */
+  readonly equivalent?: (
+    control: Verification,
+    candidate: Verification,
+  ) => boolean | { readonly same: boolean; readonly detail?: string };
 }
 
 /** One fresh pair per workload/boundary/round; startup and execution both alternate AB/BA.
@@ -298,6 +306,11 @@ export async function runIndependentCPU(options: IndependentCPUOptions) {
   if (!Number.isSafeInteger(pairs) || pairs < 9 || settleMs < 0 || !Number.isFinite(settleMs))
     throw new RangeError("Invalid independent CPU pair policy");
   const purpose = options.purpose ?? "true-parent";
+  if (
+    options.orders !== undefined &&
+    (options.orders.length !== pairs || options.orders.some((order) => new Set(order).size !== 2))
+  )
+    throw new RangeError("One complete AB or BA order is required per pair");
   if (
     options.workloads.length === 0 ||
     options.boundaries.length === 0 ||
@@ -322,7 +335,9 @@ export async function runIndependentCPU(options: IndependentCPUOptions) {
         samples = [];
       for (let cohort = 0; cohort < pairs; cohort++) {
         options.signal?.throwIfAborted();
-        const order: Arm[] = cohort % 2 === 0 ? ["control", "candidate"] : ["candidate", "control"];
+        const order: readonly Arm[] =
+          options.orders?.[cohort] ??
+          (cohort % 2 === 0 ? ["control", "candidate"] : ["candidate", "control"]);
         const verification = new Map<Arm, Verification>();
         for (const arm of order) {
           const worker = await startCPUWorker(
@@ -342,11 +357,21 @@ export async function runIndependentCPU(options: IndependentCPUOptions) {
               throw new Error("Invalid CPU output verification");
             verification.set(arm, checked);
             const other = verification.get(arm === "control" ? "candidate" : "control");
-            if (
-              other !== undefined &&
-              (other.fingerprint !== checked.fingerprint || other.rows !== checked.rows)
-            )
-              throw new Error(`CPU workload differs: ${workload}`);
+            const outcome =
+              other === undefined
+                ? true
+                : options.equivalent === undefined
+                  ? other.fingerprint === checked.fingerprint && other.rows === checked.rows
+                  : arm === "candidate"
+                    ? options.equivalent(other, checked)
+                    : options.equivalent(checked, other);
+            const same = typeof outcome === "boolean" ? outcome : outcome.same;
+            if (!same) {
+              const detail = typeof outcome === "boolean" ? undefined : outcome.detail;
+              throw new Error(
+                `CPU workload differs: ${workload}${detail === undefined ? "" : ` (${detail})`}`,
+              );
+            }
             if (settleMs > 0) await new Promise((yes) => setTimeout(yes, settleMs));
             options.signal?.throwIfAborted();
             const value = await worker.ask<CPUValue>({ op: "run", workload, boundary });

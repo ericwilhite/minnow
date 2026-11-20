@@ -11,6 +11,34 @@ Nothing here ships yet:
 
 Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 
+The optional resident three-dimension star lookup path preserves the native join
+transition order. It requires three single-key inner joins to enforced dimension
+primary keys, direct text group keys, COUNT(*) and one direct float8 SUM. Local
+dictionaries use the existing charged query-wide IDs. It traverses fact keys once,
+stages each C-surviving payload once with charged A/B query-ID sidecars, and links
+bounded row-ID buckets after A is known. Source barriers remain C, facts, A, B;
+each B prefix reaches the existing aggregate before its next source read. This
+preserves demanded source and transition errors, as well as native SUM bits. Pending
+jobs retain their owner grant through cancellation settlement. Exact domain proofs
+bound all arrays; sparse domains and
+unsupported shapes retain native joins. Ordinary-owner normalized literals and explicit
+plain TEXT bindings can use this exact three-lookup route: at most four slots, each NULL or at most
+1024 UTF-16 units without NUL. The shared binder sizes them before optional domain
+proofs; invalid or unsupported bindings retain the original bind/error demand. The
+complete strategy decision includes every parameter and progress slot. The complete original admission still
+applies, including cancellable waits and spill fallback. No smaller cap is claimed.
+
+### Count-only text membership
+
+Scalar byte `COUNT(DISTINCT)` can represent one byte prefix of at most 16 bytes followed by
+canonical decimal suffixes using exact paged bitmaps. The first demanded non-NULL
+value selects the representation. Each observed 4096-value page costs 512 bytes;
+the optional policy permits at most 128 KiB of bits. Leading zeros, other prefixes
+and larger suffixes retain ordinary byte membership. Local dictionary codes are
+resolved through their own entries. Checkpoints write every original key exactly,
+so replay preserves membership before continuing the input. Growth certificates
+include page metadata and the actual half-full byte-table growth boundary.
+
 ## Module map
 
 | Module        | Owner track                      | What it is                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
@@ -146,6 +174,14 @@ with real competing buffers, exact durable rows, and a zero final charge.
 keeps all 40 original generated scenarios per seed, and checks exact current/reopened rows over memory
 and IndexedDB. Its explicit examples include the coverage regression and its reduction.
 
+The initial row minimum also funds the WAL recovery scanner. After recovery and run
+validation have drained, the owner retires that scan-only forecast before announcing
+readiness. The four-MiB row working minimum, real allocations, outstanding loans and any
+prepared row step stay protected. Completed recovery must not retain unused credit ahead
+of a query's independently admitted minimum. `write/recovery-credit.test.ts` and
+`testing/native-recovery-credit.test.ts` generate in-flight reads with real competing
+buffers, prepared rows, exact reopen/continued writes and zero final charge.
+
 Extent-list preparation and `GroupWriter` page buffers use that metadata budget too:
 reclaimed idle row credit is never mistaken for prepaid publication workspace. Only the
 keeper's internal metadata-pressure request can reach the outer retry; genuine external
@@ -154,18 +190,46 @@ nonwaiting admission and fall back to the smaller disk/plain route instead of de
 more credit. After durable installation, the keeper borrows its exact committed list from
 the already funded root, as on reopen; it releases the separate keeper reservation without
 releasing the root's ownership. Standalone keepers retain their own list charge.
+Before constructing a column group, the writer prepays its simultaneous column buffers,
+validity, sketches, directory entries, inline pages, encoder/resize overlap and one tail
+serialization. Native immutable chunks cache their actual row/value bounds; large values
+contribute pointer bytes to the page, with a separate bounded part/prefix allowance. Small
+TEXT inputs no longer allocate a full raw target for every column. Optional dictionaries
+leave the mandatory remainder prepaid and fall back to plain pages. Directory/sketch bytes
+are charged before serialization and dropped after append; packed tails retain descriptors.
+A complete group or step forecast above the cap raises SQLSTATE `53200` before allocation or
+queueing. Generated `write/group-minimum.test.ts` and `write/group-value-bounds.test.ts`
+check wide fitting/oversize schemas, mixed physical types, NULLs, inline/large boundaries,
+rollback cache invalidation, exact page-oracle output and zero final charge. The committed
+`next-writer-insert-bench.mts` compares narrow, wide numeric and wide TEXT native flushes;
+setup, decoded input creation, verification and close are outside its CPU clock.
+
 `testing/native-write-pressure.test.ts` covers six direct native 1 MiB TEXT
 inserts at 32 MiB, generated microtask interleavings, competing reader buffers, provisional
 writer unwind before admission, exact rows, one root charge before/after reopen and zero
 final charge. `testing/native-root-list-funding.test.ts` pins the identity and pending-state
 handoff guards and the standalone keeper lifetime. Its optional-workspace
 companion pins both cheaper fallbacks under fully occupied ordinary credit.
-Growth surrenders the target account's reclaimable estimates before admitting its full
-remaining deficit. Asking for the old deficit lets admission reclaim that same account,
-hand its credit back, and repeat without net growth or a task turn. Live buffers, loans,
-the prepared-row floor and metadata headroom stay owned. `write/credit-growth.test.ts`
-generates row/metadata growth, real competing buffers, completion/cancellation, one
-complete-deficit admission and zero final charge under 32 MiB.
+The dictionary fixture supplies its immutable row/value bounds and prepays the full plain
+step before its competing reader takes the rest; observers forward the mandatory remainder
+to optional admission. Publication-pressure histories give their reader every idle account
+forecast and observe grouped waits too, so native account netting cannot bypass the pressure.
+Growth first moves idle row, metadata, WAL and merge credit into the next step. Before a
+global wait it returns unused forecasts and admits the complete remaining requirement in
+one group. Live buffers, loans, prepared rows and funded active steps remain owned. Cold
+run readers open before private merge credit or a provisional writer is retained. The
+merge's ByteBudget prepays its I/O, so its complete admission can use the whole cap without
+a legacy reserve loan. The funded metadata window survives the merge-account handoff.
+An idle writer returns forecasts when a fitting reader needs them. A read-only SELECT in
+an existing writable transaction retains its read view without pinning future write credit;
+row, DDL and native-command writes are forbidden on that internal read-only statement.
+`write/credit-growth.test.ts` keeps all competing accounts backed by real buffers while
+checking completion, cancellation, one complete deficit and zero final charge. The idle
+credit and write/query suites cover prepared handoffs, phase notifications, forecast reuse
+and exact SQL reads at 52, 56, 60 and 64 MiB. A zero-progress reclaim callback returns
+without notifying its own governor drain; genuine phase settlement wakes queued requests.
+Native maintenance, cold-merge and WAL-continuation
+suites keep active work funded while unrelated phases wait or grow.
 Oversized insert calls admit at most 2,048 rows at once, so an entire call's conservative
 estimate does not need to fit beside other working grants. Eligible pending chunks stage
 between pieces of the same call; uniqueness, foreign keys and rollback still span the whole
@@ -1722,12 +1786,24 @@ with at least seven of nine pairs favouring control is an accepted regression. O
 profiles are outside the component timing; query materialization remains in whole timing.
 The report includes CPU samples, full spreads, checkpointed partial rounds, profiles and the
 actual transformed JS needed to interpret line-level ticks. No baseline is an executor path.
-Query-root `keyLookup` and `indexRange` IR remain behind the internal `keyOrder:true`
-diagnostic opt-in, including LIMIT zero. The general cursor/fetch recipe is available without
-that opt-in on the modification input's single-source path through unary operators. Its
-producer atomically reserves the complete DML cursor/fetch minimum. Cursors beneath join
-or set-operation branches retain the diagnostic gate: a MODIFY ancestor alone does not
-prove the branch minimum. This does not enable query-root index predicates. Ordinary SQL selects the admitted index recipe for a direct, complete
+Native `keyLookup` and `indexRange` inputs execute without a diagnostic option, at query
+roots and beneath filters, projections, joins, sorts, LIMIT and modification inputs.
+The whole query funds separate cursor/key and selected-row fetch workspaces before either
+opens. IN lists materialize one key at a time: up to sixteen complete query keys use bounded
+encoded-key duplicate checks; larger complete query lists use a charged bitmap with one
+spill file. Partial probes and multi-key modifications sort and deduplicate locators with spill,
+retaining physical target order for writes. Serial join and binary EXCEPT inputs reuse one
+prepaid cursor workspace after the preceding cursor has closed and repaid its loan; replay,
+recursive, window and volatile plans retain independent workspaces. Deterministic key casts
+are validated before the first probe, so LIMIT cannot hide an invalid later IN-list key. NULL keys never match; key casts must
+produce the indexed physical type, while widening comparisons retain a scan. Cursor and
+fetch inputs use the same pinned snapshot through staging, publication and concurrent writes.
+A satisfied streaming LIMIT stops fetching and evaluating later rows. SQL ordering still
+requires ORDER BY. Existing TEXT-to-integer cast-kernel refusals are independent of access
+path selection; integer inputs accept supported explicit numeric casts. Composite-prefix
+queries retain scans unless every indexed column is proven non-null by its schema or a
+strict predicate: native indexes omit tuples containing any NULL component.
+Ordinary SQL selects the admitted index recipe for a direct, complete
 primary-key ORDER BY with LIMIT or OFFSET, including OFFSET without LIMIT. The pinned
 catalog must certify the same unique key columns, byte collation and direction. Direct
 projections are supported; row-locking intent, filters, computed ordering, partial keys, mixed
@@ -1960,10 +2036,30 @@ shipped-engine or stored-format change.
   only the pages the predicate cannot rule out; `refine` (after deletions or an earlier conjunct)
   loads every page its positions touch. The rest of the filter (the residual) runs on decoded
   values.
-- At or above 40 % of a range selected, every column decodes densely (residual columns too) and
+- On the ordinary batch route, at or above 40 % of a range selected, every column decodes densely (residual columns too) and
   keeps the selection, the residual then narrowing it. Below it only the selected positions are
   gathered; with a residual, its columns are gathered first and the others only for the rows it
   keeps.
+- The planner selects encoded-capable scan, project and profiling variants once for a supported
+  scalar reduction. Other plans retain the ordinary scan loop, projection layout and profiling
+  wrappers, with no page-capability discovery or dispatch per batch. A metadata-only filter
+  probe declines residual or mixed pushed/residual filters before building page bindings; it
+  does not convert constants or copy their payloads.
+- Restricted scalar scan/filter/reduce recipes can instead consume selected encoded pages
+  through `page/consume.ts` and `exec/page-consumer.ts`. COUNT reads validity without expanding
+  dictionary values; int32 SUM/AVG and ordered float8 SUM dispatch to prebuilt typed kernels.
+  Same-type column projections and profiling wrappers forward the capability through existing
+  binding maps, including duplicate-column packing, without new per-step mapping arrays. All needed
+  pages are loaded and validated before transitions, and complete-step eligibility precedes
+  any state change. Eligibility covers predicate-only columns too: dense steps preserve their
+  full decode span, while gathers inspect only selected pages. Unproven safe-number pages and
+  out-of-line regions retain ordinary loading and validation. A missing column, unsupported
+  page/operator, residual, memory segment, locator or refused optional descriptor workspace
+  keeps the ordinary batch route. No prefix
+  is replayed. The first implementation preserves 2,048-row transition and byte-sizing barriers,
+  including ordinary fallback prepayment; it does not remove full-source admission sizing.
+  Borrowed pages never cross an await or escape their kernel. Metadata remains accessible
+  before payload for a future independently validated exact-summary consumer.
 - Shape setup reuses only verified scalar header facts while endpoint pages remain resident;
   install/release/materialization invalidates them. Exact-range byte counts have a separate
   memo. `exec/column-shape.test.ts` compares against header queries with memoization disabled
@@ -2075,6 +2171,10 @@ shipped-engine or stored-format change.
   tuple for several keys: direct-mapped (the value ids bit-packed into a slot of a table of at
   most 2^16) while the columns' value counts fit, hashed column by column past that. SQL GROUP BY equality: NULLs together, −0 = 0, NaN = NaN, NUMERIC by
   value.
+- A non-NULL flat text key column is interned in one loop per batch with the source's
+  DataView made once; keys of 16 to 64 bytes hash through it with the same XXH32, and byte
+  equality still resolves collisions. Storage grows on each new key exactly as the per-row
+  route grows it, so batch peaks are unchanged; the batch's complete growth is admitted first.
 - One int2/int4/date key whose range spans no more slots than the hash table would hold (twice
   its slots, at most 2^22 values) is direct-mapped instead: slot `key − base`, no hashing or
   probing, half the bytes. A key past the span widens it; a range too wide goes back to hashing;
@@ -2129,8 +2229,11 @@ shipped-engine or stored-format change.
   complete resident join/codebook/state/output grants, admitted together before input opens.
   A bounded proof scans plain keys when dictionary metadata cannot certify them. Proof
   grants close before whole admission. Unknown domains, excessive bounds, unproved uniqueness,
-  parameters, volatile/computed producers or insufficient whole-cap room retain the generic
-  route. All selected joins stay resident, preserving native per-group float transition order.
+  unsupported parameters, volatile/computed producers or insufficient whole-cap room retain the
+  generic route. At most four plain TEXT slots (NULL or <=1024 UTF-16 units, no NUL)
+  may enter the exact three-lookup family after shared binding validation and exact parameter-byte sizing. Other bound dictionary recipes retain their old fallback. The
+  per-execution check precedes proof reads and includes all parameter/progress bytes;
+  a cached plan does not reuse a previous binding certificate. All selected joins stay resident, preserving native per-group float transition order.
   Error-free dimension comparisons, AND/OR/NOT and NULL tests run on original vectors.
   Dimension TEXT attributes may be grouping keys. LEFT joins remain generic: null padding
   needs additional domain and uniqueness certification.
@@ -2355,6 +2458,9 @@ shipped-engine or stored-format change.
   composite key with text or bytes length-prefixes them instead of escaping them (equality
   needs no order). A batch's encoded keys get one buffer of their exact size, charged before it
   is allocated, and each value is copied into it once, in budgeted pieces (no regrowth copies).
+- Byte keys of at most 64 bytes hash and compare without a nested generator. They
+  spend the same inspected bytes and yield before publishing hashes or acting on a match.
+  Longer keys retain resumable streaming, including the second hash and collision cursor.
 - The build store and table are allocated from the join's spillable grant. A dense integer key
   is direct-addressed; others use open addressing with the key's words inline. Matched outputs
   reuse probe key vectors for build key columns that are identical in representation.
@@ -3713,10 +3819,10 @@ coalesced window; it does not skip the gzip/large-value sizing proof or raise th
 `npx vite-node scripts/read-retention-bench.mts --compare=REV` runs five interleaved frozen-parent/
 candidate component rounds, checks physical frame bytes (including masks, padding and dictionary
 deltas), and guards warm repeated reads plus real persisted SQL scans and point selections.
-The ordinary query executor refuses `keyLookup` without diagnostic opt-in; this query benchmark
-uses `id + 0` to exercise the supported scan path. DML's separately admitted input recipe is
-not a query-point-lookup path. The separate storage point-read guard is a direct single-blob
-cache hit. This benchmark does not claim indexed SQL point-lookup performance.
+This query benchmark uses `id + 0` to retain its forced-scan control. Ordinary indexed
+predicates now use the complete query cursor/fetch recipe. The separate storage point-read
+guard is a direct single-blob cache hit; this benchmark still does not measure indexed SQL
+point-lookup performance.
 
 `MINNOW_EXPORT_RETENTION_REFERENCE=REV` freezes the entire core at that Git revision on its
 ordinary module IDs for a control whole-owner campaign. It is bench-only; ordinary invocations
@@ -4654,6 +4760,23 @@ keeper first attempts their complete reservation; a boolean or typed memory refu
 selects the same disk inventory used for larger sources. Other errors propagate.
 The disk route admits its smaller working window before copying or consuming entries.
 
+A group constructor may also prepay at most 1 MiB of optional dictionary headroom from
+currently free credit. It never waits for that spare or includes it in the required minimum.
+Dictionary allocations keep the remaining mandatory workspace reserved; they do not grow
+or reclaim while emitting. If spare credit is unavailable, or its owner returns unused spare,
+the existing plain encoding remains the bounded fallback. Plentiful-memory stored inputs retain dictionary
+pages for certified grouping/percentile routes.
+
+An idle transaction can retain the writer slot while a recycler queues behind it. That queued
+recycler owns no active step: fitting readers can reclaim the dormant writer forecasts before
+the transaction releases its slot. Live allocations, prepared rows, active metadata/WAL work
+and funded merge handoffs remain owned; recycling re-admits its workspace after it gets the slot.
+Phase settlement wakes pending admissions through an account without loan-backed allocations.
+It does not release or repay live loans merely to send a wake; loan repayment supplies its own wake.
+Funded commit and merge handoffs keep their compound prepayment until the waiting consumer
+resumes. Concurrent preparation cannot trade that same credit back and forth. These handoffs
+own admitted next steps; unused estimates still return before any new admission wait.
+
 ### Bounded native writer ownership
 
 Abort detaches each builder before consuming its reservation. Its remaining disk bytes move
@@ -4753,7 +4876,7 @@ Connection prepared handles use a bounded governor-charged cache, rather than ho
 outside its original cache's charge. Executions include the original SQL as an exact fallback
 for eviction or reconnection, under the same protocol sequence and ledger identity. Private-DDL
 preparation runs in its session and does not retain the private plan beyond that session cache.
-The unreleased protocol profile is 8 for these optional owner-side call guards/session binding;
+The unreleased protocol profile is 9 (inspection ops plus optional owner-side call guards/session binding);
 this changes no stored bytes or published package entry. Raw id-only execution requires a live
 cached handle; the internal facade always supplies fallback SQL.
 
@@ -4946,6 +5069,17 @@ cancellation; an intrinsic compound minimum above the selected capacity fails wi
 Ordinary funding preserves the governor reserve. Only an already-proven complete private
 progress step may use the existing whole-cap mode.
 
+Immediate growth can preserve warm WAL and merge windows when free credit funds the step.
+Before any queued admission, growth nets all unused forecasts and surrenders dormant
+working floors; a warm window never pins credit while waiting. This also lets keyed FTS
+invalidations append without waiting for an unrelated held root publication.
+
+Idle readers can retire every unused account forecast. The next native producer re-admits
+its row, publication, WAL and merge companion minima in one request before publishing a
+witness; it never reports donated credit as still owned. Completed recovery scan credit is
+excluded. A relief pass compares the full next publication headroom when deciding whether
+to retry or refuse, including headroom not yet funded, so an impossible step cannot spin.
+
 Keep no image, producer borrow or progress loan across preparation or fresh admission.
 Include retained preparation/rules/parameters and all simultaneous next-step maxima in
 `rootBytes`; exclude the native floor already reported by the boundary. Protect rule and
@@ -4980,6 +5114,20 @@ Native command statements retain their memory policy across end and commit. Endi
 the command scope must not reintroduce a future background-merge estimate into the
 commit step while another admitted execution retains its workspace. The next live
 statement selects its own policy; actual merge acquisition still funds its full step.
+
+Short raw join-key batches borrow one DataView over their existing source bytes
+for16–64-byte XXH32 word reads. This is the existing checksum with the same seed
+and byte range; long and encoded keys keep their original paths. The view stays
+local to extraction, and every key spends the same work before progress/yields.
+The incremental ordinary-build component is recorded separately from the short
+dispatch baseline in `scripts/bench-evidence/b9-j2-key-view-84d-2026-11-19.json`.
+
+Extent-delta capture remains internal preparation: allocate its immutable descriptor view
+before marking an external sink as entered. Internal `MetadataPressure` unwinds the
+provisional writer and keeper attempt before retry; an unentered sink receives no abort.
+An exception from the actual sink, including that same error class, stays fatal.
+`testing/write-sink-capture-pressure.test.ts` generates both boundaries and verifies
+reopen, observer attempts and final ownership.
 
 A publication captures quiet index-build coverage together with its catalog cut. Rows arriving
 while the root is assembled keep their normal index deltas and WAL coverage; they cannot revoke

@@ -1,0 +1,942 @@
+{
+  "piece": "J2 native-demand three-dimension star stream",
+  "base": "84d10cff312e5c42dfa9602b3eb83423859db0b0",
+  "engineWorkingTree": true,
+  "mergeQualification": "PENDING hosted full gates and current/frozen W1M/S1. No engine commit yet.",
+  "law": {
+    "authority": "PostgreSQL duplicate/NULL join bags and float8 SUM errors; next/exec/pipeline.ts requires each source prefix consumed before next(). Governor requires charge before allocation and pending-work retirement before grant close.",
+    "eligibility": "Three single-key inner joins with enforced dimension PKs, direct TEXT groups, COUNT(*) and one direct float8 SUM; original exact resident proof and complete admission. No residual/computed/ordered/outer/mark/volatile fusion.",
+    "schedule": "C, facts, A, then streaming B; one source fact scan plus bounded A/B query-ID linking. B source order, A descending, fact ascending.",
+    "state": "16B per certified fact in buckets +8B A/B sidecars; dense buckets only exact bounded A ordinal x B query-ID domain; sparse/unaffordable retains native joins."
+  },
+  "component": {
+    "kind": "ordinary-owner normalized TEXT star",
+    "rows": 32768,
+    "fields": ["id", "d03", "d04", "d07", "f00"],
+    "parent": "/home/eric/.cache/minnow-b9-prototypes/ndv-production-84d/parent",
+    "candidate": "/home/eric/.cache/minnow-b9-prototypes/star-stream-v1/candidate",
+    "warmups": 8,
+    "repeats": 4,
+    "pairs": [
+      {
+        "round": 0,
+        "order": [0, 1],
+        "samples": [
+          {
+            "arm": "parent",
+            "cpuMs": 51.307
+          },
+          {
+            "arm": "candidate",
+            "cpuMs": 25.89475
+          }
+        ]
+      },
+      {
+        "round": 1,
+        "order": [1, 0],
+        "samples": [
+          {
+            "arm": "candidate",
+            "cpuMs": 26.857
+          },
+          {
+            "arm": "parent",
+            "cpuMs": 50.669
+          }
+        ]
+      },
+      {
+        "round": 2,
+        "order": [0, 1],
+        "samples": [
+          {
+            "arm": "parent",
+            "cpuMs": 34.923
+          },
+          {
+            "arm": "candidate",
+            "cpuMs": 36.9345
+          }
+        ]
+      },
+      {
+        "round": 3,
+        "order": [1, 0],
+        "samples": [
+          {
+            "arm": "candidate",
+            "cpuMs": 22.135
+          },
+          {
+            "arm": "parent",
+            "cpuMs": 34.85775
+          }
+        ]
+      },
+      {
+        "round": 4,
+        "order": [0, 1],
+        "samples": [
+          {
+            "arm": "parent",
+            "cpuMs": 61.101
+          },
+          {
+            "arm": "candidate",
+            "cpuMs": 20.55375
+          }
+        ]
+      },
+      {
+        "round": 5,
+        "order": [1, 0],
+        "samples": [
+          {
+            "arm": "candidate",
+            "cpuMs": 15.332
+          },
+          {
+            "arm": "parent",
+            "cpuMs": 32.05375
+          }
+        ]
+      },
+      {
+        "round": 6,
+        "order": [0, 1],
+        "samples": [
+          {
+            "arm": "parent",
+            "cpuMs": 61.44725
+          },
+          {
+            "arm": "candidate",
+            "cpuMs": 21.801
+          }
+        ]
+      },
+      {
+        "round": 7,
+        "order": [1, 0],
+        "samples": [
+          {
+            "arm": "candidate",
+            "cpuMs": 14.19625
+          },
+          {
+            "arm": "parent",
+            "cpuMs": 33.6505
+          }
+        ]
+      },
+      {
+        "round": 8,
+        "order": [0, 1],
+        "samples": [
+          {
+            "arm": "parent",
+            "cpuMs": 30.33075
+          },
+          {
+            "arm": "candidate",
+            "cpuMs": 16.91025
+          }
+        ]
+      }
+    ],
+    "route": {
+      "parameters": ["text"],
+      "candidateLookups": 1,
+      "parentLookups": 0
+    },
+    "strictNativeResults": true,
+    "identicalBitsEveryRepeat": true,
+    "clock": "process user+system CPU, all threads and natural GC; 9 AB/BA pairs; no forced GC; fixture/warmup/validation excluded",
+    "acceptance": {
+      "pairs": [
+        {
+          "control": 51.307,
+          "candidate": 25.89475,
+          "delta": -25.412250000000004
+        },
+        {
+          "control": 50.669,
+          "candidate": 26.857,
+          "delta": -23.811999999999998
+        },
+        {
+          "control": 34.923,
+          "candidate": 36.9345,
+          "delta": 2.011499999999998
+        },
+        {
+          "control": 34.85775,
+          "candidate": 22.135,
+          "delta": -12.722750000000001
+        },
+        {
+          "control": 61.101,
+          "candidate": 20.55375,
+          "delta": -40.54725
+        },
+        {
+          "control": 32.05375,
+          "candidate": 15.332,
+          "delta": -16.72175
+        },
+        {
+          "control": 61.44725,
+          "candidate": 21.801,
+          "delta": -39.646249999999995
+        },
+        {
+          "control": 33.6505,
+          "candidate": 14.19625,
+          "delta": -19.454250000000002
+        },
+        {
+          "control": 30.33075,
+          "candidate": 16.91025,
+          "delta": -13.420499999999997
+        }
+      ],
+      "medianDeltaMs": -19.454250000000002,
+      "q1DeltaMs": -25.412250000000004,
+      "q3DeltaMs": -13.420499999999997,
+      "iqrDeltaMs": 11.991750000000007,
+      "minDeltaMs": -40.54725,
+      "maxDeltaMs": 2.011499999999998,
+      "rangeDeltaMs": 42.558749999999996,
+      "spreadDeltaMs": 42.558749999999996,
+      "favoursCandidate": 8,
+      "favoursControl": 1,
+      "requiredFavourable": 7,
+      "acceptedGain": true,
+      "significantRegression": false,
+      "noRegression": true
+    },
+    "rawResults": [
+      [
+        "t1",
+        "t3",
+        "victor-661",
+        {
+          "floatBits": "0000000000001440"
+        },
+        {
+          "floatBits": "078195430bb9ad40"
+        }
+      ],
+      [
+        "t2",
+        "t3",
+        "november-589",
+        {
+          "floatBits": "0000000000001840"
+        },
+        {
+          "floatBits": "986e1283c008ad40"
+        }
+      ],
+      [
+        "t2",
+        "t2",
+        "victor-149",
+        {
+          "floatBits": "0000000000001040"
+        },
+        {
+          "floatBits": "355eba498cceab40"
+        }
+      ],
+      [
+        "t3",
+        "t2",
+        "monthly-813",
+        {
+          "floatBits": "0000000000001840"
+        },
+        {
+          "floatBits": "f97e6abc34a5ab40"
+        }
+      ],
+      [
+        "t2",
+        "t2",
+        "monthly-557",
+        {
+          "floatBits": "0000000000001040"
+        },
+        {
+          "floatBits": "1b2fdd24c691aa40"
+        }
+      ],
+      [
+        "t1",
+        "t0",
+        "delivery-881",
+        {
+          "floatBits": "0000000000001440"
+        },
+        {
+          "floatBits": "cff753e3a564a940"
+        }
+      ],
+      [
+        "t1",
+        "t2",
+        "bravo-1",
+        {
+          "floatBits": "0000000000001440"
+        },
+        {
+          "floatBits": "c64b37894150a740"
+        }
+      ],
+      [
+        "t2",
+        "t0",
+        "zulu-409",
+        {
+          "floatBits": "0000000000001040"
+        },
+        {
+          "floatBits": "1f85eb513848a740"
+        }
+      ],
+      [
+        "t2",
+        "t0",
+        "refund-285",
+        {
+          "floatBits": "0000000000001440"
+        },
+        {
+          "floatBits": "8295438bec0fa740"
+        }
+      ],
+      [
+        "t1",
+        "t3",
+        "foxtrot-197",
+        {
+          "floatBits": "0000000000001040"
+        },
+        {
+          "floatBits": "40355eba899ba640"
+        }
+      ],
+      [
+        "t1",
+        "t1",
+        "foxtrot-261",
+        {
+          "floatBits": "0000000000001440"
+        },
+        {
+          "floatBits": "6891ed7cff8aa640"
+        }
+      ],
+      [
+        "t2",
+        "t3",
+        "store-737",
+        {
+          "floatBits": "0000000000001440"
+        },
+        {
+          "floatBits": "a01a2fdde447a640"
+        }
+      ],
+      [
+        "t0",
+        "t0",
+        "view-293",
+        {
+          "floatBits": "0000000000001040"
+        },
+        {
+          "floatBits": "5eba490c823ca640"
+        }
+      ],
+      [
+        "t0",
+        "t1",
+        "desktop-253",
+        {
+          "floatBits": "0000000000000840"
+        },
+        {
+          "floatBits": "3bdf4f8dd7d3a540"
+        }
+      ],
+      [
+        "t2",
+        "t0",
+        "view-677",
+        {
+          "floatBits": "0000000000001040"
+        },
+        {
+          "floatBits": "2fdd2406017da540"
+        }
+      ],
+      [
+        "t2",
+        "t3",
+        "refund-477",
+        {
+          "floatBits": "0000000000001040"
+        },
+        {
+          "floatBits": "cdcccccccc64a540"
+        }
+      ],
+      [
+        "t2",
+        "t3",
+        "sort-41",
+        {
+          "floatBits": "0000000000000840"
+        },
+        {
+          "floatBits": "8d976e1283e5a440"
+        }
+      ],
+      [
+        "t3",
+        "t3",
+        "november-397",
+        {
+          "floatBits": "0000000000001040"
+        },
+        {
+          "floatBits": "263108acdc60a440"
+        }
+      ],
+      [
+        "t3",
+        "t1",
+        "foxtrot-325",
+        {
+          "floatBits": "0000000000000840"
+        },
+        {
+          "floatBits": "ee7c3f351e41a440"
+        }
+      ],
+      [
+        "t3",
+        "t1",
+        "romeo-721",
+        {
+          "floatBits": "0000000000000840"
+        },
+        {
+          "floatBits": "00000000c03ca440"
+        }
+      ],
+      [
+        "t2",
+        "t0",
+        "victor-149",
+        {
+          "floatBits": "0000000000001040"
+        },
+        {
+          "floatBits": "1804560e6dd6a340"
+        }
+      ],
+      [
+        "t3",
+        "t0",
+        "rating-249",
+        {
+          "floatBits": "0000000000001040"
+        },
+        {
+          "floatBits": "b29defa786d1a340"
+        }
+      ],
+      [
+        "t1",
+        "t1",
+        "november-333",
+        {
+          "floatBits": "0000000000000840"
+        },
+        {
+          "floatBits": "c0caa145b6c8a340"
+        }
+      ],
+      [
+        "t1",
+        "t1",
+        "foxtrot-325",
+        {
+          "floatBits": "0000000000001040"
+        },
+        {
+          "floatBits": "378941606599a340"
+        }
+      ],
+      [
+        "t0",
+        "t3",
+        "refund-541",
+        {
+          "floatBits": "0000000000000840"
+        },
+        {
+          "floatBits": "2fdd24060190a340"
+        }
+      ],
+      [
+        "t3",
+        "t3",
+        "view-485",
+        {
+          "floatBits": "0000000000000840"
+        },
+        {
+          "floatBits": "7f6abc749389a340"
+        }
+      ],
+      [
+        "t0",
+        "t3",
+        "refund-29",
+        {
+          "floatBits": "0000000000000840"
+        },
+        {
+          "floatBits": "068195430b6fa340"
+        }
+      ],
+      [
+        "t1",
+        "t0",
+        "store-673",
+        {
+          "floatBits": "0000000000001040"
+        },
+        {
+          "floatBits": "2a5c8fc2f522a340"
+        }
+      ],
+      [
+        "t1",
+        "t0",
+        "zulu-793",
+        {
+          "floatBits": "0000000000000840"
+        },
+        {
+          "floatBits": "894160e590fda240"
+        }
+      ],
+      [
+        "t2",
+        "t0",
+        "foxtrot-69",
+        {
+          "floatBits": "0000000000001040"
+        },
+        {
+          "floatBits": "7b14ae4761fba240"
+        }
+      ],
+      [
+        "t0",
+        "t0",
+        "foxtrot-901",
+        {
+          "floatBits": "0000000000000840"
+        },
+        {
+          "floatBits": "8195438bace9a240"
+        }
+      ],
+      [
+        "t1",
+        "t3",
+        "rating-953",
+        {
+          "floatBits": "0000000000001040"
+        },
+        {
+          "floatBits": "ea2631086cdfa240"
+        }
+      ],
+      [
+        "t1",
+        "t0",
+        "refund-989",
+        {
+          "floatBits": "0000000000001040"
+        },
+        {
+          "floatBits": "62105839b4bba240"
+        }
+      ],
+      [
+        "t2",
+        "t3",
+        "romeo-145",
+        {
+          "floatBits": "0000000000001440"
+        },
+        {
+          "floatBits": "e92631086cb1a240"
+        }
+      ],
+      [
+        "t1",
+        "t0",
+        "juliet-201",
+        {
+          "floatBits": "0000000000001840"
+        },
+        {
+          "floatBits": "2fdd24064184a240"
+        }
+      ],
+      [
+        "t0",
+        "t1",
+        "rating-57",
+        {
+          "floatBits": "0000000000001040"
+        },
+        {
+          "floatBits": "eb51b81e4576a240"
+        }
+      ],
+      [
+        "t1",
+        "t0",
+        "victor-213",
+        {
+          "floatBits": "0000000000000840"
+        },
+        {
+          "floatBits": "022b8716d974a240"
+        }
+      ],
+      [
+        "t2",
+        "t3",
+        "desktop-189",
+        {
+          "floatBits": "0000000000001040"
+        },
+        {
+          "floatBits": "bf9f1a2fdd69a240"
+        }
+      ],
+      [
+        "t2",
+        "t0",
+        "zulu-89",
+        {
+          "floatBits": "0000000000001040"
+        },
+        {
+          "floatBits": "5c8fc2f5285da240"
+        }
+      ],
+      [
+        "t1",
+        "t2",
+        "view-549",
+        {
+          "floatBits": "0000000000000840"
+        },
+        {
+          "floatBits": "4c3789412042a240"
+        }
+      ],
+      [
+        "t2",
+        "t0",
+        "zulu-665",
+        {
+          "floatBits": "0000000000000840"
+        },
+        {
+          "floatBits": "84c0caa1c541a240"
+        }
+      ],
+      [
+        "t2",
+        "t1",
+        "desktop-189",
+        {
+          "floatBits": "0000000000000840"
+        },
+        {
+          "floatBits": "a8c64b378930a240"
+        }
+      ],
+      [
+        "t2",
+        "t2",
+        "delivery-177",
+        {
+          "floatBits": "0000000000000840"
+        },
+        {
+          "floatBits": "85eb51b81e06a240"
+        }
+      ],
+      [
+        "t1",
+        "t2",
+        "refund-861",
+        {
+          "floatBits": "0000000000001040"
+        },
+        {
+          "floatBits": "21b07268d1eba140"
+        }
+      ],
+      [
+        "t2",
+        "t3",
+        "victor-469",
+        {
+          "floatBits": "0000000000000840"
+        },
+        {
+          "floatBits": "1a2fdd24c6dba140"
+        }
+      ],
+      [
+        "t3",
+        "t0",
+        "sort-105",
+        {
+          "floatBits": "0000000000001040"
+        },
+        {
+          "floatBits": "0ad7a3703dd0a140"
+        }
+      ],
+      [
+        "t1",
+        "t0",
+        "foxtrot-645",
+        {
+          "floatBits": "0000000000000840"
+        },
+        {
+          "floatBits": "ea2631082ccfa140"
+        }
+      ],
+      [
+        "t3",
+        "t2",
+        "store-993",
+        {
+          "floatBits": "0000000000001040"
+        },
+        {
+          "floatBits": "fca9f1d28dbba140"
+        }
+      ],
+      [
+        "t2",
+        "t2",
+        "zulu-473",
+        {
+          "floatBits": "0000000000000840"
+        },
+        {
+          "floatBits": "b6f3fdd478a2a140"
+        }
+      ],
+      [
+        "t0",
+        "t0",
+        "bravo-65",
+        {
+          "floatBits": "0000000000000840"
+        },
+        {
+          "floatBits": "08ac1c5ae4a0a140"
+        }
+      ]
+    ],
+    "limits": "local five-field component, not 200-column W1M; ordinary-build prototype emission hashes must be checked before hosted timing"
+  },
+  "profileShare": {
+    "source": "fresh main84d hosted44497039678",
+    "cell": "join_star_3dims",
+    "columnStoreSelfPercent": 29.6,
+    "joinTableSelfPercent": 19.3,
+    "groupsSelfPercent": 14.8,
+    "limits": "Profile shares overlap function subsets; not the new candidate timing. Whole-cell numbers require the new hosted runner."
+  },
+  "red": {
+    "oldPrefetch": "Both seeds b9f91/b9f92: later B failure preempted demanded PostgreSQL/native22003. star-source-demand-second.log.",
+    "rejectedLatch": "Error identity alone passed but candidate demanded later B1 times/native0; star-source-demand-latch-not-enough.log. Gated input could wait.",
+    "limits": "These REDs apply to the prior uncommitted fusion experiment. Main84d semantics were correct; no claim of a main semantic defect."
+  },
+  "generatedDimensions": [
+    "B2049..2052 and4097facts",
+    "finite and overflow prefix",
+    "fact and A failures versus later B",
+    "all source phases including unchanged dictionary proof trace",
+    "independent backing census4097..65536/domain1..16 at8MiB",
+    "staged missing A/NULL payload/duplicate and nonmonotonic B visits",
+    "existing SQL/PGlite/float/parameter/pressure generated histories retained"
+  ],
+  "mutants": [
+    {
+      "mutant": "prefetch-latch",
+      "exit": 1,
+      "intended": "expected [ 'C', 'A', 'B', 'facts' ]",
+      "valid": true,
+      "log": "/home/eric/.cache/minnow-b9-logs/star-stream-mutant-prefetch-latch.log"
+    },
+    {
+      "mutant": "drop-sidecar-charge",
+      "exit": 1,
+      "intended": "actual backing requires preceding owner charge",
+      "valid": true,
+      "log": "/home/eric/.cache/minnow-b9-logs/star-stream-mutant-drop-sidecar-charge.log"
+    },
+    {
+      "mutant": "missing-close-fence",
+      "exit": 1,
+      "intended": "owner grant retired before pending B work",
+      "valid": true,
+      "log": "/home/eric/.cache/minnow-b9-logs/star-stream-mutant-missing-close-fence.log"
+    },
+    {
+      "mutant": "early-buffer-release",
+      "exit": 1,
+      "intended": "expected",
+      "valid": true,
+      "log": "/home/eric/.cache/minnow-b9-logs/star-stream-mutant-early-buffer-release.log"
+    },
+    {
+      "mutant": "overwrite-duplicates",
+      "exit": 1,
+      "intended": "deeply equal",
+      "valid": true,
+      "log": "/home/eric/.cache/minnow-b9-logs/star-stream-mutant-overwrite-duplicates.log"
+    },
+    {
+      "mutant": "A-order",
+      "exit": 1,
+      "intended": "deeply equal",
+      "valid": true,
+      "log": "/home/eric/.cache/minnow-b9-logs/star-stream-mutant-A-order.log"
+    },
+    {
+      "mutant": "wrong-staged-B-id",
+      "exit": 1,
+      "intended": "AssertionError",
+      "valid": true,
+      "log": "/home/eric/.cache/minnow-b9-logs/star-stream-mutant-wrong-staged-B-id.log"
+    }
+  ],
+  "bindingMutants": [
+    {
+      "mutant": "old-parameter-barrier",
+      "exit": 1,
+      "intendedReject": true,
+      "reason": "expected \"probe\" to be called 1 times, but got 0 times",
+      "log": "/home/eric/.cache/minnow-b9-logs/star-stream-binding-mutants/old-parameter-barrier.log"
+    },
+    {
+      "mutant": "proof-before-binding",
+      "exit": 1,
+      "intendedReject": true,
+      "reason": "to be +0",
+      "log": "/home/eric/.cache/minnow-b9-logs/star-stream-binding-mutants/proof-before-binding.log"
+    },
+    {
+      "mutant": "omit-complete-parameter-minimum",
+      "exit": 1,
+      "intendedReject": true,
+      "reason": "optional resident minimum includes all parameters",
+      "log": "/home/eric/.cache/minnow-b9-logs/star-stream-binding-mutants/omit-complete-parameter-minimum.log"
+    },
+    {
+      "mutant": "broader-bound-dictionary-family",
+      "exit": 1,
+      "intendedReject": true,
+      "reason": "unsupported bound family must not open optional proof readers",
+      "log": "/home/eric/.cache/minnow-b9-logs/star-stream-binding-mutants/broader-bound-dictionary-family.log"
+    }
+  ],
+  "notCounted": "A catch-and-continue around B scanning survived: the runtime still latched and returned the same original error. No rejection claimed.",
+  "limits": [
+    "Local five-field32768-row component only, not the200-column W1M or S1.",
+    "Prior owner and executor component files are historical; this ordinary84d comparison is the current campaign.",
+    "No caps, seeds, counts, deadlines, float comparisons or full-gate scope are relaxed.",
+    "Advisory statistics do not establish uniqueness, pruning or admission.",
+    "Source is an independent patch; do not combine with aligned views/short keys/NDV/admission until individually qualified."
+  ],
+  "green": {
+    "tests": 58,
+    "files": 15,
+    "restored": "/home/eric/.cache/minnow-b9-logs/star-stream-restored.json",
+    "sourceCoreBuild": "PASS ordinary tsc -b packages/core",
+    "componentTypes": "PASS",
+    "lint": "PASS with NODE_OPTIONS8192",
+    "format": "PASS",
+    "fullGates": "PENDING hosted; all scopes retained"
+  },
+  "emissionCalibration": {
+    "modules": [
+      {
+        "file": "next/exec/plan.js",
+        "ordinarySha256": "1f26bc5d62cabce2879d40dc027e52c57dcffde860d301b850be3680d447c952",
+        "measuredSha256": "1f26bc5d62cabce2879d40dc027e52c57dcffde860d301b850be3680d447c952",
+        "byteExact": true,
+        "emittedSyntaxExact": true
+      },
+      {
+        "file": "next/exec/star-bound.js",
+        "ordinarySha256": "21649ae61615dde4cd9e3a6c7985f7da7d09f7a6073b30a8b7d2652df041706f",
+        "measuredSha256": "21649ae61615dde4cd9e3a6c7985f7da7d09f7a6073b30a8b7d2652df041706f",
+        "byteExact": true,
+        "emittedSyntaxExact": true
+      },
+      {
+        "file": "next/exec/join-star-parameters.js",
+        "ordinarySha256": "3a8429beea1f6dff5a1638533cad461d1df6411dacd051b0030e60e8229d1ff5",
+        "measuredSha256": "3a8429beea1f6dff5a1638533cad461d1df6411dacd051b0030e60e8229d1ff5",
+        "byteExact": true,
+        "emittedSyntaxExact": true
+      },
+      {
+        "file": "next/exec/join-star-shape.js",
+        "ordinarySha256": "d35abffbf6964b2754cb717ccd6a5399c2c9b5be374751a92acd1467259be4ff",
+        "measuredSha256": "d35abffbf6964b2754cb717ccd6a5399c2c9b5be374751a92acd1467259be4ff",
+        "byteExact": true,
+        "emittedSyntaxExact": true
+      },
+      {
+        "file": "next/exec/join-star-lookups.js",
+        "ordinarySha256": "1094c872e878d9f2f470e7ccc88dc5f1ec561d3d24869dbab8e102e7e858f84e",
+        "measuredSha256": "e5e676b8c9fced2a187165cc3289251398948c7f83a6a4515bd0f0b26ca70510",
+        "byteExact": false,
+        "emittedSyntaxExact": true
+      },
+      {
+        "file": "next/exec/join-star-buckets.js",
+        "ordinarySha256": "c839b397a6954b148e63f0e6db5acd5ad55c01a1f5e5f46d0ee01a6b63a97262",
+        "measuredSha256": "c839b397a6954b148e63f0e6db5acd5ad55c01a1f5e5f46d0ee01a6b63a97262",
+        "byteExact": true,
+        "emittedSyntaxExact": true
+      }
+    ],
+    "authority": "Ordinary tsc -b emitted modules; TypeScript JS parse/print with comments removed matches exact measured syntax. Only new lint suppression comment differs.",
+    "limits": "Syntax identity is not full hosted whole-cell qualification."
+  }
+}

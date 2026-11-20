@@ -108,7 +108,7 @@ for (const backend of ["memory", "indexeddb"] as const)
             // arrives: record it only after the startup owner returns that credit and
             // write admission proceeds. It does not require keeping idle credit through admission.
             // active progress loan: the same real borrow.
-            // idle estimate headroom: the same path.admit estimate. allocated write above
+            // idle estimate headroom: non-allocating grant credit, not a new row step. allocated write above
             // minimum: the working minimum now comes from admitGroup's row/I/O part, rather than
             // the old standalone admit. Commit-buffer ownership still uses onCommitBuffer,
             // finding the native commit part recorded at that same atomic group split.
@@ -164,7 +164,11 @@ for (const backend of ["memory", "indexeddb"] as const)
               const write = grants.find((g) => g.label === "write path" && g.held > 0);
               if (s.atMerge && options.label.startsWith("merge") && write && pressure) {
                 const growth = governor.capBytes - governor.reserveBytes - governor.usedBytes - 1;
-                if (growth > 0) await pressure(write.held - write.allocated + growth);
+                // Inject an idle forecast, not another row step inside the
+                // suspended merge admission. admit() would preflight a second
+                // publication and move this very credit into its metadata floor.
+                if (growth > 0)
+                  expect(write.tryGrow(growth), "fixture fills free ordinary credit").toBe(true);
               }
               pendingWriteAdmissions++;
               try {
@@ -246,7 +250,11 @@ for (const backend of ["memory", "indexeddb"] as const)
                 // A genuine estimate reservation, like the wide-batch estimate in B1's W5M repro.
                 // Leave too little ordinary room for metadata growth or the next merge minimum.
                 const growth = governor.capBytes - governor.reserveBytes - governor.usedBytes - 1;
-                if (growth > 0) await path.admit(write.held - write.allocated + growth);
+                if (growth > 0)
+                  expect(
+                    write.tryGrow(growth),
+                    "idle estimate uses only free ordinary credit",
+                  ).toBe(true);
                 reach.reach("idle estimate headroom");
                 const ids = Array.from({ length: s.rows }, (_, k) => cycle * s.rows + k);
                 const strings = ids.map((id) => `value-${String(id)}-${"x".repeat(s.valueBytes)}`);

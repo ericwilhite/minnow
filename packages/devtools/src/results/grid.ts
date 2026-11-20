@@ -6,6 +6,8 @@ import { toCsv } from "./serialize.js";
 
 export interface GridColumn {
   name: string;
+  /** Visible label when the storage key is positional; legacy columns use name. */
+  displayName?: string;
   /** Right-aligns numbers and sizes the column; inferred from the values for a bare query result. */
   type?: string;
   /** What the header shows beside the name — the declared SQL type — when it is more than `type`. */
@@ -17,6 +19,8 @@ export interface GridColumn {
 }
 
 export interface GridDeps {
+  /** Override selected-row copy for a positional presentation; legacy CSV is the default. */
+  selectionText?(columns: readonly GridColumn[], rows: readonly QueryRow[]): string;
   /** Fired when a sortable header is clicked. */
   onSort?(column: string): void;
   /** Fired when the viewport nears the end of the loaded rows. */
@@ -48,6 +52,8 @@ export interface CellEditor {
 }
 
 export interface Grid {
+  /** Release observer/frame ownership and detach this view. Idempotent. */
+  destroy(): void;
   node: HTMLElement;
   setColumns(columns: readonly GridColumn[]): void;
   /** Replaces the rows and scrolls back to the top. */
@@ -212,7 +218,7 @@ export function createGrid(deps: GridDeps = {}): Grid {
     node.setAttribute("aria-colcount", String(columns.length));
     head.replaceChildren(
       ...columns.map((column, index) => {
-        const label = el("span", { class: "grid-name", text: column.name });
+        const label = el("span", { class: "grid-name", text: column.displayName ?? column.name });
         const children: Array<Node | string> = [label];
         const typeText = column.label ?? column.type;
         if (typeText !== undefined) {
@@ -386,8 +392,10 @@ export function createGrid(deps: GridDeps = {}): Grid {
     }
   }
 
+  let disposed = false;
+  let resizeObserver: ResizeObserver | undefined;
   function schedule(): void {
-    if (frame !== 0) return;
+    if (disposed || frame !== 0) return;
     frame = requestAnimationFrame(() => {
       frame = 0;
       render();
@@ -401,9 +409,10 @@ export function createGrid(deps: GridDeps = {}): Grid {
   // space below the old window stays blank until a scroll happens to ask for a render. Where
   // there is no ResizeObserver the scroll path still completes the window, just late.
   if (typeof ResizeObserver === "function") {
-    new ResizeObserver(() => {
+    resizeObserver = new ResizeObserver(() => {
       schedule();
-    }).observe(viewport);
+    });
+    resizeObserver.observe(viewport);
   }
 
   /** Reads the row and column a pointer event landed on, using the pooled node's own bookkeeping. */
@@ -461,11 +470,15 @@ export function createGrid(deps: GridDeps = {}): Grid {
     const picked = [...selection].sort((a, b) => a - b).map((index) => rows[index]);
     const text =
       picked.length > 0
-        ? toCsv(
+        ? (deps.selectionText?.(
+            columns,
+            picked.filter((row): row is QueryRow => row !== undefined),
+          ) ??
+          toCsv(
             names,
             picked.filter((row): row is QueryRow => row !== undefined),
             "\t",
-          )
+          ))
         : cell.textContent;
     try {
       await navigator.clipboard.writeText(text);
@@ -624,6 +637,20 @@ export function createGrid(deps: GridDeps = {}): Grid {
 
   return {
     node,
+    destroy: () => {
+      if (disposed) return;
+      disposed = true;
+      if (frame !== 0) cancelAnimationFrame(frame);
+      frame = 0;
+      resizeObserver?.disconnect();
+      viewport.removeEventListener("scroll", schedule);
+      rows = [];
+      columns = [];
+      selection.clear();
+      closeEdit();
+      reset();
+      node.remove();
+    },
     rowCount: () => rows.length,
     rowAt: (index) => rows[index],
     findIndex: (predicate) => rows.findIndex(predicate),

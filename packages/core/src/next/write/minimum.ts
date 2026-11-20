@@ -1,6 +1,8 @@
 import { LIST_PAGE_EXTENTS } from "../storage/extent-list.js";
 import { WRITER_OWNERSHIP_STEP_BYTES } from "../storage/writer-inventory.js";
 /** Bounds one publication from its actual schema, directories and pending inputs (governor rule 3). */
+import { groupWriterMinimum } from "../page/writer.js";
+import { nativeGroupOptions } from "./group-options.js";
 import { FTS_PUBLICATION_MINIMUM_BYTES } from "./fts-minimum.js";
 import type { MaybePromise } from "../access/key-index.js";
 import type { RunRef } from "../format/manifest.js";
@@ -35,7 +37,8 @@ export function writeStepMinimum(
       directory = 0,
       runMetadata = 0,
       mergeBytes = MERGE_INPUT_BYTES,
-      keyBytes = 2048;
+      keyBytes = 2048,
+      groupBytes = 0;
     for (const def of catalog.tables) {
       largest = Math.max(largest, 512 + def.columns.length * 512);
       yield;
@@ -52,6 +55,14 @@ export function writeStepMinimum(
       );
       for (let group = 0; group < view.groups.count; group++) {
         largest = Math.max(largest, view.groups.root(group).length);
+        yield;
+      }
+      for (const memtable of view.memtables) {
+        if (memtable.rowCount > 0 && memtable.published === null)
+          groupBytes = Math.max(
+            groupBytes,
+            groupWriterMinimum(yield* nativeGroupOptions(memtable)),
+          );
         yield;
       }
       const definition = catalog.table(view.tableId);
@@ -92,8 +103,8 @@ export function writeStepMinimum(
           ? FTS_PUBLICATION_MINIMUM_BYTES
           : 0,
         WRITER_OWNERSHIP_STEP_BYTES +
-          // The keeper's decoded/output list-page window overlaps run/root buffers.
-          256 * LIST_PAGE_EXTENTS +
+          // Group buffers close before the keeper window; retain one phase peak.
+          Math.max(256 * LIST_PAGE_EXTENTS, groupBytes) +
           RUN_ENCODER_MINIMUM +
           (keyBytes > 2048 ? 8 * keyBytes : 0) +
           4096 +
