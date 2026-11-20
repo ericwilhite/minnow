@@ -8,9 +8,9 @@
 name: Head-to-head
 
 on:
-  # SCRATCH BRANCH ONLY: screens B9 DISTINCT (perf/p1-b9-distinct) against main. Never merge.
+  # SCRATCH BRANCH ONLY: A/A control of the candidate screen (identical main build). Never merge.
   push:
-    branches: [ci/p1-screen-b9-distinct]
+    branches: [ci/p1-screen-aa]
   schedule:
     # 05:00 UTC daily, before the Node and browser performance lanes.
     - cron: "0 5 * * *"
@@ -47,7 +47,7 @@ jobs:
     env:
       SHIPPED: ${{ inputs.shipped || '0.20.0' }}
       ROUNDS: ${{ inputs.rounds || '9' }}
-      CANDIDATE: ${{ inputs.candidate || 'c44b34165272ef71d5d498b5d8438b527af3dae5' }}
+      CANDIDATE: ${{ inputs.candidate || '3881fff536b358ebbd66411b88b8d286815fa912' }}
     steps:
       - uses: actions/checkout@v5
         with:
