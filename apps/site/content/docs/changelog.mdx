@@ -10,6 +10,11 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The Node SQL performance gate (`npm run benchmark:gate`) keys its regression thresholds by CPU
+model as well as OS, architecture and Node major version, and refuses a host whose CPU model
+has no calibrated profile instead of comparing it with another machine's thresholds. No package
+code or stored format changes.
+
 The unexported 1.0 rebuild reserves wide sort merge workspace independently of source batch size, including encoded keys and the `WITH TIES` boundary row when a competing query forces a smaller source recipe.
 
 The private 1.0 writer preserves exact BIGINT values when updating or deleting persisted
