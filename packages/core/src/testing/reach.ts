@@ -1616,6 +1616,9 @@ export const LOWER_M3_JOINS_REACH = [
   "flushed",
   "reopened",
   "complete",
+  "build column in expression",
+  "aggregate over join",
+  "probe-only projection",
 ] as const;
 
 /** SQL windows run through durable storage and the actual executor, not a plan interpreter. */

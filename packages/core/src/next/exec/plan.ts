@@ -394,6 +394,20 @@ function counted(runtime: QueryRuntime, rel: OperatorIdentity, sink: Operator): 
   };
 }
 
+/** Every input column a scalar expression reads: only `column` references its input. */
+function readColumns(expr: ScalarExpr, into: Set<number>): void {
+  if (expr.op === "column") {
+    into.add(expr.index);
+    return;
+  }
+  const visit = (value: unknown): void => {
+    if (Array.isArray(value)) for (const item of value) visit(item);
+    else if (value !== null && typeof value === "object" && "op" in value)
+      readColumns(value as ScalarExpr, into);
+  };
+  for (const value of Object.values(expr)) visit(value);
+}
+
 /** Add non-column keys once, preserving the original columns at their original positions. */
 function keyProjection(input: readonly PhysicalType[], expressions: readonly ScalarExpr[]) {
   const exprs = columns(input);
@@ -667,6 +681,32 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
     loanSlots: number;
   }> = [];
   const compoundColumns = new Map<number, number>();
+  /** Join output columns its direct parent projection reads (absent: every column). */
+  const joinOutputDemand = new Map<number, ReadonlySet<number>>();
+  /**
+   * Build store columns an inner join need not gather: key-only columns it added past the
+   * build input, and input columns its parent projection never reads. Not for a residual,
+   * a filter, an outer/semi/mark join or a star-rewritten join (its outputs move).
+   */
+  const unusedBuildOf = (
+    join: Rel,
+    probeWidth: number,
+    buildWidth: number,
+    storeWidth: number,
+  ): { unusedBuild?: number[] } => {
+    if (
+      join.op !== "join" ||
+      (join.kind !== "inner" && join.kind !== "cross") ||
+      join.residual !== null ||
+      (join.filter ?? null) !== null
+    )
+      return {};
+    const read = joinOutputDemand.get(join.id);
+    const unused: number[] = [];
+    for (let c = 0; c < storeWidth; c++)
+      if (c >= buildWidth || (read !== undefined && !read.has(probeWidth + c))) unused.push(c);
+    return unused.length === 0 ? {} : { unusedBuild: unused };
+  };
   const compoundCopies = new Map<number, number>();
   const optionalIndexSorts = new Map<number, (runtime: QueryRuntime) => boolean>();
   const sortRows = new Map<
@@ -1494,6 +1534,12 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
       case "filter":
       case "project":
       case "limit": {
+        // A projection over a join reads only these join output columns (output demand).
+        if (rel.op === "project" && rel.input.op === "join") {
+          const read = new Set<number>();
+          for (const expr of rel.exprs) readColumns(expr, read);
+          joinOutputDemand.set(rel.input.id, read);
+        }
         const originalChild = prepare(rel.input),
           input = types(rel.input);
         const targetColumn =
@@ -2684,6 +2730,8 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
             ),
             // Runtime filters are optional acceleration; scans still evaluate every predicate.
             publishes: [],
+            // A star rewrite moves output positions: only the planned join uses demand.
+            ...(actual === rel ? unusedBuildOf(actual, lt.length, rt.length, rk.types.length) : {}),
           };
           if (runtime === undefined || grant === null) validateHashJoinSpec(spec);
           const join =
