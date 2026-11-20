@@ -29,6 +29,7 @@
  * tile it (decode.ts `parsePage`), so no value aliases another or a page (review B2-p2b #1).
  */
 import { CONDITIONAL_FORMAT, DURABLE_FORMATS, requireHeader } from "../durable-format.js";
+import type { ByteCharge } from "../vector/varlen.js";
 import { validateSketch } from "./sketch.js";
 import type { ChunkDirectory, PageEntry, StatValue } from "../format/manifest.js";
 import { PageEncoding } from "../format/manifest.js";
@@ -44,18 +45,16 @@ const VERSION = DURABLE_FORMATS.pageDirectory.version;
 export type { ChunkDirectory } from "../format/manifest.js";
 
 class Writer {
-  bytes = new Uint8Array(256);
-  view = new DataView(this.bytes.buffer);
+  readonly bytes: Uint8Array;
+  readonly view: DataView;
   length = 0;
-
+  constructor(capacity: number) {
+    this.bytes = new Uint8Array(capacity);
+    this.view = new DataView(this.bytes.buffer);
+  }
   #reserve(extra: number): void {
-    if (this.length + extra <= this.bytes.length) return;
-    let size = this.bytes.length * 2;
-    while (size < this.length + extra) size *= 2;
-    const grown = new Uint8Array(size);
-    grown.set(this.bytes.subarray(0, this.length));
-    this.bytes = grown;
-    this.view = new DataView(grown.buffer);
+    if (this.length + extra > this.bytes.length)
+      throw new RangeError("The page directory exceeded its preflight size");
   }
 
   u8(value: number): void {
@@ -221,8 +220,46 @@ function validEncoding(encoding: number): boolean {
   );
 }
 
-export function encodeDirectory(directory: ChunkDirectory): Uint8Array {
-  const writer = new Writer();
+/** Exact allocation size, including every optional bound and the sketch tail. */
+export function directoryBytes(directory: ChunkDirectory): number {
+  const stat = (value: StatValue): number => {
+    if (value instanceof Uint8Array) return 2 + value.length;
+    switch (directory.tag) {
+      case ValueTag.bool:
+        return 1;
+      case ValueTag.i32:
+        return 4;
+      case ValueTag.i64:
+      case ValueTag.f64:
+      case ValueTag.f32:
+        return 8;
+      case ValueTag.dec64:
+        return 16;
+      default:
+        throw new RangeError("A byte statistic must be a Uint8Array");
+    }
+  };
+  let bytes =
+    20 +
+    (directory.dictionary === null ? 0 : 20) +
+    (directory.sketch === null ? 0 : 4 + directory.sketch.length);
+  for (const page of directory.pages) {
+    bytes += 26 + (page.largeRegion === undefined ? 0 : 8);
+    if (hasStats(directory.tag)) {
+      if (page.min !== null) bytes += stat(page.min);
+      if (page.max !== null) bytes += stat(page.max);
+    }
+  }
+  return bytes;
+}
+
+export function encodeDirectory(directory: ChunkDirectory, charge?: ByteCharge): Uint8Array {
+  const bytes = directoryBytes(directory);
+  if (bytes > MAX_DIRECTORY_BYTES)
+    throw new RangeError(`A page directory of ${String(bytes)} bytes exceeds the 1 MiB blob cap`);
+  if (charge !== undefined && !charge.allocate(bytes))
+    throw new RangeError("The page directory needs prepaid working memory");
+  const writer = new Writer(bytes);
   writer.u32(MAGIC);
   writer.u8(VERSION);
   writer.u8(directory.tag);
@@ -275,7 +312,8 @@ export function encodeDirectory(directory: ChunkDirectory): Uint8Array {
     throw new RangeError(
       `A page directory of ${String(writer.length)} bytes exceeds the 1 MiB blob cap`,
     );
-  return writer.bytes.slice(0, writer.length);
+  if (writer.length !== bytes) throw new RangeError("The page directory preflight size differs");
+  return writer.bytes;
 }
 
 /** Where each parsed directory's last page (or dictionary) ends: computed once, at parse. */

@@ -1305,7 +1305,8 @@ describe("review B4-p2c-2: the scan's lifecycle, budget and pacing", () => {
       const budget = counting();
       const scan = scanOf(empty, space, null, { budget, emitLocator });
       // Five Uint16Array(2048) position and selection lists, and Float64Array(2048) locators.
-      expect(budget.held).toBe(5 * 2048 * 2 + (emitLocator ? 2048 * 8 : 0));
+      // The constant placeholder also owns a Uint8Array(1).
+      expect(budget.held).toBe(1 + 5 * 2048 * 2 + (emitLocator ? 2048 * 8 : 0));
       scan.close();
       expect(budget.held).toBe(0);
     }

@@ -355,7 +355,8 @@ class ScanMemory implements TargetMemory, ByteBudget {
 
 /** The scan's fixed scratch: position lists, selections and (with `emitLocator`) locators. */
 function scratchBytes(emitLocator: boolean): number {
-  return 5 * BATCH_ROWS * Uint16Array.BYTES_PER_ELEMENT + (emitLocator ? BATCH_ROWS * 8 : 0);
+  // The constant placeholder owns one boolean slot beside the five position lists.
+  return 1 + 5 * BATCH_ROWS * Uint16Array.BYTES_PER_ELEMENT + (emitLocator ? BATCH_ROWS * 8 : 0);
 }
 
 export class TableScan implements BatchSource {

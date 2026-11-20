@@ -18,7 +18,13 @@ import { runOutsideRange } from "./run-bounds.js";
 import { runKeyBytes } from "./overflow-keys.js";
 import { need } from "./bytes.js";
 import type { KeyDelta } from "./key-hash.js";
-import { DeltaRangeInput, RunRangeInput, rangeRunBytes, type RangeInput } from "./range-input.js";
+import {
+  DeltaRangeInput,
+  RunRangeInput,
+  rangeRunBytes,
+  type RangeInput,
+  type RetainedDeltaInput,
+} from "./range-input.js";
 import type { ViewIndex } from "./view.js";
 
 const EMPTY = new Uint8Array(0);
@@ -36,6 +42,7 @@ export class StreamingRangeCursor implements IndexCursor {
   #ownedGrant: Grant | null = null;
   #account: MinimumBudget | null = null;
   #unlink: (() => void) | null = null;
+  #prepared: RetainedDeltaInput | null = null;
   #inputs: RangeInput[] = [];
   #heap: RangeInput[] = [];
   #size = 0;
@@ -60,12 +67,24 @@ export class StreamingRangeCursor implements IndexCursor {
       this.#unlink = () => admitted.signal.removeEventListener("abort", cancel);
       if (admitted.signal.aborted) cancel();
     }
+    // Transfer only after every throwing constructor step. A failed open leaves
+    // the prepared input with its plan, which still owns cancellation/cleanup.
+    const resident = admitted?.plan.resident;
+    if (resident && !this.#closed) {
+      this.#prepared = resident.input;
+      resident.input = null;
+    }
   }
 
   /** Enumeration is synchronous: capture paid inputs before the first metadata read can publish. */
   #layers(
     visit: (delta: KeyDelta | null, run: RunRef | null, limit: number, pure: boolean) => void,
   ): void {
+    const captured = this.#prepared;
+    if (captured !== null) {
+      visit(captured.delta, null, Infinity, false);
+      return;
+    }
     const id = this.index.def.id,
       table = this.index.table;
     const primary = this.index.def.role === "primary";
@@ -151,26 +170,36 @@ export class StreamingRangeCursor implements IndexCursor {
       this.#previous = new Uint8Array(current.keyBytes);
       this.#layers((delta, run, limit, pure) => {
         this.#inputs.push(
-          delta !== null
+          this.#prepared !== null
             ? new DeltaRangeInput(
-                delta,
+                this.#prepared.delta,
                 this.index.table.snapshot.bound,
                 this.range,
                 this.#direction,
                 this.#abort.signal,
+                this.#prepared,
               )
-            : new RunRangeInput(
-                shared.space,
-                grant,
-                need(run),
-                this.range,
-                this.#direction,
-                limit,
-                this.#abort.signal,
-                pure,
-              ),
+            : delta !== null
+              ? new DeltaRangeInput(
+                  delta,
+                  this.index.table.snapshot.bound,
+                  this.range,
+                  this.#direction,
+                  this.#abort.signal,
+                )
+              : new RunRangeInput(
+                  shared.space,
+                  grant,
+                  need(run),
+                  this.range,
+                  this.#direction,
+                  limit,
+                  this.#abort.signal,
+                  pure,
+                ),
         );
       });
+      this.#prepared = null; // The ordinary cursor input list now owns the transferred lease.
       this.#heap = new Array<RangeInput>(this.#inputs.length);
       for (const input of this.#inputs) {
         if (this.#stopped()) return;
@@ -422,6 +451,8 @@ export class StreamingRangeCursor implements IndexCursor {
     if (!this.#busy) this.#dispose();
   }
   #dispose(): void {
+    this.#prepared?.release();
+    this.#prepared = null;
     for (const input of this.#inputs) input.close();
     this.#inputs = [];
     this.#heap = [];

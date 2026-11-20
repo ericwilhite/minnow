@@ -39,6 +39,7 @@ it.each(seedsFor("next-executor-pk-offset-locking", [0xe143, 0xe144]))(
     const reach = createReach("PK OFFSET locking fallback", [
       ...locks,
       "unlocked cursor",
+      "resident generic",
       "locking fallback",
       "constant",
       "parameter",
@@ -58,6 +59,7 @@ it.each(seedsFor("next-executor-pk-offset-locking", [0xe143, 0xe144]))(
       return { ...prepared, execute: (request) => prepared.execute({ ...request, governor }) };
     });
     let spy: MockInstance<ViewIndex["planRange"]> | undefined;
+    let resident: MockInstance<ViewIndex["prepareResidentRange"]> | undefined;
     try {
       await pg.waitReady;
       for (const name of ["s", "m"]) {
@@ -77,6 +79,7 @@ it.each(seedsFor("next-executor-pk-offset-locking", [0xe143, 0xe144]))(
         { id: 2, p: 2 },
       ]);
       spy = vi.spyOn(ViewIndex.prototype, "planRange");
+      resident = vi.spyOn(ViewIndex.prototype, "prepareResidentRange");
       await fc.assert(
         fc.asyncProperty(
           fc.constantFrom(...locks),
@@ -95,16 +98,23 @@ it.each(seedsFor("next-executor-pk-offset-locking", [0xe143, 0xe144]))(
             const params = bound ? [limit, offset] : [];
             for (const locking of [false, true]) {
               spy?.mockClear();
+              resident?.mockClear();
               const sql = base + (locking ? " FOR " + lock : "");
               const expected = (await pg.query(sql, params)).rows;
               const result = await core.execute(sql, params);
               if (!("batches" in result)) throw new Error("Expected rows");
               expect(oracleRows(result), sql).toEqual(expected);
-              expect(spy?.mock.calls.length, sql).toBe(locking || limit === 0 ? 0 : 1);
+              // Both capabilities open admitted cursors. A complete two-row
+              // retained input with LIMIT != 1 instead uses the cheaper generic sort.
+              const cursor = !locking && limit !== 0 && (stored || limit === 1);
+              expect((spy?.mock.calls.length ?? 0) + (resident?.mock.calls.length ?? 0), sql).toBe(
+                cursor ? 1 : 0,
+              );
               if (locking) {
                 reach.reach("locking fallback");
                 reach.reach(lock);
-              } else if (limit !== 0) reach.reach("unlocked cursor");
+              } else if (cursor) reach.reach("unlocked cursor");
+              else if (limit !== 0) reach.reach("resident generic");
               expect(governor.usedBytes).toBe(0);
               expect(core.spill.bytesInUse).toBe(0);
             }
@@ -133,6 +143,7 @@ it.each(seedsFor("next-executor-pk-offset-locking", [0xe143, 0xe144]))(
       reach.assertReached();
     } finally {
       spy?.mockRestore();
+      resident?.mockRestore();
       prepare.mockRestore();
       await core.close();
       await pg.close();

@@ -162,6 +162,13 @@ for (const seed of seedsFor("next-write-native-credit-cancel", [0xb3c2]))
           const credits = await WriteCredits.open(governor, minimum);
           expect(credits.rows.allocate(credits.rows.held)).toBe(true);
           const row = new Uint8Array(credits.rows.allocated).fill(7);
+          // Cancellation must wait on real owned buffers, not revocable forecasts.
+          const retainedAccounts = [credits.metadata, credits.commits, credits.merge];
+          const owned = retainedAccounts.map((account) => {
+            const bytes = account.held;
+            expect(account.allocate(bytes)).toBe(true);
+            return new Uint8Array(bytes).fill(5);
+          });
           const spare = governor.capBytes - governor.reserveBytes - governor.usedBytes;
           const holder = await governor.admit({
             label: "protected reader",
@@ -204,6 +211,10 @@ for (const seed of seedsFor("next-write-native-credit-cancel", [0xb3c2]))
             credits.cancel(reason);
             await pending;
             credits.rows.free(row.byteLength);
+            for (let i = 0; i < retainedAccounts.length; i++) {
+              expect(owned[i]?.[0]).toBe(5);
+              retainedAccounts[i]?.free(owned[i]?.byteLength ?? 0);
+            }
             holder.close();
             credits.close();
           }
