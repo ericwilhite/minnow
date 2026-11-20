@@ -440,6 +440,7 @@ export function encodeGroupRoot(root: GroupRoot): Uint8Array {
     out.blob(chunk.directory);
     writeStatistics(body, chunk.statistics);
     out.optionalBlob(chunk.distinctSketch);
+    out.optionalBlob(chunk.aggregateSummary);
   }
   return out.finish(MAGIC.group, MAX_BLOB_BYTES, "A group root");
 }
@@ -488,8 +489,17 @@ function readGroupRoot(reader: ByteReader, capture?: RootView): GroupRoot {
     const statistics = readStatistics(reader);
     valid(statistics.nullCount <= rowCount, "More nulls than rows");
     const distinctSketch = refs.optionalBlob();
+    const aggregateSummary = refs.optionalBlob();
     if (capture === undefined)
-      columns.push({ columnId, type, data, directory, statistics, distinctSketch });
+      columns.push({
+        columnId,
+        type,
+        data,
+        directory,
+        statistics,
+        distinctSketch,
+        aggregateSummary,
+      });
   }
   valid(nextType === types.length, "A type table entry is never used");
   refs.end();
@@ -594,7 +604,16 @@ class RootView {
         directory = blob(),
         statistics = readStatistics(reader);
       const distinctSketch = reader.u8() === 0 ? null : blob();
-      columns.push({ columnId, type, data: chunkData, directory, statistics, distinctSketch });
+      const aggregateSummary = reader.u8() === 0 ? null : blob();
+      columns.push({
+        columnId,
+        type,
+        data: chunkData,
+        directory,
+        statistics,
+        distinctSketch,
+        aggregateSummary,
+      });
     }
     return columns;
   }
