@@ -5,6 +5,11 @@
  * 1. Held bytes include cache, leases, operator/input/result buffers and resize overlap.
  * 2. Complete executions atomically admit their whole minimum FIFO, holding nothing while
  *    waiting. `includesProgress` includes their private I/O and per-operator progress credit.
+ *    Admissions before that minimum (query preparation: retained source recipes, sizing
+ *    scratch, planning probes) come from one preparation credit carved with `carve`, or are
+ *    immediate (`canAdmitNow`), or wait only while the query holds nothing. Otherwise the query
+ *    releases everything and waits, holding nothing, for a larger credit, then prepares again
+ *    (exec/preparation.ts).
  * 3. Only a complete minimum above the whole cap is a typed admission-size refusal. An
  *    incomplete legacy operator minimum leaves the shared reserve for its isolated step loans.
  * 4. Held and allocated differ: allocate/free suballocate an existing grant. Allocation and
@@ -214,6 +219,8 @@ interface Request {
 
 class GrantImpl implements Grant {
   group: readonly GrantImpl[] | null = null;
+  /** A grant carved from held credit returns its bytes there while that credit is open. */
+  parent: GrantImpl | null = null;
   held = 0;
   allocated = 0;
   loan = 0;
@@ -263,7 +270,14 @@ class GrantImpl implements Grant {
     const releasable = this.held - this.allocated - this.loan;
     if (bytes > releasable) throw new LoanBackedReleaseError(this.label, bytes, releasable);
     this.held -= bytes;
-    this.governor.give(bytes);
+    this.#giveBack(bytes);
+  }
+
+  /** Returned bytes go back to an open parent credit, else to the governor. */
+  #giveBack(bytes: number): void {
+    const parent = this.parent;
+    if (parent !== null && !parent.closed) parent.held += bytes;
+    else this.governor.give(bytes);
   }
 
   borrow(bytes: number, signal?: AbortSignal): Promise<Loan> {
@@ -286,7 +300,9 @@ class GrantImpl implements Grant {
             repaid = true;
             this.loan = 0;
             this.governor.repaid(bytes);
-            this.release(bytes);
+            // Loan bytes came from the governor: they never join a parent credit.
+            this.held -= bytes;
+            this.governor.give(bytes);
           },
         };
       },
@@ -308,12 +324,15 @@ class GrantImpl implements Grant {
     // the retired operator graph alive through its cooperative spill callback.
     this.reclaim = null;
     this.governor.forget(this);
-    const held = this.held;
+    const held = this.held,
+      loan = this.loan;
     this.held = 0;
     this.allocated = 0;
-    if (this.loan > 0) this.governor.repaid(this.loan);
+    if (loan > 0) this.governor.repaid(loan);
     this.loan = 0;
-    this.governor.give(held);
+    // Loan bytes return to the governor; the rest to an open parent credit.
+    if (loan > 0) this.governor.give(loan);
+    this.#giveBack(held - loan);
   }
 }
 
@@ -809,6 +828,47 @@ export class Governor implements MemoryGovernor {
     } finally {
       admitted.close();
     }
+  }
+
+  /**
+   * Whether an admission of `bytes` would be served at once: nothing is queued and it fits now,
+   * after evicting caches (a private-progress group may use the reserve). Takes no credit; an
+   * `admitGroup` of that size called next, synchronously, is served without waiting.
+   */
+  canAdmitNow(bytes: number, includesProgress: boolean): boolean {
+    if (
+      this.#draining ||
+      this.#loans.length > 0 ||
+      this.#reads.length > 0 ||
+      this.#admissions.length > 0
+    )
+      return false;
+    return this.#room(bytes, includesProgress);
+  }
+
+  /**
+   * Carves a new ordinary grant of `bytes` from `source`'s idle credit, synchronously. Nothing is
+   * admitted: the bytes were already held by the same owner, so no queued admission is passed.
+   * The carved grant returns what it releases or closes to `source` while `source` is open (then
+   * to the governor). Null when `source` cannot spare the bytes.
+   */
+  carve(source: Grant, label: string, spillable: boolean, bytes: number): Grant | null {
+    if (!Number.isSafeInteger(bytes) || bytes < 0)
+      throw new RangeError("Carved bytes must be a nonnegative safe integer");
+    if (
+      !(source instanceof GrantImpl) ||
+      source.governor !== this ||
+      source.closed ||
+      this.#idleCredit.has(source) ||
+      bytes > source.held - source.allocated - source.loaned
+    )
+      return null;
+    const grant = new GrantImpl(this, label, spillable);
+    grant.parent = source;
+    this.#grants.add(grant);
+    source.held -= bytes;
+    grant.held += bytes;
+    return grant;
   }
 
   transferCredit(source: Grant, target: Grant, bytes: number): boolean {

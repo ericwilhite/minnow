@@ -10,6 +10,8 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The unexported 1.0 rebuild no longer waits for memory while a query holds memory for its preparation, such as a retained source of a small or recently written table. Such a query could wait forever behind another query that needed that memory. Preparation now takes its memory from one credit or not at all; when it would wait, it releases everything, waits for a larger credit, and prepares again. Results are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.
+
 The unexported 1.0 rebuild's streaming star join keeps each source's native read demand: it passes each prefix of the last dimension's matches through the ordinary aggregate before reading more input, so errors keep their PostgreSQL order. Results and errors are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.
 
 The unexported 1.0 rebuild groups by a non-NULL text column in one loop per batch. Results and memory use are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.

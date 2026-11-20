@@ -199,7 +199,7 @@ function sourceTarget(
   input: readonly PhysicalType[],
 ): number {
   const rows = runtime.residentSourceRows(tableId),
-    cap = runtime.request.governor.capBytes;
+    cap = runtime.governor.capBytes;
   return rows === null ? batchTargetFor(cap, 4) : indexReadTarget(input, cap, rows);
 }
 type Stop = () => boolean;
@@ -1367,7 +1367,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           if (previous) return previous;
           const grant = runtime.admit(
             `${keyIdentity.op}#${String(keyIdentity.id)}`,
-            keyMinimum(runtime.request.governor.capBytes, runtime),
+            keyMinimum(runtime.governor.capBytes, runtime),
             true,
             keyIdentity,
           );
@@ -1426,9 +1426,9 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                 runtime,
                 rel,
                 counted(runtime, rel, downstream),
-                minimum(runtime.request.governor.capBytes, runtime),
+                minimum(runtime.governor.capBytes, runtime),
                 keyIdentity,
-                keyMinimum(runtime.request.governor.capBytes, runtime),
+                keyMinimum(runtime.governor.capBytes, runtime),
                 () => keyBudget(runtime),
                 trackLocators(runtime),
                 needsSort(runtime) ? sort : null,
@@ -1590,7 +1590,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           // Star lookups compose registered scan recipes (scanRecipes), on either path.
           const ordinaryScan: Recipe = (runtime, downstream, stops, rowsNeeded) => {
             if (stops.some((stop) => stop())) return downstream.finish();
-            const target = batchTargetFor(runtime.request.governor.capBytes, 4);
+            const target = batchTargetFor(runtime.governor.capBytes, 4);
             return instantiate(
               runtime,
               rel,
@@ -2203,7 +2203,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
               allocateResult: (bytes: number) => runtime.allocateResultOwned(bytes),
               spill: runtime.request.spill,
               queryId: runtime.request.queryId,
-              capacity: saved ? 0 : runtime.request.governor.capBytes,
+              capacity: saved ? 0 : runtime.governor.capBytes,
               retainedBytes: saved?.retainedBytes ?? 0,
               progressBytes: runtime.retainedProgressEnvelope(),
               signal: runtime.signal,
@@ -3265,7 +3265,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                 runtime,
                 project,
                 input,
-                fetchMinimum(runtime.request.governor.capBytes),
+                fetchMinimum(runtime.governor.capBytes),
                 BATCH_ROWS,
                 (context, grant) => {
                   const directories = directoryCacheFor(runtime.view.pages);
@@ -3287,7 +3287,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                       ...(directories === undefined ? {} : { directories }),
                       spill: runtime.request.spill,
                       queryId: runtime.request.queryId,
-                      targetBytes: batchTargetFor(runtime.request.governor.capBytes, 4),
+                      targetBytes: batchTargetFor(runtime.governor.capBytes, 4),
                       signal: runtime.signal,
                       onPipeline: () => runtime.pipeline(),
                     },
@@ -3598,7 +3598,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
         return {
           complete: Math.max(
             0,
-            (bounds.get(id)?.progress ?? 0) - indexFetchTarget(runtime.request.governor.capBytes),
+            (bounds.get(id)?.progress ?? 0) - indexFetchTarget(runtime.governor.capBytes),
           ),
         };
       const indexKeys = indexKeyPlans.get(id);
@@ -3847,7 +3847,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
         minimum:
           typeof entry.minimum === "number"
             ? entry.minimum
-            : entry.minimum(runtime.request.governor.capBytes, runtime),
+            : entry.minimum(runtime.governor.capBytes, runtime),
       }));
     // At most one unfinished JSON producer is active. Completed children are delivered
     // from files, while unopened ancestors/EXCEPT siblings have no native JSON buffers.
@@ -3981,7 +3981,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
             runtime.view,
             planner.shape.source,
             runtime.request.reads,
-            runtime.request.governor,
+            runtime.governor,
             read,
             runtime.signal,
             `query#${String(runtime.request.queryId)}/percentile-domain-planning`,
@@ -4003,7 +4003,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
         entry.minimum = minimum;
         entry.loanSlots = 0;
         // Optional complete resident workspace: no private allocation or input has opened yet.
-        if (runtime.minimumBytes(entries) <= runtime.request.governor.capBytes)
+        if (runtime.minimumBytes(entries) <= runtime.governor.capBytes)
           selectedPercentiles.set(entry.rel.id, { bound, minimum });
         else Object.assign(entry, saved);
       }
@@ -4034,7 +4034,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                 runtime.view,
                 planner.dictionary.source,
                 runtime.request.reads,
-                runtime.request.governor,
+                runtime.governor,
                 read,
                 runtime.signal,
                 `query#${String(runtime.request.queryId)}/aggregate-domain-planning`,
@@ -4060,7 +4060,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
       }
       // A certified hash workspace is optional. Prefer external spilling when it has a smaller
       // complete minimum and is what makes this execution admissible. No credit is held yet.
-      while (runtime.minimumBytes(entries) > runtime.request.governor.capBytes) {
+      while (runtime.minimumBytes(entries) > runtime.governor.capBytes) {
         let best: (typeof entries)[number] | undefined,
           total = runtime.minimumBytes(entries);
         for (const entry of entries) {
@@ -4105,7 +4105,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
               runtime.request.parameters,
               runtime.nativeParameters !== null,
               runtime.signal,
-              runtime.request.governor.capBytes,
+              runtime.governor.capBytes,
             ),
           );
           if (parameterFootprint === null) continue;
@@ -4126,7 +4126,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                   payloads: [],
                 },
                 runtime.request.reads,
-                runtime.request.governor,
+                runtime.governor,
                 read,
                 runtime.signal,
                 `query#${String(runtime.request.queryId)}/star-domain-planning`,
@@ -4166,7 +4166,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
               parameterFootprint.bytes,
               parameterFootprint.largestSlot,
               parameterFootprint.slotBytes ?? [],
-            ) > runtime.request.governor.capBytes
+            ) > runtime.governor.capBytes
           ) {
             if (priorStrategy) configureChoice(shape.aggregate.id, priorStrategy);
             for (const prior of saved) {
@@ -4227,7 +4227,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           },
         };
         return (async () => {
-          const idle = await acquirePhasePool(runtime.request.governor, runtime.signal);
+          const idle = await acquirePhasePool(runtime.governor, runtime.signal);
           let failed = false,
             failure: unknown;
           try {
@@ -4324,7 +4324,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                 runtime.minimumBytes(next, logicalInputs, binding.largestSlot, binding.slotBytes) +
                   binding.bytes -
                   logicalInputs >
-                  runtime.request.governor.capBytes
+                  runtime.governor.capBytes
               ) {
                 // Geometric slack is optional. Only the exact complete minimum can refuse.
                 jsonCapacities.get(runtime)?.set(cut.rel, cut.phase.capacity);
@@ -4413,12 +4413,12 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                   : {}),
                 rows: demand.get(source.id) ?? null,
               },
-              runtime.request.governor,
+              runtime.governor,
               runtime.signal,
               // Index fetch owners admit exactly indexFetchTarget (see their minimum);
               // every other source takes the bounded-demand target.
               indexFetchOwners.has(source.id)
-                ? indexFetchTarget(runtime.request.governor.capBytes)
+                ? indexFetchTarget(runtime.governor.capBytes)
                 : sourceTarget(runtime, source.tableId, source.types),
               BATCH_ROWS,
               runtime.metadataCaches(
@@ -4460,7 +4460,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                     windowBytes: 0,
                     rows: demand.get(source.id) ?? null,
                   },
-                  runtime.request.governor,
+                  runtime.governor,
                   runtime.signal,
                   1,
                   1,
@@ -4498,9 +4498,9 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                     windowBytes: 0,
                     rows: demand.get(source.id) ?? null,
                   },
-                  runtime.request.governor,
+                  runtime.governor,
                   runtime.signal,
-                  batchTargetFor(runtime.request.governor.capBytes, 4),
+                  batchTargetFor(runtime.governor.capBytes, 4),
                   BATCH_ROWS,
                   runtime.metadataCaches(source.retain !== false, sources),
                 ),
@@ -4526,7 +4526,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                   windowBytes: 0,
                   rows: demand.get(source.id) ?? null,
                 },
-                runtime.request.governor,
+                runtime.governor,
                 runtime.signal,
                 1,
                 1,
@@ -4552,7 +4552,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                   windowBytes: 0,
                   rows: demand.get(source.id) ?? null,
                 },
-                runtime.request.governor,
+                runtime.governor,
                 runtime.signal,
                 1,
                 1,
@@ -4577,7 +4577,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
               boundSource(
                 runtime.sourceView(),
                 { ...source, windowBytes: 0, rows: demand.get(source.id) ?? null },
-                runtime.request.governor,
+                runtime.governor,
                 runtime.signal,
                 1,
                 1,
@@ -4616,11 +4616,8 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
         // smaller optional source recipes before queuing behind retained storage.
         // This pressure bound selects alternatives only: admission still waits
         // cancellably for temporary holders, and refusal uses the whole cap.
-        const producerRoom = Math.max(
-          0,
-          runtime.request.governor.capBytes - runtime.request.governor.usedBytes,
-        );
-        const overCap = minimum > Math.min(runtime.request.governor.capBytes, producerRoom);
+        const producerRoom = Math.max(0, runtime.governor.capBytes - runtime.governor.usedBytes);
+        const overCap = minimum > Math.min(runtime.governor.capBytes, producerRoom);
         if (windows && overCap && [...bounds.values()].some((bound) => bound.windowBytes > 0)) {
           // Coalesced export windows are optional. All sizing holds have ended: retry the
           // ordinary bounded batch before treating the execution minimum as over-cap.
@@ -4653,7 +4650,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
       if (
         fallback !== null &&
         aggregatePlanners.size === 0 &&
-        runtime.minimumBytes(entries) > runtime.request.governor.capBytes
+        runtime.minimumBytes(entries) > runtime.governor.capBytes
       ) {
         runtime.sourceBounds(new Map());
         runtime.readMinimum(0, 0);
@@ -4700,7 +4697,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
         restore: rel,
         descending: rel.keys[0]?.direction === "desc",
       };
-      const cap = runtime.request.governor.capBytes;
+      const cap = runtime.governor.capBytes;
       const targetBytes = indexReadTarget(shape.types, cap, bounds.limit);
       const cursorRows = Math.min(BATCH_ROWS, bounds.limit ?? BATCH_ROWS);
       const inputs = integerParameterBytes(plan, runtime.request.parameters);
@@ -4774,7 +4771,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
               stagingBytes: memoryScanBufferBytes(shape.types),
               rows: null,
             },
-            runtime.request.governor,
+            runtime.governor,
             runtime.signal,
             targetBytes,
             BATCH_ROWS,
