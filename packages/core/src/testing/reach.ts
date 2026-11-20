@@ -11519,192 +11519,6 @@ export const BIGINT_REPOINT_REACH = [
   "zero charge",
 ] as const;
 
-/** Quiet index eligibility belongs to the same synchronous observation as its root cut. */
-export const QUIET_INDEX_CUT_REACH = [
-  "persisted empty root",
-  "stored rows before build",
-  "rows after cut before assembly",
-  "empty index settled at original cut",
-  "nonquiet build holds cut",
-  "older pin unchanged",
-  "committed",
-  "pending commit",
-  "pending rollback",
-  "NULL payload",
-  "all valid",
-  "reopen indexed values",
-  "exact inventory and continued writes",
-  "zero final charge",
-] as const;
-
-/** Interrupted owner cleanup never publishes provisional catalog/FTS output. */
-export const ROOT_DROP_ABORT_CRASH_REACH = [
-  "provisional catalog output",
-  "provisional FTS output",
-  "abort entry",
-  "owned extent release reached",
-  "before release",
-  "after release",
-  "old root unchanged",
-  "physical roots unchanged",
-  "no persistent work after stop",
-  "committed DROP and rows recovered",
-  "retry and FTS history readable",
-  "exact inventory and continued writes",
-  "zero charges",
-  "all explicit boundaries",
-] as const;
-
-/** A1 bounded group-summary codec: actual header representations and binding refusals. */
-export const GROUP_AGGREGATE_CODEC_REACH = [
-  "large source identity",
-  "int16",
-  "int32",
-  "int64",
-  "decimal",
-  "count only",
-  "sum",
-  "negative coefficient",
-  "zero coefficient",
-  "positive coefficient",
-  "specials",
-  "all null",
-  "source identity",
-  "header refusal",
-  "payload refusal",
-  "bounded omission",
-  "funded decode",
-  "released",
-] as const;
-
-export const GROUP_AGGREGATE_WRITER_REACH = [
-  "int16",
-  "int32",
-  "int64",
-  "decimal",
-  "nullable",
-  "all valid",
-  "mixed scale",
-  "fixed scale",
-  "specials",
-  "multiple pages",
-  "packed summaries",
-  "metadata only",
-  "source bytes",
-  "checksum refusal",
-  "typed header refusal",
-  "bitmap fallback",
-  "cancel release",
-  "zero charges",
-] as const;
-export const GROUP_AGGREGATE_FOLD_REACH = [
-  "int32 lanes",
-  "int64 lanes",
-  "int128 lanes",
-  "mixed scales",
-  "NULL payload",
-  "special counts",
-  "bounded omission",
-  "workspace refusal",
-  "exact lane carry",
-  "whole group bound",
-  "released",
-] as const;
-export const GROUP_AGGREGATE_NATIVE_REACH = [
-  "OPFS",
-  "IndexedDB",
-  "real stored source",
-  "pristine record",
-  "old pin valid",
-  "delete fallback",
-  "publication and reopen",
-  "R25 inventory",
-  "zero charges",
-  "index runs merged",
-  "summary refs unchanged",
-] as const;
-export const GROUP_AGGREGATE_PRIORITY_REACH = [
-  "summary initially funded",
-  "dictionary denied",
-  "summary reclaimed",
-  "dictionary kept",
-  "value bytes identical",
-  "zero charges",
-] as const;
-
-export const GROUP_AGGREGATE_TASK_REACH = [
-  "timer before append",
-  "complete paced fold",
-  "cancelled paced fold",
-  "abort before output",
-  "no partial metadata",
-  "zero charges",
-] as const;
-
-/** A1 optional allocations decline under real shared-governor contention. */
-export const GROUP_AGGREGATE_ADMISSION_REACH = [
-  "int32",
-  "decimal",
-  "NULL payload",
-  "all valid",
-  "real governor blocked optional",
-  "state omitted",
-  "arithmetic omitted",
-  "encode omitted",
-  "pending omitted",
-  "ample record",
-  "ordinary bytes identical",
-  "ordinary values identical",
-  "zero charges",
-] as const;
-
-/** R8: summary bytes stay owned until started I/O has drained. */
-export const GROUP_AGGREGATE_TAIL_REACH = [
-  "int32",
-  "decimal",
-  "summary append stalled",
-  "signal cancellation",
-  "explicit abort",
-  "abort waits for started I/O",
-  "charge held through I/O",
-  "no partial group",
-  "unpublished extents released",
-  "zero charges",
-] as const;
-
-export const GROUP_AGGREGATE_REBASE_REACH = [
-  "data moved",
-  "directory moved",
-  "source length changed",
-  "record moved",
-  "identity unchanged",
-  "no-op mapping",
-  "present summary",
-  "absent summary",
-  "source unchanged",
-  "kept record validates",
-  "sum record",
-  "count record",
-  "zero charges",
-] as const;
-
-export const GROUP_AGGREGATE_NATIVE_INT_REACH = [
-  ...GROUP_AGGREGATE_NATIVE_REACH,
-  "continued writes",
-] as const;
-
-export const GROUP_AGGREGATE_PACK_CANCEL_REACH = [
-  "multiple-pack demand",
-  "blocked first seal",
-  "cancel during next open",
-  "no new opens",
-  "signal cancellation",
-  "explicit abort",
-  "no new appends",
-  "no partial group",
-  "zero charges",
-] as const;
-
 /** PC2/PC4/R15.7: immutable native validation is reused only within its owner. */
 export const DIRECTORY_CACHE_NATIVE_REACH = [
   "same blob",
@@ -11807,6 +11621,319 @@ export const DIRECTORY_CACHE_LATE_REACH = [
   "all credit returned",
 ] as const;
 
+export const B9_STAR_FLOAT_DEMAND_REACH = [
+  "native bits or exact error",
+  "same plan deterministic",
+  "finite extremes",
+  "NaN",
+  "infinities",
+  "signed zero",
+  "all NULL",
+] as const;
+
+export const B9_STAR_SHAPE_REACH = [
+  "composite keys",
+  "AVG transition",
+  "additional SUM",
+  "ordered aggregate",
+  "volatile plan",
+] as const;
+
+export const B9_STAR_BUCKET_REACH = [
+  "native transition order",
+  "multiple native chunks",
+  "PostgreSQL bags",
+  "nullable groups",
+  "strict key misses",
+  "bounded empty bucket steps",
+  "all credit returned",
+] as const;
+
+export const B9_STAR_LOOKUP_SQL_REACH = [
+  "native unordered row order",
+  "ordinary SQL sink reached",
+  "native float bits",
+  "PostgreSQL groups",
+  "reversed source ordinals",
+  "forward source ordinals",
+  "NULL grouping values",
+  "all ownership returned",
+] as const;
+
+export const B9_STAR_PRESSURE_REACH = [
+  "sparse buckets keep native state",
+  "dense resident sink",
+  "exact default bits",
+  "64 MiB cap",
+  "cancelled native wait",
+  "no hold while waiting",
+  "uncontended completion",
+  "all credit returned",
+] as const;
+
+/** Ordinary owner's bound TEXT must reach the exact-order star without weakening input demand. */
+export const B9_STAR_BOUND_TEXT_REACH = [
+  "explicit TEXT slot",
+  "owner normalized literal",
+  "PGlite exact ordered bags",
+  "same native bits",
+  "lookup and proof route reached",
+  "NULL binding",
+  "string binding",
+  "empty binding",
+  "Unicode BOM binding",
+  "1024-unit boundary",
+  "zero final credits",
+] as const;
+
+/** Invalid parameter forms must not add optional dictionary proof reads. */
+export const B9_STAR_TEXT_DEMAND_REACH = [
+  "missing",
+  "NUL",
+  "bool",
+  "number",
+  "overbound",
+  "extra",
+  "old binding outcome",
+  "no optional proof demand",
+] as const;
+
+/** Bound TEXT cannot enable a different dictionary recipe or ancestor family. */
+export const B9_STAR_TEXT_SCOPE_REACH = [
+  "one join",
+  "two joins",
+  "AVG",
+  "COUNT only",
+  "parameter LIMIT",
+  "computed sort",
+  "exact native fallback",
+  "no optional proof demand",
+] as const;
+
+export const B9_STAR_SOURCE_DEMAND_REACH = [
+  "facts fail before A and B demand",
+  "A fails before B demand",
+  "native source phase order",
+  "finite prefix forwards B failure",
+  "multiple B batches",
+  "PGlite22003",
+  "native22003",
+  "selected lookup no fault",
+  "native stops before late B failure",
+  "lookup retains22003",
+  "zero charges",
+] as const;
+
+/** Staging preserves prefix demand without changing native duplicate/NULL visitation. */
+export const B9_STAR_STAGED_PREFIX_REACH = [
+  "skipped staged A",
+  "staged NULL payload",
+  "duplicate B visits",
+  "nonmonotonic query IDs",
+  "bounded prefix steps",
+  "native B A fact order",
+  "all credit returned",
+] as const;
+
+/** Constructor census observes native backing capacities before allocation returns. */
+export const B9_STAR_BACKING_REACH = [
+  "actual backing independent of charges",
+  "A and B sidecars",
+  "8 MiB cap",
+  "multiple fact batches",
+  "matrix domain",
+  "all credit returned",
+] as const;
+
+/** Quiet index eligibility belongs to the same synchronous observation as its root cut. */
+export const QUIET_INDEX_CUT_REACH = [
+  "persisted empty root",
+  "stored rows before build",
+  "rows after cut before assembly",
+  "empty index settled at original cut",
+  "nonquiet build holds cut",
+  "older pin unchanged",
+  "committed",
+  "pending commit",
+  "pending rollback",
+  "NULL payload",
+  "all valid",
+  "reopen indexed values",
+  "exact inventory and continued writes",
+  "zero final charge",
+] as const;
+
+/** Interrupted owner cleanup never publishes provisional catalog/FTS output. */
+export const ROOT_DROP_ABORT_CRASH_REACH = [
+  "provisional catalog output",
+  "provisional FTS output",
+  "abort entry",
+  "owned extent release reached",
+  "before release",
+  "after release",
+  "old root unchanged",
+  "physical roots unchanged",
+  "no persistent work after stop",
+  "committed DROP and rows recovered",
+  "retry and FTS history readable",
+  "exact inventory and continued writes",
+  "zero charges",
+  "all explicit boundaries",
+] as const;
+
+/** A1 bounded group-summary codec: actual header representations and binding refusals. */
+export const GROUP_AGGREGATE_CODEC_REACH = [
+  "large source identity",
+  "int16",
+  "int32",
+  "int64",
+  "decimal",
+  "count only",
+  "sum",
+  "negative coefficient",
+  "zero coefficient",
+  "positive coefficient",
+  "specials",
+  "all null",
+  "source identity",
+  "header refusal",
+  "payload refusal",
+  "bounded omission",
+  "funded decode",
+  "released",
+] as const;
+
+export const GROUP_AGGREGATE_WRITER_REACH = [
+  "int16",
+  "int32",
+  "int64",
+  "decimal",
+  "nullable",
+  "all valid",
+  "mixed scale",
+  "fixed scale",
+  "specials",
+  "multiple pages",
+  "packed summaries",
+  "metadata only",
+  "source bytes",
+  "checksum refusal",
+  "typed header refusal",
+  "bitmap fallback",
+  "cancel release",
+  "zero charges",
+] as const;
+
+export const GROUP_AGGREGATE_FOLD_REACH = [
+  "int32 lanes",
+  "int64 lanes",
+  "int128 lanes",
+  "mixed scales",
+  "NULL payload",
+  "special counts",
+  "bounded omission",
+  "workspace refusal",
+  "exact lane carry",
+  "whole group bound",
+  "released",
+] as const;
+
+export const GROUP_AGGREGATE_NATIVE_REACH = [
+  "OPFS",
+  "IndexedDB",
+  "real stored source",
+  "pristine record",
+  "old pin valid",
+  "delete fallback",
+  "publication and reopen",
+  "R25 inventory",
+  "zero charges",
+  "index runs merged",
+  "summary refs unchanged",
+] as const;
+
+export const GROUP_AGGREGATE_PRIORITY_REACH = [
+  "summary initially funded",
+  "dictionary denied",
+  "summary reclaimed",
+  "dictionary kept",
+  "value bytes identical",
+  "zero charges",
+] as const;
+
+export const GROUP_AGGREGATE_TASK_REACH = [
+  "timer before append",
+  "complete paced fold",
+  "cancelled paced fold",
+  "abort before output",
+  "no partial metadata",
+  "zero charges",
+] as const;
+
+/** A1 optional allocations decline under real shared-governor contention. */
+export const GROUP_AGGREGATE_ADMISSION_REACH = [
+  "int32",
+  "decimal",
+  "NULL payload",
+  "all valid",
+  "real governor blocked optional",
+  "state omitted",
+  "arithmetic omitted",
+  "encode omitted",
+  "pending omitted",
+  "ample record",
+  "ordinary bytes identical",
+  "ordinary values identical",
+  "zero charges",
+] as const;
+
+/** R8: summary bytes stay owned until started I/O has drained. */
+export const GROUP_AGGREGATE_TAIL_REACH = [
+  "int32",
+  "decimal",
+  "summary append stalled",
+  "signal cancellation",
+  "explicit abort",
+  "abort waits for started I/O",
+  "charge held through I/O",
+  "no partial group",
+  "unpublished extents released",
+  "zero charges",
+] as const;
+
+export const GROUP_AGGREGATE_REBASE_REACH = [
+  "data moved",
+  "directory moved",
+  "source length changed",
+  "record moved",
+  "identity unchanged",
+  "no-op mapping",
+  "present summary",
+  "absent summary",
+  "source unchanged",
+  "kept record validates",
+  "sum record",
+  "count record",
+  "zero charges",
+] as const;
+
+export const GROUP_AGGREGATE_NATIVE_INT_REACH = [
+  ...GROUP_AGGREGATE_NATIVE_REACH,
+  "continued writes",
+] as const;
+
+export const GROUP_AGGREGATE_PACK_CANCEL_REACH = [
+  "multiple-pack demand",
+  "blocked first seal",
+  "cancel during next open",
+  "no new opens",
+  "signal cancellation",
+  "explicit abort",
+  "no new appends",
+  "no partial group",
+  "zero charges",
+] as const;
+
 export const PUBLIC_INSPECTION_REACH = [
   "PG catalog types and names",
   "funded metadata delivery",
@@ -11817,6 +11944,7 @@ export const PUBLIC_INSPECTION_REACH = [
   "private DDL and rollback",
   "catalog drift during admission",
 ] as const;
+
 export const INSPECTION_ADMISSION_REACH = [
   "cancel queued admission",
   "retry changed source",
