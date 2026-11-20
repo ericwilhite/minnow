@@ -2546,6 +2546,25 @@ The private executor also checks wide parameter results under pinned competing c
 Its complete result reservation includes frame construction as well as payload bytes;
 binding-only UTF-8 scratch cannot stand in for result progress.
 
+The private core's `utf8-sites.test.ts` checks each encoder caller independently:
+varlen construction, length-prefixed strings, JSON, bounded write windows and
+parameters. It varies Unicode code points, lone surrogates, chunk boundaries,
+exact and generous buffer recipes, and native prefix or zero progress. Each
+site compares exact bytes with WHATWG UTF-8 and round-trips through its reader.
+The helper checks capacity before writing and uses no temporary byte buffer or
+UTF-16 suffix. A source guard rejects `encodeInto` access outside it, including destructured
+methods, prototype references, reflective calls and bound methods. Unknown computed
+keys on encoder values are refused too; ordinary data indexing remains allowed.
+The guard scans every production source in bounded file groups and pins each
+hidden-access form with rejection fixtures.
+
+`utf8-durability.test.ts` writes multibyte catalog names, defaults, ledger counts
+and rows through the real native writer. It reopens a WAL-only tail, crosses an
+observed publication boundary, reopens the stored varlen pages, then continues
+writing and reopens again. Both native memory and simulated storage run the
+same histories. Node 22, 24 and 26 run the encoder properties; the committed
+seeds declare Unicode, boundary, publication and cleanup reach explicitly.
+
 ### Rebuild directory-cache work counts
 
 The unexported 1.0 executor shares parsed column directories between source sizing and scan
