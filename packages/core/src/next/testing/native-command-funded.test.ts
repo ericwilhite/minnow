@@ -80,7 +80,11 @@ for (const seed of seedsFor("next-native-command-funded", [46974, 46975]))
                 const admit = governor.admitGroup.bind(governor);
                 const spy = vi.spyOn(governor, "admitGroup").mockImplementation((request) => {
                   const promise = admit(request);
-                  if (request.label === "native root open") entered();
+                  // The command's first admission that needs memory queues behind the foreign
+                  // result. Since write admission (#9) that can be the writer growing its own
+                  // minimum inside the root's first native step, before "native root open":
+                  // either way the root holds no credit yet. Release or cancel from outside.
+                  if (request.grants.some((grant) => grant.minimumBytes > 0)) entered();
                   return promise;
                 });
                 restoreSpy = () => {
