@@ -250,11 +250,10 @@ describe("published core tarball", () => {
       // 1,028,455 packed bytes. Raise packed once by 500; unpacked/isolation caps stay.
       // Native display-label provenance: 1,028,540 packed bytes (40 over the old cap).
       // Raise packed once by 250; unpacked/isolation caps and next/ exclusion stay.
-      // PostgreSQL ARE capture dissection (calibration build): 1,030,251 packed bytes.
-      // Raise packed once by 1,750; unpacked/isolation and next/ exclusion stay unchanged.
-      // Representation-native regex span preparation: 1,031,398 packed bytes measured.
-      // Raise packed once by 1,000; all unpacked/download/isolation limits stay unchanged.
-      expect(report?.size, "packed bytes").toBeLessThanOrEqual(1_031_500);
+      // PostgreSQL ARE capture dissection, shared byte-span regex preparation and bounded
+      // capture work: 1,032,971 packed bytes measured. Raise packed once by 4,250;
+      // unpacked/download/isolation limits and next/ exclusion stay unchanged.
+      expect(report?.size, "packed bytes").toBeLessThanOrEqual(1_033_000);
       expect(report?.unpackedSize, "unpacked bytes").toBeLessThanOrEqual(4_500_000);
       const emitted = await readFile(join(isolatedCore, "dist", "engine", "optimizer.js"), "utf8");
       expect(emitted).not.toContain("/**");

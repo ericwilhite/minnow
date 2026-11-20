@@ -12,10 +12,6 @@ compatibility policy and release process.
 
 The unexported 1.0 rebuild reserves wide sort merge workspace independently of source batch size, including encoded keys and the `WITH TIES` boundary row when a competing query forces a smaller source recipe.
 
-Shared byte-span regex preparation measures 1,031,398 packed bytes. The core tarball cap
-rises once by 1,000 bytes; download and package-isolation limits stay unchanged. Native
-SQL regex execution remains guarded while its admitted execution path is prepared.
-
 Regex substring and replacement now follow PostgreSQL's ARE capture ordering. Earlier greedy
 parts take priority over later captures; positive repetitions report the final atom after a
 greedy prefix, and an optional group absent from that atom does not reuse an earlier capture.
@@ -40,12 +36,11 @@ used 8,383,439 matching steps before capture selection and now reaches the fixed
 Simplify a pattern near this limit, or use non-capturing groups when captures are unnecessary.
 Boolean regex operators and group-free substring/replacement keep their previous work
 and success sets. No stored-format change or data migration is required.
-The capture-fix calibration build measured 1,184,226 raw / 355,431 gzip bytes
-for the main bundle,
-1,596,663 / 462,405 with OPFS, and 1,592,698 / 459,825 for the IndexedDB worker.
-Raise their raw caps once by 4 / 4 / 4.25 KiB and gzip caps by 1.5 KiB each;
-client and private-input isolation limits stay unchanged. The combined worker/client measures
-575,256 gzip bytes (cap +1.5 KiB); the core tarball measures 1,030,251 bytes (cap +1,750).
+The capture fix and shared byte-span preparation measure 1,186,623 raw / 356,523 gzip bytes
+for the main bundle, 1,599,115 / 463,523 with OPFS, and 1,595,153 / 460,902 for the IndexedDB
+worker. Their raw caps rise once by 6.25 / 6.25 / 6.75 KiB and their gzip caps by 2.5 KiB each.
+The combined worker/client measures 576,285 gzip bytes (cap +2.5 KiB) and the core tarball
+1,032,971 bytes (cap +4,250). Client, download and private-input isolation limits stay unchanged.
 
 The private 1.0 writer preserves exact BIGINT values when updating or deleting persisted
 rows, including primary and unique keys and RETURNING results. Cached memory readers keep
