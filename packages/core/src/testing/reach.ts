@@ -1638,6 +1638,19 @@ export const LOWER_M3_JOINS_REACH = [
   "complete",
 ] as const;
 
+/** Primary-key LIMIT/OFFSET windows sized over only the groups they fetch. */
+export const KEY_ORDER_WINDOW_REACH = [
+  "work bound",
+  "one group",
+  "spans groups",
+  "offset past end",
+  "one-row limit",
+  "over one batch",
+  "descending",
+  "deep offset",
+  "PG exact",
+] as const;
+
 /** SQL windows run through durable storage and the actual executor, not a plan interpreter. */
 export const LOWER_M3_WINDOWS_REACH = [
   "literal window amounts",

@@ -33,8 +33,8 @@ export class StorageCore implements NextCore {
   readonly spill = new MemorySpillService();
   #queryId = 0;
 
-  constructor(memtableRows?: number) {
-    this.harness = new Harness("strict", "memory", memtableRows);
+  constructor(memtableRows?: number, tuning?: ConstructorParameters<typeof Harness>[4]) {
+    this.harness = new Harness("strict", "memory", memtableRows, undefined, tuning);
   }
   async open(): Promise<this> {
     await this.harness.open();

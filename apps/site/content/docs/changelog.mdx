@@ -10,6 +10,8 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The unexported 1.0 rebuild sizes a primary-key `ORDER BY ... LIMIT ... OFFSET` window of up to 2048 rows over only the groups that window reads, instead of every group of the table. Results are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.
+
 The unexported 1.0 rebuild computes eligible scalar aggregates (`COUNT(*)`, `COUNT(column)`,
 `SUM`/`AVG` over INT and `SUM` over DOUBLE PRECISION, over plain columns of a table scan with no
 residual filter) straight from encoded column pages instead of building row batches. Every other

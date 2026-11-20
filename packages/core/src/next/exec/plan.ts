@@ -170,6 +170,7 @@ import {
   admittedIndexMinimums,
   planIndexRange,
   runIndexOrder,
+  windowSegments,
   type IndexShape,
   type AdmittedIndexRead,
 } from "./key-order.js";
@@ -4659,8 +4660,30 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
       )
         return genericProgram(runtime, sink);
       const size = function* (): SlicedJob<void> {
-        // A locator may name any group. Size only the output columns, but use the
-        // complete pinned source rather than assuming a physical prefix for PK order.
+        // A locator may name any group. A window of at most one cursor batch is read first
+        // (its own released scratch grant, a fresh plan on this pinned view): only the
+        // segments it names are sized. A larger or unbounded window sizes the whole source.
+        // The window's own scratch must fit the cap: it may never refuse a query that whole-
+        // source sizing admits.
+        const sizingPlan =
+          resident === null &&
+          bounds.limit !== null &&
+          bounds.limit <= BATCH_ROWS &&
+          range.minimumBytes + bounds.limit * Float64Array.BYTES_PER_ELEMENT <= cap
+            ? planIndexRange(reader, shape.descending)
+            : null;
+        const window =
+          sizingPlan !== null && bounds.limit !== null
+            ? yield* readValue(
+                windowSegments(
+                  sizingPlan,
+                  bounds.offset,
+                  bounds.limit,
+                  runtime.request.governor,
+                  runtime.signal,
+                ),
+              )
+            : undefined;
         const payload = yield* readValue(
           boundSource(
             runtime.sourceView(),
@@ -4672,6 +4695,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
               windowBytes: 0,
               stagingBytes: memoryScanBufferBytes(shape.types),
               rows: null,
+              ...(window === undefined ? {} : { segments: window }),
             },
             runtime.request.governor,
             runtime.signal,

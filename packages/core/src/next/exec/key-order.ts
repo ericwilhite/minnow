@@ -1,10 +1,11 @@
 /** Ordered index cursors and private locator fetches share the query's pinned view. */
 import type { IndexCursor, IndexReader, IndexRangePlan } from "../access/key-index.js";
-import type { ReadBound } from "../page/read-bounds.js";
+import { scratchMinimum, trackSizing, type ReadBound } from "../page/read-bounds.js";
 import { directoryCacheFor } from "../page/directory-cache.js";
 import type { PhysicalPlan, Rel } from "../ir/ir.js";
 import { BATCH_ROWS, dataBytes, type FlatVector } from "../vector/vector.js";
-import { batchTargetFor, OBJECT_OVERHEAD_BYTES } from "../memory/governor.js";
+import { batchTargetFor, OBJECT_OVERHEAD_BYTES, type MemoryGovernor } from "../memory/governor.js";
+import { locatorSegment } from "../vector/locator.js";
 import { pauseIfDue } from "../task.js";
 import { layoutOf, samePhysicalType, type PhysicalType } from "../types.js";
 import { OutputArena } from "./kernels/vectors.js";
@@ -20,6 +21,89 @@ export function planIndexRange(reader: IndexReader, descending: boolean) {
   if (plan && (!Number.isSafeInteger(plan.minimumBytes) || plan.minimumBytes < 0))
     throw new RangeError("invalid index cursor minimum");
   return plan ?? null;
+}
+
+/** The grant label of the window sizing pass (its cursor is the query's sizing cursor). */
+export const WINDOW_SIZING_LABEL = "key-order/window-sizing";
+
+/**
+ * The segments a bounded primary-key window names: OFFSET skipped in the index, then up to
+ * `rows` locators. Read under its own scratch grant during sizing and released before
+ * execution is admitted, so nothing is held while waiting. `plan` is a fresh single-use plan
+ * on the query's pinned view: execution's cursor yields the same window there, so a read
+ * bound over exactly these segments covers every row the fetch reads.
+ */
+export function windowSegments(
+  plan: IndexRangePlan,
+  offset: number,
+  rows: number,
+  governor: MemoryGovernor,
+  signal: AbortSignal,
+): Promise<Set<number>> {
+  // Registered like source sizing: teardown waits for this cursor and grant to unwind.
+  return trackSizing(signal, readWindow(plan, offset, rows, governor, signal)) as Promise<
+    Set<number>
+  >;
+}
+
+async function readWindow(
+  plan: IndexRangePlan,
+  offset: number,
+  rows: number,
+  governor: MemoryGovernor,
+  signal: AbortSignal,
+): Promise<Set<number>> {
+  if (!Number.isSafeInteger(rows) || rows < 1 || rows > BATCH_ROWS)
+    throw new RangeError("A sized window holds one cursor batch");
+  const bytes = rows * Float64Array.BYTES_PER_ELEMENT;
+  const grant = await scratchMinimum(
+    governor,
+    WINDOW_SIZING_LABEL,
+    plan.minimumBytes + bytes,
+    signal,
+  );
+  try {
+    // Charged before allocating; the cursor's own scratch is inside plan.minimumBytes.
+    if (!grant.allocate(bytes)) throw new Error("window sizing did not receive its minimum");
+    const out = new Float64Array(rows);
+    const segments = new Set<number>();
+    const cursor = plan.open({ budget: grant, signal });
+    // Cancellation closes at once (cancelling pending I/O); the outstanding call still settles
+    // before `out` and the grant are released below.
+    let open = true;
+    const close = () => {
+      if (!open) return;
+      open = false;
+      cursor.close();
+    };
+    signal.addEventListener("abort", close, { once: true });
+    try {
+      for (let skip = offset; skip > 0;) {
+        const skipped = await cursor.skip(skip);
+        signal.throwIfAborted();
+        if (!Number.isSafeInteger(skipped) || skipped < 0 || skipped > skip)
+          throw new RangeError("invalid index cursor skip count");
+        if (skipped < skip) return segments;
+        skip -= skipped;
+      }
+      for (let filled = 0; filled < rows;) {
+        const count = await cursor.next(out.subarray(filled, rows));
+        signal.throwIfAborted();
+        if (!Number.isInteger(count) || count < 0 || count > rows - filled)
+          throw new RangeError("invalid index cursor count");
+        if (count === 0) break;
+        for (let k = filled; k < filled + count; k++) segments.add(locatorSegment(out[k] ?? -1));
+        filled += count;
+      }
+      return segments;
+    } finally {
+      signal.removeEventListener("abort", close);
+      close();
+      grant.free(bytes);
+    }
+  } finally {
+    grant.close();
+  }
 }
 
 export class IndexOrderSource implements BatchSource {
