@@ -1821,6 +1821,11 @@ export class ProtocolClient {
             );
           return;
         }
+        if (
+          pending.body.t === "admin" &&
+          (pending.body.op === "describeCatalog" || pending.body.op === "explain")
+        )
+          this.#queueRelease(message.seq, 0, 1, 1); // Immediate receipt ACK; no engine-held copy escapes credit.
         this.#settle(message.seq);
         pending.resolve(
           makeResult([], [], emptySummary(), pending.dictionaries, { value: message.value }),

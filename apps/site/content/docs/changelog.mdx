@@ -10,6 +10,11 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The Node SQL performance gate (`npm run benchmark:gate`) keys its regression thresholds by CPU
+model as well as OS, architecture and Node major version, and refuses a host whose CPU model
+has no calibrated profile instead of comparing it with another machine's thresholds. No package
+code or stored format changes.
+
 The private 1.0 owner enables qualified BEFORE/AFTER row triggers through the native writer,
 with PostgreSQL trigger/FK ordering, original-target rekey-follow, cancellable funding and
 statement-atomic rollback. Enclosing savepoints recover failed statements. The shipped
@@ -51,6 +56,28 @@ The private 1.0 storage writer keeps space statistics exact while aborting a wri
 including when releasing part of its reserved space fails. Idle maintenance can read
 those statistics without a reservation error. Released 0.x behavior is unchanged;
 no stored-format change or migration is required.
+
+The private 1.0 core uses one UTF-8 progress helper for parameter binding, varlen
+builders and write codecs. Exact-capacity destinations remain byte-exact when
+Node 26's encoder returns a short write; the helper completes the tail in the
+same buffer without padding or temporary copies. Undersized destinations get
+the typed `MINNOW_UTF8_CAPACITY` error. Stored strings also retain a leading
+U+FEFF character. Released 0.x behavior and stored-format grammars are unchanged;
+no migration is required.
+
+The private 1.0 executor handles short UTF-8 encoder writes, including Node 26's
+exact-capacity tail behavior, without truncating or refusing valid text parameters.
+It keeps the measured byte count separate from reservation bounds and funds one
+temporary encoding slice across sequential parameter slots. Result admission separately
+includes frame metadata and construction workspace, so a fitting wide parameter result
+cannot run out of its reserved progress lane under competing memory pressure. Released 0.x behavior
+and stored formats are unchanged; no migration is required.
+
+The private 1.0 devtools binding reads canonical results, detached catalog descriptions and
+logical explain plans. Duplicate labels keep their column positions; exact integers, NUMERIC
+and microsecond timestamps retain their canonical values. Metadata stays charged until receipt.
+The released 0.x panel and public package entries are unchanged. Live devtools queries remain
+explicitly unbound. No stored-format change or migration is required.
 
 The shared parser now records each SELECT output's original label for the private 1.0
 engine, which follows PostgreSQL for duplicate labels (`SELECT 1 AS x, 2 AS x` returns two

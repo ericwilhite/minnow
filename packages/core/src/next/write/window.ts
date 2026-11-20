@@ -1,7 +1,7 @@
 /** A logical byte stream projected into one bounded, caller-owned byte window. */
 import { utf8Length, type ByteSink } from "./bytes.js";
 
-const encoder = new TextEncoder();
+import { encodeUtf8Into } from "../utf8.js";
 
 export class ByteWindow implements ByteSink {
   length = 0;
@@ -86,10 +86,14 @@ export class ByteWindow implements ByteSink {
       return;
     }
     for (let from = 0; from < value.length;) {
-      let to = Math.min(value.length, from + Math.floor(this.scratch.length / 4));
-      const last = value.charCodeAt(to - 1);
-      if (to < value.length && last >= 0xd800 && last <= 0xdbff) to--;
-      const { written } = encoder.encodeInto(value.slice(from, to), this.scratch);
+      let to = Math.min(value.length, from + Math.max(1, Math.floor(this.scratch.length / 4)));
+      const last = value.charCodeAt(to - 1),
+        next = value.charCodeAt(to);
+      if (to < value.length && last >= 0xd800 && last <= 0xdbff && next >= 0xdc00 && next <= 0xdfff)
+        // A tiny scratch still makes one complete scalar of progress, or the
+        // shared helper throws its typed capacity error. Never loop on an empty slice.
+        to += to === from + 1 ? 1 : -1;
+      const written = encodeUtf8Into(value.slice(from, to), this.scratch);
       this.rawRange(this.scratch, 0, written);
       from = to;
     }
