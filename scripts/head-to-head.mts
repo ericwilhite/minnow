@@ -1,6 +1,7 @@
 /** Head-to-head progress lane: this checkout's 1.0 rebuild (next/) against a published engine.
  *
  *   node scripts/head-to-head.mts run --dataset W1M --shipped <unpacked package> --output <dir>
+ *   node scripts/head-to-head.mts run --dataset W1M --candidate <built checkout> --output <dir>
  *   node scripts/head-to-head.mts report <result.json>... > table.md
  *
  * `run` starts one long-lived worker per engine (`head-to-head-worker.mts` through
@@ -43,6 +44,8 @@ export interface HeadToHeadResult {
   readonly finished: string;
   readonly revision: string;
   readonly shipped: { version: string; root: string; integrity: string | null };
+  /** Set in candidate mode: the second arm is this checkout's next/ engine, not a package. */
+  readonly candidate?: { root: string; revision: string };
   readonly rows: number;
   readonly scale: number;
   readonly rounds: number;
@@ -86,6 +89,7 @@ async function run(): Promise<void> {
     options: {
       dataset: { type: "string", default: "W1M" },
       shipped: { type: "string" },
+      candidate: { type: "string" },
       output: { type: "string" },
       rounds: { type: "string", default: "5" },
       rows: { type: "string", default: "1000000" },
@@ -97,19 +101,32 @@ async function run(): Promise<void> {
   });
   const dataset = values.dataset as Dataset;
   if (dataset !== "W1M" && dataset !== "S1") throw new Error("--dataset must be W1M or S1");
-  if (values.shipped === undefined || values.output === undefined)
-    throw new Error("--shipped <unpacked package root> and --output <dir> are required");
+  if (
+    (values.shipped === undefined) === (values.candidate === undefined) ||
+    values.output === undefined
+  )
+    throw new Error(
+      "one of --shipped <unpacked package root> or --candidate <built checkout>, and --output <dir>, are required",
+    );
+  const candidateRoot = values.candidate === undefined ? null : resolve(values.candidate);
   const rounds = Number(values.rounds),
     rows = Number(values.rows),
     scale = Number(values.scale),
     deadlineMs = Number(values["deadline-ms"]);
   for (const [name, value] of Object.entries({ rounds, rows, scale, deadlineMs }))
     if (!Number.isFinite(value) || value <= 0) throw new RangeError(`positive ${name} required`);
-  const shippedRoot = resolve(values.shipped),
+  const shippedRoot = candidateRoot ?? resolve(values.shipped ?? ""),
     output = resolve(values.output);
-  const shippedPackage = JSON.parse(await readFile(join(shippedRoot, "package.json"), "utf8")) as {
-    version: string;
-  };
+  const candidateRevision =
+    candidateRoot === null
+      ? null
+      : execFileSync("git", ["rev-parse", "HEAD"], { cwd: candidateRoot, encoding: "utf8" }).trim();
+  const shippedPackage =
+    candidateRevision === null
+      ? (JSON.parse(await readFile(join(shippedRoot, "package.json"), "utf8")) as {
+          version: string;
+        })
+      : { version: `candidate ${candidateRevision.slice(0, 10)}` };
   const only = new Set(values.only.split(",").filter(Boolean));
   const cells = (await gateBCells(dataset)).filter((id) => only.size === 0 || only.has(id));
   if (cells.length === 0) throw new Error("no cells selected");
@@ -129,7 +146,7 @@ async function run(): Promise<void> {
   const base = { dataset, rows, scale, capBytes, deadlineMs, workloads: cells } as const;
   const arms: Record<Arm, HeadToHeadData> = {
     next: { ...base, engine: "next", root: repository },
-    shipped: { ...base, engine: "shipped", root: shippedRoot },
+    shipped: { ...base, engine: candidateRoot === null ? "shipped" : "next", root: shippedRoot },
   };
   const workers: Partial<Record<Arm, Awaited<ReturnType<typeof startCPUWorker>>>> = {};
   const loadMs: Partial<Record<Arm, number>> = {};
@@ -143,7 +160,10 @@ async function run(): Promise<void> {
         {
           module: fileURLToPath(new URL("./head-to-head-worker.mts", import.meta.url)),
           cwd: repository,
-          revision: arm === "next" ? revision : `@minnowdb/core@${shippedPackage.version}`,
+          revision:
+            arm === "next"
+              ? revision
+              : (candidateRevision ?? `@minnowdb/core@${shippedPackage.version}`),
           data: arms[arm],
           execArgv: [`--max-old-space-size=${values["heap-mb"]}`],
         },
@@ -170,6 +190,9 @@ async function run(): Promise<void> {
       finished,
       revision,
       shipped: { version: shippedPackage.version, root: shippedRoot, integrity },
+      ...(candidateRevision === null || candidateRoot === null
+        ? {}
+        : { candidate: { root: candidateRoot, revision: candidateRevision } }),
       rows,
       scale,
       rounds,
@@ -203,7 +226,10 @@ async function run(): Promise<void> {
         for (const arm of order) {
           const worker = workers[arm];
           if (worker === undefined || cell.errors[arm] !== undefined) continue;
-          for (const boundary of arm === "next" ? ["rows", "frames"] : ["rows"]) {
+          // Candidate mode compares two next/ builds at the native frames boundary only.
+          const boundaries =
+            candidateRoot !== null ? ["frames"] : arm === "next" ? ["rows", "frames"] : ["rows"];
+          for (const boundary of boundaries) {
             try {
               const value = await worker.ask<CPUValue>({ op: "run", workload: id, boundary });
               const sample = { arm, boundary, round, cpuMs: value.cpuMs, wallMs: value.wallMs };
@@ -243,7 +269,85 @@ const geomean = (values: readonly number[]): number | null =>
     : Math.exp(values.reduce((sum, value) => sum + Math.log(value), 0) / values.length);
 
 /** One markdown table across every dataset in the given results. */
+/** Type-7 quantile, as the paired CPU probes use. */
+function quantile(sorted: readonly number[], p: number): number {
+  const index = (sorted.length - 1) * p,
+    low = Math.floor(index),
+    high = Math.min(low + 1, sorted.length - 1);
+  return (sorted[low] ?? NaN) + ((sorted[high] ?? NaN) - (sorted[low] ?? NaN)) * (index - low);
+}
+
+/** Candidate mode: per-cell paired frames-CPU deltas (candidate - main) by round. */
+function reportCandidate(results: readonly HeadToHeadResult[]): string {
+  const first = results[0];
+  if (first?.candidate === undefined) throw new Error("not a candidate run");
+  const lines = [
+    `## Candidate vs main (next/ engine, frames boundary)`,
+    "",
+    `main \`${first.revision.slice(0, 10)}\` · candidate \`${first.candidate.revision.slice(0, 10)}\` · Node ${first.node} · ${first.cpu ?? "unknown CPU"} · ${first.rounds} alternating rounds · 256 MiB on both`,
+    "",
+    "Process CPU in ms. Δ = candidate − main per round; a gain or regression needs |median Δ| above its IQR and at least 7 of 9 rounds the same way (the paired-CPU rule), otherwise it is inconclusive. One shared runner, no A/A: a screen, not acceptance.",
+    "",
+    "| Cell | main | candidate | Δ median | IQR | candidate faster | verdict | answers |",
+    "|---|---:|---:|---:|---:|---:|---|---|",
+  ];
+  const regressions: string[] = [],
+    gains: string[] = [];
+  for (const result of results)
+    for (const cell of result.cells) {
+      const by = (arm: Arm) =>
+        new Map(
+          cell.samples
+            .filter((sample) => sample.arm === arm && sample.boundary === "frames")
+            .map((sample) => [sample.round, sample.cpuMs]),
+        );
+      const main = by("next"),
+        candidate = by("shipped");
+      const deltas = [...main.keys()]
+        .filter((round) => candidate.has(round))
+        .map((round) => (candidate.get(round) ?? NaN) - (main.get(round) ?? NaN))
+        .sort((a, b) => a - b);
+      const name = `${result.dataset}/${cell.id}`;
+      const a = cell.verification.next,
+        b = cell.verification.shipped;
+      const answers =
+        a === undefined || b === undefined || "error" in a || "error" in b
+          ? "—"
+          : a.fingerprint === b.fingerprint && a.rows === b.rows
+            ? "same"
+            : "**differ**";
+      if (deltas.length === 0) {
+        lines.push(`| ${name} | — | — | — | — | — | error | ${answers} |`);
+        continue;
+      }
+      const middle = quantile(deltas, 0.5),
+        iqr = quantile(deltas, 0.75) - quantile(deltas, 0.25),
+        faster = deltas.filter((delta) => delta < 0).length,
+        need = Math.ceil((7 / 9) * deltas.length);
+      const verdict =
+        Math.abs(middle) > iqr && middle < 0 && faster >= need
+          ? "gain"
+          : Math.abs(middle) > iqr && middle > 0 && deltas.length - faster >= need
+            ? "**regression**"
+            : "inconclusive";
+      if (verdict === "gain") gains.push(name);
+      if (verdict !== "gain" && verdict !== "inconclusive") regressions.push(name);
+      lines.push(
+        `| ${name} | ${format(median([...main.values()]))} | ${format(median([...candidate.values()]))} | ${format(middle, 2)} | ${format(iqr, 2)} | ${String(faster)}/${String(deltas.length)} | ${verdict} | ${answers} |`,
+      );
+    }
+  lines.push(
+    "",
+    `**Gains (${String(gains.length)}):** ${gains.join(", ") || "none"}`,
+    "",
+    `**Regressions (${String(regressions.length)}):** ${regressions.join(", ") || "none"}`,
+    "",
+  );
+  return lines.join("\n");
+}
+
 export async function report(results: readonly HeadToHeadResult[]): Promise<string> {
+  if (results[0]?.candidate !== undefined) return reportCandidate(results);
   const targets = JSON.parse(
     await readFile(join(repository, "scripts/head-to-head-targets.json"), "utf8"),
   ) as Record<string, Record<string, number> | string>;

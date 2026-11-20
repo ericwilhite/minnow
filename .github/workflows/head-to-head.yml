@@ -19,6 +19,9 @@ on:
       shipped:
         description: "Published @minnowdb/core version to compare against"
         default: "0.20.0"
+      candidate:
+        description: "Optional git ref: compare main's next/ with this ref's next/ instead of 0.20"
+        default: ""
 
 permissions:
   contents: read
@@ -29,7 +32,7 @@ concurrency:
 
 jobs:
   measure:
-    name: ${{ matrix.dataset }} main vs ${{ inputs.shipped || '0.20.0' }}
+    name: ${{ matrix.dataset }} main vs ${{ inputs.candidate || inputs.shipped || '0.20.0' }}
     runs-on: ubuntu-latest
     # Measured locally at full size: W1M loads both engines in about five minutes and runs its 29
     # cells in about half an hour; a hosted runner is slower. S1 is much smaller.
@@ -41,15 +44,27 @@ jobs:
     env:
       SHIPPED: ${{ inputs.shipped || '0.20.0' }}
       ROUNDS: ${{ inputs.rounds || '5' }}
+      CANDIDATE: ${{ inputs.candidate || '' }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v5
         with:
           node-version: 24
           cache: npm
       - run: bash scripts/ci-install.sh
       - run: npx tsc -b packages/core
+      - name: Build the candidate
+        if: env.CANDIDATE != ''
+        shell: bash
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/candidate" "$CANDIDATE"
+          cd "$RUNNER_TEMP/candidate"
+          npm ci --ignore-scripts --no-audit --no-fund
+          npx tsc -b packages/core
       - name: Unpack the published engine
+        if: env.CANDIDATE == ''
         shell: bash
         run: |
           mkdir -p "$RUNNER_TEMP/shipped"
@@ -66,7 +81,7 @@ jobs:
           node scripts/head-to-head.mts run
           --dataset ${{ matrix.dataset }}
           --rounds "$ROUNDS"
-          --shipped "$RUNNER_TEMP/shipped/package"
+          $([ -n "$CANDIDATE" ] && echo --candidate "$RUNNER_TEMP/candidate" || echo --shipped "$RUNNER_TEMP/shipped/package")
           --output head-to-head
           2> >(tee head-to-head/${{ matrix.dataset }}.log >&2)
           | tee head-to-head/${{ matrix.dataset }}.md
