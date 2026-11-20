@@ -9857,7 +9857,7 @@ export const NATIVE_KYSELY_REACH = [
   "savepoint recovery",
   "catalog SQL widths",
   "explicit decoding",
-  "live unbound",
+  "live bound",
 ] as const;
 
 export const NATIVE_EXPORT_REACH = [
@@ -10653,13 +10653,6 @@ export const NATIVE_WRITE_PRESSURE_REACH = [
   "resident metadata overlaps writer step",
 ] as const;
 
-export const NATIVE_WRITE_SETTLEMENT_REACH = [
-  "published settled",
-  "aborted settled",
-  "unsettled rejected",
-  "owned bytes rejected",
-] as const;
-
 export const NATIVE_WRITE_OPTIONAL_REACH = [
   "preferred size declined",
   "cheaper path exact",
@@ -10840,6 +10833,8 @@ export const LIVE_ADMISSION_CLOSE_REACH = [
 ] as const;
 
 export const LIVE_BACKING_REACH = [
+  "shadowed buffer",
+  "shadowed capacity",
   "bytes",
   "words",
   "data",
@@ -11327,6 +11322,163 @@ export const PROJECTION_ARRAY_STEP_REACH = [
   "no payload allocation",
   "nondefault bounds",
   "element NULL",
+] as const;
+
+/** The shared native/page column grammar preserves representations and error boundaries. */
+export const LIVE_COLUMN_CODEC_REACH = [
+  "bool",
+  "i32",
+  "f32",
+  "f64",
+  "i64-safe",
+  "i64-wide",
+  "decimal-safe",
+  "decimal-i64",
+  "decimal-i128",
+  "decimal-mixed",
+  "text",
+  "enum",
+  "fixed16",
+  "interval",
+  "date",
+  "time",
+  "timestamp",
+  "shared definitions",
+  "nullable",
+  "all valid",
+  "unaligned input",
+  "same encoded bytes",
+  "typed malformed refusal",
+] as const;
+
+/** Native snapshot import ends the old live baseline and durable identity. */
+export const LIVE_SNAPSHOT_IMPORT_REACH = [
+  "OPFS",
+  "IndexedDB",
+  "outstanding delivery",
+  "acknowledged delivery",
+  "stream import",
+  "array import",
+  "explicit reset before consumer resumes",
+  "zero old live charge",
+  "reset callback isolated",
+  "typed old session refusal",
+  "stale handshake refused",
+  "key reuse has no rekey",
+  "recovered feed delivers commits",
+  "zero owner charge after close",
+] as const;
+
+export const LIVE_STORE_BINDING_REACH = [
+  "captured options",
+  "unchanged delivery clears notices",
+  "iterator start reset",
+  "iterator gap reset",
+  "iterator late reset",
+  "refresh reentry ready",
+  "refresh reentry error",
+  "decode error preserves rows",
+  "error recovery",
+  "ready",
+  "update",
+  "reconnect reset",
+  "keyed patch",
+  "decode retirement",
+  "resubscribe drains decoder",
+  "zero charge",
+] as const;
+
+export const LIVE_STORE_DISPOSAL_REACH = [
+  "loading",
+  "ready",
+  "decode",
+  "refusal",
+  "zero charge",
+  "client teardown",
+  "activity teardown",
+  "capture teardown",
+  "no later listener after close",
+] as const;
+export const NATIVE_KYSELY_LIVE_REACH = [
+  "plugin SQL",
+  "plugin result",
+  "native decoding",
+  "keyed update",
+  "window",
+  "refresh",
+  "factory disposal",
+] as const;
+export const LIVE_STORE_ACCOUNT_REACH = [
+  "wide source view refused",
+  "shadowed source view refused",
+  "wide source metadata refused",
+  "cold stores bounded",
+  "shared refusal",
+  "all credit returned",
+] as const;
+
+export const LIVE_STORE_CAPTURE_REACH = [
+  "scalar",
+  "bytes",
+  "date",
+  "admitted before clone",
+  "shadowed buffer",
+  "getter once",
+  "captured value",
+  "zero charge",
+] as const;
+
+export const LIVE_STORE_RESET_REACH = [
+  "OPFS",
+  "IndexedDB",
+  "keyed",
+  "unkeyed",
+  "outstanding",
+  "settled",
+  "stream",
+  "array",
+  "pending decoder aborted",
+  "empty old baseline",
+  "stable typed terminal error",
+  "explicit reopen full snapshot",
+  "zero receiving charge after close",
+] as const;
+
+export const LIVE_STORE_METADATA_REACH = [
+  "column labels",
+  "type metadata",
+  "small metadata admitted",
+  "refused before canonical decode",
+  "zero charge",
+] as const;
+
+export const LIVE_STORE_DATA_REACH = [
+  "data",
+  "accessor",
+  "map",
+  "set",
+  "shared",
+  "keyed",
+  "unkeyed",
+  "plain binary data admitted",
+  "rejected before clone",
+  "zero charge",
+] as const;
+
+export const LIVE_STORE_CANONICAL_REACH = [
+  "scalar mutation",
+  "binary mutation",
+  "keyed",
+  "unkeyed",
+  "canonical preserved",
+  "zero charge",
+] as const;
+
+export const NATIVE_WRITE_SETTLEMENT_REACH = [
+  "published settled",
+  "aborted settled",
+  "unsettled rejected",
+  "owned bytes rejected",
 ] as const;
 
 /** Exact signed int8 words survive every native write source and recovery boundary. */

@@ -27,7 +27,14 @@ function sourceFiles(directory: string): string[] {
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
     const path = join(directory, entry.name);
     if (entry.isDirectory()) files.push(...sourceFiles(path));
-    else if (entry.name.endsWith(".ts") && !entry.name.endsWith(".test.ts")) files.push(path);
+    // Test files and test-only helpers (excluded from the published package by
+    // `!dist/**/*.test-support.*`) may reach adapters directly; shipped code may not.
+    else if (
+      entry.name.endsWith(".ts") &&
+      !entry.name.endsWith(".test.ts") &&
+      !entry.name.endsWith(".test-support.ts")
+    )
+      files.push(path);
   }
   return files;
 }

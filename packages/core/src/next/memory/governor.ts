@@ -25,21 +25,16 @@
  * only; browser RSS is measured separately at Gate D.
  */
 import { BATCH_TARGET_BYTES } from "../vector/vector.js";
+import { MemoryAdmissionError } from "../memory-values.js";
 
-export const OBJECT_OVERHEAD_BYTES = 64;
+export {
+  MemoryAdmissionError,
+  OBJECT_OVERHEAD_BYTES,
+  bigintBytes,
+  stringBytes,
+} from "../memory-values.js";
 /** The progress reserve: one eighth of the cap, at least 1 MiB. */
 export const reserveFor = (capBytes: number): number => Math.max(1 << 20, Math.floor(capBytes / 8));
-
-/** Bytes a BigInt occupies in V8 (header plus 64-bit digits). */
-export function bigintBytes(value: bigint): number {
-  const magnitude = value < 0n ? -value : value;
-  return 16 + 8 * Math.max(1, Math.ceil(magnitude.toString(16).length / 16));
-}
-
-/** Bytes of a JS string kept on the collation fallback (two bytes per code unit plus header). */
-export function stringBytes(value: string): number {
-  return 24 + 2 * value.length;
-}
 
 /** The batch byte target for a pipeline of `operators` operators under `capBytes` (rule 3). */
 export function batchTargetFor(capBytes: number, operators: number): number {
@@ -163,24 +158,6 @@ export interface NativeGrantGroupOptions {
   readonly signal?: AbortSignal;
   /** The total includes private progress credit; its consumers never need the shared reserve. */
   readonly includesProgress?: boolean;
-}
-
-/** A non-spillable input or a fixed minimum cannot fit the owner's normal capacity. */
-export class MemoryAdmissionError extends RangeError {
-  readonly code = "MINNOW_MEMORY_ADMISSION";
-  /** PostgreSQL's out_of_memory resource error (Appendix A). */
-  readonly sqlState = "53200";
-  constructor(
-    readonly label: string,
-    readonly bytes: number,
-    readonly capacity: number,
-  ) {
-    super(
-      `${label} needs a minimum above the cap: plan smaller batches (${String(bytes)} bytes, ${String(capacity)} available)`,
-      { cause: Object.freeze({ requestedBytes: bytes, admittedBytes: capacity }) },
-    );
-    this.name = "MemoryAdmissionError";
-  }
 }
 
 export class ValueTooLargeError extends Error {
