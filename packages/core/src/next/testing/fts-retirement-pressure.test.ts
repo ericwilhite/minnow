@@ -31,9 +31,16 @@ for (const seed of seedsFor("next-fts-retirement-pressure", [0xb8c1, 0xb8c2]))
       competitor: Grant | undefined,
       pressure = false,
       growths = 0;
+    let restoreAllocation: (() => void) | undefined;
     const admit = h.governor.admitGroup.bind(h.governor);
     h.governor.admitGroup = async (options) => {
-      if (pressure && options.label === "grow write path metadata") {
+      if (
+        pressure &&
+        (options.label === "grow write path metadata" ||
+          options.grants.some(
+            (part) => part.label === "write growth write path metadata" && part.minimumBytes > 0,
+          ))
+      ) {
         growths++;
         throw new Error("FTS retirement requested fresh credit under its fixed peak");
       }
@@ -153,11 +160,31 @@ for (const seed of seedsFor("next-fts-retirement-pressure", [0xb8c1, 0xb8c2]))
       if (!metadata) throw new Error("Missing native metadata account");
       const excess = metadata.held - metadata.allocated - FTS_PUBLICATION_MINIMUM_BYTES;
       if (excess > 0) metadata.release(excess);
-      const held = metadata.held;
+      const held = metadata.held,
+        owner = metadata;
+      let allocatedPeak = owner.allocated,
+        allocationChecks = 0;
+      // eslint-disable-next-line @typescript-eslint/unbound-method -- invoke with owner and restore exactly
+      const allocate = owner.allocate;
+      owner.allocate = (bytes) => {
+        if (pressure) {
+          allocationChecks++;
+          expect(
+            owner.allocated + bytes,
+            "retirement's simultaneous metadata fits its prepaid window",
+          ).toBeLessThanOrEqual(held);
+        }
+        const accepted = allocate.call(owner, bytes);
+        if (pressure && accepted) allocatedPeak = Math.max(allocatedPeak, owner.allocated);
+        return accepted;
+      };
+      restoreAllocation = () => {
+        owner.allocate = allocate;
+      };
       competitor = await h.governor.admit({
         label: "all competing ordinary credit",
         minimumBytes: 0,
-        spillable: false,
+        spillable: true,
       });
       while (competitor.tryGrow(64 << 10)) {
         /* Drain ordinary/cache credit. */
@@ -165,13 +192,18 @@ for (const seed of seedsFor("next-fts-retirement-pressure", [0xb8c1, 0xb8c2]))
       while (competitor.tryGrow(1)) {
         /* Drain the final fractional window. */
       }
+      expect(competitor.held, "competitor must actually own ordinary capacity").toBeGreaterThan(0);
       expect(competitor.allocate(competitor.held)).toBe(true);
+      reach.reach("competitor owns ordinary credit");
       pressure = true;
       const receipt = await tx.commit(null);
       await receipt.durable;
       stop.signal.throwIfAborted();
       expect(growths).toBe(0);
-      expect(metadata.held).toBe(held);
+      expect(owner.held).toBeLessThanOrEqual(held);
+      expect(allocationChecks).toBeGreaterThan(0);
+      expect(allocatedPeak).toBeLessThanOrEqual(held);
+      reach.reach("allocated peak within prepaid window");
       expect(inventoryCount).toBe(count + ordinal);
       expect(publications).toBe(1);
       expect(inventoryReleased).toBe(true);
@@ -200,6 +232,7 @@ for (const seed of seedsFor("next-fts-retirement-pressure", [0xb8c1, 0xb8c2]))
       reach.reach("reopen exact rows");
     } finally {
       pressure = false;
+      restoreAllocation?.();
       if (competitor) {
         competitor.free(competitor.allocated);
         competitor.close();

@@ -164,6 +164,7 @@ import { TableScan, memoryScanBufferBytes } from "./table-scan.js";
 import {
   orderedSort,
   indexMinimums,
+  indexReadTarget,
   admittedIndexMinimums,
   planIndexRange,
   runIndexOrder,
@@ -180,6 +181,16 @@ import {
 
 import { windowSuppliesOrder } from "./window-order.js";
 
+/** Retained rows choose a real byte target, not an asserted value-width bound. */
+function sourceTarget(
+  runtime: QueryRuntime,
+  tableId: number,
+  input: readonly PhysicalType[],
+): number {
+  const rows = runtime.residentSourceRows(tableId),
+    cap = runtime.request.governor.capBytes;
+  return rows === null ? batchTargetFor(cap, 4) : indexReadTarget(input, cap, rows);
+}
 type Stop = () => boolean;
 type Recipe = (
   runtime: QueryRuntime,
@@ -1477,10 +1488,14 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                 (context) => new FilterOperator(filter, context, DISCARD),
                 (filter) => filter.abort(undefined),
               );
-        fixed(rel, (cap) => kernelBytes + batchTargetFor(cap, 4) + BATCH_ROWS * 16);
+        fixed(
+          rel,
+          (_cap, runtime) =>
+            kernelBytes + sourceTarget(runtime, rel.tableId, input) + BATCH_ROWS * 16,
+        );
         return (runtime, downstream, stops, rowsNeeded) => {
           if (stops.some((stop) => stop())) return downstream.finish();
-          const target = batchTargetFor(runtime.request.governor.capBytes, 4);
+          const target = sourceTarget(runtime, rel.tableId, input);
           return instantiate(
             runtime,
             rel,
@@ -4105,9 +4120,11 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
               },
               runtime.request.governor,
               runtime.signal,
+              // Index fetch owners admit exactly indexFetchTarget (see their minimum);
+              // every other source takes the bounded-demand target.
               indexFetchOwners.has(source.id)
                 ? indexFetchTarget(runtime.request.governor.capBytes)
-                : batchTargetFor(runtime.request.governor.capBytes, 4),
+                : sourceTarget(runtime, source.tableId, source.types),
               BATCH_ROWS,
               runtime.metadataCaches(
                 source.retain !== false &&
@@ -4372,85 +4389,121 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
     // Validate both bounds before zero admission, including OFFSET with LIMIT 0.
     const bounds = runtime.bounds(rel);
     if (bounds.limit === 0) return then(runtime.reserve([]), () => sink.finish());
-    const shape: IndexShape = {
-      tableId: scan.tableId,
-      columns: ordered.columns,
-      types: types(project),
-      source: scan,
-      fetch: project,
-      restore: rel,
-      descending: rel.keys[0]?.direction === "desc",
-    };
-    const cap = runtime.request.governor.capBytes;
-    const inputs = integerParameterBytes(plan, runtime.request.parameters);
-    // Keep the generic recipe without even opening an index reader when the fixed
-    // optional buffers plus owned inputs already do not fit.
-    if (inputs === null || runtime.minimumBytes(indexMinimums(shape, cap), inputs) > cap)
-      return genericProgram(runtime, sink);
-    const range = planIndexRange(runtime.view.index(scan.tableId, index.id), shape.descending);
-    const run = (read?: AdmittedIndexRead) => {
-      const entries = read ? admittedIndexMinimums(shape, cap, read) : indexMinimums(shape, cap);
-      return then(runtime.reserve(entries), () =>
-        then(
-          runIndexOrder(
-            runtime,
-            sink,
-            shape,
-            index.id,
-            bounds.limit,
-            bounds.offset,
-            undefined,
-            undefined,
-            read,
+    return then(runtime.retryResidentSources([{ tableId: scan.tableId }]), () => {
+      // A complete resident input of at most one chunk needs only the ordinary sort.
+      // Avoid admitting both an index cursor and a dormant restore sort for this case.
+      // The count chooses a recipe only: execution still visits every demanded row.
+      const residentRows = runtime.residentSourceRows(scan.tableId);
+      if (bounds.limit !== 1 && residentRows !== null && residentRows <= BATCH_ROWS)
+        return genericProgram(runtime, sink);
+      const shape: IndexShape = {
+        tableId: scan.tableId,
+        columns: ordered.columns,
+        types: types(project),
+        source: scan,
+        fetch: project,
+        restore: rel,
+        descending: rel.keys[0]?.direction === "desc",
+      };
+      const cap = runtime.request.governor.capBytes;
+      const targetBytes = indexReadTarget(shape.types, cap, bounds.limit);
+      const cursorRows = Math.min(BATCH_ROWS, bounds.limit ?? BATCH_ROWS);
+      const inputs = integerParameterBytes(plan, runtime.request.parameters);
+      // Keep the generic recipe without even opening an index reader when the fixed
+      // optional buffers plus owned inputs already do not fit.
+      if (
+        inputs === null ||
+        runtime.minimumBytes(indexMinimums(shape, cap, targetBytes, cursorRows), inputs) > cap
+      )
+        return genericProgram(runtime, sink);
+      const reader = runtime.view.index(scan.tableId, index.id),
+        direction = shape.descending ? "desc" : "asc";
+      const resident =
+        residentRows !== null && bounds.limit === 1
+          ? (reader.prepareResidentRange?.({ lower: null, upper: null }, direction) ?? null)
+          : null;
+      if (resident) runtime.dispose(() => resident.close());
+      const range = resident ?? planIndexRange(reader, shape.descending);
+      const run = (read?: AdmittedIndexRead) => {
+        const entries = read ? admittedIndexMinimums(shape, cap, read) : indexMinimums(shape, cap);
+        return then(runtime.reserve(entries), () =>
+          then(
+            runIndexOrder(
+              runtime,
+              sink,
+              shape,
+              index.id,
+              bounds.limit,
+              bounds.offset,
+              undefined,
+              undefined,
+              read,
+            ),
+            () => {
+              for (const projection of ordered.projects) {
+                if (projection.id === project.id) continue;
+                const profile = runtime.profile(projection),
+                  output = runtime.profile(project);
+                profile.rowsOut = output.rowsOut;
+                profile.batchesOut = output.batchesOut;
+              }
+            },
           ),
-          () => {
-            for (const projection of ordered.projects) {
-              if (projection.id === project.id) continue;
-              const profile = runtime.profile(projection),
-                output = runtime.profile(project);
-              profile.rowsOut = output.rowsOut;
-              profile.batchesOut = output.batchesOut;
-            }
-          },
-        ),
-      );
-    };
-    if (range === null) return options.keyOrder === true ? run() : genericProgram(runtime, sink);
-    if (runtime.minimumBytes(indexMinimums(shape, cap), inputs) + range.minimumBytes > cap)
-      return genericProgram(runtime, sink);
-    const size = function* (): SlicedJob<void> {
-      // A locator may name any group. Size only the output columns, but use the
-      // complete pinned source rather than assuming a physical prefix for PK order.
-      const payload = yield* readValue(
-        boundSource(
-          runtime.view,
-          {
-            id: project.id,
-            tableId: scan.tableId,
-            columns: shape.columns,
-            types: shape.types,
-            windowBytes: 0,
-            stagingBytes: memoryScanBufferBytes(shape.types),
-            rows: null,
-          },
-          runtime.request.governor,
-          runtime.signal,
-          batchTargetFor(cap, 4),
-          BATCH_ROWS,
-          runtime.metadataCaches(),
-        ),
-      );
-      const read: AdmittedIndexRead = { plan: range, cursor: cursorIdentity, payload };
-      runtime.sourceBounds(new Map([[project.id, payload]]));
-      runtime.readMinimum(payload.io, payload.progress);
-      if (runtime.minimumBytes(admittedIndexMinimums(shape, cap, read), inputs) > cap) {
-        runtime.sourceBounds(new Map());
-        runtime.readMinimum(0, 0);
-        return yield* readValue(genericProgram(runtime, sink));
-      }
-      return yield* readValue(run(read));
-    };
-    return runSliced(size(), new Slice(Infinity), () => undefined);
+        );
+      };
+      // The legacy diagnostic cursor does not enforce the admitted read target or
+      // locator capacity. Keep its full-batch minimum and generic alternative.
+      if (range === null)
+        return options.keyOrder === true &&
+          runtime.minimumBytes(indexMinimums(shape, cap), inputs) <= cap
+          ? run()
+          : genericProgram(runtime, sink);
+      if (
+        runtime.minimumBytes(indexMinimums(shape, cap, targetBytes, cursorRows), inputs) +
+          range.minimumBytes >
+        cap
+      )
+        return genericProgram(runtime, sink);
+      const size = function* (): SlicedJob<void> {
+        // A locator may name any group. Size only the output columns, but use the
+        // complete pinned source rather than assuming a physical prefix for PK order.
+        const payload = yield* readValue(
+          boundSource(
+            runtime.sourceView(),
+            {
+              id: project.id,
+              tableId: scan.tableId,
+              columns: shape.columns,
+              types: shape.types,
+              windowBytes: 0,
+              stagingBytes: memoryScanBufferBytes(shape.types),
+              rows: null,
+            },
+            runtime.request.governor,
+            runtime.signal,
+            targetBytes,
+            BATCH_ROWS,
+            runtime.metadataCaches(),
+          ),
+        );
+        const read: AdmittedIndexRead = {
+          plan: range,
+          cursor: cursorIdentity,
+          payload,
+          targetBytes,
+          rows: cursorRows,
+        };
+        runtime.sourceBounds(new Map([[project.id, payload]]));
+        runtime.readMinimum(payload.io, payload.progress);
+        if (runtime.minimumBytes(admittedIndexMinimums(shape, cap, read), inputs) > cap) {
+          runtime.sourceBounds(new Map());
+          runtime.readMinimum(0, 0);
+          return yield* readValue(genericProgram(runtime, sink));
+        }
+        return yield* readValue(run(read));
+      };
+      return runSliced(size(), new Slice(Infinity), () => undefined);
+    });
   };
   return fts.wrap(program, () => nextPhysicalId++);
 }

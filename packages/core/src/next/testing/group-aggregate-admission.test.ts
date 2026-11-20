@@ -11,7 +11,7 @@ import * as codec from "../format/group-aggregate.js";
 import { Governor } from "../memory/governor.js";
 import { AggregateFold } from "../page/aggregate-fold.js";
 import { MemoryExtentSpace } from "../page/memory-extents.js";
-import { GroupWriter } from "../page/writer.js";
+import { GroupWriter, groupWriterMinimum } from "../page/writer.js";
 import { defined, readChunk, vectorOf, writeGroup, type TestValue } from "../page/test-support.js";
 import type { PhysicalType } from "../types.js";
 import { MetadataBudget } from "../write/budget.js";
@@ -47,9 +47,22 @@ for (const seed of seedsFor("next-group-aggregate-admission", [0xb2ef, 0xb2f0]))
             for (const mode of modes) {
               if (mode === "arithmetic" && !decimal) continue;
               const governor = new Governor(4 << 20);
+              const shape = {
+                columns: [{ columnId: 1, type }],
+                maxRows: rows,
+                rawPageBytes: 512,
+                pageBytes: 512,
+                inlineBytes: 64,
+              };
+              // The writer admits its complete mandatory minimum before work; the step
+              // funds at least that, so only optional summary facts can be crowded out.
+              const stepBytes = Math.max(
+                (mode === "arithmetic" ? 96 : 512) << 10,
+                groupWriterMinimum(shape),
+              );
               const grant = await governor.admit({
                 label: "A1 metadata step",
-                minimumBytes: (mode === "arithmetic" ? 96 : 512) << 10,
+                minimumBytes: stepBytes,
                 spillable: false,
               });
               const holder = await governor.admit({
@@ -106,13 +119,9 @@ for (const seed of seedsFor("next-group-aggregate-admission", [0xb2ef, 0xb2f0]))
               let writer: GroupWriter | undefined;
               try {
                 writer = new GroupWriter({
-                  columns: [{ columnId: 1, type }],
+                  ...shape,
                   writer: space.beginWrite("optional A1"),
                   charge: budget,
-                  maxRows: rows,
-                  rawPageBytes: 512,
-                  pageBytes: 512,
-                  inlineBytes: 64,
                 });
                 expect(
                   await writer.append([vectorOf(type, values, { tier: "int128" })], rows),
@@ -142,7 +151,7 @@ for (const seed of seedsFor("next-group-aggregate-admission", [0xb2ef, 0xb2f0]))
                   await readChunk(baseline.space, expected),
                 );
                 reach.reach("ordinary values identical");
-                expect(grant.held).toBe((mode === "arithmetic" ? 96 : 512) << 10);
+                expect(grant.held).toBe(stepBytes);
               } finally {
                 vi.restoreAllMocks();
                 await writer?.abort();

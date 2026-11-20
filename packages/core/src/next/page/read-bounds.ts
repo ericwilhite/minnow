@@ -314,7 +314,11 @@ export function boundSource(
               grant.close();
             }
             if (!retry) {
-              const output = Math.max(totalOutput, largestOutput);
+              // B5's union of all measured prefixes bounds a short complete source,
+              // including shifted starts. A LIMIT covering only part of the physical
+              // source cannot certify that union: retain the byte-target floor there.
+              const covered = Math.max(totalOutput, largestOutput);
+              const output = rows === segment.rowCount ? covered : Math.max(target, covered);
               maximum = Math.max(
                 maximum,
                 source.stagingBytes +
