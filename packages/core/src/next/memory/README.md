@@ -64,9 +64,14 @@ live state (the engine releases its pooled arenas), and idle forecasts are retur
 still held through the wait (live allocations, loans, protected floors and an active merge)
 belongs to the step's complete minimum together with the deficit, and so do the owner's
 permanent holdings outside the write accounts: the space's non-evictable storage (fixed
-slabs and retained workspace, map, roots and ledger) and the scratch-control grant each
-native owner registers through `WritePath.retainOwnerHoldings`. Independently releasable
-query memory is not counted. When that complete minimum
+slabs plus `SpaceStats.permanentBytes`: workspace, extent map and root memory) and the
+scratch-control grant each native owner keeps. An owner that already holds such a grant passes
+it as `EngineInput.ownerHoldings`, bound before the write minimum is admitted, so open, load and
+recovery growth count it (a minimum that cannot fit beside it is refused at once); a grant
+admitted after open registers through `WritePath.retainOwnerHoldings`. Independently
+releasable memory is not counted: budgetless reader pins are charged to the space
+(`retainedBytes`) but refunded on release, so growth waits for them instead of refusing, as it
+does for query memory. When that complete minimum
 exceeds the cap (or ordinary capacity, net of loans, for a step without private progress),
 growth refuses at once with the typed 53200 `MemoryAdmissionError`; it never queues a request
 that could only be served by freeing its own inputs. A background merge refused this way is

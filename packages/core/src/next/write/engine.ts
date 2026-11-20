@@ -64,6 +64,9 @@ import { ReplayColumnMappings } from "./replay-columns.js";
 export type EngineInput = OpenWritePathInput & {
   /** Owner composition resumes initial background work only after ready is delivered. */
   readonly deferInitialMaintenance?: boolean;
+  /** Permanent grants the owner already holds beside this engine (scratch control). Bound
+   * before the write minimum is admitted, so open, load and recovery growth count them. */
+  readonly ownerHoldings?: () => number;
   readonly tuning?: {
     readonly memtableRows?: number;
     /** Tests: actual buffer ownership, independent of the governor charge. */
@@ -872,6 +875,13 @@ export class WritePathImpl implements WritePath, EngineHooks {
 
   static async #open(input: EngineInput, claim: { release(): void }): Promise<WritePathImpl> {
     const raw = input.space.root?.byteLength ?? 512;
+    // Bound before the minimum is admitted: open, load and recovery growth all count the
+    // storage floor and the owner's existing permanent grants (scratch control).
+    let engine: WritePathImpl | null = null;
+    const holdings = () =>
+      engine === null
+        ? FIXED_CACHE_BYTES + input.space.stats.permanentBytes + (input.ownerHoldings?.() ?? 0)
+        : engine.#mandatoryOwnerBytes();
     const credits = await WriteCredits.open(
       input.governor,
       {
@@ -885,10 +895,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
               (input.tuning?.merges?.fanIn ?? DEFAULT_MERGE_POLICY.fanIn) * MERGE_INPUT_BYTES,
       },
       input.options.signal,
+      holdings,
     );
     const grant = credits.rows;
     const metadataGrant = credits.metadata;
-    let engine: WritePathImpl | null = null;
     credits.bindWorkingMinimum(() =>
       engine === null
         ? { rows: MINIMUM_BYTES, commits: COMMIT_MINIMUM_BYTES }
@@ -915,13 +925,6 @@ export class WritePathImpl implements WritePath, EngineHooks {
         : credits.reclaimRows();
     };
     grant.onReclaimRequest(reclaimWriter);
-    // Non-evictable storage and owner-registered permanent grants (scratch control) are
-    // held while this engine works: they belong to every growth step's complete minimum.
-    credits.bindOwnerHoldings(() =>
-      engine === null
-        ? FIXED_CACHE_BYTES + input.space.stats.retainedBytes
-        : engine.#mandatoryOwnerBytes(),
-    );
     // Before any growth wait: pooled arenas are live but dependent (rebuilt on demand), so
     // they are released rather than kept through the wait. Memtable rows, cached run
     // readers and in-flight buffers remain required inputs counted in the complete minimum.
@@ -1067,6 +1070,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         lists,
       });
       engine.#ownerClaim = claim;
+      if (input.ownerHoldings !== undefined) engine.#ownerHoldings.add(input.ownerHoldings);
       await engine.#load();
       await engine.#prepareMinimum();
       await engine.#recover();
@@ -2207,7 +2211,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
   }
 
   #mandatoryOwnerBytes(): number {
-    let total = FIXED_CACHE_BYTES + this.#space.stats.retainedBytes;
+    let total = FIXED_CACHE_BYTES + this.#space.stats.permanentBytes;
     for (const bytes of this.#ownerHoldings) total += bytes();
     return total;
   }
@@ -2218,7 +2222,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     return (
       this.#credits.protectedBytes(undefined, headroom) +
       FIXED_CACHE_BYTES +
-      this.#space.stats.retainedBytes
+      this.#space.stats.permanentBytes
     );
   }
 
@@ -2267,7 +2271,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         needed =
           this.#credits.protectedBytes(this.#credits.minimum.merge, headroom) +
           FIXED_CACHE_BYTES +
-          this.#space.stats.retainedBytes,
+          this.#space.stats.permanentBytes,
         mandatory =
           FIXED_CACHE_BYTES +
           this.#credits.rowMinimum +

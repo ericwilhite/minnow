@@ -11550,9 +11550,38 @@ export const WRITE_LIVE_GROWTH_REACH = [
   "zero final charge",
 ] as const;
 
+export const WRITE_OPEN_HOLDINGS_REACH = [
+  "one byte over refused at open",
+  "exact cap admitted at open",
+  "one byte under admitted at open",
+  "unservable owner minimum refused",
+  "zero final charge",
+] as const;
+
+export const WRITE_RECOVERY_HOLDINGS_REACH = [
+  "crash recovery growth",
+  "clean reopen growth",
+  "exact rows after recovery",
+  "zero final charge",
+] as const;
+
+export const WRITE_PIN_HOLDINGS_REACH = [
+  "pins charged to the space",
+  "owner floor unchanged by pins",
+  "pins refunded on release",
+  "zero final charge",
+] as const;
+
+export const WRITE_RELEASABLE_HOLDER_REACH = [
+  "waited while the pin was held",
+  "proceeded after the pin was released",
+  "zero final charge",
+] as const;
+
 export const WRITE_OWNER_HOLDINGS_REACH = [
   "scratch-control holdings",
   "storage-floor holdings",
+  "one byte under the cap admitted",
   "exactly the cap admitted",
   "one byte over the cap refused",
   "zero final charge",

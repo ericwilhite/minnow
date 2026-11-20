@@ -218,8 +218,16 @@ export class WriteCredits {
     governor: MemoryGovernor,
     minimum: WriteMinimum,
     signal?: AbortSignal,
+    holdings?: () => number,
   ): Promise<WriteCredits> {
     minimum = { ...minimum };
+    // The owner's permanent holdings stay beside this minimum: above capacity together,
+    // the admission could never be served.
+    if (holdings !== undefined) {
+      const total = minimum.rows + minimum.metadata + minimum.commits + minimum.merge + holdings();
+      const capacity = governor.capBytes - governor.reserveBytes;
+      if (total > capacity) throw new MemoryAdmissionError("write owner minimum", total, capacity);
+    }
     const grants = await governor.admitGroup({
       label: "write owner minimum",
       grants: [
@@ -232,7 +240,9 @@ export class WriteCredits {
     });
     try {
       signal?.throwIfAborted();
-      return new WriteCredits(governor, minimum, signal, grants);
+      const credits = new WriteCredits(governor, minimum, signal, grants);
+      if (holdings !== undefined) credits.bindOwnerHoldings(holdings);
+      return credits;
     } catch (error) {
       for (const grant of grants) grant.close();
       throw error;
