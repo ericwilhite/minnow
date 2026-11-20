@@ -13295,3 +13295,160 @@ export const QUERY_INDEX_SEEN_REACH = [
   "read after cancel",
   "zero ownership",
 ] as const;
+
+export const B9_STAR_FLOAT_DEMAND_REACH = [
+  "native bits or exact error",
+  "same plan deterministic",
+  "finite extremes",
+  "NaN",
+  "infinities",
+  "signed zero",
+  "all NULL",
+] as const;
+
+export const B9_STAR_SHAPE_REACH = [
+  "composite keys",
+  "AVG transition",
+  "additional SUM",
+  "ordered aggregate",
+  "volatile plan",
+] as const;
+
+export const B9_STAR_BUCKET_REACH = [
+  "native transition order",
+  "multiple native chunks",
+  "PostgreSQL bags",
+  "nullable groups",
+  "strict key misses",
+  "bounded empty bucket steps",
+  "all credit returned",
+] as const;
+
+export const B9_STAR_LOOKUP_SQL_REACH = [
+  "native unordered row order",
+  "ordinary SQL sink reached",
+  "native float bits",
+  "PostgreSQL groups",
+  "reversed source ordinals",
+  "forward source ordinals",
+  "NULL grouping values",
+  "all ownership returned",
+] as const;
+
+export const B9_STAR_PRESSURE_REACH = [
+  "sparse buckets keep native state",
+  "dense resident sink",
+  "exact default bits",
+  "64 MiB cap",
+  "cancelled native wait",
+  "no hold while waiting",
+  "uncontended completion",
+  "all credit returned",
+] as const;
+
+/** Ordinary owner's bound TEXT must reach the exact-order star without weakening input demand. */
+export const B9_STAR_BOUND_TEXT_REACH = [
+  "explicit TEXT slot",
+  "owner normalized literal",
+  "PGlite exact ordered bags",
+  "same native bits",
+  "lookup and proof route reached",
+  "NULL binding",
+  "string binding",
+  "empty binding",
+  "Unicode BOM binding",
+  "1024-unit boundary",
+  "zero final credits",
+] as const;
+
+/** Invalid parameter forms must not add optional dictionary proof reads. */
+export const B9_STAR_TEXT_DEMAND_REACH = [
+  "missing",
+  "NUL",
+  "bool",
+  "number",
+  "overbound",
+  "extra",
+  "old binding outcome",
+  "no optional proof demand",
+] as const;
+
+/** Bound TEXT cannot enable a different dictionary recipe or ancestor family. */
+export const B9_STAR_TEXT_SCOPE_REACH = [
+  "one join",
+  "two joins",
+  "AVG",
+  "COUNT only",
+  "parameter LIMIT",
+  "computed sort",
+  "exact native fallback",
+  "no optional proof demand",
+] as const;
+
+export const B9_STAR_SOURCE_DEMAND_REACH = [
+  "facts fail before A and B demand",
+  "A fails before B demand",
+  "native source phase order",
+  "finite prefix forwards B failure",
+  "multiple B batches",
+  "PGlite22003",
+  "native22003",
+  "selected lookup no fault",
+  "native stops before late B failure",
+  "lookup retains22003",
+  "zero charges",
+] as const;
+
+/** Staging preserves prefix demand without changing native duplicate/NULL visitation. */
+export const B9_STAR_STAGED_PREFIX_REACH = [
+  "skipped staged A",
+  "staged NULL payload",
+  "duplicate B visits",
+  "nonmonotonic query IDs",
+  "bounded prefix steps",
+  "native B A fact order",
+  "all credit returned",
+] as const;
+
+/** Constructor census observes native backing capacities before allocation returns. */
+export const B9_STAR_BACKING_REACH = [
+  "actual backing independent of charges",
+  "A and B sidecars",
+  "8 MiB cap",
+  "multiple fact batches",
+  "matrix domain",
+  "all credit returned",
+] as const;
+
+/** Flat TEXT batches intern keys in one loop and grow exactly as the per-row route. */
+export const FLAT_BYTE_BATCH_REACH = [
+  "nonzero offset base",
+  "ordinary frozen lookup",
+  "partial selection",
+  "hash collision",
+  "pinned competitor",
+  "second batch",
+  "NULL then flat",
+  "dictionary then flat",
+  "independent backing",
+  "reversed selection",
+  "duplicates",
+  "unique growth",
+  "unaligned view",
+  "UUID36",
+  "hash boundary",
+  "zero charges",
+] as const;
+
+/** Native flat byte grouping retains exact PG results after a denied growth spills. */
+export const FLAT_BYTE_PG_REACH = [
+  "PG exact",
+  "pinned 8 MiB",
+  "spill",
+  "later pass",
+  "selection",
+  "NULL",
+  "non-NULL flat",
+  "UUID36 width",
+  "zero state and spill",
+] as const;
