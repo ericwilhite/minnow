@@ -60,7 +60,7 @@ import { DURABLE_CODECS } from "../durable-format.js";
 import { layoutOf, type Layout, type PhysicalType } from "../types.js";
 
 /** Most rows in a batch: keeps selections in Uint16Array and a narrow column in L1/L2. */
-export const BATCH_ROWS = 2048;
+export const BATCH_ROWS = 8192;
 /** Target bytes of one batch across all its columns; wide rows get fewer rows. */
 export const BATCH_TARGET_BYTES = 1024 * 1024;
 
