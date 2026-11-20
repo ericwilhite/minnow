@@ -5,6 +5,13 @@ import DurationSequencer from "./scripts/test-shards.ts";
 
 const maintenanceWorkload = "packages/core/src/engine/maintenance-under-load.test.ts";
 const modifyPressureWorkload = "packages/core/src/next/testing/modify-large-targets.test.ts";
+/**
+ * The preparation scaling check samples allocation with V8's optimizing tiers off and constant
+ * sampling intervals, so its measure repeats exactly. Those are process-wide V8 flags: they are
+ * startup arguments of this project's own workers, never toggled at run time, so no other test
+ * file shares a worker with them.
+ */
+const preparationScaling = "packages/core/src/next/testing/native-preparation-scaling.test.ts";
 const reachUnions = "packages/**/*.reach.test.ts";
 
 /**
@@ -62,6 +69,7 @@ export default defineConfig({
             // Wall-clock stalls run unchanged in the isolated one-worker CI project.
             "packages/core/src/engine/event-loop-latency.test.ts",
             modifyPressureWorkload,
+            preparationScaling,
             reachUnions,
           ],
           // `npm run test:packed`: every segment the engine can pack is packed.
@@ -98,6 +106,19 @@ export default defineConfig({
           // its rows, seeds, differential checks and memory cap stay unchanged.
           fileParallelism: false,
           sequence: { groupOrder: 3 },
+        },
+      },
+      {
+        extends: true,
+        test: {
+          name: "preparation-scaling",
+          include: [preparationScaling],
+          execArgv: [
+            "--no-turbofan",
+            "--no-maglev",
+            "--sampling-heap-profiler-suppress-randomness",
+          ],
+          sequence: { groupOrder: 1 },
         },
       },
       {

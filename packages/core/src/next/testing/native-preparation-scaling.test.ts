@@ -23,9 +23,7 @@
 // eslint-disable-next-line no-restricted-imports -- Test-only allocation sampling.
 import { Session } from "node:inspector";
 import fc from "fast-check";
-// eslint-disable-next-line no-restricted-imports -- Test-only: deterministic tiers while sampling.
-import { setFlagsFromString } from "node:v8";
-import { afterAll, beforeAll, expect, it } from "vitest";
+import { expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach, NATIVE_PREPARATION_SCALING_REACH } from "../../testing/reach.js";
 import { withCopyMeter, type CopyMeter } from "../../engine/copy-meter.js";
@@ -43,22 +41,12 @@ const SLACK = 1.5,
 
 // Optimizing compilers make a site's bytes depend on history: TurboFan and Maglev inline callees
 // (the sampling profiler then charges their allocations to the caller) and remove allocations by
-// escape analysis, at a time set by what earlier shapes made hot. With both off, lowering runs in
-// the interpreter and baseline tier, whose allocations follow the code alone; with constant
-// sampling intervals the measure is then the same on every run and every Node version. Restored
-// for any later file in this worker.
-const DETERMINISTIC = [
-  "--no-turbofan",
-  "--no-maglev",
-  "--sampling-heap-profiler-suppress-randomness",
-] as const;
-beforeAll(() => {
-  for (const flag of DETERMINISTIC) setFlagsFromString(flag);
-});
-afterAll(() => {
-  for (const flag of ["--turbofan", "--maglev", "--no-sampling-heap-profiler-suppress-randomness"])
-    setFlagsFromString(flag);
-});
+// escape analysis, at a time set by what earlier shapes made hot. This file runs in its own
+// Vitest project ("preparation-scaling", vitest.config.ts) whose workers start with both off and
+// with constant sampling intervals, so the measure is the same on every run and Node version.
+for (const flag of ["--no-turbofan", "--no-maglev", "--sampling-heap-profiler-suppress-randomness"])
+  if (!process.execArgv.includes(flag))
+    throw new Error(`Run this file through its Vitest project: ${flag} missing from execArgv`);
 
 /** Operator chains: the operator and its operand type, as one INSERT into a typed column. */
 const CHAINS: ReadonlyArray<readonly [string, string, string, string]> = [
