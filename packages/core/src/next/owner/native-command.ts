@@ -23,6 +23,7 @@ import {
   prepareParameters,
   needsParameterSizing,
   PARAMETER_SIZING_BYTES,
+  type ParameterBinding,
 } from "../exec/parameters.js";
 import { nativeParameterMinimumBytes } from "../exec/native-parameters.js";
 import { StatementImpl } from "../write/transaction.js";
@@ -38,6 +39,12 @@ import { NativeRootCredits, NATIVE_ROOT_CREDIT_BYTES } from "./native-root-credi
 import { NATIVE_INPUT_CAPTURE_BYTES } from "./native-input.js";
 import { PREPAID_QUERY_BYTES } from "./prepaid-query.js";
 import { retainedBytes } from "./rule-cache.js";
+import {
+  bodyPreparationBound,
+  bodyRetainedBytes,
+  rulePreparationBound,
+  ruleRetainedBytes,
+} from "./native-preparation-bound.js";
 import { OBJECT_OVERHEAD_BYTES } from "../memory/governor.js";
 import type { StatementPlanner, PlannerContext } from "./planner.js";
 
@@ -142,38 +149,26 @@ function checkPlan(plan: PhysicalPlan): void {
   if (plan.volatile || plan.ftsQueries?.length || plan.initPlans.length)
     refuse("volatile, FTS or init-plan native modification input");
 }
-/** One admitted preparation step. `build` is a single planning step (lowering one stored
- * statement or rule set), the same transient work as planning a root statement; its retained
- * result is charged to `metadata` before it is returned, so the next step and every wait run
- * with all earlier results already charged. When held credit cannot cover the result, it is
- * dropped first (it never leaves `attempt`), credit grows by a cancellable admitted wait, and
- * the step is planned again from the same immutable catalog inputs: no uncharged plan is ever
- * held across a wait, and at most one step's planning is in flight uncharged. */
-export async function preparedStep<T>(
-  credits: Pick<NativeRootCredits, "metadata" | "prepareMetadata">,
-  build: () => T,
-  measure: (value: T) => number,
-  signal: AbortSignal,
-): Promise<{ readonly value: T; readonly bytes: number }> {
-  let want = 0;
-  for (;;) {
-    signal.throwIfAborted();
-    const outcome = attempt(credits.metadata, build, measure);
-    if (typeof outcome !== "number") return outcome;
-    // Re-planning is deterministic for one catalog; never ask for less than already seen.
-    want = Math.max(want, outcome);
-    await credits.prepareMetadata(want, signal);
-  }
+interface Want {
+  readonly metadata: number;
+  readonly rules: number;
+  readonly parameters: number;
 }
-function attempt<T>(
-  metadata: NativeRootCredits["metadata"],
-  build: () => T,
-  measure: (value: T) => number,
-): { readonly value: T; readonly bytes: number } | number {
-  const value = build(),
-    bytes = measure(value);
-  if (!Number.isSafeInteger(bytes) || bytes < 0) throw new RangeError("Invalid preparation size");
-  return metadata.allocate(bytes) ? { value, bytes } : bytes;
+interface Prepared {
+  readonly preparation: NativeRootPreparation;
+  readonly fixedMetadata: number;
+  readonly ruleBytes: number;
+  readonly parameters: ParameterBinding;
+}
+/** The complete initial working set last needed by a cached root plan for one catalog. Lets
+ * the next execution admit it at once instead of learning it by one released attempt. */
+const learnedWants = new WeakMap<PhysicalPlan, Want>();
+/** A zoned timestamp clock parameter: a small fixed object with one bigint. */
+const CLOCK_BOUND_BYTES = 1024;
+function exceeded(what: string, actual: number, bound: number): never {
+  throw new TypeError(
+    `Native ${what} preparation exceeded its static bound (${String(actual)} > ${String(bound)})`,
+  );
 }
 /** Runs a qualified ordinary-owner modification. Returns the root count and
  * invalidation reach; no child-count approximation is made. */
@@ -209,60 +204,123 @@ export async function executeNativeCommand(
   try {
     credits = await NativeRootCredits.open({ governor, statement, signal, includesProgress: true });
     const paid = credits;
-    await paid.reserve(
-      { metadata: NATIVE_ROOT_CREDIT_BYTES + nativeCommandReachBytes(catalog) },
-      signal,
-    );
-    reach = await NativeCommandReach.prepare(
-      catalog,
-      plan.root as Extract<PhysicalPlan["root"], { op: "modify" }>,
-      paid.metadata,
-      { signal },
-    );
-    const triggers: Array<NativeRootPreparation["triggers"][number]> = [],
-      defaults: Array<NativeRootPreparation["defaults"][number]> = [];
-    let ruleBytes = 0,
-      prelude =
-        NATIVE_INPUT_CAPTURE_BYTES + PREPAID_QUERY_BYTES + nativeParameterMinimumBytes(plan),
-      preparationBytes = 0;
-    // Preparation is a sequence of admitted planning steps (see preparedStep): every retained
-    // program, plan and container is charged to the root's metadata before the next step
-    // starts or any wait begins. Lower immutable programs only. No default/sequence/generated
-    // expression is evaluated to size a workspace, and no source row or image is retained.
-    const charge = async <T>(build: () => T, measure: (value: T) => number): Promise<T> => {
-      const { value, bytes } = await preparedStep(paid, build, measure, signal);
-      retained += bytes;
-      preparationBytes += bytes;
-      return value;
+    // Preparation admits its complete working set before building anything, while holding
+    // nothing of an earlier attempt: static bounds (native-preparation-bound.ts) cover every
+    // lowered program, plan and container before they are built. The remainder that only the
+    // built preparation can size (setup, rule and parameter workspaces) is checked without
+    // waiting; if held credit does not cover it, every attempt object and charge is released
+    // and the complete, now-known working set is admitted from nothing before building again.
+    let want: Want = learnedWants.get(plan) ?? {
+      metadata: NATIVE_ROOT_CREDIT_BYTES + nativeCommandReachBytes(catalog),
+      rules: 0,
+      parameters: needsParameterSizing(plan, request.parameters) ? PARAMETER_SIZING_BYTES : 0,
     };
-    const tableCount = reach.tables.length,
-      triggerCount = reach.triggers.length;
-    let bodyCount = 0;
-    for (const definition of reach.triggers) bodyCount += definition.statements.length;
-    const clock = await charge(
-      () => clockParameter({ kind: "timestamp", zoned: true }, request.execution.statementTime),
-      (clock) =>
-        retainedBytes(clock) +
+    let prepared: Prepared | null = null;
+    while (!prepared) {
+      signal.throwIfAborted();
+      await paid.reserve(want, signal);
+      const outcome = await prepareWithin(want);
+      if ("retry" in outcome) {
+        want = outcome.retry;
+        paid.releaseAll();
+      } else prepared = outcome;
+    }
+    learnedWants.set(plan, want);
+    const { preparation, parameters } = prepared;
+    if (
+      !paid.cover({
+        metadata: prepared.fixedMetadata,
+        rules: prepared.ruleBytes,
+        parameters: parameters.bytes,
+      })
+    )
+      throw new TypeError("Native preparation lost its admitted credit");
+    async function prepareWithin(admitted: Want): Promise<Prepared | { retry: Want }> {
+      const triggers: Array<NativeRootPreparation["triggers"][number]> = [],
+        defaults: Array<NativeRootPreparation["defaults"][number]> = [];
+      let ruleBytes = 0,
+        prelude =
+          NATIVE_INPUT_CAPTURE_BYTES + PREPAID_QUERY_BYTES + nativeParameterMinimumBytes(plan),
+        preparationBytes = 0;
+      const release = (): void => {
+        bindings.length = 0;
+        reach?.close();
+        reach = null;
+        if (retained) paid.metadata.free(retained);
+        retained = 0;
+        if (paid.parameters.allocated) paid.parameters.free(paid.parameters.allocated);
+      };
+      try {
+        const reachBytes = nativeCommandReachBytes(catalog);
+        reach = await NativeCommandReach.prepare(
+          catalog,
+          plan.root as Extract<PhysicalPlan["root"], { op: "modify" }>,
+          paid.metadata,
+          { signal },
+        );
+        const prepared = reach;
+        const tables = prepared.tables.map((id) => {
+          const table = catalog.table(id);
+          if (!table) throw new TypeError("Missing native command table");
+          return table;
+        });
+        let bodyCount = 0;
+        for (const definition of prepared.triggers) bodyCount += definition.statements.length;
         // Preparation object, its arrays, one binding/trigger entry each, and array slots.
-        OBJECT_OVERHEAD_BYTES * (8 + 2 * tableCount + 2 * triggerCount) +
-        8 * (tableCount + triggerCount + bodyCount),
-    );
-    for (const id of reach.tables) {
-      const table = catalog.table(id);
-      if (!table) throw new TypeError("Missing native command table");
-      if (table.columns.some((c) => c.autoIncrement === true))
-        refuse("native trigger auto-increment preflight");
-      for (const index of table.indexes)
+        const containerBytes =
+          OBJECT_OVERHEAD_BYTES * (8 + 2 * tables.length + 2 * prepared.triggers.length) +
+          8 * (tables.length + prepared.triggers.length + bodyCount) +
+          CLOCK_BOUND_BYTES;
+        let bound = containerBytes;
+        for (const table of tables) bound += rulePreparationBound(table);
+        for (const definition of prepared.triggers)
+          for (const body of definition.statements) bound += bodyPreparationBound(body, catalog);
+        const base = NATIVE_ROOT_CREDIT_BYTES + reachBytes;
         if (
-          index.columnIds.length > 16 ||
-          index.columnIds.some((id) => {
-            const column = table.columns.find((c) => c.id === id);
-            return !column || ["varlen", "decimal"].includes(layoutOf(column.type));
-          })
-        )
-          refuse("native trigger indexed-domain preflight");
-      const step = await charge(
-        () => {
+          paid.metadata.held - paid.metadata.allocated < bound ||
+          admitted.metadata < base + bound
+        ) {
+          release();
+          return {
+            retry: { ...admitted, metadata: Math.max(admitted.metadata, base + bound) },
+          };
+        }
+        const parameters = await prepareParameters(
+          plan,
+          request.parameters,
+          signal,
+          governor.capBytes,
+          paid.parameters,
+        );
+        // Every build below runs inside the admitted bound; charge exactly what it retains.
+        const keep = (bytes: number, limit: number, what: string): void => {
+          if (bytes > limit) exceeded(what, bytes, limit);
+          if (!paid.metadata.allocate(bytes)) exceeded(what, bytes, paid.metadata.held);
+          retained += bytes;
+          preparationBytes += bytes;
+        };
+        const clock = clockParameter(
+          { kind: "timestamp", zoned: true },
+          request.execution.statementTime,
+        );
+        keep(
+          containerBytes - CLOCK_BOUND_BYTES + retainedBytes(clock),
+          containerBytes,
+          "container",
+        );
+        for (const table of tables) {
+          signal.throwIfAborted();
+          if (table.columns.some((c) => c.autoIncrement === true))
+            refuse("native trigger auto-increment preflight");
+          for (const index of table.indexes)
+            if (
+              index.columnIds.length > 16 ||
+              index.columnIds.some((id) => {
+                const column = table.columns.find((c) => c.id === id);
+                return !column || ["varlen", "decimal"].includes(layoutOf(column.type));
+              })
+            )
+              refuse("native trigger indexed-domain preflight");
           const expr = request.planner.lowerTableRules(table, catalog),
             program = compileTableRules(table, catalog.version, expr);
           qualify(program);
@@ -274,82 +332,80 @@ export async function executeNativeCommand(
                 columnId: column.id,
                 expr: expr.defaults?.find((d) => d.columnId === column.id)?.expr ?? null,
               });
-          return { expr, program, defaults: rows, minimum: minimum({ table, program }) };
-        },
-        (step) => retainedBytes(step),
-      );
-      bindings.push({ table, program: step.program, minimum: step.minimum, rules: null });
-      ruleBytes += step.minimum;
-      defaults.push(...step.defaults);
-    }
-    for (const definition of reach.triggers) {
-      const table = catalog.table(definition.tableId);
-      if (!table) throw new TypeError("Missing native trigger table");
-      const bodies: TriggerBodyRunner[] = [];
-      for (const body of definition.statements) {
-        const runner = await charge(
-          () => {
+          const bytes = minimum({ table, program });
+          keep(
+            ruleRetainedBytes({ expr, program, defaults: rows }),
+            rulePreparationBound(table),
+            "rule",
+          );
+          bindings.push({ table, program, minimum: bytes, rules: null });
+          ruleBytes += bytes;
+          for (const row of rows) defaults.push(row);
+        }
+        for (const definition of prepared.triggers) {
+          const table = catalog.table(definition.tableId);
+          if (!table) throw new TypeError("Missing native trigger table");
+          const bodies: TriggerBodyRunner[] = [];
+          for (const body of definition.statements) {
+            signal.throwIfAborted();
             const lowered = request.planner.lower(body.sql, {
               ...request.context,
               parameterTypes: body.bindings.map((binding) => binding.type),
             });
             if (lowered.kind !== "modify") refuse("non-modifying native trigger body");
             checkPlan(lowered.plan);
-            return new TriggerBodyRunner(table, body, lowered.plan);
-          },
-          // The runner's own plan copy shares the lowered graph; its binding program is
-          // sized by the binding descriptors it is compiled from.
-          (runner) =>
-            OBJECT_OVERHEAD_BYTES +
-            retainedBytes({ plan: runner.plan, bindings: body.bindings, minimum: 0 }),
-        );
-        bodies.push(runner);
-        prelude = Math.max(
-          prelude,
-          NATIVE_INPUT_CAPTURE_BYTES +
-            PREPAID_QUERY_BYTES +
-            nativeParameterMinimumBytes(runner.plan),
-        );
+            const runner = new TriggerBodyRunner(table, body, lowered.plan);
+            // The runner's plan copy shares the lowered graph; its binding program holds one
+            // column/slot entry per binding.
+            keep(
+              bodyRetainedBytes(runner.plan, body.bindings.length),
+              bodyPreparationBound(body, catalog),
+              "trigger body",
+            );
+            bodies.push(runner);
+            prelude = Math.max(
+              prelude,
+              NATIVE_INPUT_CAPTURE_BYTES +
+                PREPAID_QUERY_BYTES +
+                nativeParameterMinimumBytes(runner.plan),
+            );
+          }
+          triggers.push({ definition, bodies });
+        }
+        // Reach already supplies the UTF8 name/ID order.
+        const preparation: NativeRootPreparation = {
+          rootId: request.rootId,
+          catalog,
+          frames: prepared.frames,
+          rowEvents: prepared.rowEvents,
+          root: plan,
+          triggers,
+          tableIds: prepared.tables,
+          defaults,
+          clock,
+        };
+        const remainder = nativeCommandRootSetupBytes(preparation) + prelude;
+        const fixedMetadata = base + preparationBytes + remainder;
+        // A rebuild retains at most the bound, so this complete want always covers it.
+        const complete: Want = {
+          metadata: Math.max(admitted.metadata, base + bound + remainder),
+          rules: Math.max(admitted.rules, ruleBytes),
+          parameters: Math.max(admitted.parameters, parameters.bytes),
+        };
+        if (
+          paid.metadata.held < fixedMetadata ||
+          paid.rules.held < ruleBytes ||
+          paid.parameters.held < parameters.bytes
+        ) {
+          release();
+          return { retry: complete };
+        }
+        return { preparation, fixedMetadata, ruleBytes, parameters };
+      } catch (error) {
+        release();
+        throw error;
       }
-      triggers.push({ definition, bodies });
     }
-    // Reach already supplies the UTF8 name/ID order.
-    const preparation: NativeRootPreparation = {
-      rootId: request.rootId,
-      catalog,
-      frames: reach.frames,
-      rowEvents: reach.rowEvents,
-      root: plan,
-      triggers,
-      tableIds: reach.tables,
-      defaults,
-      clock,
-    };
-    const fixedMetadata =
-      NATIVE_ROOT_CREDIT_BYTES +
-      nativeCommandReachBytes(catalog) +
-      preparationBytes +
-      nativeCommandRootSetupBytes(preparation) +
-      prelude;
-    await paid.reserve(
-      {
-        metadata: fixedMetadata,
-        rules: ruleBytes,
-        parameters: needsParameterSizing(plan, request.parameters) ? PARAMETER_SIZING_BYTES : 0,
-      },
-      signal,
-    );
-    const parameters = await prepareParameters(
-      plan,
-      request.parameters,
-      signal,
-      governor.capBytes,
-      paid.parameters,
-    );
-    await paid.reserve(
-      { metadata: fixedMetadata, rules: ruleBytes, parameters: parameters.bytes },
-      signal,
-    );
     const bound = await parameters.bind(paid.parameters, request.execution.statementTime);
 
     for (const binding of bindings)
@@ -371,7 +427,7 @@ export async function executeNativeCommand(
         source: paid.source,
         prepareMetadata: (n, s) => paid.prepareMetadata(n, s),
         prepareSource: (n, s) => paid.prepareSource(n, s),
-        prepareRules: (_table, _image, _phase, s) => paid.protectRules(ruleBytes, s),
+        prepareRules: (_table, _image, _phase, s) => paid.protectRules(prepared.ruleBytes, s),
         releaseIdleStep: () => paid.releaseIdleStep(),
       },
       checkpoint: async () => {
@@ -383,7 +439,7 @@ export async function executeNativeCommand(
     });
     const rowCount = await root.run({ slots: bound.slots.slice(0, plan.placeholderCount) });
     await root.end();
-    result = { rowCount, tables: reach.tables.slice() };
+    result = { rowCount, tables: preparation.tableIds.slice() };
   } catch (reason) {
     failure = { reason };
   }
@@ -408,7 +464,8 @@ export async function executeNativeCommand(
     }
   }
   try {
-    reach?.close();
+    // Assigned by the preparation attempt closure; flow analysis cannot see that.
+    (reach as NativeCommandReach | null)?.close();
   } catch (error) {
     cleanup.push(error);
   }

@@ -129,6 +129,35 @@ export class NativeRootCredits {
     }
     return this.#fund(signal);
   }
+  /** Drops every retained minimum back to this controller's own 4096B and returns idle credit
+   * now, so the next reserve waits holding nothing else. Callers free their allocations first. */
+  releaseAll(): void {
+    this.#check();
+    for (const role of ROLES) {
+      if (this.#grants[role].allocated > (role === "metadata" ? NATIVE_ROOT_CREDIT_BYTES : 0))
+        throw new TypeError("Native root credit released while allocated");
+      this.#base[role] = role === "metadata" ? NATIVE_ROOT_CREDIT_BYTES : 0;
+      this.#wanted[role] = this.#base[role];
+    }
+    this.#reclaim();
+  }
+  /** Sets retained minima that already-held credit covers, without any wait or new boundary.
+   * Returns false, changing nothing, when any role would need more credit. */
+  cover(minimum: Partial<Record<Exclude<Role, "source">, number>>): boolean {
+    this.#check();
+    for (const role of ROLES) {
+      const n = role === "source" ? undefined : minimum[role];
+      if (n !== undefined && this.#grants[role].held < checked(n)) return false;
+    }
+    for (const role of ROLES) {
+      if (role === "source") continue;
+      const n = minimum[role];
+      if (n === undefined) continue;
+      this.#base[role] = Math.max(role === "metadata" ? NATIVE_ROOT_CREDIT_BYTES : 0, n);
+      this.#wanted[role] = this.#base[role];
+    }
+    return true;
+  }
   prepareMetadata(bytes: number, signal: AbortSignal): Promise<void> {
     this.#check();
     this.#wanted.metadata = Math.max(

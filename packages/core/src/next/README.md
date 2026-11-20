@@ -5060,14 +5060,17 @@ The internal ordinary owner dispatches qualified INSERT/UPDATE/DELETE commands t
 and row-rule funding stay separate. Graph I/O and leases retire before rules and credit.
 There is no public override, package-entry change or default-engine switch.
 
-Preparation is admitted step by step (`preparedStep`). Each table rule program and each
-trigger body plan is lowered as one planning step, measured, and charged to the root's
-metadata account before the next step or any wait. If held credit cannot cover a step, its
-result is dropped first, the account grows through the root's cancellable boundary, and the
-step is planned again from the same immutable catalog. No uncharged plan is held across a wait.
-Only one step's planning is in flight uncharged, the same policy as planning a root statement.
-A text-based size bound would be unsound: view expansion and long expression chains make the
-lowered size grow much faster than the stored SQL.
+Preparation admits its complete working set before anything is built and never waits while
+holding preparation. `owner/native-preparation-bound.ts` computes a static upper bound for every
+lowered rule program and trigger body from catalog metadata only: SQL token and character
+counts, OLD/NEW bindings, and the columns, stored DEFAULT/generated text and keys of each table
+the text names. Trigger bodies cannot name views and INSERT bodies use VALUES, so lowering grows
+at most linearly in those terms. One admission covers the whole bound (or fails with a typed
+53200 when the bound exceeds the cap), every build runs inside it, and an item that retains more
+than its bound fails loudly. Setup, rule and parameter workspaces can only be sized from the
+built preparation; if held credit does not cover them, every attempt object and charge is
+released and the complete, now-known working set is admitted from nothing before building
+again. The learned working set is kept per cached root plan, so later executions admit it at once.
 
 The same funded/SQL histories run at 32 MiB with `MINNOW_TRIGGER_CAP_MIB=32` and at
 64 MiB by default. They compare PostgreSQL BEFORE/AFTER name order, RI and nested bodies,

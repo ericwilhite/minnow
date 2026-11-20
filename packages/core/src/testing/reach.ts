@@ -11495,13 +11495,34 @@ export const NATIVE_ROOT_CREDITS_REACH = [
   "zero root ownership",
 ] as const;
 
-/** Native trigger preparation charges each planning step before the next step or any wait. */
+/** Static native preparation bounds cover the real lowerer and rule compiler. */
+export const NATIVE_PREPARATION_BOUND_REACH = [
+  "insert",
+  "update",
+  "delete",
+  "long chain",
+  "nested CASE",
+  "long IN list",
+  "long ASCII literal",
+  "long non-ASCII literal",
+  "subquery",
+  "subquery star",
+  "wide table",
+  "long defaults",
+  "generated columns",
+  "checks",
+  "several bodies",
+] as const;
+
+/** Native trigger preparation admits its whole bound before building and never waits holding it. */
 export const NATIVE_COMMAND_PREPARATION_REACH = [
   "no competing credit",
   "granted after release",
   "cancelled while waiting",
-  "waited before retaining",
-  "replanned after wait",
+  "waited holding nothing",
+  "admissions checked",
+  "released and retried",
+  "above-cap refusal before building",
   "exact PG rows",
   "large body",
   "several triggers",
