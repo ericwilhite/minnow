@@ -10,6 +10,8 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The unexported 1.0 rebuild bounds the work of its short-key join dispatch and hashes short TEXT keys through views over buffers it already holds, instead of copying them. Results are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.
+
 The unexported 1.0 rebuild reserves wide sort merge workspace independently of source batch size, including encoded keys and the `WITH TIES` boundary row when a competing query forces a smaller source recipe.
 
 The private 1.0 writer preserves exact BIGINT values when updating or deleting persisted
