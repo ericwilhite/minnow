@@ -104,12 +104,15 @@ function columns(): Array<{ type: PhysicalType; values: TestValue[] }> {
 
 interface StoredPage {
   readonly chunk: ColumnChunk;
+  readonly campaign: number;
   readonly entry: PageEntry;
   readonly dictionary: boolean;
 }
 
 let written: Written;
 let pages: StoredPage[] = [];
+const campaigns = Array.from({ length: 16 }, (_, index) => index);
+const checkedBytes = new Uint32Array(campaigns.length);
 
 beforeAll(async () => {
   const input = columns();
@@ -134,21 +137,27 @@ beforeAll(async () => {
   );
   const moved = defined(zipped.group.columns[0]);
   pages = [];
-  for (const chunk of [...written.group.columns, moved]) {
+  for (const [campaign, chunk] of [...written.group.columns, moved].entries()) {
     const reader = await openChunk(written.space, chunk);
-    for (const entry of reader.directory.pages) pages.push({ chunk, entry, dictionary: false });
+    for (const entry of reader.directory.pages)
+      pages.push({ chunk, campaign, entry, dictionary: false });
     if (reader.directory.dictionary !== null)
-      pages.push({ chunk, entry: reader.directory.dictionary, dictionary: true });
+      pages.push({ chunk, campaign, entry: reader.directory.dictionary, dictionary: true });
+    reader.close();
   }
 });
 
 async function loadOne(page: StoredPage): Promise<void> {
   const reader = await openChunk(written.space, page.chunk);
-  if (page.dictionary) await reader.loadDictionary();
-  else
-    await reader.load([
-      reader.directory.pages.findIndex((entry) => entry.offset === page.entry.offset),
-    ]);
+  try {
+    if (page.dictionary) await reader.loadDictionary();
+    else
+      await reader.load([
+        reader.directory.pages.findIndex((entry) => entry.offset === page.entry.offset),
+      ]);
+  } finally {
+    reader.close();
+  }
 }
 
 describe("corruption is refused, never decoded", () => {
@@ -165,33 +174,65 @@ describe("corruption is refused, never decoded", () => {
     expect([...kinds].some((encoding) => (encoding & PageEncoding.gzip) !== 0)).toBe(true);
   });
 
-  it("detects every single-byte change of every stored page by checksum", async () => {
-    const bytes = written.space.bytes;
-    const missed: number[] = [];
-    let flips = 0;
-    for (const page of pages) {
-      await loadOne(page); // intact: loads
-      const start = dataAddress(page.chunk.data) + page.entry.offset;
-      for (let at = start; at < start + page.entry.length; at++) {
-        for (const mask of [0x01, 0xff]) {
-          const original = bytes[at] ?? 0;
-          bytes[at] = original ^ mask;
-          try {
-            await loadOne(page);
-            missed.push(at);
-          } catch (error) {
-            if (!(error instanceof PageCorruptionError || error instanceof StoreCorruptionError))
-              missed.push(at);
-          } finally {
-            bytes[at] = original;
+  it.each(campaigns)(
+    "detects every single-byte change of every stored page by checksum (column %i)",
+    async (campaign) => {
+      const bytes = written.space.bytes;
+      const missed: number[] = [];
+      let flips = 0;
+      const selected = pages.filter((page) => page.campaign === campaign);
+      expect(selected.length).toBeGreaterThan(0);
+      for (const page of selected) {
+        await loadOne(page); // intact: loads
+        // The directory is intact throughout this page's campaign. Parse it once, but keep
+        // payload reads cold: release every loaded page and use the uncached test-store view.
+        // Dictionaries survive release(), so their mutations still use a fresh reader.
+        const reader = page.dictionary ? null : await openChunk(written.space, page.chunk);
+        const indices =
+          reader === null
+            ? []
+            : [reader.directory.pages.findIndex((entry) => entry.offset === page.entry.offset)];
+        const start = dataAddress(page.chunk.data) + page.entry.offset;
+        try {
+          for (let at = start; at < start + page.entry.length; at++) {
+            for (const mask of [0x01, 0xff]) {
+              const original = bytes[at] ?? 0;
+              bytes[at] = original ^ mask;
+              try {
+                if (reader === null) await loadOne(page);
+                else await reader.load(indices);
+                missed.push(at);
+              } catch (error) {
+                if (!(
+                  error instanceof PageCorruptionError || error instanceof StoreCorruptionError
+                ))
+                  missed.push(at);
+              } finally {
+                bytes[at] = original;
+                reader?.release();
+              }
+              flips++;
+            }
           }
-          flips++;
+        } finally {
+          reader?.close();
         }
       }
-    }
-    expect(missed).toEqual([]);
+      expect(missed).toEqual([]);
+      expect(flips).toBe(selected.reduce((sum, page) => sum + page.entry.length * 2, 0));
+      checkedBytes[campaign] = flips;
+    },
+    120_000,
+  );
+
+  it("detects every single-byte change of every stored page by checksum (complete inventory)", () => {
+    // Partition only the original independent columns. Every byte still gets both original
+    // masks, including dictionaries and gzip; a missing/duplicated column fails this audit.
+    expect(new Set(pages.map((page) => page.campaign)).size).toBe(campaigns.length);
+    const flips = checkedBytes.reduce((sum, count) => sum + count, 0);
     expect(flips).toBeGreaterThan(50_000);
-  }, 120_000);
+    expect(flips).toBe(pages.reduce((sum, page) => sum + page.entry.length * 2, 0));
+  });
 
   it("detects every single-byte change of every page directory", async () => {
     const bytes = written.space.bytes;
@@ -226,6 +267,9 @@ describe("corruption is refused, never decoded", () => {
       if (page.dictionary || (page.entry.encoding & PageEncoding.gzip) !== 0) continue;
       const reader = await openChunk(written.space, page.chunk);
       const tag = reader.directory.tag;
+      // decodeRange overwrites the complete target. Reuse its 1 MiB payload allocation;
+      // each mutation still gets its own source copy and all the original decode checks.
+      const target = targetFor(reader, page.entry.rowCount, varlenBytes, { forceInt64: true });
       const start = dataAddress(page.chunk.data) + page.entry.offset;
       for (let at = start; at < start + page.entry.length; at++) {
         for (const mask of [0x01, 0xff]) {
@@ -244,7 +288,6 @@ describe("corruption is refused, never decoded", () => {
           const field = at - start;
           if (!(field === 2 || (field >= 8 && field < 12) || field >= 16))
             problems.push(`header byte ${String(field)} passed`);
-          const target = targetFor(reader, page.entry.rowCount, varlenBytes, { forceInt64: true });
           if (target.data.layout === "varlen") target.data.offsets[0] = 0;
           try {
             decodeRange(view, 0, page.entry.rowCount, target, 0, null);

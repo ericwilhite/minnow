@@ -67,6 +67,7 @@ it.each(seedsFor("next-validated-root", [0xb2f1, 0xb2f2]))(
                 dictionarySize: null,
               },
               distinctSketch: i % 2 ? blob : null,
+              aggregateSummary: null,
             })),
           };
           const bytes = encodeGroupRoot(root),
@@ -325,6 +326,7 @@ it.each(seedsFor("next-validated-root-pressure", [0xb2f3, 0xb2f4]))(
             directory: { extent, offset: 128, length: 0, checksum: 0 },
             statistics: { nullCount: 0, min: null, max: null, dictionarySize: null },
             distinctSketch: null,
+            aggregateSummary: null,
           })),
         };
         const ref = (await space.beginWrite("sizing").write([encodeGroupRoot(root)])).blobs[0];

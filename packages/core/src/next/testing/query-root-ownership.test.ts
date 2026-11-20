@@ -78,6 +78,7 @@ it.each(seedsFor("next-query-root-ownership", [0xb2e3, 0xb2e4]))(
               dictionarySize: null,
             },
             distinctSketch: null,
+            aggregateSummary: null,
           })),
         };
         const bytes = encodeGroupRoot(expected);

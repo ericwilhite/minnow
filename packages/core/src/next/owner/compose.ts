@@ -1,5 +1,8 @@
 import { LiveRuntime } from "../live/runtime.js";
 import type { OwnerSnapshotOperations } from "./snapshot-connection.js";
+import { inspectReply } from "./admin-reply.js";
+import { describeCatalog, catalogDescriptionBytes } from "./catalog-description.js";
+import { describeExplain, explainDescriptionBytes } from "./explain-description.js";
 import { StatementRules } from "../exec/statement-rules.js";
 /**
  * The composition root's engine: `OwnerEngine` and `EngineSession` (engine.ts) over the planner
@@ -547,6 +550,12 @@ class ComposedEngine implements CatalogOwnerEngine {
     return (this.#live ??= new LiveRuntime(this, this.#options.governor, feed));
   }
 
+  async retireLive(): Promise<void> {
+    const live = this.#live;
+    await live?.close();
+    this.#live = null;
+  }
+
   onCommit(listener: (tables: readonly number[]) => void): () => void {
     const feed = this.#options.writePath.changes;
     if (feed !== undefined)
@@ -571,7 +580,44 @@ class ComposedEngine implements CatalogOwnerEngine {
     }
   }
 
-  admin(op: string): Promise<unknown> {
+  admin(
+    op: string,
+    args: readonly WireValue[] = [],
+    context?: RunContext,
+    session?: EngineSession,
+  ): Promise<unknown> {
+    if (op === "describeCatalog" || op === "explain") {
+      if (
+        op === "describeCatalog"
+          ? args.length !== 0
+          : args.length !== 1 || typeof args[0] !== "string"
+      )
+        return Promise.reject(new TypeError(`Invalid ${op} arguments`));
+      const catalog = () => {
+        if (session === undefined) return this.#options.writePath.catalog;
+        if (session.inspectionCatalog === undefined)
+          throw new TypeError("Session inspection unavailable");
+        return session.inspectionCatalog();
+      };
+      const version = () => catalog().version;
+      if (op === "describeCatalog")
+        return inspectReply(
+          this.#options.governor,
+          version,
+          () => catalogDescriptionBytes(catalog()),
+          () => describeCatalog(catalog()),
+          context?.signal,
+        );
+      const sql = args[0] as string;
+      const plan = () => (session === undefined ? this.plan(sql) : session.plan(sql));
+      return inspectReply(
+        this.#options.governor,
+        version,
+        () => explainDescriptionBytes(plan()),
+        () => describeExplain(plan()),
+        context?.signal,
+      );
+    }
     if (op === "catalog")
       return Promise.resolve(structuredClone(inspectCatalog(this.#options.writePath.catalog)));
     if (op === "storageStats") return Promise.resolve({ ...this.#options.writePath.stats() });
@@ -721,6 +767,10 @@ class ComposedSession implements EngineSession {
   /** The catalog this session's statements see. */
   #catalog(): CatalogView {
     return this.#tx?.catalog ?? this.#readPin?.catalog ?? this.#writePath().catalog;
+  }
+
+  inspectionCatalog(): CatalogView {
+    return this.#catalog();
   }
 
   get catalogVersion(): number {
@@ -985,6 +1035,7 @@ class ComposedSession implements EngineSession {
     if (this.#state === "open" && this.#tx !== null) {
       const tx = this.#tx;
       const statement = tx.statement({
+        readOnly: true,
         rules: this.#rules(() => statement.catalog),
         signal: context.signal,
       });

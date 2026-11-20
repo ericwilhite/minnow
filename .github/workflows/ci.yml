@@ -3,8 +3,8 @@
 # Split by failure domain: the static checks catch most mistakes, the unit suite proves behavior
 # and holds the coverage floors, the browser matrix proves storage and site behavior a Node
 # substitute cannot, and the oldest-Node suite proves the oldest Node the package claims to support
-# still runs it. The performance gate deliberately lives in its own scheduled workflow — it
-# measures a machine as much as the code, so it must never block a merge.
+# still runs it. Event-loop latency contracts have an isolated serial runner here. Broader
+# performance benchmarks live in their scheduled workflow and do not block a merge.
 #
 # The long suites are spread across parallel runners, in parts balanced by measured duration so
 # they finish together (scripts/test-parts.mjs). Each split gate ends in an aggregate job
@@ -17,6 +17,8 @@ on:
   push:
     branches: [main]
   pull_request:
+    # Drafts skip the gate; marking a PR ready for review runs it.
+    types: [opened, synchronize, reopened, ready_for_review]
   # The whole gate on any branch (`gh workflow run CI --ref <branch>`), e.g. a merge candidate,
   # without opening a pull request. Release publishing follows only push runs on main.
   workflow_dispatch:
@@ -32,6 +34,7 @@ permissions:
 jobs:
   static:
     name: Format, types, lint, build, API contract, SQLLogicTest, heap plateau
+    if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -68,6 +71,22 @@ jobs:
       - name: Heap plateau
         run: npm run soak:memory
 
+  # A fresh hosted runner executes only these latency workloads, one worker and no
+  # coverage instrumentation. The parallel unit lane keeps deterministic work counts.
+  stall-latency:
+    name: Event-loop latency guarantees (isolated)
+    if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/install
+        with:
+          node-version: 24
+      - run: npm run test:prepare
+      - name: Require original stall and key-forward trim limits
+        run: npx vitest run --config vitest.stall-latency.config.ts --project stall-latency --maxWorkers=1
+
   # The unit suite under coverage, in seven parts. Every test file runs in exactly one part, chosen
   # by its measured duration (scripts/test-shards.ts, weights in scripts/test-durations.json) so the
   # parts finish together; each part starts its longest files first. The maintenance workload has
@@ -77,6 +96,7 @@ jobs:
   # its files and its reach-union check in one part.
   unit:
     name: Unit tests with coverage (${{ matrix.part }})
+    if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
     strategy:
@@ -129,7 +149,7 @@ jobs:
   coverage:
     name: Unit test results and coverage floors
     needs: unit
-    if: ${{ !cancelled() }}
+    if: ${{ (!cancelled()) && (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -166,8 +186,8 @@ jobs:
   # static checks, every unit-test part, and the merged coverage gate all passed.
   check:
     name: Format, types, lint, build, unit tests
-    if: always()
-    needs: [static, unit, coverage]
+    if: ${{ (always()) && (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
+    needs: [static, unit, coverage, stall-latency]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -176,14 +196,17 @@ jobs:
           STATIC_RESULT: ${{ needs.static.result }}
           UNIT_RESULT: ${{ needs.unit.result }}
           COVERAGE_RESULT: ${{ needs.coverage.result }}
+          STALL_RESULT: ${{ needs.stall-latency.result }}
         run: |
           echo "static: $STATIC_RESULT, unit parts: $UNIT_RESULT, coverage: $COVERAGE_RESULT"
           test "$STATIC_RESULT" = "success"
           test "$UNIT_RESULT" = "success"
           test "$COVERAGE_RESULT" = "success"
+          test "$STALL_RESULT" = "success"
 
   browser-matrix:
     name: Real browser (${{ matrix.name }})
+    if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     # Each browser step first runs `tsc -b packages/core --force`, which outgrew Node's default
@@ -338,7 +361,7 @@ jobs:
   # result fail the aggregate gate.
   browser:
     name: Real browsers
-    if: always()
+    if: ${{ (always()) && (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
     needs: browser-matrix
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -369,6 +392,7 @@ jobs:
 
   engines-floor-part:
     name: Unit tests on the oldest supported Node (${{ matrix.shard }})
+    if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
     runs-on: ubuntu-latest
     # The whole unit suite without coverage, in four parts balanced by measured file duration
     # (scripts/test-shards.ts). Node 22 runs the fake-indexeddb simulator seeds about twice as
@@ -419,7 +443,7 @@ jobs:
   # Preserve the stable check name for the oldest-Node gate: it passes only when every shard did.
   engines-floor:
     name: Unit tests on the oldest supported Node
-    if: always()
+    if: ${{ (always()) && (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
     needs: engines-floor-part
     runs-on: ubuntu-latest
     timeout-minutes: 10

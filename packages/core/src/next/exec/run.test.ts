@@ -1,5 +1,5 @@
 import { DeferredGrant } from "./deferred-grant.js";
-import { ResultSink } from "./result-sink.js";
+import { ResultSink, resultRowOverheadBytes } from "./result-sink.js";
 import { ResultChannel } from "./result.js";
 import { acquirePhasePool } from "./phase-pool.js";
 import { expect, it } from "vitest";
@@ -576,13 +576,18 @@ it.each(seedsFor("next-phase-progress-envelope", [0xb4d9, 0xb4da]))(
           runtime.readMinimum(0, source);
           const entries = [{ rel: { id: 9, op: "aggregate" as const }, minimum: 64, loanSlots: 1 }];
           const progress = source * multiple + 65536;
-          expect(runtime.minimumBytes(entries)).toBe(64 + 3 * progress);
+          // Delivery funds the one-column frame's fixed construction once per step,
+          // on top of whichever payload envelope dominates (result-sink.ts recipe).
+          const frame = resultRowOverheadBytes(1) + 64;
+          expect(runtime.minimumBytes(entries)).toBe(64 + 3 * progress + frame);
           reach.reach("compound initial");
           runtime.readMinimum(0, 0, progress);
-          expect(runtime.minimumBytes(entries)).toBe(64 + 3 * progress);
+          expect(runtime.minimumBytes(entries)).toBe(64 + 3 * progress + frame);
           reach.reach("saved unchanged");
           runtime.readMinimum(0, 2 * source, progress);
-          expect(runtime.minimumBytes(entries)).toBe(64 + 3 * (2 * source * multiple + 65536));
+          expect(runtime.minimumBytes(entries)).toBe(
+            64 + 3 * (2 * source * multiple + 65536) + frame,
+          );
           reach.reach("future source");
           await runtime.close();
           result.close();

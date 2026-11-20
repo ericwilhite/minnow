@@ -303,6 +303,7 @@ export interface SelectContext {
   /** The chunk's matching dictionary codes (dictionary pages). */
   readonly codes: Uint32Array | null;
   readonly dictionary: PageDictionary | null;
+  /** May acquire the owner's charged workspace on first access; encoded kernels do not need it. */
   readonly scratch: SelectScratch;
   /** Loaded out-of-line values (varlen pages with large rows, ordering comparisons). */
   readonly values: LargeResolver | null;

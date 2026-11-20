@@ -11,6 +11,8 @@
  * collation fallback.
  */
 import { BATCH_TARGET_BYTES, type VectorData } from "./vector.js";
+import { encodeUtf8Into, utf8Length } from "../utf8.js";
+export { utf8Length } from "../utf8.js";
 
 type VarlenData = Extract<VectorData, { layout: "varlen" }>;
 
@@ -38,7 +40,6 @@ export function varlenMatchesString(data: VarlenData, slot: number, label: strin
   return cursor === end;
 }
 
-const encoder = new TextEncoder();
 // SQL TEXT has no transport BOM: U+FEFF is a stored character, including at offset zero.
 const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
@@ -48,7 +49,10 @@ const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
  */
 export interface ByteCharge {
   /** Optional encoding optimizations may decline without requesting async admission. */
-  tryAllocate?(bytes: number): boolean;
+  tryAllocate?(bytes: number, reserve?: number): boolean;
+  /** Fund the required step before any buffer. Optional headroom is best effort,
+   * synchronous and never part of a minimum or an asynchronous admission. */
+  preflightAllocation?(bytes: number, optionalBytes?: number): void;
   allocate(bytes: number): boolean;
   free(bytes: number): void;
 }
@@ -62,24 +66,6 @@ export interface ByteCharge {
  *   the retry allocates from the loaned bytes.
  */
 export type AppendResult = "ok" | "full" | "denied";
-
-/** UTF-8 length of a JS string without encoding it. */
-export function utf8Length(value: string): number {
-  let bytes = 0;
-  for (let index = 0; index < value.length; index++) {
-    const code = value.charCodeAt(index);
-    if (code < 0x80) bytes += 1;
-    else if (code < 0x800) bytes += 2;
-    else if (code >= 0xd800 && code <= 0xdbff && index + 1 < value.length) {
-      const next = value.charCodeAt(index + 1);
-      if (next >= 0xdc00 && next <= 0xdfff) {
-        bytes += 4;
-        index += 1;
-      } else bytes += 3;
-    } else bytes += 3;
-  }
-  return bytes;
-}
 
 /**
  * Builds varlen data row by row into buffers reused across batches, under a memory grant.
@@ -172,7 +158,7 @@ export class VarlenBuilder {
     const length = utf8Length(value);
     const result = this.#admit(length);
     if (result !== "ok") return result;
-    const { written } = encoder.encodeInto(value, this.#bytes.subarray(this.#used));
+    const written = encodeUtf8Into(value, this.#bytes.subarray(this.#used), length);
     this.#used += written;
     this.#close();
     return "ok";

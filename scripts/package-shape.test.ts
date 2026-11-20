@@ -1,8 +1,8 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { cp, mkdir, mkdtemp, readdir, readFile, rm, symlink } from "node:fs/promises";
+import { constants, existsSync, readdirSync, readFileSync } from "node:fs";
+import { copyFile, cp, mkdir, mkdtemp, readdir, readFile, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 const repoRoot = join(import.meta.dirname, "..");
@@ -27,6 +27,27 @@ async function filesUnder(directory: string, prefix = ""): Promise<string[]> {
       files.push(...(await filesUnder(join(directory, entry.name), relative)));
     else files.push(relative);
   }
+  return files;
+}
+
+/** Clone every emitted input with bounded I/O, without cp's repeated per-file metadata walk. */
+async function cloneBuildTree(source: string, destination: string): Promise<string[]> {
+  const files = await filesUnder(source);
+  const directories = new Set(files.map((file) => dirname(file)));
+  await Promise.all(
+    [...directories].map((directory) => mkdir(join(destination, directory), { recursive: true })),
+  );
+  let next = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(16, files.length) }, async () => {
+      for (;;) {
+        const file = files[next++];
+        if (file === undefined) return;
+        // Copy-on-write when available, ordinary copy otherwise; prepack owns its writes.
+        await copyFile(join(source, file), join(destination, file), constants.COPYFILE_FICLONE);
+      }
+    }),
+  );
   return files;
 }
 
@@ -148,13 +169,31 @@ describe("published core tarball", () => {
       f: (value: number) => number;
     };
     expect(module.f(41)).toBe(42);
+    const started = performance.now();
+    const reportPhase = (phase: string) => {
+      if (process.env.MINNOW_PACKAGE_SHAPE_REPORT)
+        console.info(
+          JSON.stringify({ phase, milliseconds: Math.round(performance.now() - started) }),
+        );
+    };
     const coreRoot = join(repoRoot, "packages", "core");
     const manifest = JSON.parse(await readFile(join(coreRoot, "package.json"), "utf8")) as {
       scripts?: Record<string, string>;
+      files?: string[];
     };
     expect(manifest.scripts?.prepack).toBe(
       "node ../../scripts/prepare-package.mjs --strip-comments",
     );
+    const fixtureRoots = (await readdir(coreRoot, { withFileTypes: true })).filter(
+      (entry) => entry.isFile() || entry.name === "dist",
+    );
+    // Every positive publish input must be in the reduced fixture, including root JSON.
+    // A future directory/glob addition must update the fixture rather than pass vacuously.
+    expect(
+      manifest.files?.filter(
+        (path) => !path.startsWith("!") && !fixtureRoots.some((entry) => entry.name === path),
+      ),
+    ).toEqual([]);
     // npm's prepack hook rewrites JavaScript. Pack an isolated copy so concurrent bundle and
     // declaration tests always read the original build, never partially rewritten files.
     const originalOptimizer = await readFile(
@@ -164,7 +203,19 @@ describe("published core tarball", () => {
     const isolatedRoot = await mkdtemp(join(tmpdir(), "minnow-package-shape-"));
     const isolatedCore = join(isolatedRoot, "packages", "core");
     try {
-      await cp(coreRoot, isolatedCore, { recursive: true });
+      await mkdir(isolatedCore, { recursive: true });
+      // npm publishes root metadata and dist. Keep the ENTIRE dist tree, including every
+      // excluded rebuild/test declaration, so all archive-exclusion checks remain real.
+      // Source, browser fixtures and SQLLogicTest inputs never participate in prepack.
+      let distFiles: string[] = [];
+      for (const entry of fixtureRoots) {
+        const source = join(coreRoot, entry.name);
+        const destination = join(isolatedCore, entry.name);
+        if (entry.name === "dist") distFiles = await cloneBuildTree(source, destination);
+        else await copyFile(source, destination, constants.COPYFILE_FICLONE);
+      }
+      expect((await filesUnder(join(isolatedCore, "dist"))).sort()).toEqual(distFiles.sort());
+      reportPhase("clone");
       await mkdir(join(isolatedRoot, "scripts"));
       for (const script of ["prepare-package.mjs", "strip-dist-comments.mjs"]) {
         await cp(join(repoRoot, "scripts", script), join(isolatedRoot, "scripts", script));
@@ -175,6 +226,7 @@ describe("published core tarball", () => {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "ignore"],
       });
+      reportPhase("pack");
       const [report] = JSON.parse(output.slice(output.indexOf("["))) as Array<{
         size: number;
         unpackedSize: number;
@@ -192,11 +244,15 @@ describe("published core tarball", () => {
       expect(report?.files.filter(({ path }) => path.includes(".test-support."))).toEqual([]);
       // prepare-package.mjs strips only the JavaScript it expects to ship; every shipped file
       // must come out stripped, so a too-wide skip rule fails here.
-      for (const { path } of report?.files ?? []) {
-        if (!path.endsWith(".js")) continue;
-        const shipped = await readFile(join(isolatedCore, path), "utf8");
-        expect(shipped, path).not.toMatch(/^\s*(?:\/\*\*|\/\/)/mu);
-      }
+      const javaScript = (report?.files ?? []).filter(({ path }) => path.endsWith(".js"));
+      for (let from = 0; from < javaScript.length; from += 16)
+        await Promise.all(
+          javaScript.slice(from, from + 16).map(async ({ path }) => {
+            const shipped = await readFile(join(isolatedCore, path), "utf8");
+            expect(shipped, path).not.toMatch(/^\s*(?:\/\*\*|\/\/)/mu);
+          }),
+        );
+      reportPhase("inspect JavaScript");
       // Existing publication budgets also cover declaration pruning. Raised from 870,000 and
       // 4,300,000 with 0.10.1's coordination and recovery fixes, then to 920,000 and 4,500,000
       // when the interaction-plan simulator joined the published testing entry, then to 955,000
@@ -260,6 +316,7 @@ describe("published core tarball", () => {
       );
     } finally {
       await rm(isolatedRoot, { recursive: true, force: true });
+      reportPhase("cleanup");
     }
   }, 60_000);
 });

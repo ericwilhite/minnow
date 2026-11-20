@@ -36,7 +36,7 @@ import {
 } from "./parameters.js";
 import { RESULT_FRAME_TARGET_BYTES, RESULT_WINDOW_BYTES, ResultChannel } from "./result.js";
 import type { ResultAllocator } from "./result-buffer.js";
-import { ResultSink, resultFrameMetadataBytes } from "./result-sink.js";
+import { ResultSink, resultFrameMetadataBytes, resultRowOverheadBytes } from "./result-sink.js";
 import type { ParameterSlots, CallResolver } from "./kernels/compile.js";
 import { ReservedGrant } from "./admission.js";
 import { DeferredGrant } from "./deferred-grant.js";
@@ -308,6 +308,11 @@ export class QueryRuntime {
           ),
           this.#resultCopies,
           this.#resultCopySourceProgress ?? this.#progressBytes,
+          this.#resultCopies,
+          // Payload bounds exclude the binding-only UTF16 slice. Delivery must
+          // independently fund frame metadata, fixed arrays, arena overlap and
+          // promotions, including each field's minimum 64-byte arena.
+          resultRowOverheadBytes(this.plan.columns.length) + 64 * this.plan.columns.length,
         )
       : // A JSON checkpoint bounds its complete serialized row, including repeated aliases.
         // Only an input/source envelope needs the separate logical copy multiplier.
@@ -369,6 +374,10 @@ export class QueryRuntime {
       pages: this.view.pages,
       table: (id, options) => this.#sourceRecipes.get(id)?.table ?? this.view.table(id, options),
     };
+  }
+  /** Exact row count of an explicitly retained source, never a pruning certificate. */
+  residentSourceRows(tableId: number): number | null {
+    return this.#sourceRecipes.get(tableId)?.table.liveRowCount ?? null;
   }
   retryResidentSources(
     sources: ReadonlyArray<{ readonly tableId: number }>,
@@ -541,6 +550,7 @@ export class QueryRuntime {
     copies = 1,
     readProgress = this.#progressBytes,
     savedCopies = copies,
+    fixedBytes = 0,
   ): number {
     // ReadBound.progress already covers a complete source prefix, not one cell.
     // Add newly materialized inline/literal/owned-parameter columns; multiply only
@@ -550,7 +560,12 @@ export class QueryRuntime {
         this.#expressionProgress +
         4 * inputs * this.#expressionMultiplicity
       : Math.max(readProgress, largestInput);
-    return Math.max(MAX_BLOB_BYTES, savedCopies * this.#savedProgressBytes, copies * current);
+    // Fixed frame construction costs are funded once per step, whichever payload
+    // envelope (a retired producer's saved step or the current one) dominates.
+    return Math.max(
+      MAX_BLOB_BYTES,
+      Math.max(savedCopies * this.#savedProgressBytes, copies * current) + fixedBytes,
+    );
   }
   #operatorStepBytes(
     rel: OperatorIdentity,
@@ -621,8 +636,17 @@ export class QueryRuntime {
       this.#groupKeyProgress?.(rel.id, slot, slots ?? [], largest, minimum, baseline) ?? 0,
     );
   }
+  readonly #stepOwners = new Set<number>();
+  /** A streaming source may own progress without an extra nested helper loan. */
+  operatorStepOwner(id: number): void {
+    this.#stepOwners.add(id);
+  }
   operatorStep(rel: OperatorIdentity): number {
     return this.#operatorProgress.get(rel.id) ?? 0;
+  }
+  /** The scoped lane, including its complete provenance recipe, was funded atomically. */
+  operatorLoanBytes(rel: OperatorIdentity, slot = 0): number {
+    return this.#laneBytes(rel, slot, this.operatorStep(rel), this.#parameterSlotBytes);
   }
 
   minimumBytes(
@@ -637,6 +661,7 @@ export class QueryRuntime {
     for (const entry of entries) {
       const canBorrow =
         (entry.loanSlots ?? 0) > 0 ||
+        this.#stepOwners.has(entry.rel.id) ||
         ["sort", "aggregate", "join", "window", "setOp", "modify"].includes(entry.rel.op);
       if (!canBorrow) continue;
       const progress = this.#operatorStepBytes(entry.rel, inputs, largestInput, slots);
@@ -754,6 +779,7 @@ export class QueryRuntime {
     );
     const canBorrow = (rel: OperatorIdentity) =>
       explicitLoans.has(rel.id) ||
+      this.#stepOwners.has(rel.id) ||
       rel.op === "sort" ||
       rel.op === "aggregate" ||
       rel.op === "join" ||

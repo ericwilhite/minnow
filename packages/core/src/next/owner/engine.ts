@@ -62,6 +62,7 @@ import type { OwnerSnapshotOperations } from "./snapshot-connection.js";
  * aborts (the executor cancels; the transaction rolls back). From that call on the signal is
  * ignored and the run completes.
  */
+import type { CatalogView } from "../access/catalog.js";
 import type { CommitRequest, Durability } from "../access/write-path.js";
 import type { SequenceSession } from "../exec/executor.js";
 import type { ResultFrame, ResultStream } from "../exec/result.js";
@@ -156,6 +157,8 @@ export interface EngineSession {
    * DDL), a read-only transaction's pinned one, or the committed one.
    */
   readonly catalogVersion: number;
+  /** Read-only owner inspection. Never retain this catalog across admission/await. */
+  inspectionCatalog?(): CatalogView;
   /**
    * Plans `text` against that catalog. Plans of committed catalogs are shared across sessions;
    * plans against a transaction's uncommitted schema stay private to the session and are dropped
@@ -223,6 +226,8 @@ export interface OwnerEngine {
 
   /** Native live runtime; absent only on older test engines. */
   readonly live?: LiveRuntime;
+  /** Exclusive replacement barrier: drain live execution and detach the old publication feed. */
+  retireLive?(): Promise<void>;
   readonly snapshots?: OwnerSnapshotOperations | undefined;
   /** Durable database incarnation; owner changes alone do not change it. */
   readonly databaseId: bigint;
@@ -247,7 +252,12 @@ export interface OwnerEngine {
   /** Calls `listener` after native publication. An empty list means globally dirty (catalog/unknown/reset). */
   onCommit(listener: (tables: readonly number[]) => void): () => void;
   /** Admin calls (protocol.ts `AdminOp`), each with its structured-clone value. */
-  admin(op: string, args: readonly WireValue[], context: RunContext): Promise<unknown>;
+  admin(
+    op: string,
+    args: readonly WireValue[],
+    context: RunContext,
+    session?: EngineSession,
+  ): Promise<unknown>;
   /**
    * Starts a log flush now if relaxed commits are pending; resolves when they are durable, at
    * once if none are (ruling R9: called when the host reports `hidden`).

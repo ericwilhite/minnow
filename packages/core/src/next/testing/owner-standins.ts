@@ -316,6 +316,10 @@ export interface StandinWritePathOptions {
 
 export class StandinWritePath implements WritePath {
   readonly databaseId = 1n;
+  /** The stand-in admits no write growth, so owner holdings change nothing. */
+  retainOwnerHoldings(): () => void {
+    return () => undefined;
+  }
   readonly durability: "strict" | "relaxed";
   /**
    * Called with each statement's options as it opens (tests): the stand-in enforces no rules, so a
