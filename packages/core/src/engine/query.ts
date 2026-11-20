@@ -4006,12 +4006,15 @@ function assertTopLevelNamesResolve(
   const aliases = sources.map((source) => source.alias);
   const known = sources.map((source) => columnsOf(source.table));
   const outputs = new Set(plan.select.map((item) => item.alias));
-  const references = (expression: Expression): string[] =>
-    expression.kind === "column"
-      ? !recordDeclaredTypes || rowFieldSource(expression) === undefined
-        ? [expression.reference]
-        : []
-      : childExpressions(expression).flatMap(references);
+  // One accumulator in depth-first order: a per-level flatMap would copy every descendant's
+  // references again at each ancestor, quadratic in the expression depth.
+  const references = (expression: Expression, found: string[] = []): string[] => {
+    if (expression.kind === "column") {
+      if (!recordDeclaredTypes || rowFieldSource(expression) === undefined)
+        found.push(expression.reference);
+    } else for (const child of childExpressions(expression)) references(child, found);
+    return found;
+  };
   const check = (expression: Expression): void => {
     for (const reference of references(expression)) {
       const dot = reference.indexOf(".");
@@ -4690,9 +4693,47 @@ function someNestedBlock(block: CompiledQuery, test: (nested: CompiledQuery) => 
  * columns are DATE. A column the caller cannot type is not an integer, so the compiler's static
  * answer only ever widens once the catalog is known.
  */
+/**
+ * Per-pass memo for `integerTypedExpression` while `annotateIntegerDivision` runs. That pass
+ * types every node bottom-up; without the memo each node re-types its whole subtree, which is
+ * quadratic in an operator chain. Keyed by the column resolver, so a subquery block's own scope
+ * never shares answers with its parent. Cleared when the outermost pass returns.
+ */
+let integerMemo: WeakMap<object, WeakMap<Expression, boolean>> | null = null;
+
 export function integerTypedExpression(
   expression: Expression,
   columnInteger: (reference: string) => boolean = () => false,
+  tableIntegerColumns?: (table: string) => IntegerColumns | undefined,
+  columnDatetime: (reference: string) => DatetimeTypeKind | undefined = () => undefined,
+  tableDatetimes?: (table: string) => DatetimeColumns | undefined,
+): boolean {
+  if (integerMemo === null)
+    return integerTypedExpressionOnce(
+      expression,
+      columnInteger,
+      tableIntegerColumns,
+      columnDatetime,
+      tableDatetimes,
+    );
+  let memo = integerMemo.get(columnInteger);
+  if (memo === undefined) integerMemo.set(columnInteger, (memo = new WeakMap()));
+  const known = memo.get(expression);
+  if (known !== undefined) return known;
+  const answer = integerTypedExpressionOnce(
+    expression,
+    columnInteger,
+    tableIntegerColumns,
+    columnDatetime,
+    tableDatetimes,
+  );
+  memo.set(expression, answer);
+  return answer;
+}
+
+function integerTypedExpressionOnce(
+  expression: Expression,
+  columnInteger: (reference: string) => boolean,
   tableIntegerColumns?: (table: string) => IntegerColumns | undefined,
   columnDatetime: (reference: string) => DatetimeTypeKind | undefined = () => undefined,
   tableDatetimes?: (table: string) => DatetimeColumns | undefined,
@@ -4889,6 +4930,35 @@ export function integerQuotient(left: number, right: number): number | null {
 export function annotateIntegerDivision(
   expression: Expression,
   columnInteger: (reference: string) => boolean = () => false,
+  tableIntegerColumns?: (table: string) => IntegerColumns | undefined,
+  columnDatetime: (reference: string) => DatetimeTypeKind | undefined = () => undefined,
+  tableDatetimes?: (table: string) => DatetimeColumns | undefined,
+): void {
+  if (integerMemo !== null)
+    return annotateIntegerDivisionOnce(
+      expression,
+      columnInteger,
+      tableIntegerColumns,
+      columnDatetime,
+      tableDatetimes,
+    );
+  integerMemo = new WeakMap();
+  try {
+    annotateIntegerDivisionOnce(
+      expression,
+      columnInteger,
+      tableIntegerColumns,
+      columnDatetime,
+      tableDatetimes,
+    );
+  } finally {
+    integerMemo = null;
+  }
+}
+
+function annotateIntegerDivisionOnce(
+  expression: Expression,
+  columnInteger: (reference: string) => boolean,
   tableIntegerColumns?: (table: string) => IntegerColumns | undefined,
   columnDatetime: (reference: string) => DatetimeTypeKind | undefined = () => undefined,
   tableDatetimes?: (table: string) => DatetimeColumns | undefined,

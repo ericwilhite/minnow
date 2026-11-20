@@ -9,7 +9,11 @@ import { PGlite } from "@electric-sql/pglite";
 import fc from "fast-check";
 import { expect, it, vi } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
-import { createReach, NATIVE_COMMAND_REUSE_REACH } from "../../testing/reach.js";
+import {
+  createReach,
+  NATIVE_COMMAND_CONTENTION_REACH,
+  NATIVE_COMMAND_REUSE_REACH,
+} from "../../testing/reach.js";
 import {
   executeNativeCommand,
   learnedEntry,
@@ -71,17 +75,37 @@ interface Root {
 interface Pressure {
   armed: number;
   applied: number;
+  /** Contention: hold roots at open until this many exist, then fill once. */
+  barrier?: number;
+  /** Release the foreign grant only once two root admissions are waiting together. */
+  overlap?: boolean;
+  overlapped?: boolean;
 }
 function watchRoots(
   violations: string[],
   governor: Governor,
   pressure: Pressure,
 ): { roots: Root[]; restore: () => void } {
-  let foreign: Grant | null = null;
+  let foreign: Grant | null = null,
+    waiting = 0,
+    opened = 0,
+    arrived: () => void = () => undefined;
+  const barrier = new Promise<void>((resolve) => {
+    arrived = resolve;
+  });
   const admit = governor.admitGroup.bind(governor);
   const admitSpy = vi.spyOn(governor, "admitGroup").mockImplementation((request) => {
+    const root = request.label !== "foreign";
     const pending = admit(request);
-    if (foreign && request.label !== "foreign") {
+    if (root) {
+      waiting++;
+      void pending.then(
+        () => waiting--,
+        () => waiting--,
+      );
+    }
+    if (foreign && root && (!pressure.overlap || waiting >= 2)) {
+      if (pressure.overlap) pressure.overlapped = true;
       const grant = foreign;
       foreign = null;
       queueMicrotask(() => {
@@ -108,7 +132,7 @@ function watchRoots(
   const openSpy = vi.spyOn(NativeRootCredits, "open").mockImplementation(async (scope) => {
     const credits = await open(scope);
     roots.push({ credits, preparing: true, reserved: [], attempts: 0 });
-    if (pressure.armed > 0) {
+    if (pressure.barrier === undefined && pressure.armed > 0) {
       pressure.armed--;
       await fill();
     }
@@ -133,6 +157,15 @@ function watchRoots(
     }
     // Count what was actually reserved: a reservation refused above the cap holds nothing.
     return reserve.call(this, minimum, signal).then(async () => {
+      // Contention: once every root holds its first preparation reservation, take the rest of
+      // memory, so each must need more while the others hold theirs.
+      if (pressure.barrier !== undefined && root?.preparing && minimum.metadata !== undefined) {
+        if (root.reserved.length === 0 && ++opened === pressure.barrier) {
+          await fill();
+          arrived();
+        }
+        await barrier;
+      }
       if (pressure.armed > 0 && root?.preparing) {
         pressure.armed--;
         await fill();
@@ -332,3 +365,68 @@ it("learns a plan's measured need, never its reservation padding", () => {
     parameters: 0,
   });
 });
+
+for (const seed of seedsFor("next-native-command-contention", [49751, 49752]))
+  it(`two cold preparations grow while contending (${String(seed)})`, async () => {
+    const reach = createReach("native command contention", NATIVE_COMMAND_CONTENTION_REACH);
+    await fc.assert(
+      fc.asyncProperty(
+        fc.integer({ min: 50, max: 400 }),
+        fc.integer({ min: 0, max: 12 }),
+        async (terms, arms) => {
+          reach.beginHistory();
+          const governor = new Governor(128 << 20),
+            cores = [new StorageCore(64), new StorageCore(64)],
+            violations: string[] = [],
+            s = schema(terms, arms);
+          for (const core of cores) {
+            Object.defineProperty(core.harness, "governor", { value: governor });
+            await core.open();
+          }
+          // Hold both roots at open until both exist, then take all free memory: each
+          // preparation falls short, must release and wait, and the waits overlap before
+          // the foreign grant is returned.
+          const pressure: Pressure = { armed: 0, applied: 0, barrier: 2, overlap: true };
+          let settled = false;
+          const watch = watchRoots(violations, governor, pressure);
+          try {
+            for (const core of cores) for (const sql of s.native) await core.execute(sql);
+            const outcomes = await Promise.all(
+              cores.map((core, i) => {
+                const lowered = core.lowerer.lower(MUTATION, core.context());
+                if (lowered.kind !== "modify") throw new TypeError("modify plan required");
+                return run(core, governor, lowered.plan, SMALL, i + 1);
+              }),
+            );
+            for (const outcome of outcomes) {
+              if ("error" in outcome) throw outcome.error;
+              expect(outcome.rows).toBe(2);
+            }
+            expect(violations).toEqual([]);
+            // Both roots needed more credit while the foreign grant held the rest.
+            expect(pressure.overlapped).toBe(true);
+            expect(watch.roots.every((root) => root.attempts >= 2)).toBe(true);
+            reach.reach("both roots waited at once holding nothing");
+            settled = true;
+            if (arms > 0) reach.reach("copies grew the need");
+            if (terms >= 200) reach.reach("large body");
+          } finally {
+            watch.restore();
+            for (const core of cores) await core.close();
+            // After a settled history only: an earlier failure must surface, not its leak.
+            if (settled) expect(governor.usedBytes).toBe(0);
+          }
+          reach.reach("zero ownership");
+        },
+      ),
+      {
+        seed,
+        numRuns: 4,
+        examples: [
+          [300, 0],
+          [100, 8],
+        ],
+      },
+    );
+    reach.assertReached();
+  }, 600000);

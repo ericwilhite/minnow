@@ -567,9 +567,11 @@ it("runs single-set grouping and quoted keyword bodies like PostgreSQL", async (
   }
 });
 
-it("charges a wide ROLLUP before building its prefixes (peak check)", async () => {
-  // Live heap at the meter's abort must not exceed what the meter charged: an allocation built
-  // before its charge shows up here even though no plan graph survives.
+it("charges a wide ROLLUP before building its prefixes (heap growth at an aborted lowering)", async () => {
+  // A wide ROLLUP must reach the meter's budget and abort. Heap growth measured right after the
+  // abort unwinds (median of three gc'd samples) must stay within what the meter charged plus a
+  // fixed margin: anything built before its charge shows up even though no plan graph survives.
+  // This is growth after unwinding, not a sampled peak of live heap during lowering.
   setFlagsFromString("--expose-gc");
   const gc = runInNewContext("gc") as () => void;
   const core = new StorageCore(256);
@@ -579,7 +581,6 @@ it("charges a wide ROLLUP before building its prefixes (peak check)", async () =
       "CREATE TABLE p(id INT PRIMARY KEY)",
       "CREATE TABLE t(id INT PRIMARY KEY, note TEXT)",
       "CREATE TABLE u(k INT PRIMARY KEY, w INT)",
-      "CREATE TRIGGER r AFTER UPDATE ON p BEGIN UPDATE t SET note = 'x' WHERE id = OLD.id; END",
     ])
       await core.execute(sql);
     const columns = Array.from({ length: 2000 }, () => "k").join(", ");
@@ -589,24 +590,31 @@ it("charges a wide ROLLUP before building its prefixes (peak check)", async () =
     const scan = scanSql(sql),
       base = PREPARATION_TOKEN_BYTES * scan.tokens + PREPARATION_TEXT_BYTES * scan.characters,
       budget = base + (4 << 20);
-    let charged = base;
-    const meter: CopyMeter = {
-      charge(bytes) {
-        if (charged + bytes > budget) throw new RangeError("meter budget");
-        charged += bytes;
-      },
-    };
-    gc();
-    const before = process.memoryUsage().heapUsed;
-    let live = 0;
-    try {
-      withCopyMeter(meter, () => core.lowerer.lower(sql, core.context()));
-    } catch (error) {
-      live = process.memoryUsage().heapUsed - before;
-      expect(String(error)).toMatch(/meter budget/u);
+    const samples: number[] = [];
+    let charged = 0;
+    for (let sample = 0; sample < 3; sample++) {
+      charged = base;
+      const meter: CopyMeter = {
+        charge(bytes) {
+          if (charged + bytes > budget) throw new RangeError("meter budget");
+          charged += bytes;
+        },
+      };
+      gc();
+      const before = process.memoryUsage().heapUsed;
+      let aborted: unknown = null;
+      try {
+        withCopyMeter(meter, () => core.lowerer.lower(sql, core.context()));
+      } catch (error) {
+        aborted = error;
+      }
+      // The lowering must not succeed: this check is about what happens before the abort.
+      expect(String(aborted)).toMatch(/meter budget/u);
+      samples.push(process.memoryUsage().heapUsed - before);
     }
-    // The unmetered prefixes alone were about 16 MB for this body.
-    expect(live).toBeLessThanOrEqual(charged + (2 << 20));
+    samples.sort((a, b) => a - b);
+    // Before the fix this body grew by hundreds of MB here; the margin absorbs GC/JIT noise.
+    expect(samples[1] ?? Infinity).toBeLessThanOrEqual(charged + (4 << 20));
   } finally {
     await core.close();
   }

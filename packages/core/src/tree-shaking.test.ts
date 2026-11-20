@@ -63,9 +63,10 @@ const SQL_ENGINE_MODULES =
 // Native display-label provenance (PostgreSQL duplicate labels): 1,179,975 raw / 353,974 gzip.
 // Raise raw once by 512 and gzip by 128; private-input isolation stays unchanged.
 // Copy-meter hooks for metered native trigger preparation (inert in this engine), including
-// grouping-set metering: 1,181,635 raw / 354,531 gzip. Raise raw once by 1.25 KiB, gzip by 512.
-const COMPLETE_ENTRY_RAW_BUDGET = 1154 * 1024;
-const COMPLETE_ENTRY_GZIP_BUDGET = 346.25 * 1024;
+// grouping-set metering and linear-time integer typing: 1,181,955 raw / 354,642 gzip. Raise raw
+// once by 1.75 KiB and gzip by 768.
+const COMPLETE_ENTRY_RAW_BUDGET = 1154.5 * 1024;
+const COMPLETE_ENTRY_GZIP_BUDGET = 346.5 * 1024;
 // The engine with the larger durable adapter, OPFS.
 // JSON_TABLE metadata: 1,585,069 raw / 458,168 gzip bytes; counterfactual
 // 1,584,618 / 458,049 (+451 / +119). Raw cap +512 once, gzip cap unchanged.
@@ -87,9 +88,9 @@ const COMPLETE_ENTRY_GZIP_BUDGET = 346.25 * 1024;
 // Raise raw once by 512 and gzip by 256; no next/ or test input is reachable.
 // Native display-label provenance (PostgreSQL duplicate labels): 1,592,412 raw / 460,959 gzip.
 // Raise raw once by 512 and gzip by 128; no next/ or test input is reachable.
-// Copy-meter hooks: 1,594,072 raw / 461,480 gzip. Raise raw once by 1.25 KiB, gzip by 512.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1556.75 * 1024;
-const ENGINE_WITH_OPFS_GZIP_BUDGET = 450.75 * 1024;
+// Copy-meter hooks: 1,594,392 raw / 461,576 gzip. Raise raw once by 1.75 KiB, gzip by 768.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1557.25 * 1024;
+const ENGINE_WITH_OPFS_GZIP_BUDGET = 451 * 1024;
 // The IndexedDB-only worker entry: the whole engine, the host, and one adapter, bundled without
 // code splitting the way Vite's default iife worker format does.
 // JSON_TABLE metadata: 1,581,102 raw / 455,735 gzip bytes; counterfactual
@@ -110,15 +111,15 @@ const ENGINE_WITH_OPFS_GZIP_BUDGET = 450.75 * 1024;
 // gzip, standalone client and all isolation assertions stay unchanged.
 // Exact native FK provenance / schema-action comparison: 1,588,242 raw / 458,212 gzip.
 // Raise raw once by 768 and gzip by 128; standalone client and isolation caps stay.
-// Copy-meter hooks: 1,590,072 raw bytes. Raise raw once by 1.75 KiB.
-const INDEXEDDB_WORKER_RAW_BUDGET = 1553 * 1024;
+// Copy-meter hooks: 1,590,392 raw bytes. Raise raw once by 2 KiB.
+const INDEXEDDB_WORKER_RAW_BUDGET = 1553.25 * 1024;
 // Native trigger-name folding: 1,587,617 raw / 457,994 gzip bytes (+100 / +28).
 // The old gzip cap is exceeded by 10 bytes. Raise once by 128; raw and isolation caps stay.
 // Bounded boolean regex (3dc95943): 1,588,261 raw / 458,253 gzip bytes with the
 // official Node 24.22.2 compressor, matching CI 44044406507 (13 bytes over the old cap).
 // Raise once by the existing 128-byte budget step; raw, sibling and isolation caps stay.
-// Copy-meter hooks: 458,897 gzip bytes. Raise gzip once by 640 bytes.
-const INDEXEDDB_WORKER_GZIP_BUDGET = 448.25 * 1024;
+// Copy-meter hooks: 459,016 gzip bytes (the test's own build). Raise gzip once by 896 bytes.
+const INDEXEDDB_WORKER_GZIP_BUDGET = 448.5 * 1024;
 // What a page that hosts the engine in a worker ships on the main thread: the client, the schema
 // DSL and error classes, the Kysely dialect and live queries, and the React hooks, with `kysely`
 // and `react` left to the application. 105.9 KiB raw / 31.6 KiB gzip.

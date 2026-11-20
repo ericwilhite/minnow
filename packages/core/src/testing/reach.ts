@@ -11691,6 +11691,34 @@ export const NATIVE_PREPARATION_BOUND_REACH = [
 ] as const;
 
 /** Learned native preparation needs are reused exactly; concurrent statements grow safely. */
+/** Preparation allocation scales no faster than its charge, per grammar shape. */
+export const NATIVE_PREPARATION_SCALING_REACH = [
+  "binary chain",
+  "column chain",
+  "select column chain",
+  "nested parentheses",
+  "CASE arms",
+  "IN list",
+  "row IN list",
+  "row NOT IN list",
+  "function nesting",
+  "subquery nesting",
+  "join chain",
+  "USING join chain",
+  "grouping sets",
+  "DEFAULT rows",
+  "correlated select items",
+  "large size",
+] as const;
+
+/** Two cold native preparations both grow while contending for the same governor. */
+export const NATIVE_COMMAND_CONTENTION_REACH = [
+  "both roots waited at once holding nothing",
+  "copies grew the need",
+  "large body",
+  "zero ownership",
+] as const;
+
 export const NATIVE_COMMAND_REUSE_REACH = [
   "reuse in one attempt",
   "parameter sizing changed on reuse",

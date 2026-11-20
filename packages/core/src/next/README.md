@@ -5117,13 +5117,15 @@ There is no public override, package-entry change or default-engine switch.
 Preparation is metered under a growing reservation and never waits while holding preparation.
 Each table rule set and trigger body is charged a base share, linear in stored text
 (`owner/native-preparation-bound.ts`: SQL tokens and characters, bindings, and the columns,
-stored DEFAULT/generated text and keys of each table the text names), before it is built. Every
-copy of one source subtree that the shared parser, optimizer or lowering makes is charged as it
-happens: the private-rebuild copy meter (`engine/copy-meter.ts`) is installed only around native
+stored DEFAULT/generated text and keys of each table the text names), before it is built. The
+copies of one source subtree that the shared parser, optimizer and lowering are known to make are
+charged as they happen: the private-rebuild copy meter (`engine/copy-meter.ts`) is installed only around native
 preparation, and the copy helpers (`cloneTreeValue`, the expression copy sites such as simple
 CASE operands, BETWEEN, row predicates, statistical aggregates, alias and merged-column
-references and grouping sets, and repeated DEFAULT cells in lowering) charge each node before
-copying it. The released engine installs no meter, so its parse and compile are unchanged.
+references and grouping sets, repeated DEFAULT cells and per-join column lists in lowering)
+charge each node before copying it. Passes that used to copy every descendant's list again at
+each ancestor (top-level name resolution, correlated references) or re-type every subtree at
+each node (integer typing) now run in linear time. The released engine installs no meter, so its parse and compile are unchanged.
 When a charge does not fit, the attempt is abandoned: every attempt object and charge is
 released, and the reservation is admitted again from nothing at max(known need, min(2 x
 previous, cap)). A reservation the cap cannot grant beside the writer is reduced to the largest
@@ -5136,9 +5138,12 @@ attempt, because a reused plan can receive values of a different size (a NUMERIC
 Wide ROLLUP and CUBE charge every grouping-set array and every lowered reference to their
 columns before building them, and each grouping set's member block charges the parts it shares.
 The factor that covers a copy's lowered IR (`COPY_IR_FACTOR`, 8) is empirical: generated bodies
-retain at most about 0.6 of their charge. The checks compare the retained plan graph with the
-charge, and live heap with the charge at a meter abort; they do not trace every transient
-allocation, closure or WeakMap entry.
+retain at most about 0.6 of their charge. Three checks back this: the retained plan graph against
+the charge over generated bodies; heap growth after a wide ROLLUP's lowering aborts on its
+budget; and a scaling test that lowers every grammar shape at N and 4N and requires array volume
+and heap growth to scale no faster than the charge. None of them traces every transient
+allocation, closure or WeakMap entry, so a new kind of copy is caught when it changes scaling or
+retained size, not by construction.
 
 The same funded/SQL histories run at 32 MiB with `MINNOW_TRIGGER_CAP_MIB=32` and at
 64 MiB by default. They compare PostgreSQL BEFORE/AFTER name order, RI and nested bodies,

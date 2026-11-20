@@ -1,4 +1,5 @@
 import { rememberRowOutputName } from "../../engine/json-call-sources.js";
+import { chargeExactBytes } from "../../engine/copy-meter.js";
 import { viewSources } from "./view-sources.js";
 /**
  * A FROM clause (`base` + `joins` of a compiled block, or a DML statement's target and sources)
@@ -1052,6 +1053,9 @@ const JOIN_KINDS = {
   inner: "inner",
 } as const;
 
+/** Per input column of one join: position-map entries, layout slots, column and output records. */
+const JOIN_COLUMN_BYTES = 512;
+
 function joinUnits(
   left: Unit,
   right: Unit,
@@ -1060,6 +1064,10 @@ function joinUnits(
   rows: number,
   builder: PlanBuilder,
 ): Unit {
+  // Every join node lists every column of its inputs (layouts, position maps, output schema),
+  // so a left-deep chain's plan grows with joins x columns. Under a preparation meter
+  // (engine/copy-meter.ts) charge this join's per-column share before building it.
+  chargeExactBytes(JOIN_COLUMN_BYTES * (left.layout.length + right.layout.length) + 1024);
   const { keys, rest } = splitConditions(conditions, left.sources, right.sources);
   const leftPosition = positionIn(left.layout);
   const rightPosition = positionIn(right.layout);
