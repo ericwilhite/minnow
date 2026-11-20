@@ -102,6 +102,21 @@ export interface ReadSource {
    * those segments only, so the caller must read no other segment of the same pinned view.
    */
   readonly segments?: Uint32Array;
+  /**
+   * The caller holds memory while this sizing runs (a window's segment list): sizing must not
+   * wait for an admission, or it can deadlock behind a queued admission that waits for what the
+   * caller holds. Every admission is tried without waiting; a refusal throws SizingWouldWait,
+   * and the caller releases what it holds and sizes again normally.
+   */
+  readonly noWait?: true;
+}
+
+/** A no-wait sizing pass could not be admitted at once: release holdings and size normally. */
+export class SizingWouldWait extends Error {
+  constructor(readonly label: string) {
+    super(`${label}: sizing would wait while its caller holds memory`);
+    this.name = "SizingWouldWait";
+  }
 }
 export interface ReadBound {
   readonly batchRows?: 1;
@@ -211,6 +226,14 @@ export function boundSource(
   prefixRows = BATCH_ROWS,
   caches?: QueryRoots,
 ): MaybePromise<ReadBound> {
+  /** A sizing scratch grant: waiting admission, or (noWait) an immediate one or a refusal. */
+  const sizingGrant = (label: string, capacity: number): MaybePromise<Grant> => {
+    if (source.noWait !== true) return scratchMinimum(governor, label, capacity, signal);
+    if (capacity > governor.capBytes - governor.reserveBytes) throw new SizingWouldWait(label);
+    const grant = governor.tryAdmit({ label, minimumBytes: capacity, spillable: false });
+    if (grant === null) throw new SizingWouldWait(label);
+    return grant;
+  };
   return trackSizing(signal, run(size()));
   function* size(): ReadJob<ReadBound> {
     const directoryCache = directoryCacheFor(view.pages);
@@ -269,9 +292,7 @@ export function boundSource(
         if (segment.readHint !== undefined && source.columns.length > 0) {
           let capacity = Math.min(governor.capBytes, 65536);
           for (;;) {
-            const grant = yield* readValue(
-              scratchMinimum(governor, "read-step/memory-sizing", capacity, signal),
-            );
+            const grant = yield* readValue(sizingGrant("read-step/memory-sizing", capacity));
             const budget = new SizingBudget(grant, capacity);
             let retry = false,
               required = capacity,
@@ -404,16 +425,16 @@ export function boundSource(
         // Optional recipe construction must never wait, jump FIFO or raise the ordinary
         // source-sizing minimum. Pressure and a queued admission use the old path unchanged.
         const immediate =
-          preferred > capacity && preferred <= governor.capBytes - governor.reserveBytes
+          source.noWait !== true &&
+          preferred > capacity &&
+          preferred <= governor.capBytes - governor.reserveBytes
             ? governor.tryAdmit({
                 label: "read-step/sizing",
                 minimumBytes: preferred,
                 spillable: false,
               })
             : null;
-        const grant =
-          immediate ??
-          (yield* readValue(scratchMinimum(governor, "read-step/sizing", capacity, signal)));
+        const grant = immediate ?? (yield* readValue(sizingGrant("read-step/sizing", capacity)));
         const budget = new SizingBudget(grant, immediate === null ? capacity : preferred);
         const readers: ChunkReader[] = [];
         let root: import("../format/reachable.js").Held<ScanRootFacts> | null = null;

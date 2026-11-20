@@ -1796,9 +1796,11 @@ opened with its own scratch grant (`key-order/window-sizing`: the plan minimum p
 locator, charged before allocation), skips OFFSET and reads up to LIMIT locators. That cursor
 closes at once on cancellation; its scratch is released only after its pending index call
 settles, and always before execution is admitted. The same admission charges the window's
-distinct segment list (`key-order/window-segments`, 4 bytes a locator, sorted in place); only
-that list is held while the following sizing admits, and it is released when sizing ends. Only
-the groups those locators name are then sized. The execution cursor reads the same window from the
+distinct segment list (`key-order/window-segments`, 4 bytes a locator, sorted in place). Only
+the groups those locators name are then sized, and while the list is held that sizing never waits
+for memory: each admission is tried at once (`ReadSource.noWait`). If one would wait (a queued
+admission is ahead), the list is released and the whole source is sized normally, holding
+nothing while it waits, so a queued admission blocked by the list cannot deadlock with it. The execution cursor reads the same window from the
 same snapshot, so every group it fetches was sized. Such a query therefore opens exactly two
 cursors (sizing, then execution), each closed and each reading at most LIMIT + OFFSET rows.
 Larger or unbounded windows, LIMIT 1 over a resident one-chunk table (its single-use resident

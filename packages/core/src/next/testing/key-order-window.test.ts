@@ -11,7 +11,7 @@ import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import { WINDOW_SIZING_LABEL, windowSegments } from "../exec/key-order.js";
 import { packLocator } from "../vector/locator.js";
 import { MetadataReader } from "../format/metadata-reader.js";
-import { Governor } from "../memory/governor.js";
+import { Governor, type Grant } from "../memory/governor.js";
 import { ViewIndex } from "../write/view.js";
 import { oracleRows } from "./differential-adapter.js";
 import { StorageCore } from "./storage-core.js";
@@ -392,3 +392,59 @@ it("charges the window's segment list until sizing releases it (review repro)", 
   window.release();
   expect(governor.usedBytes).toBe(0);
 });
+
+it("never waits for memory while holding the window's segment list (FIFO repro)", async () => {
+  // Review repro on a 16 MiB governor: the window holds its segment list; another query queues
+  // an admission of all the room that list blocks (everything but the query's earlier source
+  // recipe); window sizing must not then queue behind it. Sizing tries without waiting,
+  // releases the list and sizes the whole source.
+  const governor = new Governor(16 << 20);
+  const sql = "SELECT id, v, s FROM t ORDER BY id LIMIT 100 OFFSET 86";
+  const want = await pg.query<Record<string, unknown>>(sql);
+  const nativePrepare = core.executor.prepare.bind(core.executor);
+  const prepare = vi.spyOn(core.executor, "prepare").mockImplementation((plan) => {
+    const prepared = nativePrepare(plan);
+    return { ...prepared, execute: (request) => prepared.execute({ ...request, governor }) };
+  });
+  const queued: { competitor: Promise<Grant> | null } = { competitor: null };
+  const listBytes = 100 * Uint32Array.BYTES_PER_ELEMENT;
+  const tryAdmit = governor.tryAdmit.bind(governor);
+  const spy = vi.spyOn(governor, "tryAdmit").mockImplementation((options) => {
+    if (queued.competitor === null && options.label.startsWith("read-step/"))
+      queued.competitor = governor.admit({
+        label: "list-blocked competitor",
+        // Fits exactly once the list is released.
+        minimumBytes: governor.capBytes - governor.reserveBytes - (governor.usedBytes - listBytes),
+        spillable: false,
+      });
+    return tryAdmit(options);
+  });
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const query = core.execute(sql, [], controller.signal);
+    // The competitor is admitted only once the list is released, and leaves at once.
+    const competed = (async () => {
+      while (queued.competitor === null) await new Promise((resolve) => setTimeout(resolve, 1));
+      (await queued.competitor).close();
+    })();
+    const outcome = await Promise.race([
+      query.then(() => "done" as const),
+      new Promise<"deadlock">((resolve) => {
+        timer = setTimeout(() => resolve("deadlock"), 10_000);
+      }),
+    ]);
+    if (outcome === "deadlock") controller.abort(new Error("deadlocked"));
+    expect(outcome, "sizing never waits while holding the list").toBe("done");
+    await competed;
+    const result = await query;
+    if (result.kind !== "rows" || !("batches" in result)) throw new Error("rows");
+    expect(canonical(oracleRows(result))).toEqual(canonical(want.rows));
+    expect(queued.competitor, "the queued list-blocked admission happened").not.toBeNull();
+    expect(governor.usedBytes).toBe(0);
+  } finally {
+    clearTimeout(timer);
+    spy.mockRestore();
+    prepare.mockRestore();
+  }
+}, 30_000);

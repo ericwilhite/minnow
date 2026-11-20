@@ -71,7 +71,13 @@ import {
   exceptMinimumBytes,
   type ExceptCheckpoint,
 } from "./except.js";
-import { readValue, boundSource, type ReadSource, type ReadBound } from "../page/read-bounds.js";
+import {
+  readValue,
+  boundSource,
+  SizingWouldWait,
+  type ReadSource,
+  type ReadBound,
+} from "../page/read-bounds.js";
 import { directoryCacheFor } from "../page/directory-cache.js";
 import { batchTargetFor, type Grant } from "../memory/governor.js";
 import { jsonLiteralBytes, jsonInputsBounded, phaseRetainingParents } from "./json-plan.js";
@@ -4684,32 +4690,38 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                 ),
               )
             : undefined;
-        // The window's segment list keeps its charge until this sizing finishes.
-        let payload: ReadBound;
-        try {
-          payload = yield* readValue(
-            boundSource(
-              runtime.sourceView(),
-              {
-                id: project.id,
-                tableId: scan.tableId,
-                columns: shape.columns,
-                types: shape.types,
-                windowBytes: 0,
-                stagingBytes: memoryScanBufferBytes(shape.types),
-                rows: null,
-                ...(window === undefined ? {} : { segments: window.segments }),
-              },
-              runtime.request.governor,
-              runtime.signal,
-              targetBytes,
-              BATCH_ROWS,
-              runtime.metadataCaches(),
-            ),
+        // While the window's segment list is held, sizing may not wait for memory: it tries
+        // every admission at once. A refusal (a queued admission is ahead) releases the list,
+        // then the whole source is sized normally, holding nothing while it waits.
+        const sizePayload = (segments?: Uint32Array) =>
+          boundSource(
+            runtime.sourceView(),
+            {
+              id: project.id,
+              tableId: scan.tableId,
+              columns: shape.columns,
+              types: shape.types,
+              windowBytes: 0,
+              stagingBytes: memoryScanBufferBytes(shape.types),
+              rows: null,
+              ...(segments === undefined ? {} : { segments, noWait: true as const }),
+            },
+            runtime.request.governor,
+            runtime.signal,
+            targetBytes,
+            BATCH_ROWS,
+            runtime.metadataCaches(),
           );
-        } finally {
-          window?.release();
-        }
+        let payload: ReadBound | null = null;
+        if (window !== undefined)
+          try {
+            payload = yield* readValue(sizePayload(window.segments));
+          } catch (error) {
+            if (!(error instanceof SizingWouldWait)) throw error;
+          } finally {
+            window.release();
+          }
+        payload ??= yield* readValue(sizePayload());
         const read: AdmittedIndexRead = {
           plan: range,
           cursor: cursorIdentity,
