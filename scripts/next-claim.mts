@@ -512,7 +512,7 @@ async function run(): Promise<void> {
           const left = (a as Verification & { answer?: AnswerDigest }).answer,
             right = (b as Verification & { answer?: AnswerDigest }).answer;
           return left !== undefined && right !== undefined
-            ? compareAnswers(left, right, ordered.has(cell)).same
+            ? compareAnswers(left, right, ordered.has(cell))
             : a.fingerprint === b.fingerprint && a.rows === b.rows;
         },
         onSample: (sample) => log({ cell, purpose, sample }),

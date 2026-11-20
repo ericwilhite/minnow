@@ -398,8 +398,11 @@ function reportCandidate(results: readonly HeadToHeadResult[]): string {
         iqr = quantile(deltas, 0.75) - quantile(deltas, 0.25),
         faster = deltas.filter((delta) => delta < 0).length,
         need = Math.ceil((7 / 9) * result.rounds);
-      const verdict =
-        Math.abs(middle) > iqr && middle < 0 && faster >= need
+      // A speed lead needs answers verified equal; differing or unverifiable answers get none.
+      const verified = cell.answers?.same === true;
+      const verdict = !verified
+        ? "no lead: answers not verified"
+        : Math.abs(middle) > iqr && middle < 0 && faster >= need
           ? "lead: faster"
           : Math.abs(middle) > iqr && middle > 0 && deltas.length - faster >= need
             ? "**lead: slower**"

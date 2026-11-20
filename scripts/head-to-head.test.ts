@@ -13,6 +13,7 @@ function result(options: {
   candidate?: boolean;
   faster?: boolean;
   error?: string;
+  answers?: { same: boolean; method: "inline"; detail?: string };
 }): HeadToHeadResult {
   const samples = [];
   for (let round = 0; round < options.completed; round++) {
@@ -49,7 +50,7 @@ function result(options: {
       {
         id: "scan_proj3_agg",
         verification: {},
-        answers: { same: true, method: "inline" },
+        answers: options.answers ?? { same: true, method: "inline" },
         samples,
         errors: options.error === undefined ? {} : { next: options.error },
       },
@@ -85,6 +86,20 @@ describe("head-to-head report", () => {
     ]);
     expect(full).toContain("lead: faster");
     expect(full).toContain("## Candidate screen: fedcba9876 vs main");
+  });
+
+  it("gives no speed lead when answers are unverifiable or differ", async () => {
+    for (const answers of [
+      { same: false, method: "inline" as const, detail: "unverifiable: no column types" },
+      { same: false, method: "inline" as const, detail: "rows 1/2" },
+    ]) {
+      const text = await report([
+        result({ ref: "main", rounds: 9, completed: 9, candidate: true, faster: true, answers }),
+      ]);
+      expect(text).toContain("no lead: answers not verified");
+      expect(text).not.toContain("lead: faster");
+      expect(text).toContain("**Leads, faster (0):** none");
+    }
   });
 });
 

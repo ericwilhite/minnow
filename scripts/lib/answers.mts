@@ -32,7 +32,16 @@ export const INLINE_VALUES = 2_000_000;
 export const MATCH_BOUND = 256;
 
 export type ColumnKind =
-  "integer" | "numeric" | "float" | "text" | "json" | "bytes" | "bool" | "temporal" | "value";
+  | "integer"
+  | "numeric"
+  | "float"
+  | "text"
+  | "json"
+  | "bytes"
+  | "bool"
+  | "temporal"
+  | "value"
+  | "unknown";
 
 /** The comparison kind of a next/ physical type kind. */
 export function columnKind(physical: string): ColumnKind {
@@ -59,8 +68,14 @@ export function columnKind(physical: string): ColumnKind {
     case "timestamp":
     case "time":
       return "temporal";
-    default:
+    // Recognised types compared by their lossless encoding.
+    case "interval":
+    case "array":
+    case "locator":
       return "value";
+    // A type this comparator does not know can never verify an answer.
+    default:
+      return "unknown";
   }
 }
 
@@ -182,6 +197,7 @@ export function normalize(value: unknown, kind: ColumnKind): Normal {
       }
       break;
     case "value":
+    case "unknown":
       return byType(value);
   }
   // A value of an unexpected representation stays distinct and lossless.
@@ -237,6 +253,7 @@ export class AnswerCollector {
     const kinds = this.#kinds;
     if (kinds === undefined) this.#unverifiable ??= "no column types";
     else if (kinds.length !== row.length) this.#unverifiable ??= "incomplete column types";
+    else if (kinds.includes("unknown")) this.#unverifiable ??= "unknown column type";
     const normal = row.map((value, c) => normalize(value, kinds?.[c] ?? "value"));
     this.#rows++;
     this.#values += normal.length;

@@ -290,7 +290,11 @@ export interface IndependentCPUOptions {
   /** Arm order per pair; default alternates AB/BA. Supply a balanced randomized sequence. */
   readonly orders?: ReadonlyArray<readonly [Arm, Arm]>;
   /** Answer equivalence across arms; default requires equal fingerprints and row counts. */
-  readonly equivalent?: (control: Verification, candidate: Verification) => boolean;
+  /** True, or a comparison whose detail explains why the outputs are not accepted as equal. */
+  readonly equivalent?: (
+    control: Verification,
+    candidate: Verification,
+  ) => boolean | { readonly same: boolean; readonly detail?: string };
 }
 
 /** One fresh pair per workload/boundary/round; startup and execution both alternate AB/BA.
@@ -353,14 +357,21 @@ export async function runIndependentCPU(options: IndependentCPUOptions) {
               throw new Error("Invalid CPU output verification");
             verification.set(arm, checked);
             const other = verification.get(arm === "control" ? "candidate" : "control");
-            const same =
-              other === undefined ||
-              (options.equivalent === undefined
-                ? other.fingerprint === checked.fingerprint && other.rows === checked.rows
-                : arm === "candidate"
-                  ? options.equivalent(other, checked)
-                  : options.equivalent(checked, other));
-            if (!same) throw new Error(`CPU workload differs: ${workload}`);
+            const outcome =
+              other === undefined
+                ? true
+                : options.equivalent === undefined
+                  ? other.fingerprint === checked.fingerprint && other.rows === checked.rows
+                  : arm === "candidate"
+                    ? options.equivalent(other, checked)
+                    : options.equivalent(checked, other);
+            const same = typeof outcome === "boolean" ? outcome : outcome.same;
+            if (!same) {
+              const detail = typeof outcome === "boolean" ? undefined : outcome.detail;
+              throw new Error(
+                `CPU workload differs: ${workload}${detail === undefined ? "" : ` (${detail})`}`,
+              );
+            }
             if (settleMs > 0) await new Promise((yes) => setTimeout(yes, settleMs));
             options.signal?.throwIfAborted();
             const value = await worker.ask<CPUValue>({ op: "run", workload, boundary });

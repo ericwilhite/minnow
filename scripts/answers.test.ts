@@ -239,4 +239,14 @@ describe("head-to-head answer comparison", () => {
       ).same,
     ).toBe(false);
   });
+
+  it("marks an unknown physical type unverifiable, never equal", () => {
+    expect(columnKind("not-a-type")).toBe("unknown");
+    for (const kind of ["interval", "array", "locator"]) expect(columnKind(kind)).toBe("value");
+    const a = collect([[1]], false, [columnKind("not-a-type")]),
+      b = collect([[1]], false, [columnKind("not-a-type")]);
+    const comparison = compareAnswers(a, b, false);
+    expect(comparison.same).toBe(false);
+    expect(comparison.detail).toContain("unknown column type");
+  });
 });
