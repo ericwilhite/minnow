@@ -63,7 +63,7 @@ async function scanMinimum(sql: string): Promise<{ rows: unknown[]; minimum: num
 }
 
 it("sizes a plain scan of a retained resident source from its rows, not the cap", async () => {
-  const types: PhysicalType[] = [{ kind: "int32" }, { kind: "text" }];
+  const types: PhysicalType[] = [{ kind: "int32", bits: 32 }, { kind: "text" }];
   const resident = indexReadTarget(types, CAP, ROWS);
   expect(resident).toBeLessThan(batchTargetFor(CAP, 4));
   // Unfiltered: the minimum is exactly the resident target plus the fixed selection lists.
