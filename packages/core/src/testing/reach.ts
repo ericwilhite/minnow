@@ -1619,6 +1619,16 @@ export const LOWER_M3_JOINS_REACH = [
   "build column in expression",
   "aggregate over join",
   "probe-only projection",
+  "nested join demand",
+  "aggregate over nested joins",
+] as const;
+
+/** Column-store appends of NULL constant columns (all-NULL or a join's unread column). */
+export const COLUMN_STORE_REACH = [
+  "null constant",
+  "varlen null constant",
+  "null constant spans a whole word",
+  "selected null constant",
 ] as const;
 
 /** Join output demand over every expression shape and placement (join-demand-expressions). */

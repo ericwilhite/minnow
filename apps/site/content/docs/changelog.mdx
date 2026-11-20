@@ -10,7 +10,7 @@ compatibility policy and release process.
 
 ## Unreleased
 
-The unexported 1.0 rebuild's inner joins skip gathering build-side columns that no consumer reads, when a projection sits directly over the join and the join has no residual condition. Results are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.
+The unexported 1.0 rebuild's inner joins skip gathering build-side columns that no consumer reads, when a projection or another inner join sits directly over the join and the join has no residual condition, including dictionary-encoded star joins. Results are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.
 
 The unexported 1.0 rebuild reserves wide sort merge workspace independently of source batch size, including encoded keys and the `WITH TIES` boundary row when a competing query forces a smaller source recipe.
 

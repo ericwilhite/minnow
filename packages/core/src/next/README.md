@@ -2358,6 +2358,11 @@ shipped-engine or stored-format change.
 - The build store and table are allocated from the join's spillable grant. A dense integer key
   is direct-addressed; others use open addressing with the key's words inline. Matched outputs
   reuse probe key vectors for build key columns that are identical in representation.
+- Output demand: an inner join without a residual or filter gathers only the build columns its
+  consumer reads, and emits the rest as typed NULL constants nothing reads. The consumer is a
+  projection directly above it, or a parent inner join, which passes on its own demand plus the
+  columns its keys read. Star-encoded joins use the same demand (the rewrite changes column
+  types, not positions). The column store writes a NULL constant as one validity range.
 - When refused memory the join partitions 16 ways (grace/hybrid), reads back the partitions
   that fit, spills the rest of the probe, and joins each spilled pair one level down with
   independent hash bits. A partition that does not split, or an oversized mark join, runs in
