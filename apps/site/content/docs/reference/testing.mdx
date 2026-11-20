@@ -186,6 +186,14 @@ Node/V8 versions and host load before timing. Threshold profiles group machines 
 and Node major version; CPU context is diagnostic and does not automatically select a looser threshold.
 `.github/workflows/browser-performance.yml` runs the [browser performance lane](#browser-performance-lane)
 nightly, also off the merge path, and uploads its JSON lines and summary as an artifact.
+`.github/workflows/head-to-head.yml` is the 1.0 rebuild's progress lane, nightly and on demand and
+also off the merge path. For the W1M and S1 Gate B cells it runs this checkout's rebuild engine
+(`next/`) and the published `@minnowdb/core@0.20.0` side by side on one runner, with alternating
+rounds, after checking that both give the same answers. It writes one table per run to the run
+summary: main, 0.20 and the fixed DuckDB-Wasm target per cell, with their ratios. Run it locally
+with `node scripts/head-to-head.mts run --dataset W1M --shipped <unpacked package> --output <dir>`
+(`--rows` and `--scale` shrink the fixtures). A timing never fails the lane; an engine that cannot
+load its fixture does.
 
 Each browser runner owns its test directory, server, port, and build prerequisites. Shared browser
 defaults live in `playwright.shared.mjs`; runner-specific configuration stays in its named
