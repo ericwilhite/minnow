@@ -11,7 +11,14 @@ import { storeConformanceCases } from "../src/next/storage/conformance.js";
 import type { StorageBackend } from "../src/next/storage/contract.js";
 import type { BlobRef, ExtentRef, ExtentSpace } from "../src/next/storage/extents.js";
 import type { StorageObserver, SyncFile } from "../src/next/storage/contract.js";
-import { createOpfsBackend, webLocks, type OpfsDirectoryLike } from "../src/next/storage/opfs.js";
+import {
+  createOpfsBackend,
+  OPFS_FILE_NAMES,
+  webLocks,
+  type OpfsDirectoryLike,
+  type OpfsFileHandleLike,
+  type WebLocksLike,
+} from "../src/next/storage/opfs.js";
 import { openIndexedDb, type IdbDatabaseLike } from "../src/next/storage/idb-like.js";
 import { createIndexedDbBackend } from "../src/next/storage/indexeddb.js";
 import { chooseBackend } from "../src/next/storage/select.js";
@@ -58,7 +65,15 @@ export type NextStorageRequest = {
   | { readonly op: "idb-scenarios" }
   | { readonly op: "bench-idb"; readonly dir: string; readonly batching: boolean }
   | { readonly op: "publish-loop"; readonly dir: string; readonly rounds: number }
-  | { readonly op: "verify"; readonly dir: string; readonly minAcked: number }
+  | {
+      readonly op: "verify";
+      readonly dir: string;
+      readonly minAcked: number;
+      /** Trace every step and platform call to the page (default true). */
+      readonly trace?: boolean;
+      /** Test hook: never return from this traced step (the stall report's own check). */
+      readonly stallAt?: string;
+    }
   | { readonly op: "hold"; readonly dir: string }
   | { readonly op: "write-after-loss" }
   | {
@@ -100,6 +115,7 @@ export type NextStorageRequest = {
   | { readonly op: "reopen-measure"; readonly dir: string }
   | { readonly op: "reopen-idb-requests"; readonly dir: string }
   | { readonly op: "diagnose-wedge"; readonly dir: string }
+  | { readonly op: "diagnose-opfs"; readonly dir: string; readonly probeMs: number }
   | { readonly op: "chaos-release" }
   | {
       readonly op: "chaos";
@@ -117,10 +133,19 @@ const scope = self as unknown as {
   addEventListener(type: "message", listener: (event: MessageEvent<unknown>) => void): void;
 };
 
-async function directory(name: string): Promise<OpfsDirectoryLike & FileSystemDirectoryHandle> {
-  const root = await navigator.storage.getDirectory();
-  const base = await root.getDirectoryHandle("next-storage", { create: true });
-  return await base.getDirectoryHandle(name, { create: true });
+async function directory(
+  name: string,
+  trace: ((step: string) => void) | null = null,
+): Promise<OpfsDirectoryLike & FileSystemDirectoryHandle> {
+  const step = <T>(what: string, work: () => Promise<T>) =>
+    trace === null ? work() : traced(trace, what, work);
+  const root = await step("storage.getDirectory", () => navigator.storage.getDirectory());
+  const base = await step("getDirectoryHandle next-storage", () =>
+    root.getDirectoryHandle("next-storage", { create: true }),
+  );
+  return await step(`getDirectoryHandle ${name}`, () =>
+    base.getDirectoryHandle(name, { create: true }),
+  );
 }
 
 const locks = webLocks(navigator.locks);
@@ -156,6 +181,135 @@ function countingDirectory(inner: OpfsDirectoryLike): OpfsDirectoryLike {
           });
         },
       };
+    },
+  };
+}
+
+/**
+ * Posts each step of the request being handled to the page (`{ trace }`), so a page that stops
+ * waiting can say where the worker was. Posted before the step runs: a synchronous call that never
+ * returns still leaves its name with the page. Null outside a traced request.
+ */
+let tracer: ((step: string) => void) | null = null;
+const traceStep = (step: string) => {
+  scope.postMessage({ trace: step });
+};
+
+/** `work`, traced at its start and at its settlement (result or error name). */
+async function traced<T>(
+  trace: (step: string) => void,
+  step: string,
+  work: () => Promise<T>,
+): Promise<T> {
+  trace(step);
+  try {
+    const value = await work();
+    trace(`${step}: done`);
+    return value;
+  } catch (error) {
+    trace(`${step}: ${error instanceof Error ? error.name : String(error)}`);
+    throw error;
+  }
+}
+
+/** A sync handle whose every call is traced before it runs and after it returns or throws. */
+function tracedSyncFile(file: SyncFile, name: string, trace: (step: string) => void): SyncFile {
+  return new Proxy(file, {
+    get(target, key) {
+      const value: unknown = Reflect.get(target, key);
+      if (typeof value !== "function") return value;
+      const method = value as (...args: unknown[]) => unknown;
+      const step = `${name}.${String(key)}`;
+      return (...args: unknown[]) => {
+        trace(step);
+        try {
+          const result = method.apply(target, args);
+          trace(`${step}: done`);
+          return result;
+        } catch (error) {
+          trace(`${step}: ${error instanceof Error ? error.name : String(error)}`);
+          throw error;
+        }
+      };
+    },
+  });
+}
+
+/** A snapshot Blob whose reads (`arrayBuffer`, and the Blobs `slice` returns) are traced. */
+function tracedBlob(blob: Blob, name: string, trace: (step: string) => void): Blob {
+  return new Proxy(blob, {
+    get(target, key) {
+      if (key === "arrayBuffer")
+        return () => traced(trace, `${name} blob.arrayBuffer`, () => target.arrayBuffer());
+      if (key === "slice")
+        return (...args: Parameters<Blob["slice"]>) =>
+          tracedBlob(target.slice(...args), name, trace);
+      const value: unknown = Reflect.get(target, key);
+      return typeof value === "function" ? (value as () => unknown).bind(target) : value;
+    },
+  });
+}
+
+/** The directory, with every handle lookup, sync-handle open, sync call and snapshot read traced
+ * (the test adapter boundary: nothing reaches the platform underneath it untraced). */
+function tracingDirectory(
+  inner: OpfsDirectoryLike,
+  trace: (step: string) => void,
+): OpfsDirectoryLike {
+  return {
+    async getFileHandle(name, options) {
+      const handle: OpfsFileHandleLike = await traced(trace, `getFileHandle ${name}`, () =>
+        inner.getFileHandle(name, options),
+      );
+      return {
+        createSyncAccessHandle: async () =>
+          tracedSyncFile(
+            await traced(trace, `createSyncAccessHandle ${name}`, () =>
+              handle.createSyncAccessHandle(),
+            ),
+            name,
+            trace,
+          ),
+        ...(handle.getFile === undefined
+          ? {}
+          : {
+              getFile: async () => {
+                const blob = await traced(trace, `getFile ${name}`, async () => {
+                  const file = await handle.getFile?.();
+                  if (file === undefined) throw new Error("getFile vanished");
+                  return file;
+                });
+                return tracedBlob(blob, name, trace);
+              },
+            }),
+      };
+    },
+  };
+}
+
+/** `navigator.locks` with each request traced (requested, granted, released or refused) and each
+ * query traced. */
+function tracingLocks(trace: (step: string) => void): WebLocksLike {
+  return {
+    query: () => traced(trace, "locks.query", () => navigator.locks.query()),
+    request(name, options, callback) {
+      const step = `lock ${name}${options.steal === true ? " (steal)" : ""}`;
+      trace(`${step} requested`);
+      return navigator.locks
+        .request(name, options, (lock) => {
+          trace(`${step} granted`);
+          return callback(lock);
+        })
+        .then(
+          (value) => {
+            trace(`${step} released`);
+            return value;
+          },
+          (error: unknown) => {
+            trace(`${step}: ${error instanceof Error ? error.name : String(error)}`);
+            throw error;
+          },
+        );
     },
   };
 }
@@ -196,10 +350,12 @@ async function backendFor(name: string): Promise<StorageBackend> {
       serializeTransactions: serializeIdb,
       ...(storageObserver === null ? {} : { observe: storageObserver }),
     });
+  const trace = tracer;
+  const counted = countingDirectory(await directory(name, trace));
   return createOpfsBackend({
-    directory: countingDirectory(await directory(name)),
+    directory: trace === null ? counted : tracingDirectory(counted, trace),
     name: `next-test:${name}`,
-    locks,
+    locks: trace === null ? locks : webLocks(tracingLocks(trace)),
     ...(storageObserver === null ? {} : { observe: storageObserver }),
   });
 }
@@ -520,7 +676,16 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
       return { finished: number };
     }
     case "verify": {
+      // Every step and platform call is traced to the page (next-storage-run.ts names the last
+      // ones on a stall), unless the page measures the run untraced.
+      tracer = request.trace === false ? null : traceStep;
+      const step = (what: string): Promise<void> | undefined => {
+        tracer?.(what);
+        // Test hook: a verifier that never returns from this step (the stall report's check).
+        return what === request.stallAt ? new Promise<void>(() => undefined) : undefined;
+      };
       const started = performance.now();
+      await step("acquire and open");
       const { space, lease } = await openSpace(request.dir);
       const openedMs = performance.now() - started;
       const root = decodeRoot(space.root);
@@ -534,14 +699,23 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
         throw new Error(
           `previous root ${String(previous?.round)} is not ${String(root.round - 1)}`,
         );
+      await step("read root blobs");
       await readAll(space, root.blobs);
+      await step("read previous blobs");
       if (previous !== null) await readAll(space, previous.blobs);
+      await step("audit");
       await space.audit();
       // The reopened owner keeps writing.
-      await round(space, root.round + 1, extentsOf(root));
+      await round(space, root.round + 1, extentsOf(root), (phase) => {
+        void step(`round ${String(root.round + 1)}: ${phase}`);
+      });
+      await step("audit after the round");
       await space.audit();
+      await step("close");
       await space.close();
+      await step("release");
       await lease.release();
+      tracer?.("verified");
       return { round: root.round, previous: previous?.round ?? null, openedMs };
     }
     case "hold": {
@@ -764,6 +938,56 @@ async function handle(request: NextStorageRequest): Promise<unknown> {
     case "chaos-release": {
       if (chaosRelease === null) throw new Error("no chaos workload to release");
       return chaosRelease();
+    }
+    case "diagnose-opfs": {
+      // Where a reopen is stuck on OPFS: the lock manager's view of this store's locks, then each
+      // file's sync handle opened and closed alone, each file retried until free or its own
+      // `probeMs` budget has passed (the page's diagnosis deadline bounds the whole probe).
+      // Each step is streamed to the page as it starts and ends: a synchronous call that never
+      // returns (a close, say) blocks this worker's timers, so the page keeps the deadline.
+      const step = traceStep;
+      step("locks.query");
+      const query = await navigator.locks.query();
+      const ours = (list: readonly LockInfo[] | undefined) =>
+        (list ?? [])
+          .filter((info) => info.name?.includes(`next-test:${request.dir}`) === true)
+          .map((info) => `${info.name ?? ""} (${info.mode ?? ""})`);
+      step(
+        `locks after termination: held ${JSON.stringify(ours(query.held))}, pending ${JSON.stringify(ours(query.pending))}`,
+      );
+      const dir = await directory(request.dir, step);
+      const files: Record<string, string> = {};
+      for (const name of OPFS_FILE_NAMES) {
+        const started = performance.now();
+        let outcome: string;
+        for (;;) {
+          const attempt = await Promise.race([
+            (async () => {
+              const handle = await traced(step, `getFileHandle ${name}`, () =>
+                dir.getFileHandle(name),
+              );
+              const file = await traced(step, `createSyncAccessHandle ${name}`, () =>
+                handle.createSyncAccessHandle(),
+              );
+              step(`${name}.close`);
+              file.close();
+              step(`${name}.close: done`);
+              return "free";
+            })().catch((error: unknown) => (error instanceof Error ? error.name : String(error))),
+            new Promise<string>((resolve) => {
+              setTimeout(() => {
+                resolve("open did not settle in 2 s");
+              }, 2_000);
+            }),
+          ]);
+          outcome = `${attempt} after ${String(Math.round(performance.now() - started))} ms`;
+          if (attempt === "free" || performance.now() - started > request.probeMs) break;
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        files[name] = outcome;
+        step(`handle ${name}: ${outcome}`);
+      }
+      return { held: ours(query.held), pending: ours(query.pending), files };
     }
     case "diagnose-wedge": {
       // Where a recovering owner is stuck (the WebKit wedge): the lock manager's view, a bounded

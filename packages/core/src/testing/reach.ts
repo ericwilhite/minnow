@@ -867,6 +867,48 @@ export const XXHASH32_REACH = [
   "reused view byte tail",
 ] as const;
 
+/** B9 short byte keys must keep boundary, collision, dictionary and slice laws. */
+export const JOIN_SHORT_KEY_REACH = [
+  "view hash",
+  "source byte offset",
+  "source offset base",
+  "empty",
+  "one byte",
+  "63 bytes",
+  "64 bytes",
+  "65 bytes",
+  "long fallback",
+  "flat",
+  "dictionary",
+  "reordered selection",
+  "collision mismatch",
+  "duplicate chain",
+  "due hash yield",
+  "due comparison yield",
+  "zero charges",
+] as const;
+
+export const JOIN_SHORT_SQL_REACH = [
+  "empty",
+  "63 bytes",
+  "64 bytes",
+  "65 bytes",
+  "80 bytes",
+  "UTF8",
+  "inner",
+  "left",
+  "right",
+  "full",
+  "semi",
+  "anti",
+  "mark",
+  "residual ON",
+  "null-safe",
+  "flat",
+  "dictionary",
+  "minimum-grant spill",
+] as const;
+
 export function createReach<State extends string>(
   campaign: string,
   states: readonly State[],
@@ -1662,6 +1704,30 @@ export const LOWER_M3_JOINS_REACH = [
   "flushed",
   "reopened",
   "complete",
+  "build column in expression",
+  "aggregate over join",
+  "probe-only projection",
+] as const;
+
+/** Join output demand over every expression shape and placement (join-demand-expressions). */
+export const JOIN_DEMAND_EXPRESSION_REACH = [
+  "searched CASE",
+  "simple CASE",
+  "CASE condition",
+  "COALESCE",
+  "NULLIF",
+  "nested call",
+  "IN list",
+  "cast",
+  "arithmetic",
+  "nested shapes",
+  "projection",
+  "residual",
+  "parent join key",
+  "ORDER BY",
+  "GROUP BY",
+  "window argument",
+  "PG exact",
 ] as const;
 
 /** SQL windows run through durable storage and the actual executor, not a plan interpreter. */
