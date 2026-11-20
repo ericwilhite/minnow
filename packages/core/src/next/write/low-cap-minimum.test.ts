@@ -119,7 +119,30 @@ for (const [backend, reclaimed] of [
             if (typeof governor.admitGroup === "function") {
               const admitGroup = governor.admitGroup.bind(governor);
               governor.admitGroup = async (options) => {
-                const grants = await admitGroup(options);
+                const pending = admitGroup(options);
+                if (
+                  holder &&
+                  (options.label.startsWith("merge") ||
+                    options.label.startsWith("grow ") ||
+                    options.label.startsWith("complete grow "))
+                ) {
+                  const settlement = { complete: false };
+                  void pending.then(
+                    () => {
+                      settlement.complete = true;
+                    },
+                    () => {
+                      settlement.complete = true;
+                    },
+                  );
+                  for (let turn = 0; turn < 8; turn++) await Promise.resolve();
+                  if (!settlement.complete) {
+                    blocked++;
+                    blockedAt.push("pending global complete-step admission");
+                    release(); // cleanup only; failure is the bounded progress assertion.
+                  }
+                }
+                const grants = await pending;
                 for (const grant of grants) watchMetadata(grant);
                 return grants;
               };

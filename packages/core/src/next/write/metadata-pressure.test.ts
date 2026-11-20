@@ -103,6 +103,7 @@ for (const backend of ["memory", "indexeddb"] as const)
             if (typeof governor.admitGroup === "function") {
               const admitGroup = governor.admitGroup.bind(governor);
               governor.admitGroup = async (options) => {
+                if (reader && options.grants.some((part) => part.minimumBytes > 0)) schedule();
                 const group = await admitGroup(options);
                 for (const g of group) watchGrant(g);
                 return group;
@@ -124,13 +125,19 @@ for (const backend of ["memory", "indexeddb"] as const)
               });
               for (let cycle = 0; cycle < s.cycles; cycle++) {
                 await path.quiesce();
+                // Fill the competing reader from every idle forecast. The new
+                // growth path can net accounts, so retained row/WAL estimates
+                // would not force an external wait and were never real pressure.
                 for (const g of grants)
-                  if (
-                    g.label !== "write path" &&
-                    g.label !== "write commit buffers" &&
-                    g.held > g.allocated + g.loaned
-                  )
-                    g.release(g.held - g.allocated - g.loaned);
+                  if (g.held > g.allocated + g.loaned) g.release(g.held - g.allocated - g.loaned);
+                expect(
+                  grants.reduce(
+                    (sum, grant) => sum + Math.max(0, grant.held - grant.allocated - grant.loaned),
+                    0,
+                  ),
+                  "the holder receives every donated forecast, not only unowned governor credit",
+                ).toBe(0);
+                reach.reach("idle forecasts donated before reader pressure");
                 reader = await governor.admit({
                   label: "concurrent reader",
                   minimumBytes: 0,

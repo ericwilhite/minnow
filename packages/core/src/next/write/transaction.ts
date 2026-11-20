@@ -290,6 +290,11 @@ export class TransactionImpl implements WriteTransaction {
   #lastNativeCommands = false;
   #savepointMap: Map<number, number> | null = null;
 
+  /** An idle transaction retains its actual rows, not a future step's forecast. */
+  get hasWritableStatement(): boolean {
+    return this.#open !== null && !this.#open.readOnly;
+  }
+
   get #savepoints(): Map<number, number> {
     return (this.#savepointMap ??= new Map());
   }
@@ -787,6 +792,7 @@ export class StatementImpl implements Statement {
   /** Row ids this statement updated or deleted, per table (row-affected-twice). */
   #touchedMap: Map<number, Set<number>> | null = null;
   readonly targets: StatementOptions["targets"];
+  readonly readOnly: boolean;
 
   get touched(): Map<number, Set<number>> {
     return (this.#touchedMap ??= new Map());
@@ -849,6 +855,7 @@ export class StatementImpl implements Statement {
     this.#rules = options.rules;
     this.#signal = options.signal;
     this.targets = options.targets;
+    this.readOnly = options.readOnly === true;
     this.#start = tx.undo.length;
     this.#startCatalog = tx.catalog;
   }
@@ -886,6 +893,7 @@ export class StatementImpl implements Statement {
   /** Internal composition capability; no SQL caller installs it until its whole route is ready. */
   openNativeCommands(scope: Omit<NativePrimaryScope, "statement">): NativePrimaryAdapter {
     this.#checkOpen();
+    if (this.readOnly) throw new TransactionStateError("A read-only statement cannot write");
     if (this.#commandMode || this.tx.undo.length !== this.#start)
       throw new TransactionStateError("Native command scope must precede statement writes");
     const commands = new NativePrimaryAdapter({ ...scope, statement: this });
@@ -897,6 +905,7 @@ export class StatementImpl implements Statement {
   /** Existing/retained legacy writers must not bypass command ownership after installation. */
   checkLegacyWrite(): void {
     this.#checkOpen();
+    if (this.readOnly) throw new TransactionStateError("A read-only statement cannot write");
     if (this.#commandMode)
       throw new TransactionStateError("Native command writes require their primary capability");
   }
@@ -1043,6 +1052,7 @@ export class StatementImpl implements Statement {
   }
 
   table(tableId: number, options: TableWriteOptions = {}): TableWriterImpl {
+    if (this.readOnly) throw new TransactionStateError("A read-only statement cannot write");
     if (this.#state !== "open") throw new TransactionStateError(`The statement is ${this.#state}`);
     if (options.requireTrackedTargets === true && this.targets === undefined)
       throw new TypeError("SQL modification requires admitted target tracking");
