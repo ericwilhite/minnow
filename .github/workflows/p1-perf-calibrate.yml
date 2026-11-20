@@ -1,0 +1,41 @@
+# SCRATCH BRANCH ONLY (ci/p1-perf-calibrate). Never merge. Hosted runner CPU assignment is
+# random, so twelve identical jobs run the gate's own --update calibration; each uploads the
+# baseline it wrote, its log and its CPU. Only runs of the target CPU are used.
+name: P1 perf gate calibration (branch only)
+on:
+  push:
+    branches: [ci/p1-perf-calibrate]
+permissions:
+  contents: read
+jobs:
+  calibrate:
+    if: github.ref == 'refs/heads/ci/p1-perf-calibrate'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        job: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: bash scripts/ci-install.sh
+      - run: npx tsc -b packages/core
+      - name: Calibrate
+        shell: bash
+        run: |
+          mkdir -p calibration
+          node -p 'require("os").cpus()[0].model' > calibration/cpu.txt
+          npm run benchmark:gate -- ${{ env.MODE }} 2>&1 | tee calibration/gate.txt
+          cp packages/core/perf-baseline.json calibration/perf-baseline.json
+        env:
+          MODE: --update
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: calibration-${{ matrix.job }}
+          path: calibration/
+          retention-days: 30
