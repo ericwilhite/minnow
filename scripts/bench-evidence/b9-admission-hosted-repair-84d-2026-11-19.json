@@ -1,0 +1,1021 @@
+{
+  "base": "84d10cff312e5c42dfa9602b3eb83423859db0b0",
+  "admissionCommit": "d08d7466073647be35f8938dbdd36b274cb463ce",
+  "P2TestCommit": "8b3aca622cfa19564c90d0c390e2d4a8f8d6c57c",
+  "piece": "Repair hosted one-locator admission failure and independently account scan backing",
+  "Law": "next/memory/governor.ts complete-minimum and charge-before-allocation contract. next/access/snapshot.ts physical-slot MemoryReadHint/ChunkOutput contract: SQL LIMIT bounds active locators, not the ordinal/selection capacity. PostgreSQL owns exact ordered rows, NUMERIC values and locking syntax. Internal strategy assertions follow the already documented complete-resident generic and separately retained index capability; no SQL expectation is relaxed.",
+  "RED": {
+    "hostedRun": "https://github.com/ericwilhite/minnow/actions/runs/44497039678",
+    "runner": "GitHub ubuntu-latest hosted runner",
+    "parent": "all4 test shards passed",
+    "candidate": "test shards1/3 failed,2/4 passed; build/typecheck/lint/format/API/version passed",
+    "failures": [
+      {
+        "file": "testing/executor-pk-offset-locking.test.ts",
+        "seeds": [57667, 57668],
+        "cause": "4624-byte memory hint refused after fixed fetch buffers"
+      },
+      {
+        "file": "testing/executor-pk-offset.test.ts",
+        "seeds": [57665, 57666],
+        "cause": "internal observer assumes cursor for documented complete resident generic recipe"
+      }
+    ],
+    "newGeneratedBudgetMutant": "first pinned2-row INT case reproduces4624-byte refusal",
+    "newIndependentBackingFinding": "scan constructor pays20480B but constructs20481B: placeholder Uint8Array(1) omitted"
+  },
+  "GREEN": {
+    "uniqueChecks": 107,
+    "scope": "16 files; broad run106/107, then33/33 scan replay plus2/2 final demand replay; union107 passed",
+    "checks": [
+      {
+        "file": "packages/core/src/next/dependency-rules.test.ts",
+        "test": "next/ dependency rules every next/ module imports only what its layer allows",
+        "status": "passed",
+        "durationMs": 2630.5744539999996
+      },
+      {
+        "file": "packages/core/src/next/dependency-rules.test.ts",
+        "test": "next/ dependency rules non-bridge next/ sources use the old code only as types",
+        "status": "passed",
+        "durationMs": 190.00583499999993
+      },
+      {
+        "file": "packages/core/src/next/dependency-rules.test.ts",
+        "test": "next/ dependency rules nothing outside next/ imports it",
+        "status": "passed",
+        "durationMs": 730.064594
+      },
+      {
+        "file": "packages/core/src/next/dependency-rules.test.ts",
+        "test": "next/ dependency rules shared Date and FTS leaves have only neutral transitive dependencies",
+        "status": "passed",
+        "durationMs": 1.0200730000001386
+      },
+      {
+        "file": "packages/core/src/next/exec/key-order.test.ts",
+        "test": "bounds cursor reads and closes once (seed 57603)",
+        "status": "passed",
+        "durationMs": 159.98302999999987
+      },
+      {
+        "file": "packages/core/src/next/exec/key-order.test.ts",
+        "test": "bounds cursor reads and closes once (seed 57604)",
+        "status": "passed",
+        "durationMs": 19.529665999999906
+      },
+      {
+        "file": "packages/core/src/next/exec/key-order.test.ts",
+        "test": "drains a pending cursor next before closing output storage",
+        "status": "passed",
+        "durationMs": 1.0401849999998376
+      },
+      {
+        "file": "packages/core/src/next/exec/key-order.test.ts",
+        "test": "drains a pending cursor skip before closing output storage",
+        "status": "passed",
+        "durationMs": 0.6894779999997809
+      },
+      {
+        "file": "packages/core/src/next/exec/key-order.test.ts",
+        "test": "gates native query range fields even below LIMIT zero (seed 57607)",
+        "status": "passed",
+        "durationMs": 51.96285399999988
+      },
+      {
+        "file": "packages/core/src/next/exec/key-order.test.ts",
+        "test": "gates native query range fields even below LIMIT zero (seed 57608)",
+        "status": "passed",
+        "durationMs": 6.751162999999906
+      },
+      {
+        "file": "packages/core/src/next/exec/key-order.test.ts",
+        "test": "retains restore admission under a competing holder (seed 57605)",
+        "status": "passed",
+        "durationMs": 18.475069000000076
+      },
+      {
+        "file": "packages/core/src/next/exec/key-order.test.ts",
+        "test": "retains restore admission under a competing holder (seed 57606)",
+        "status": "passed",
+        "durationMs": 26.46483900000021
+      },
+      {
+        "file": "packages/core/src/next/exec/memory-scan.test.ts",
+        "test": "MemorySegmentScan applies deletions as the batch selection",
+        "status": "passed",
+        "durationMs": 72.77214400000003
+      },
+      {
+        "file": "packages/core/src/next/exec/memory-scan.test.ts",
+        "test": "MemorySegmentScan handles re-pointed segments whose chunk() is async",
+        "status": "passed",
+        "durationMs": 190.93427700000007
+      },
+      {
+        "file": "packages/core/src/next/exec/memory-scan.test.ts",
+        "test": "MemorySegmentScan reads resident chunks synchronously, one borrowed chunk per segment",
+        "status": "passed",
+        "durationMs": 125.77565400000003
+      },
+      {
+        "file": "packages/core/src/next/exec/memory-scan.test.ts",
+        "test": "MemorySegmentScan refuses a denied part with no row (no progress loan to borrow)",
+        "status": "passed",
+        "durationMs": 11.831052999999883
+      },
+      {
+        "file": "packages/core/src/next/exec/memory-scan.test.ts",
+        "test": "MemorySegmentScan resumes a partial re-pointed chunk at its resume row, within the same chunk index",
+        "status": "passed",
+        "durationMs": 285.0410459999998
+      },
+      {
+        "file": "packages/core/src/next/exec/memory-scan.test.ts",
+        "test": "retains every live row across bounded borrowed intervals (seed 51459)",
+        "status": "passed",
+        "durationMs": 2657.939773
+      },
+      {
+        "file": "packages/core/src/next/exec/memory-scan.test.ts",
+        "test": "retains every live row across bounded borrowed intervals (seed 51460)",
+        "status": "passed",
+        "durationMs": 1616.7373210000005
+      },
+      {
+        "file": "packages/core/src/next/exec/memory-scan.test.ts",
+        "test": "selects a sparse predicate in one borrowed interval before applying its row bound",
+        "status": "passed",
+        "durationMs": 10.266368000000512
+      },
+      {
+        "file": "packages/core/src/next/exec/table-scan.test.ts",
+        "test": "review B4-p2c-2: the scan's lifecycle, budget and pacing 1. a failure after borrowing leaves the loan to abort, which repays it",
+        "status": "passed",
+        "durationMs": 8.119787999999971
+      },
+      {
+        "file": "packages/core/src/next/exec/table-scan.test.ts",
+        "test": "review B4-p2c-2: the scan's lifecycle, budget and pacing 1. a loan is repaid once when the scan is closed right after the loan-backed batch",
+        "status": "passed",
+        "durationMs": 11.190113999997266
+      },
+      {
+        "file": "packages/core/src/next/exec/table-scan.test.ts",
+        "test": "review B4-p2c-2: the scan's lifecycle, budget and pacing 1. a loan served after the scan was aborted is repaid at once",
+        "status": "passed",
+        "durationMs": 7.671972000000096
+      },
+      {
+        "file": "packages/core/src/next/exec/table-scan.test.ts",
+        "test": "review B4-p2c-2: the scan's lifecycle, budget and pacing 2. one loan covers the row's whole working set: its value lease and decode buffers",
+        "status": "passed",
+        "durationMs": 9.380805000000692
+      },
+      {
+        "file": "packages/core/src/next/exec/table-scan.test.ts",
+        "test": "review B4-p2c-2: the scan's lifecycle, budget and pacing 3. fixed-width output counts toward the byte target",
+        "status": "passed",
+        "durationMs": 84.66256299999804
+      },
+      {
+        "file": "packages/core/src/next/exec/table-scan.test.ts",
+        "test": "review B4-p2c-2: the scan's lifecycle, budget and pacing 4. a scan rejecting every row yields to a task within one long next()",
+        "status": "passed",
+        "durationMs": 1179.1069270000007
+      },
+      {
+        "file": "packages/core/src/next/exec/table-scan.test.ts",
+        "test": "review B4-p2c-2: the scan's lifecycle, budget and pacing 5. abort at every suspension of a group scan: nothing more read or emitted, all closed",
+        "status": "passed",
+        "durationMs": 297.11050799999794
+      },
+      {
+        "file": "packages/core/src/next/exec/table-scan.test.ts",
+        "test": "review B4-p2c-2: the scan's lifecycle, budget and pacing 5. abort during a memory chunk's asynchronous read: no batch, no later read",
+        "status": "passed",
+        "durationMs": 10.844693999999436
+      },
+      {
+        "file": "packages/core/src/next/exec/table-scan.test.ts",
+        "test": "review B4-p2c-2: the scan's lifecycle, budget and pacing 6. the scan charges its scratch before building it, and gives it back",
+        "status": "passed",
+        "durationMs": 9.978887000001123
+      },
+      {
+        "file": "packages/core/src/next/exec/table-scan.test.ts",
+        "test": "review B4-p2c-2: the scan's lifecycle, budget and pacing R23.4: the slice runs on across next() calls a caller makes at once",
+        "status": "passed",
+        "durationMs": 29.142195999997057
+      },
+      {
+        "file": "packages/core/src/next/exec/table-scan.test.ts",
+        "test": "review B4-p2c-3: loans under the real governor 1. a rejected oversized row gives its working set back and repays before the next",
+        "status": "passed",
+        "durationMs": 21.5850989999999
+      },
+      {
+        "file": "packages/core/src/next/exec/table-scan.test.ts",
+        "test": "review B4-p2c-3: loans under the real governor 2. abort during an in-flight charged value read repays once the read settles",
+        "status": "passed",
+        "durationMs": 5.667248000001564
+      },
+      {
+        "file": "packages/core/src/next/exec/table-scan.test.ts",
+        "test": "review B4-p2c-3: loans under the real governor abort after a decode failure under a real loan returns every byte and the loan",
+        "status": "passed",
+        "durationMs": 5.680127000003267
+      },
+      {
+        "file": "packages/core/src/next/exec/table-scan.test.ts",
+        "test": "review B4-p2c-3: loans under the real governor detached loan-backed output holds its credit until release (seed 45735)",
+        "status": "passed",
+        "durationMs": 312.01619700000083
+      },
+      {
+        "file": "packages/core/src/next/exec/table-scan.test.ts",
+        "test": "review B4-p2c-3: loans under the real governor detached loan-backed output holds its credit until release (seed 45736)",
+        "status": "passed",
+        "durationMs": 119.3257279999998
+      },
+      {
+        "file": "packages/core/src/next/exec/table-scan.test.ts",
+        "test": "review B4-p2c-3: loans under the real governor dictionary charges and values survive source end until output release (seed 45737)",
+        "status": "passed",
+        "durationMs": 200.9046899999994
+      },
+      {
+        "file": "packages/core/src/next/exec/table-scan.test.ts",
+        "test": "review B4-p2c-3: loans under the real governor dictionary charges and values survive source end until output release (seed 45738)",
+        "status": "passed",
+        "durationMs": 94.68156699999963
+      },
+      {
+        "file": "packages/core/src/next/exec/table-scan.test.ts",
+        "test": "review B4-p2c-3: loans under the real governor oversized rows under a real grant: residuals keep or reject them, loans balance (seed 23721)",
+        "status": "passed",
+        "durationMs": 124.49546199999895
+      },
+      {
+        "file": "packages/core/src/next/exec/table-scan.test.ts",
+        "test": "review B4-p2c-3: loans under the real governor oversized rows under a real grant: residuals keep or reject them, loans balance (seed 29)",
+        "status": "passed",
+        "durationMs": 113.64352599999984
+      },
+      {
+        "file": "packages/core/src/next/exec/table-scan.test.ts",
+        "test": "review B4-p2c-3: loans under the real governor ownership falls back for missing/deleted/memory rows seed 45739",
+        "status": "passed",
+        "durationMs": 221.11730300000272
+      },
+      {
+        "file": "packages/core/src/next/exec/table-scan.test.ts",
+        "test": "review B4-p2c-3: loans under the real governor ownership falls back for missing/deleted/memory rows seed 45740",
+        "status": "passed",
+        "durationMs": 398.399766999999
+      },
+      {
+        "file": "packages/core/src/next/exec/table-scan.test.ts",
+        "test": "review B4-p2c-3: loans under the real governor result allocations wait for released credit, including abort seed 45741",
+        "status": "passed",
+        "durationMs": 272.9269690000001
+      },
+      {
+        "file": "packages/core/src/next/exec/table-scan.test.ts",
+        "test": "review B4-p2c-3: loans under the real governor result allocations wait for released credit, including abort seed 45742",
+        "status": "passed",
+        "durationMs": 47.43192000000272
+      },
+      {
+        "file": "packages/core/src/next/exec/table-scan.test.ts",
+        "test": "table scan: pushdown, gather and late materialization never change the answer borrows a progress loan for one row the grant cannot hold, and repays it (R18.3)",
+        "status": "passed",
+        "durationMs": 48.4325800000006
+      },
+      {
+        "file": "packages/core/src/next/exec/table-scan.test.ts",
+        "test": "table scan: pushdown, gather and late materialization never change the answer contiguous split prefixes use range APIs; gaps preserve positions (seed 379538)",
+        "status": "passed",
+        "durationMs": 427.0015509999994
+      },
+      {
+        "file": "packages/core/src/next/exec/table-scan.test.ts",
+        "test": "table scan: pushdown, gather and late materialization never change the answer contiguous split prefixes use range APIs; gaps preserve positions (seed 379539)",
+        "status": "passed",
+        "durationMs": 306.88674699999865
+      },
+      {
+        "file": "packages/core/src/next/exec/table-scan.test.ts",
+        "test": "table scan: pushdown, gather and late materialization never change the answer generated tables and filters (seed 23721)",
+        "status": "passed",
+        "durationMs": 6226.935806000001
+      },
+      {
+        "file": "packages/core/src/next/exec/table-scan.test.ts",
+        "test": "table scan: pushdown, gather and late materialization never change the answer generated tables and filters (seed 29)",
+        "status": "passed",
+        "durationMs": 6355.146449
+      },
+      {
+        "file": "packages/core/src/next/exec/table-scan.test.ts",
+        "test": "table scan: pushdown, gather and late materialization never change the answer one-pass row windows balance retries and cancellation (seed 45729)",
+        "status": "passed",
+        "durationMs": 2097.643585
+      },
+      {
+        "file": "packages/core/src/next/exec/table-scan.test.ts",
+        "test": "table scan: pushdown, gather and late materialization never change the answer one-pass row windows balance retries and cancellation (seed 45730)",
+        "status": "passed",
+        "durationMs": 1746.4614659999988
+      },
+      {
+        "file": "packages/core/src/next/exec/table-scan.test.ts",
+        "test": "table scan: pushdown, gather and late materialization never change the answer opt-in windows preserve cached synchronous steps; default stays cached (seed 45745)",
+        "status": "passed",
+        "durationMs": 1388.0427490000002
+      },
+      {
+        "file": "packages/core/src/next/exec/table-scan.test.ts",
+        "test": "table scan: pushdown, gather and late materialization never change the answer opt-in windows preserve cached synchronous steps; default stays cached (seed 45746)",
+        "status": "passed",
+        "durationMs": 380.6593589999993
+      },
+      {
+        "file": "packages/core/src/next/exec/table-scan.test.ts",
+        "test": "table scan: pushdown, gather and late materialization never change the answer pushes NUMERIC, text, int8 and float constants exactly (encoded seam vs decoded)",
+        "status": "passed",
+        "durationMs": 209.1242999999995
+      },
+      {
+        "file": "packages/core/src/next/page/read-bounds-native-demand.test.ts",
+        "test": "uses complete hint unions and preserves partial source coverage seed 761377",
+        "status": "passed",
+        "durationMs": 235.92007699999976
+      },
+      {
+        "file": "packages/core/src/next/page/read-bounds-native-demand.test.ts",
+        "test": "uses complete hint unions and preserves partial source coverage seed 761378",
+        "status": "passed",
+        "durationMs": 95.0905130000001
+      },
+      {
+        "file": "packages/core/src/next/testing/executor-demand-admission.test.ts",
+        "test": "diagnostic cursor requests fit their complete reserved capacity seed 761425",
+        "status": "passed",
+        "durationMs": 3798.5545760000023
+      },
+      {
+        "file": "packages/core/src/next/testing/executor-demand-admission.test.ts",
+        "test": "diagnostic cursor requests fit their complete reserved capacity seed 761426",
+        "status": "passed",
+        "durationMs": 2726.226364999995
+      },
+      {
+        "file": "packages/core/src/next/testing/executor-demand-admission.test.ts",
+        "test": "independent backing census rejects allocation without its charge",
+        "status": "passed",
+        "durationMs": 36.22664100000111
+      },
+      {
+        "file": "packages/core/src/next/testing/executor-demand-admission.test.ts",
+        "test": "native key-order demand is sound and proportional under pinned pressure seed 761345",
+        "status": "passed",
+        "durationMs": 19266.194657
+      },
+      {
+        "file": "packages/core/src/next/testing/executor-demand-admission.test.ts",
+        "test": "native key-order demand is sound and proportional under pinned pressure seed 761346",
+        "status": "passed",
+        "durationMs": 8074.454698000001
+      },
+      {
+        "file": "packages/core/src/next/testing/executor-demand-admission.test.ts",
+        "test": "peak meter excludes unused loan credit and counts its allocated buffers once",
+        "status": "passed",
+        "durationMs": 4.990000000001601
+      },
+      {
+        "file": "packages/core/src/next/testing/executor-demand-admission.test.ts",
+        "test": "peak meter observes native group grants without counting their held minimum",
+        "status": "passed",
+        "durationMs": 5.622838999999658
+      },
+      {
+        "file": "packages/core/src/next/testing/executor-demand-admission.test.ts",
+        "test": "retains the sized resident source through publication after admission seed 761393",
+        "status": "passed",
+        "durationMs": 2318.065601999995
+      },
+      {
+        "file": "packages/core/src/next/testing/executor-demand-admission.test.ts",
+        "test": "retains the sized resident source through publication after admission seed 761394",
+        "status": "passed",
+        "durationMs": 1868.1664359999995
+      },
+      {
+        "file": "packages/core/src/next/testing/executor-demand-admission.test.ts",
+        "test": "two-row INT TEXT NUMERIC ordered LIMIT fits an8MiB query governor",
+        "status": "passed",
+        "durationMs": 68.50969800000166
+      },
+      {
+        "file": "packages/core/src/next/testing/executor-demand-boundaries.test.ts",
+        "test": "complete admission covers multi-batch variable buffers under pinned pressure seed 761457",
+        "status": "passed",
+        "durationMs": 46046.969486
+      },
+      {
+        "file": "packages/core/src/next/testing/executor-demand-boundaries.test.ts",
+        "test": "complete admission covers multi-batch variable buffers under pinned pressure seed 761458",
+        "status": "passed",
+        "durationMs": 30695.081784
+      },
+      {
+        "file": "packages/core/src/next/testing/executor-demand-live.test.ts",
+        "test": "native ordered live binding publishes updates at64MiB seed 761361",
+        "status": "passed",
+        "durationMs": 1476.639843
+      },
+      {
+        "file": "packages/core/src/next/testing/executor-demand-live.test.ts",
+        "test": "native ordered live binding publishes updates at64MiB seed 761362",
+        "status": "passed",
+        "durationMs": 265.5377840000001
+      },
+      {
+        "file": "packages/core/src/next/testing/executor-key-order-budget.test.ts",
+        "test": "retains a fitting generic recipe when index buffers plus inputs exceed the cap (seed 57609)",
+        "status": "passed",
+        "durationMs": 7441.8007510000025
+      },
+      {
+        "file": "packages/core/src/next/testing/executor-key-order-budget.test.ts",
+        "test": "retains a fitting generic recipe when index buffers plus inputs exceed the cap (seed 57610)",
+        "status": "passed",
+        "durationMs": 3901.0441089999986
+      },
+      {
+        "file": "packages/core/src/next/testing/executor-key-order-demand.test.ts",
+        "test": "funds fixed physical-slot buffers beside one-row demand under pressure (seed 761601)",
+        "status": "passed",
+        "durationMs": 13769.424424999997
+      },
+      {
+        "file": "packages/core/src/next/testing/executor-key-order-demand.test.ts",
+        "test": "funds fixed physical-slot buffers beside one-row demand under pressure (seed 761602)",
+        "status": "passed",
+        "durationMs": 7280.630068999999
+      },
+      {
+        "file": "packages/core/src/next/testing/executor-key-order-lifecycle.test.ts",
+        "test": "settles ordered-index fetch before releasing query resources",
+        "status": "passed",
+        "durationMs": 132.7204740000002
+      },
+      {
+        "file": "packages/core/src/next/testing/executor-key-order-lifecycle.test.ts",
+        "test": "settles ordered-index frame before releasing query resources",
+        "status": "passed",
+        "durationMs": 200.3728540000002
+      },
+      {
+        "file": "packages/core/src/next/testing/executor-key-order-lifecycle.test.ts",
+        "test": "settles ordered-index index before releasing query resources",
+        "status": "passed",
+        "durationMs": 758.6604269999998
+      },
+      {
+        "file": "packages/core/src/next/testing/executor-key-order-lifecycle.test.ts",
+        "test": "settles ordered-index publish before releasing query resources",
+        "status": "passed",
+        "durationMs": 422.3865960000003
+      },
+      {
+        "file": "packages/core/src/next/testing/executor-key-order-lifecycle.test.ts",
+        "test": "settles ordered-index skip before releasing query resources",
+        "status": "passed",
+        "durationMs": 153.72062099999994
+      },
+      {
+        "file": "packages/core/src/next/testing/executor-pk-offset-locking.test.ts",
+        "test": "keeps the review FOR UPDATE probe on the generic route",
+        "status": "passed",
+        "durationMs": 2084.2714670000005
+      },
+      {
+        "file": "packages/core/src/next/testing/executor-pk-offset-locking.test.ts",
+        "test": "preserves locking fallback beside an eligible unlocked control (seed 57667)",
+        "status": "passed",
+        "durationMs": 7197.551090000001
+      },
+      {
+        "file": "packages/core/src/next/testing/executor-pk-offset-locking.test.ts",
+        "test": "preserves locking fallback beside an eligible unlocked control (seed 57668)",
+        "status": "passed",
+        "durationMs": 5908.086508000002
+      },
+      {
+        "file": "packages/core/src/next/testing/executor-pk-offset.test.ts",
+        "test": "routes exact PK order and retains generic semantics otherwise (seed 57665)",
+        "status": "passed",
+        "durationMs": 7859.502836000001
+      },
+      {
+        "file": "packages/core/src/next/testing/executor-pk-offset.test.ts",
+        "test": "routes exact PK order and retains generic semantics otherwise (seed 57666)",
+        "status": "passed",
+        "durationMs": 4629.929288000001
+      },
+      {
+        "file": "packages/core/src/next/write/memory-read.test.ts",
+        "test": "checks the shared task clock during resident row copies (seed 45123)",
+        "status": "passed",
+        "durationMs": 386.796065999999
+      },
+      {
+        "file": "packages/core/src/next/write/memory-read.test.ts",
+        "test": "drains late reads before returning private I/O on cancellation (seed 51729)",
+        "status": "passed",
+        "durationMs": 1466.9203930000003
+      },
+      {
+        "file": "packages/core/src/next/write/memory-read.test.ts",
+        "test": "fills stronger decimal destinations and resumes at capacity (seed 45134)",
+        "status": "passed",
+        "durationMs": 4138.263978999999
+      },
+      {
+        "file": "packages/core/src/next/write/memory-read.test.ts",
+        "test": "keeps a statement's hint through first staging publication (seed 45123)",
+        "status": "passed",
+        "durationMs": 352.30321299999923
+      },
+      {
+        "file": "packages/core/src/next/write/memory-read.test.ts",
+        "test": "keeps logical prefixes and original bounds across publication (seed 2718)",
+        "status": "passed",
+        "durationMs": 3140.794883999999
+      },
+      {
+        "file": "packages/core/src/next/write/memory-read.test.ts",
+        "test": "keeps logical prefixes and original bounds across publication (seed 45133)",
+        "status": "passed",
+        "durationMs": 3532.2600270000003
+      },
+      {
+        "file": "packages/core/src/next/write/memory-read.test.ts",
+        "test": "keeps logical prefixes and original bounds across publication (seed 90210)",
+        "status": "passed",
+        "durationMs": 2721.547687
+      },
+      {
+        "file": "packages/core/src/next/write/memory-read.test.ts",
+        "test": "precharges a decoder's native alignment copy independently of reported peak (seed 45123)",
+        "status": "passed",
+        "durationMs": 1175.7435870000008
+      },
+      {
+        "file": "packages/core/src/next/write/memory-read.test.ts",
+        "test": "reaches all bounded provider dimensions",
+        "status": "passed",
+        "durationMs": 0.4469150000004447
+      },
+      {
+        "file": "packages/core/src/next/write/memory-read.test.ts",
+        "test": "reads a frozen memtable without waiting for its publication (seed 45123)",
+        "status": "passed",
+        "durationMs": 1056.906762999999
+      },
+      {
+        "file": "packages/core/src/next/write/memory-read.test.ts",
+        "test": "reads recovered staged groups through the caller's context (seed 45123)",
+        "status": "passed",
+        "durationMs": 1706.530447000001
+      },
+      {
+        "file": "packages/core/src/next/write/memory-read.test.ts",
+        "test": "rejects foreign tokens and altered requests before I/O",
+        "status": "passed",
+        "durationMs": 43.47014300000046
+      },
+      {
+        "file": "packages/core/src/next/write/memory-read.test.ts",
+        "test": "reports a native integer or first-null need without replacing buffers (published=false)",
+        "status": "passed",
+        "durationMs": 102.93383399999948
+      },
+      {
+        "file": "packages/core/src/next/write/memory-read.test.ts",
+        "test": "reports a native integer or first-null need without replacing buffers (published=true)",
+        "status": "passed",
+        "durationMs": 89.63061600000037
+      },
+      {
+        "file": "packages/core/src/next/write/memory-read.test.ts",
+        "test": "requires int128 before writing a decimal into an int64 output (published=false)",
+        "status": "passed",
+        "durationMs": 100.1804149999989
+      },
+      {
+        "file": "packages/core/src/next/write/memory-read.test.ts",
+        "test": "requires int128 before writing a decimal into an int64 output (published=true)",
+        "status": "passed",
+        "durationMs": 63.552412999997614
+      },
+      {
+        "file": "packages/core/src/next/write/memory-read.test.ts",
+        "test": "streams a multi-blob value across a mid-scan publication without touching a later value (seed 45123)",
+        "status": "passed",
+        "durationMs": 3073.5773819999995
+      },
+      {
+        "file": "packages/core/src/next/write/range-resident.test.ts",
+        "test": "captured delta stays exact through handoff and publication seed 761409",
+        "status": "passed",
+        "durationMs": 2482.912055
+      },
+      {
+        "file": "packages/core/src/next/write/range-resident.test.ts",
+        "test": "captured delta stays exact through handoff and publication seed 761410",
+        "status": "passed",
+        "durationMs": 684.7028879999998
+      },
+      {
+        "file": "packages/core/src/testing/seeds.test.ts",
+        "test": "regression seeds executes every recorded seed: each registry key is iterated by exactly one suite",
+        "status": "passed",
+        "durationMs": 2729.6055810000003
+      },
+      {
+        "file": "packages/core/src/testing/seeds.test.ts",
+        "test": "regression seeds names every suite the soak runner explores",
+        "status": "passed",
+        "durationMs": 807.0066050000005
+      },
+      {
+        "file": "packages/core/src/testing/seeds.test.ts",
+        "test": "regression seeds replays exactly the MINNOW_SEED override and refuses a non-numeric one",
+        "status": "passed",
+        "durationMs": 17.398785999999973
+      },
+      {
+        "file": "packages/core/src/testing/seeds.test.ts",
+        "test": "regression seeds runs a suite's defaults first and then every seed recorded for it",
+        "status": "passed",
+        "durationMs": 27.836450999999897
+      },
+      {
+        "file": "packages/core/src/testing/seeds.test.ts",
+        "test": "regression seeds seeds every generated property from the registry",
+        "status": "passed",
+        "durationMs": 502.55269000000044
+      }
+    ],
+    "static": [
+      {
+        "check": "types",
+        "exit": 0,
+        "seconds": 100.87057185173035,
+        "command": [
+          "node",
+          "node_modules/typescript/bin/tsc",
+          "-p",
+          "/home/eric/.cache/minnow-b9-prototypes/admission-hosted-fix-tsconfig.json",
+          "--pretty",
+          "false"
+        ]
+      },
+      {
+        "check": "lint",
+        "exit": 0,
+        "seconds": 69.99282169342041,
+        "command": [
+          "node",
+          "node_modules/eslint/bin/eslint.js",
+          "packages/core/src/next/exec/table-scan.test.ts",
+          "packages/core/src/next/exec/table-scan.ts",
+          "packages/core/src/next/testing/allocation-audit.ts",
+          "packages/core/src/next/exec/key-order.ts",
+          "packages/core/src/next/testing/executor-key-order-demand.test.ts",
+          "packages/core/src/next/testing/executor-pk-offset.test.ts",
+          "packages/core/src/next/testing/executor-pk-offset-locking.test.ts",
+          "packages/core/src/testing/reach.ts"
+        ]
+      },
+      {
+        "check": "format",
+        "exit": 0,
+        "seconds": 9.909789562225342,
+        "command": [
+          "node",
+          "node_modules/prettier/bin/prettier.cjs",
+          "--check",
+          "packages/core/src/next/exec/table-scan.test.ts",
+          "packages/core/src/next/exec/table-scan.ts",
+          "packages/core/src/next/testing/allocation-audit.ts",
+          "packages/core/src/next/exec/key-order.ts",
+          "packages/core/src/next/testing/executor-key-order-demand.test.ts",
+          "packages/core/src/next/testing/executor-pk-offset.test.ts",
+          "packages/core/src/next/testing/executor-pk-offset-locking.test.ts",
+          "packages/core/src/testing/reach.ts",
+          "apps/site/content/docs/engine/memory.mdx",
+          "apps/site/content/docs/changelog.mdx"
+        ]
+      },
+      {
+        "check": "prototype",
+        "exit": 0,
+        "seconds": 9.239689588546753,
+        "command": ["node", "/home/eric/.cache/minnow-b9-prototypes/build-admission-hosted-fix.mjs"]
+      },
+      {
+        "check": "component",
+        "exit": 0,
+        "seconds": 7.96756911277771,
+        "command": [
+          "node",
+          "--v8-pool-size=1",
+          "scripts/b9-demand-admission-component.mts",
+          "--parent",
+          "/home/eric/.cache/minnow-b9-prototypes/admission-hosted-fix-84d/parent",
+          "--candidate",
+          "/home/eric/.cache/minnow-b9-prototypes/admission-hosted-fix-84d/candidate",
+          "--output",
+          "/home/eric/.cache/minnow-b9-logs/admission-hosted-fix-component.json"
+        ]
+      }
+    ],
+    "existingBackingHistories": 108,
+    "newPhysicalSlotHistories": 36,
+    "existingCaps": "8MiB small-query and64MiB native live unchanged",
+    "newCaps": "2/257 rows8MiB;2049-row native publication retains established64MiB boundary cap",
+    "fullGate": "NEW FULL HOSTED GATE REQUIRED; not qualified for merge"
+  },
+  "Mutant": [
+    {
+      "mutant": "missing-fixed-fetch-workspace",
+      "exit": 1,
+      "intendedReject": true,
+      "expected": "The chunk reader needs",
+      "log": "/home/eric/.cache/minnow-b9-logs/admission-hosted-mutant-missing-fixed-fetch-workspace.log"
+    },
+    {
+      "mutant": "dropped-scan-scratch-charge",
+      "exit": 1,
+      "intendedReject": true,
+      "expected": "Uncharged backing in TableScan.constructor",
+      "log": "/home/eric/.cache/minnow-b9-logs/admission-hosted-mutant-dropped-scan-scratch-charge.log"
+    },
+    {
+      "mutant": "dropped-flat-charge",
+      "exit": 1,
+      "intendedReject": true,
+      "expectedReasons": ["Uncharged backing", "OutputArena.flat"],
+      "log": "/home/eric/.cache/minnow-b9-logs/admission-review-mutant-dropped-flat-charge.log"
+    },
+    {
+      "mutant": "silent-backing-observer",
+      "exit": 1,
+      "intendedReject": true,
+      "expectedReasons": ["AssertionError", "68"],
+      "log": "/home/eric/.cache/minnow-b9-logs/admission-review-mutant-silent-backing-observer.log"
+    }
+  ],
+  "Reach": {
+    "newSuite": "next-executor-key-order-demand",
+    "seeds": [761601, 761602],
+    "runsPerSeed": 18,
+    "fixedExamplesPerSeed": 4,
+    "dimensions": [
+      "2/257/2049 rows",
+      "INTEGER/TEXT/NUMERIC",
+      "ASC/DESC",
+      "resident/stored",
+      "OFFSET0/1",
+      "independent backing",
+      "PG exact",
+      "released"
+    ],
+    "declared": "testing/reach.ts EXECUTOR_KEY_ORDER_DEMAND_REACH",
+    "oldPKOffset": "31->32 histories per seed, with one added stored exact-end example; random population retained",
+    "boundarySuite": "Existing b9e71/72:30 each, variable1..38 digit NUMERIC,BYTEA/JSON/JSONB,wide values,2047/2048/2049/4097/8193 rows,LIMIT2049 OFFSET2047,WITH TIES,SQL DISTINCT and native DISTINCT retained"
+  },
+  "component": {
+    "summary": {
+      "rounds": 9,
+      "warmups": 4,
+      "repeats": 32,
+      "parentMedianMs": 2.21575,
+      "candidateMedianMs": 2.256125,
+      "pairedDeltaMs": 0.020937500000000053,
+      "pairedIqrMs": 0.8577187500000003,
+      "pairedRangeMs": 3.23621875,
+      "candidateFavorable": 3,
+      "cpuVerdict": "inconclusive",
+      "minimums": {
+        "parent": [35782158],
+        "candidate": [1259995]
+      }
+    },
+    "raw": {
+      "kind": "small recipe component; not hosted whole-cell",
+      "rows": 2,
+      "limit": 1,
+      "capBytes": 67108864,
+      "warmups": 4,
+      "rounds": 9,
+      "repeats": 32,
+      "runtimes": [
+        "/home/eric/.cache/minnow-b9-prototypes/admission-hosted-fix-84d/parent",
+        "/home/eric/.cache/minnow-b9-prototypes/admission-hosted-fix-84d/candidate"
+      ],
+      "pairs": [
+        {
+          "round": 0,
+          "order": ["parent", "candidate"],
+          "values": [
+            {
+              "arm": "parent",
+              "cpuMs": 2.96203125,
+              "minimumBytes": 35782158
+            },
+            {
+              "arm": "candidate",
+              "cpuMs": 3.10715625,
+              "minimumBytes": 1259995
+            }
+          ]
+        },
+        {
+          "round": 1,
+          "order": ["candidate", "parent"],
+          "values": [
+            {
+              "arm": "candidate",
+              "cpuMs": 2.256125,
+              "minimumBytes": 1259995
+            },
+            {
+              "arm": "parent",
+              "cpuMs": 3.08659375,
+              "minimumBytes": 35782158
+            }
+          ]
+        },
+        {
+          "round": 2,
+          "order": ["parent", "candidate"],
+          "values": [
+            {
+              "arm": "parent",
+              "cpuMs": 2.21575,
+              "minimumBytes": 35782158
+            },
+            {
+              "arm": "candidate",
+              "cpuMs": 2.2366875,
+              "minimumBytes": 1259995
+            }
+          ]
+        },
+        {
+          "round": 3,
+          "order": ["candidate", "parent"],
+          "values": [
+            {
+              "arm": "candidate",
+              "cpuMs": 3.369125,
+              "minimumBytes": 1259995
+            },
+            {
+              "arm": "parent",
+              "cpuMs": 2.3125625,
+              "minimumBytes": 35782158
+            }
+          ]
+        },
+        {
+          "round": 4,
+          "order": ["parent", "candidate"],
+          "values": [
+            {
+              "arm": "parent",
+              "cpuMs": 1.7910625,
+              "minimumBytes": 35782158
+            },
+            {
+              "arm": "candidate",
+              "cpuMs": 2.933125,
+              "minimumBytes": 1259995
+            }
+          ]
+        },
+        {
+          "round": 5,
+          "order": ["candidate", "parent"],
+          "values": [
+            {
+              "arm": "candidate",
+              "cpuMs": 1.73753125,
+              "minimumBytes": 1259995
+            },
+            {
+              "arm": "parent",
+              "cpuMs": 1.71771875,
+              "minimumBytes": 35782158
+            }
+          ]
+        },
+        {
+          "round": 6,
+          "order": ["parent", "candidate"],
+          "values": [
+            {
+              "arm": "parent",
+              "cpuMs": 1.84546875,
+              "minimumBytes": 35782158
+            },
+            {
+              "arm": "candidate",
+              "cpuMs": 2.54521875,
+              "minimumBytes": 1259995
+            }
+          ]
+        },
+        {
+          "round": 7,
+          "order": ["candidate", "parent"],
+          "values": [
+            {
+              "arm": "candidate",
+              "cpuMs": 1.88996875,
+              "minimumBytes": 1259995
+            },
+            {
+              "arm": "parent",
+              "cpuMs": 2.0479375,
+              "minimumBytes": 35782158
+            }
+          ]
+        },
+        {
+          "round": 8,
+          "order": ["parent", "candidate"],
+          "values": [
+            {
+              "arm": "parent",
+              "cpuMs": 4.227375,
+              "minimumBytes": 35782158
+            },
+            {
+              "arm": "candidate",
+              "cpuMs": 2.13321875,
+              "minimumBytes": 1259995
+            }
+          ]
+        }
+      ]
+    },
+    "profileShare": "Original84d project24,969,322B/35,782,158B=69.8% reserved minimum, not CPU attribution. Hosted per-cell profiles/path table retained in handoff. No new CPU share inferred from bytes."
+  },
+  "population": {
+    "base": "84d10cff312e5c42dfa9602b3eb83423859db0b0",
+    "candidateFileProjectPairs": 1205,
+    "serialShardCounts": [303, 301, 300, 301],
+    "sameUnion": true,
+    "disjoint": true,
+    "authority": "Actual resolved Vitest DurationSequencer.shard on globTestSpecifications, maxWorkers2; no test execution",
+    "scope": ["packages/core/src/next", "scripts", "packages/core/src/engine"],
+    "limits": "Enumeration/partition proof only; fresh hosted full test execution required. Existing caps, seeds, run counts and deadlines retained."
+  },
+  "priorHostedTiming": {
+    "scope": "OLD d08 runtime only, not this repair",
+    "currentMainCells": 25,
+    "strictCohorts": 225,
+    "ordinaryEmissionMatches": 151,
+    "verdict": "all25 met existing CPU no-regression rule, but full correctness gate failed",
+    "frozenFlags": [
+      "agg_highcard_text",
+      "agg_3dims_20aggs",
+      "S_q3",
+      "S_q14",
+      "S_q15",
+      "S_fact_fact"
+    ],
+    "raw": "/home/eric/.cache/minnow-b9-hosted/44497039678/final"
+  },
+  "Limits": [
+    "Full hosted gate/whole-cell timings required for new runtime; prior failed run does not qualify it. No CPU speedup claimed.",
+    "Census observes native backing in named synchronous factories, not all JS headers/heap/RSS or asynchronous pre-paid read-step buffers. Cumulative constructed capacity is not live peak.",
+    "8MiB is query-only with separate ordinary fixture writer; no8MiB native-owner or multi-chunk publication claim. Multi-chunk pressure uses pre-existing64MiB boundary cap.",
+    "Initial constructor audit uncovered one-byte omission before intended workspace mutant; that rejection was not counted. Dropped scan charge also removes its matching failed-construction refund so the receipt error is not masked by an over-refund.",
+    "Earlier BaseSequencer counts did not represent configured DurationSequencer; actual resolved sequencer proof supersedes them.",
+    "No stored bytes, format gates or supported predecessor policy changed."
+  ],
+  "sourceSha256": {
+    "packages/core/src/next/exec/key-order.ts": "ffe31eb67240981ae59b599257949637430c4dcd0917cec674d37b7ce6d681dd",
+    "packages/core/src/next/exec/table-scan.ts": "c66517f3eb9a28dc76d9025522e345b5a90a52b6a8213ec58d63934aa79ea07c",
+    "packages/core/src/next/testing/allocation-audit.ts": "61fc4618f3cd528bc23afd58af680948e843ad8c53c28e9f277d1816f379da29",
+    "packages/core/src/next/testing/executor-key-order-demand.test.ts": "ae89dd9b9a82ccc829b7f53985235f8d67965839f4f6d1b3a0966684fc3c5e4d"
+  }
+}

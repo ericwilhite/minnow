@@ -83,13 +83,22 @@ export interface IndexReader {
   planProbe?(key: Uint8Array): IndexRangePlan;
   /** Plan without native allocations or admission; range bounds must remain immutable. */
   planRange?(range: KeyRange, direction: "asc" | "desc"): IndexRangePlan;
+  /** Optional captured native input. Retains existing owner-charged index arrays,
+   * allocating no native buffers or query grants. Caller closes even if never opened. */
+  prepareResidentRange?(range: KeyRange, direction: "asc" | "desc"): ResidentIndexRangePlan | null;
+}
+export interface ResidentIndexRangePlan extends IndexRangePlan {
+  /** Cancel its cursor and release the retained input; idempotent. */
+  close(): void;
 }
 
 /** A single-use plan for one pinned view. The complete minimum includes resident heads,
  * key copies, navigation and overlapping encoded/decoded I/O. Publication cannot widen it.
  * Open never admits or grows. The caller owns the dedicated grant and closes it only after
  * pending cursor calls settle; cursor close releases allocations, never the caller's grant.
- * The signal cancels reads, waits and traversal. No leases are held before open.
+ * The signal cancels reads, waits and traversal. Ordinary planRange/planProbe plans
+ * hold no leases before open. ResidentIndexRangePlan explicitly retains an input
+ * until its caller closes that separate capability.
  */
 export interface IndexRangePlan {
   readonly minimumBytes: number;

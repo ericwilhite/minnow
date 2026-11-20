@@ -6,8 +6,9 @@ import { seedsFor } from "../../testing/seeds.js";
 import { createReach } from "../../testing/reach.js";
 import { createExecutor } from "../exec/create.js";
 import { prepareParameters } from "../exec/parameters.js";
-import { indexMinimums, orderedSort } from "../exec/key-order.js";
+import { indexMinimums, indexReadTarget, orderedSort } from "../exec/key-order.js";
 import { Governor, MemoryAdmissionError } from "../memory/governor.js";
+import { BATCH_ROWS } from "../vector/vector.js";
 import { MAX_BLOB_BYTES } from "../access/space.js";
 import { ChunkReader } from "../page/reader.js";
 import type { PreparedPlan, ParameterValue } from "../exec/executor.js";
@@ -132,7 +133,11 @@ it.each(seedsFor("next-key-order-parameter-admission", [0xe109, 0xe10a]))(
           async (wide, two, nullLimit, slack, descending, unused) => {
             reach.beginHistory();
             const sql = `SELECT ${wide ? "*" : "id"} FROM t ORDER BY id ${descending ? "DESC" : "ASC"} LIMIT $1 OFFSET ${two ? "$2" : "1"}`;
-            const args = two ? [nullLimit ? null : 3, 1] : [nullLimit ? null : 3];
+            // Demand-sized small LIMITs now make the optional cursor cheaper than
+            // this generic recipe. A full locator batch preserves the non-fitting
+            // strategy boundary this suite owns; small bounds remain generated in
+            // executor-demand-admission.test.ts.
+            const args = two ? [nullLimit ? null : BATCH_ROWS, 1] : [nullLimit ? null : BATCH_ROWS];
             const plan = core.prepare(sql).plan,
               ordered = orderedSort(plan);
             if (!ordered) throw new Error("ordered fixture");
@@ -147,8 +152,17 @@ it.each(seedsFor("next-key-order-parameter-admission", [0xe109, 0xe10a]))(
             };
             // The diagnostic strategy has one restore breaker and one result phase.
             // Each owns one private blob-sized progress step inside the whole cap.
+            // Stay just below the selected recipe, whose enforced target now follows
+            // LIMIT. The old full-batch estimate no longer creates a non-fitting case.
+            const limit = nullLimit ? null : BATCH_ROWS;
             const total = (cap: number) =>
-              indexMinimums(shape, cap).reduce((n, e) => n + e.minimum, 0) + 2 * MAX_BLOB_BYTES;
+              indexMinimums(
+                shape,
+                cap,
+                indexReadTarget(shape.types, cap, limit),
+                Math.min(BATCH_ROWS, limit ?? BATCH_ROWS),
+              ).reduce((n, e) => n + e.minimum, 0) +
+              2 * MAX_BLOB_BYTES;
             const binding = await prepareParameters(plan, args);
             let lo = 2 << 20,
               hi = 64 << 20;

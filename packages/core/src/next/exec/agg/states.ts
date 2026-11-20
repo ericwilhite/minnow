@@ -67,8 +67,44 @@ import { GroupValues } from "./values.js";
 import { arrayGrowth, payloadBytes } from "./growth.js";
 import type { StateRow, StateReader } from "./state-row.js";
 
+import {
+  PageEncoding,
+  type PageEntry,
+  type EncodedPageCheck,
+  type EncodedPageKernel,
+} from "../../page/consume.js";
+import { countPageRows } from "./page-count.js";
+import { sumPlainF64Page, sumConstantF64Page } from "./page-float.js";
+import {
+  sumScaledF640Page,
+  sumScaledF648Page,
+  sumScaledF6416Page,
+  sumScaledF6432Page,
+} from "./page-scaled.js";
+import {
+  sumI32PlainPage,
+  sumI328Page,
+  sumI3216Page,
+  sumI3232Page,
+  sumDeltaI320Page,
+  sumDeltaI328Page,
+  sumDeltaI3216Page,
+  sumDeltaI3232Page,
+} from "./page-int32.js";
+
 export interface Accumulator {
   readonly type: PhysicalType;
+  /** Metadata-only eligibility; no transition or allocation. The returned prebuilt callback
+   * borrows one validated page synchronously for at most BATCH_ROWS demanded positions and
+   * updates already-admitted scalar state. A larger selection window retains those steps.
+   * A supplied pageCheck must also succeed before any argument transitions.
+   * Missing support keeps the complete unconsumed logical step on the decoded route.
+   */
+  pageKernel?(type: PhysicalType, entry: PageEntry): EncodedPageKernel<Accumulator> | null;
+  /** Optional raw-header eligibility, checked for the entire step before transition. */
+  readonly pageCheck?: EncodedPageCheck;
+  /** COUNT(*) only: transition by selected row count, without reading a value. */
+  addPageRows?(count: number): void;
   grow(groups: number): void;
   /** New buffer/variable-state allocation peak before the next batch. */
   growthBytes?(groups: number, vector: Vector | null, rows: number): number;
@@ -217,6 +253,37 @@ function validityFrom(present: Uint8Array, from: number, count: number): Validit
 // COUNT(*), COUNT(x)
 
 class CountAccumulator implements Accumulator {
+  // Ordinary int64/decimal/interval decoding rechecks demanded safe-f64 slots unless the
+  // header proves the bound. COUNT cannot bypass that corruption law by reading only bits.
+  static readonly #checkPage: EncodedPageCheck = (view) =>
+    view.allNull || !view.safe || view.boundSafe;
+  readonly pageCheck: EncodedPageCheck = CountAccumulator.#checkPage;
+  static readonly #page: EncodedPageKernel<Accumulator> = (
+    state,
+    view,
+    entry,
+    _type,
+    _dictionary,
+    rows,
+    from,
+    to,
+  ) => {
+    const count = state as CountAccumulator;
+    count.#counts[0] =
+      (count.#counts[0] ?? 0) + countPageRows(view, entry.firstRow, rows, from, to);
+    return undefined;
+  };
+  pageKernel(_type: PhysicalType, entry: PageEntry): EncodedPageKernel<Accumulator> | null {
+    // Do not change the existing out-of-line payload demand in this first piece.
+    return this.star || entry.largeRegion !== undefined ? null : CountAccumulator.#page;
+  }
+  addNonNullPageRows(count: number): void {
+    this.#counts[0] = (this.#counts[0] ?? 0) + count;
+  }
+  addPageRows(count: number): void {
+    if (!this.star) throw new TypeError("Only COUNT(*) accepts a row count");
+    this.#counts[0] = (this.#counts[0] ?? 0) + count;
+  }
   save(group: number, row: StateRow): void {
     row.number(this.#counts[group] ?? 0);
   }
@@ -702,6 +769,52 @@ function addFlat32(
 }
 
 class IntegerSumAccumulator implements Accumulator {
+  static readonly #page: EncodedPageKernel<Accumulator> = (
+    state,
+    view,
+    entry,
+    _type,
+    _dictionary,
+    rows,
+    from,
+    to,
+  ) => {
+    if (view.allNull) return undefined;
+    const sum = state as IntegerSumAccumulator;
+    const count = countPageRows(view, entry.firstRow, rows, from, to);
+    if (count === 0) return undefined;
+    const total =
+      view.kind === PageEncoding.constant
+        ? (new Int32Array(view.bytes.buffer, view.bytes.byteOffset + view.start, 1)[0] ?? 0) * count
+        : view.checkpoints !== null
+          ? view.width === 0
+            ? sumDeltaI320Page(view, rows, from, to, entry.firstRow)
+            : view.width === 1
+              ? sumDeltaI328Page(view, rows, from, to, entry.firstRow)
+              : view.width === 2
+                ? sumDeltaI3216Page(view, rows, from, to, entry.firstRow)
+                : sumDeltaI3232Page(view, rows, from, to, entry.firstRow)
+          : view.kind === PageEncoding.plain
+            ? sumI32PlainPage(view, rows, from, to, entry.firstRow)
+            : view.width === 1
+              ? sumI328Page(view, rows, from, to, entry.firstRow)
+              : view.width === 2
+                ? sumI3216Page(view, rows, from, to, entry.firstRow)
+                : sumI3232Page(view, rows, from, to, entry.firstRow);
+    sum.#sums.add(0, total);
+    sum.#sums.has[0] = 1;
+    sum.#counts?.addNonNullPageRows(count);
+    return undefined;
+  };
+  pageKernel(type: PhysicalType, entry: PageEntry): EncodedPageKernel<Accumulator> | null {
+    const kind = entry.encoding & ~PageEncoding.gzip;
+    return type.kind === "int32" &&
+      (kind === PageEncoding.constant ||
+        kind === PageEncoding.plain ||
+        kind === PageEncoding.frameOfReference)
+      ? IntegerSumAccumulator.#page
+      : null;
+  }
   save(group: number, row: StateRow): void {
     this.#sums.save(group, row);
     if (this.#counts) this.#counts.save(group, row);
@@ -1180,6 +1293,64 @@ export function updateGroupedPair(
 }
 
 class FloatSumAccumulator implements Accumulator {
+  // Existing dense/gather decode differs for a writer-unreachable -0 width0 base. Preserve
+  // that route rather than choosing a new value sign in an execution-only optimization.
+  static readonly #checkPage: EncodedPageCheck = (view) =>
+    view.kind !== PageEncoding.scaledFloat || view.width !== 0 || !Object.is(view.baseNumber, -0);
+  readonly pageCheck: EncodedPageCheck = FloatSumAccumulator.#checkPage;
+  static readonly #page: EncodedPageKernel<Accumulator> = (
+    state,
+    view,
+    entry,
+    _type,
+    _dictionary,
+    rows,
+    from,
+    to,
+  ) => {
+    if (view.allNull) return undefined;
+    const sum = state as FloatSumAccumulator;
+    if (view.kind === PageEncoding.constant)
+      sumConstantF64Page(
+        sum.#sums,
+        sum.#has,
+        new Float64Array(view.bytes.buffer, view.bytes.byteOffset + view.start, 1)[0] ?? 0,
+        view.validity,
+        rows,
+        from,
+        to,
+        entry.firstRow,
+      );
+    else if (view.kind === PageEncoding.plain)
+      sumPlainF64Page(
+        sum.#sums,
+        sum.#has,
+        view.plain as Float64Array,
+        view.validity,
+        rows,
+        from,
+        to,
+        entry.firstRow,
+      );
+    else if (view.width === 0)
+      sumScaledF640Page(sum.#sums, sum.#has, view, rows, from, to, entry.firstRow);
+    else if (view.width === 1)
+      sumScaledF648Page(sum.#sums, sum.#has, view, rows, from, to, entry.firstRow);
+    else if (view.width === 2)
+      sumScaledF6416Page(sum.#sums, sum.#has, view, rows, from, to, entry.firstRow);
+    else sumScaledF6432Page(sum.#sums, sum.#has, view, rows, from, to, entry.firstRow);
+    return undefined;
+  };
+  pageKernel(type: PhysicalType, entry: PageEntry): EncodedPageKernel<Accumulator> | null {
+    const kind = entry.encoding & ~PageEncoding.gzip;
+    return !this.average &&
+      type.kind === "float64" &&
+      (kind === PageEncoding.constant ||
+        kind === PageEncoding.plain ||
+        kind === PageEncoding.scaledFloat)
+      ? FloatSumAccumulator.#page
+      : null;
+  }
   save(group: number, row: StateRow): void {
     row.float64(this.#sums, group);
     row.number(this.average ? (this.#counts[group] ?? 0) : (this.#has[group] ?? 0));

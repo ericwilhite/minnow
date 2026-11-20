@@ -8025,15 +8025,15 @@ export const MODIFY_INDEX_GATE_REACH = [
   "indexRange",
   "zero SELECT limit",
   "positive SELECT limit",
-  "query unset refused",
-  "query false refused",
+  "query unset admitted",
+  "query false admitted",
   "query opt-in prepared",
   "DML unset admitted",
   "DML false admitted",
   "PG and shipped rows",
   "zero spill",
-  "nested join refused",
-  "nested set refused",
+  "nested join admitted",
+  "nested set admitted",
 ] as const;
 
 /** Root scalar registries have a fixed charged directory independent of row/event count. */
@@ -12706,4 +12706,521 @@ export const WRITE_WARM_CREDIT_REACH = [
   "rows",
   "metadata",
   "zero final charge",
+] as const;
+
+/** Encoded selection avoids unused decode scratch; real fallbacks still fund and release it. */
+export const PAGE_SELECTION_WORKSPACE_REACH = [
+  "int32",
+  "int64 FOR",
+  "decimal FOR",
+  "int64 plain",
+  "decimal128 plain",
+  "multiple pages",
+  "range",
+  "refine",
+  "mask",
+  "nullable",
+  "null predicate",
+  "encoded without workspace",
+  "fallback refused before allocation",
+  "fallback charged",
+  "workspace reused",
+  "closed and released",
+] as const;
+
+/** S1 encoded scan COUNT: semantic and admission states, each reached by committed seeds. */
+export const ENCODED_SCAN_REACH = [
+  "encoded count without value vectors",
+  "metadata refusal uses ordinary batches",
+  "empty selection",
+  "nulls",
+  "visibility",
+  "sparse selection",
+  "dense selection",
+  "multiple logical steps",
+  "dictionary validity without expansion",
+  "close returns all credit",
+  "pure column remap",
+  "shared sum and average",
+  "missing column uses complete ordinary step",
+  "nested duplicate-column bindings",
+] as const;
+
+/** S1 real encoded page reductions; inspected physical paths, not generator labels. */
+export const ENCODED_PAGE_VALUES_REACH = [
+  "plain int32",
+  "FOR u8",
+  "FOR u16",
+  "delta checkpoints",
+  "plain float",
+  "scaled float",
+  "float patches",
+  "nulls",
+  "repeated positions",
+  "selected input order",
+  "all-null page",
+  "constant page",
+  "contiguous range",
+  "delta zero-width",
+  "delta u16",
+  "scaled zero-width",
+  "scaled u8",
+  "scaled u16",
+  "scaled u32",
+] as const;
+
+/** Ordered float8pl demand and prefix preservation for raw encoded pages. */
+export const ENCODED_PAGE_FLOAT_ERRORS_REACH = [
+  "positive overflow",
+  "negative overflow",
+  "infinity first",
+  "NaN first",
+  "signed zero",
+  "repeated positions before failure",
+  "plain payload error transitions",
+  "scaled payload error transitions",
+  "all-valid error transitions",
+  "nullable error transitions",
+] as const;
+
+/** Metadata-only and synchronous payload ownership at the S1 reader seam. */
+export const ENCODED_PAGE_BORROW_REACH = [
+  "metadata before payload",
+  "empty span without payload",
+  "unloaded page refused before callback",
+  "span endpoints checked",
+  "loaded page borrowed without new capacity",
+  "closed reader refused",
+  "close returns credit",
+  "loaded eligibility without transition",
+] as const;
+
+/** Expired ordinary payload and temporary column mappings cannot outlive encoded readiness. */
+export const ENCODED_PROJECT_BORROW_REACH = [
+  "single projection",
+  "nested projections",
+  "after readiness",
+  "synchronous readiness",
+  "receiver error",
+  "successful consumption",
+  "expired source collected",
+  "binding metadata collected",
+] as const;
+
+/** Ordinary SQL planning reaches encoded consumption, including a decoded memory tail. */
+export const ENCODED_NATIVE_REACH = [
+  "native encoded recipe",
+  "counted scan rows preserved",
+  "duplicate aggregate column binding",
+  "stored and memory transitions",
+  "null columns",
+  "deleted rows",
+  "retained generation pinned before update",
+  "updated generation flushed",
+  "encoded retained generation after flush",
+  "scan retained generation after flush",
+  "encoded newer generation",
+  "scan newer generation",
+  "generations keep distinct answers",
+  "complete native cleanup",
+] as const;
+
+/** Reader-legal u32 FOR/delta int32 pages which the size-choosing writer does not emit. */
+export const ENCODED_PAGE_WIDE32_REACH = [
+  "FOR u32",
+  "delta u32",
+  "signed modulo wrap",
+  "nullable FOR",
+  "duplicate positions",
+  "contiguous range",
+] as const;
+
+/** COUNT cannot hide a demanded safe-number corruption or inspect an unselected scalar. */
+export const ENCODED_COUNT_VALIDATION_REACH = [
+  "declined before count transition",
+  "demanded unsafe value refused",
+  "unselected unsafe value remains undemanded",
+  "wide lane retains direct count",
+  "int64",
+  "decimal",
+  "interval",
+] as const;
+
+/** Source-only columns retain ordinary dense/gather validation before raw reductions. */
+export const ENCODED_SOURCE_DEMAND_REACH = [
+  "int64",
+  "decimal",
+  "interval",
+  "dense unselected scalar stays demanded",
+  "entire unselected page stays demanded",
+  "sparse unsafe scalar stays undemanded",
+  "wide source stays direct",
+  "undemanded page stays direct",
+  "COUNT star",
+  "COUNT other column",
+  "pure projection hides source column",
+  "close returns all credit",
+] as const;
+
+/** Source-only out-of-line reads keep dense/gather error order and bounded fallback. */
+export const ENCODED_SOURCE_LARGE_DEMAND_REACH = [
+  "dense source value remains demanded",
+  "wholly unselected value page remains demanded",
+  "sparse value stays undemanded",
+  "separate undemanded page stays direct",
+  "COUNT star",
+  "COUNT other column",
+  "pure projection hides source column",
+  "close returns all credit",
+] as const;
+
+/** Noneligible recipes perform no encoded-capability discovery or batch dispatch. */
+export const ENCODED_COST_REACH = [
+  "plain",
+  "selective",
+  "grouped",
+  "minmax",
+  "expression",
+  "distinct",
+  "filter",
+  "numeric",
+  "mixed",
+  "limited",
+  "residual",
+  "partial residual",
+  "no capability probes",
+  "no aggregate capability discovery",
+  "no encoded transitions",
+  "nullable source",
+  "ordinary memory tail",
+  "eligible reduction remains encoded",
+  "complete cleanup",
+] as const;
+
+/** A metadata-only eligibility probe agrees with the scan splitter without payload reads. */
+export const PUSHDOWN_ELIGIBILITY_REACH = [
+  "int16",
+  "int32",
+  "int64 safe",
+  "float32",
+  "float64",
+  "float32 from f64",
+  "float64 from f32",
+  "date",
+  "timestamp",
+  "timestamptz",
+  "time",
+  "bool",
+  "int64 wide",
+  "numeric safe",
+  "numeric int64",
+  "numeric int128",
+  "numeric wide",
+  "numeric NaN",
+  "numeric Infinity",
+  "numeric -Infinity",
+  "text",
+  "bytes",
+  "uuid",
+  "interval",
+  "json",
+  "jsonb",
+  "array",
+  "enum",
+  "locator",
+  "compare",
+  "flipped",
+  "in",
+  "negated in",
+  "is null",
+  "parameter",
+  "and",
+  "mixed and",
+  "or",
+  "empty and",
+  "null literal",
+  "nonnull literal",
+  "empty literal",
+  "mismatched layout",
+  "missing column",
+  "C collation",
+  "non C collation",
+  "residual filter",
+  "accepted pushdown",
+  "no payload reads",
+  "text compare nonC",
+  "text IN nonC",
+  "null IN member accepted",
+  "null compare residual",
+] as const;
+
+export const EXECUTOR_DEMAND_ADMISSION_REACH = [
+  "pinned competitor denies optional growth",
+  "PGlite exact ordered rows",
+  "declared widths",
+  "unknown widths",
+  "descending physical reorder",
+  "ascending physical reorder",
+  "LIMIT zero",
+  "unbounded LIMIT",
+  "bound LIMIT",
+  "oversized row",
+  "nullable input",
+  "minimum versus charged peak",
+  "zero final query credit",
+] as const;
+
+export const READ_DEMAND_COVERAGE_REACH = [
+  "physical prefix is not complete chunk",
+  "whole chunk covers every subinterval",
+  "unused byte target not retained",
+  "one-row hints cover whole source",
+  "zero sizing credits",
+] as const;
+
+export const EXECUTOR_DEMAND_PUBLICATION_REACH = [
+  "resident source retained before publication",
+  "publication after complete admission",
+  "old snapshot exact values after publication",
+  "8MiB query zero final credit",
+] as const;
+
+export const RESIDENT_RANGE_REACH = [
+  "bounded resident minimum",
+  "real delta replacement keeps captured arrays",
+  "publication before open",
+  "cancel before open",
+  "cancel transferred input before next",
+  "cancel pending input keeps charge until settle",
+  "descending exact locators",
+  "ascending exact locators",
+  "pinned optional growth denied",
+  "zero cursor credits",
+] as const;
+
+export const EXECUTOR_LEGACY_DEMAND_REACH = [
+  "optional range capability absent",
+  "complete query fits8MiB",
+  "PGlite exact direct projection",
+  "ascending",
+  "descending",
+  "legacy diagnostic cursor exercised",
+  "operator requests within reserved capacity",
+  "zero final credits",
+] as const;
+
+/** Independent factory allocations across input/output batch and variable width boundaries. */
+export const EXECUTOR_DEMAND_BOUNDARIES_REACH = [
+  "BYTEA",
+  "JSON",
+  "JSONB",
+  "native",
+  "ties",
+  "distinct",
+  "sql-distinct",
+  "2047",
+  "2048",
+  "2049",
+  "4097",
+  "8193",
+  "DISTINCT returns rows beyond offset",
+  "wide payload",
+  "variable NUMERIC coefficients",
+  "safe coefficient source",
+  "int64 coefficient source",
+  "int128 coefficient source",
+  "LIMIT above batch",
+  "OFFSET crosses batch",
+  "independent backing credit",
+  "pinned pressure",
+  "PGlite exact rows",
+  "zero final credit",
+] as const;
+
+/** One-locator admission must retain full physical-position workspace. */
+export const EXECUTOR_KEY_ORDER_DEMAND_REACH = [
+  "2",
+  "257",
+  "2049",
+  "int",
+  "text",
+  "numeric",
+  "resident",
+  "stored",
+  "ASC",
+  "DESC",
+  "OFFSET",
+  "no OFFSET",
+  "PG exact",
+  "independent backing",
+  "released",
+] as const;
+
+/** Indexed SELECTs share complete query admission and scan-equivalent pinned visibility. */
+export const QUERY_INDEX_REACH = [
+  "mixed serial set inputs",
+  "memory",
+  "stored",
+  "reopen",
+  "root",
+  "range root",
+  "projection",
+  "filter",
+  "sort",
+  "limit/offset",
+  "ascending",
+  "descending",
+  "keyLookup",
+  "indexRange",
+  "forced scan",
+  "PGlite",
+  "IN duplicates",
+  "nonadjacent duplicates",
+  "NULL key",
+  "NULL bound",
+  "coerced key",
+  "widening scan",
+  "limit early stop",
+  "text key",
+  "composite point",
+  "composite range",
+  "composite prefix",
+  "join",
+  "simultaneous sources",
+  "zero limit",
+  "pinned concurrent writes",
+  "concurrent publication",
+  "reopen after writes",
+  "zero charge",
+] as const;
+
+export const QUERY_INDEX_STAGED_REACH = [
+  "staged native input",
+  "point and range",
+  "NULL and duplicates",
+  "rollback",
+  "commit",
+  "reopen",
+  "zero ownership",
+] as const;
+
+export const QUERY_INDEX_PRESSURE_REACH = [
+  "serial index workspaces",
+  "point",
+  "range",
+  "oversized absent key",
+  "large IN",
+  "duplicates and NULL",
+  "near-limit key",
+  "medium key",
+  "short key",
+  "stored",
+  "memory",
+  "no late admission",
+  "protected minimum",
+  "observed wait",
+  "cancel",
+  "grant after wait",
+  "zero ownership",
+] as const;
+
+export const QUERY_INDEX_SPILL_REACH = [
+  "complete minimum",
+  "stored range",
+  "spilled sort",
+  "full payload exact",
+  "ascending",
+  "descending",
+  "files retired",
+  "zero ownership",
+] as const;
+
+export const QUERY_INDEX_NULLABLE_REACH = [
+  "memory",
+  "stored",
+  "reopen",
+  "nullable suffix",
+  "declared nonnull suffix",
+  "safe index",
+  "scan fallback",
+  "forced scan",
+  "PGlite",
+  "partial prefixes",
+  "complete point and null argument",
+  "strict residual proof",
+  "IN proof",
+  "IS NOT NULL proof",
+  "no proof from NULL-safe or OR",
+  "null first component",
+  "UPDATE and DELETE targets",
+  "zero ownership",
+] as const;
+
+/** Index keys serve only byte-collation predicates; others keep the executor's typed refusal. */
+export const QUERY_INDEX_COLLATION_REACH = [
+  "forced scan",
+  "index route considered",
+  "index served",
+  "byte collation index",
+  "matching key",
+  "no matching key",
+  "non-byte collation refused",
+  "no COLLATE",
+  "C",
+  "default",
+  "POSIX",
+  "ucs_basic",
+  "und-x-icu",
+  "composite equality prefix",
+  "IN list",
+  "collated key side",
+  "collated column side",
+  "unique",
+  "primary",
+  "composite",
+  "select",
+  "update",
+  "memory",
+  "stored",
+  "reopen",
+  "zero ownership",
+] as const;
+
+export const QUERY_INDEX_COERCION_REACH = [
+  "cast first",
+  "cast later",
+  "smallint",
+  "integer",
+  "success",
+  "22003",
+  "matching prefix",
+  "no early match",
+  "NULL keys",
+  "LIMIT",
+  "ordered result",
+  "memory",
+  "stored",
+  "reopen",
+  "PGlite",
+  "forced scan",
+  "index path",
+  "before any key probe",
+  "modify error order",
+  "unchanged rows after error",
+  "zero ownership",
+] as const;
+
+/** A large unordered IN input deduplicates online without an unbounded locator set. */
+export const QUERY_INDEX_SEEN_REACH = [
+  "sparse locator blocks",
+  "bitmap spill",
+  "one file",
+  "NULL and repeated keys",
+  "PGlite",
+  "forward keys",
+  "reverse keys",
+  "cancel after spill",
+  "fenced cleanup",
+  "read after cancel",
+  "zero ownership",
 ] as const;

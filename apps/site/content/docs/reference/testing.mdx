@@ -128,8 +128,10 @@ protocol survives it: every broker request is bounded and retried, and each brok
 announces an id so clients resend and owners register again;
 [the SharedWorker restart note](https://github.com/ericwilhite/minnow/blob/main/packages/core/src/next/owner/webkit-sharedworker.md) has the measurements and the repro.
 
-The merge gate and fast SQLLogicTest profile run in `.github/workflows/ci.yml` on every push and pull
-request, spread across parallel jobs. One job runs the format, type, lint, build, API contract,
+The merge gate and fast SQLLogicTest profile run in `.github/workflows/ci.yml` on every push to
+`main` and every pull request that is not a draft, spread across parallel jobs. Draft pull requests
+skip this gate, the release-readiness conformance and the performance gate; marking a draft ready
+for review runs them. One job runs the format, type, lint, build, API contract,
 SQLLogicTest, and heap-plateau checks. The unit suite runs under coverage in seven Vitest parts; a
 final job merges their results and coverage and enforces the coverage floors on the whole suite,
 exactly as `npm run test:coverage` does. The `Format, types, lint, build, unit tests` check requires
@@ -1870,6 +1872,63 @@ class or introducing negative zero fails at the intended operation. Reversing an
 unordered result passes. Live subscriptions, concurrent openers, crash schedules,
 native browser storage and order-dependent floating aggregates remain outside this
 serial harness; their existing suites still own those checks.
+
+### Rebuild-core encoded selection component
+
+`scripts/next-selection-workspace-bench.mts` compares two separately built core roots. Save a
+parent build, then build the candidate and run:
+
+```bash
+mkdir -p "$HOME/.cache/minnow-bench-tmp"
+TMPDIR="$HOME/.cache/minnow-bench-tmp" node scripts/next-selection-workspace-bench.mts \
+  --control-root "$HOME/.cache/minnow-parent" \
+  --output "$HOME/.cache/minnow-selection"
+```
+
+The component measures the first encoded selection through reader close, including any
+predicate decode workspace it acquires and releases. Fixture construction, reader open, page
+loading, predicate compilation, output buffers and result checks are outside the clock. Both
+nullable and all-valid pages use production readers; every selected position is checked and
+every reader must release its charges. It takes nine interleaved AB/BA rounds of CPU across all
+Node threads, with natural GC, and records raw samples, code hashes, CPU affinity and paired
+median/IQR decisions. This isolates workspace cost; it does not establish a scan, aggregate,
+browser, I/O or spill speedup. Whole-query comparisons and generated/PGlite suites remain
+separate checks.
+
+### Rebuild-core encoded plan work
+
+`next/testing/executor-encoded-cost.test.ts` counts page-capability reads and encoded
+transitions through native plans. Generated ordinary scans, selective scans, grouped or
+unsupported reductions, residual or mixed filters and limited inputs must perform no
+encoded-capability work. Every
+history also runs an eligible COUNT on the same stored data and proves that encoded
+consumption remains active. PostgreSQL checks the ordinary results; cleanup checks governor
+and spill credit. This is a work-count law, independent of elapsed time or host load.
+`next/exec/pushdown-eligibility.test.ts` also checks the planning probe against the scan
+splitter over stored literal forms, nulls, collation and compound predicates, while proving
+that eligibility never reads or copies a literal payload.
+
+### Rebuild-core encoded reduction component
+
+`scripts/next-encoded-page-bench.mts` compares selection followed by ordinary decode/reduce
+with direct encoded-page consumption, using production readers and aggregate accumulators:
+
+```bash
+TMPDIR="$HOME/.cache/minnow-bench-tmp" node scripts/next-encoded-page-bench.mts \
+  --control-root "$HOME/.cache/minnow-parent" \
+  --output "$HOME/.cache/minnow-encoded-pages"
+```
+
+Run an A/A first with both roots set to the parent and `--candidate-mode decoded`. The runner
+uses nine interleaved CPU pairs and retains every sample. It sweeps 2,048, 8,192 and 32,768-row
+selection windows under a four-MiB component budget. Each window retains 2,048-row aggregate
+transition steps; this does not authorize wider error-demand steps in production. Both nullable
+and all-valid inputs check exact integer and ordered float sums and release every charge.
+
+The CPU bracket covers selection, decode where used, and reduction over already loaded pages.
+Fixture construction, loading, state allocation, final output and checks are untimed. The
+runner records code hashes, byte peaks and median/IQR decisions, including the full range as
+a diagnostic. Whole-query and PGlite/governor checks remain separate evidence.
 
 ### Rebuild-core write CPU comparisons
 
