@@ -2592,6 +2592,17 @@ unchanged native file image for all three frozen directory shapes. The pre-regis
 writer still refuses the current root with `MINNOW_MANIFEST_CORRUPT`; its separate check
 preserves root/data payloads, without claiming that obsolete writer has a pre-fence gate.
 
+The private executor's `parameter-utf8.test.ts` compares every encoded parameter
+with WHATWG UTF-8 output across long one- through four-byte text, lone surrogates,
+and pairs around the 8,192 UTF-16-unit slice boundary. Mixed slot types and NULLs
+vary independently. Forced slice yields and short encoder writes check that binding
+resumes by reported progress and preserves each slot's measured byte extent. The
+same cases run on Node 22, 24 and 26; source and reservation bounds are distinct.
+
+The private executor also checks wide parameter results under pinned competing credit.
+Its complete result reservation includes frame construction as well as payload bytes;
+binding-only UTF-8 scratch cannot stand in for result progress.
+
 ### Rebuild directory-cache work counts
 
 The unexported 1.0 executor shares parsed column directories between source sizing and scan

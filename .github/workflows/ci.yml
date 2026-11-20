@@ -3,8 +3,8 @@
 # Split by failure domain: the static checks catch most mistakes, the unit suite proves behavior
 # and holds the coverage floors, the browser matrix proves storage and site behavior a Node
 # substitute cannot, and the oldest-Node suite proves the oldest Node the package claims to support
-# still runs it. The performance gate deliberately lives in its own scheduled workflow — it
-# measures a machine as much as the code, so it must never block a merge.
+# still runs it. Event-loop latency contracts have an isolated serial runner here. Broader
+# performance benchmarks live in their scheduled workflow and do not block a merge.
 #
 # The long suites are spread across parallel runners, in parts balanced by measured duration so
 # they finish together (scripts/test-parts.mjs). Each split gate ends in an aggregate job
@@ -67,6 +67,21 @@ jobs:
       # takes seconds, so it rides on this job's install rather than holding a runner of its own.
       - name: Heap plateau
         run: npm run soak:memory
+
+  # A fresh hosted runner executes only these latency workloads, one worker and no
+  # coverage instrumentation. The parallel unit lane keeps deterministic work counts.
+  stall-latency:
+    name: Event-loop latency guarantees (isolated)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/install
+        with:
+          node-version: 24
+      - run: npm run test:prepare
+      - name: Require original stall and key-forward trim limits
+        run: npx vitest run --config vitest.stall-latency.config.ts --project stall-latency --maxWorkers=1
 
   # The unit suite under coverage, in seven parts. Every test file runs in exactly one part, chosen
   # by its measured duration (scripts/test-shards.ts, weights in scripts/test-durations.json) so the
@@ -167,7 +182,7 @@ jobs:
   check:
     name: Format, types, lint, build, unit tests
     if: always()
-    needs: [static, unit, coverage]
+    needs: [static, unit, coverage, stall-latency]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -176,11 +191,13 @@ jobs:
           STATIC_RESULT: ${{ needs.static.result }}
           UNIT_RESULT: ${{ needs.unit.result }}
           COVERAGE_RESULT: ${{ needs.coverage.result }}
+          STALL_RESULT: ${{ needs.stall-latency.result }}
         run: |
           echo "static: $STATIC_RESULT, unit parts: $UNIT_RESULT, coverage: $COVERAGE_RESULT"
           test "$STATIC_RESULT" = "success"
           test "$UNIT_RESULT" = "success"
           test "$COVERAGE_RESULT" = "success"
+          test "$STALL_RESULT" = "success"
 
   browser-matrix:
     name: Real browser (${{ matrix.name }})

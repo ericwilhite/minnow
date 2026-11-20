@@ -15,6 +15,12 @@ export interface ResultInput {
 export function decodeResult<TRow = Row>(input: ResultInput): Result<TRow> {
   return new NativeResult<TRow>(input);
 }
+/** Internal bounded positional decoder, for previews and adapters. No public Result/API
+ * addition: only canonical Results carry the private frame/cache implementation. */
+export function resultCell(result: Result, row: number, ordinal: number): Value {
+  if (!(result instanceof NativeResult)) throw new TypeError("Expected a canonical Result");
+  return result.cell(row, ordinal);
+}
 const NULL_SLOT: Slot = {
   flat: {
     form: "flat",
@@ -220,6 +226,11 @@ class NativeResult<TRow> implements Result<TRow> {
     }
     values[index] = value;
     return value;
+  }
+  cell(row: number, ordinal: number): Value {
+    const column = this.#index(ordinal),
+      at = this.#locate(row);
+    return this.#value(column, row, required(at.frame.columns[column]), at.row);
   }
   values(column: string | number): Value[] {
     const index = this.#index(column);

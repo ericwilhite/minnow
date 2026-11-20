@@ -24,7 +24,8 @@
  * - statements and writes on session 0 while session 0 is known idle: no transaction open, and no
  *   earlier session-0 request unresolved that may change that (its kind is not `other`: see
  *   `classifyStatementText`), since it could have been `BEGIN`. Concurrent autocommit statements stay resendable;
- * - `prepare`, `subscribe`, `admin`.
+ * - session-free `prepare`, `subscribe` and `admin`; session-bound inspection follows
+ *   the same known-idle rule as statements.
  * Everything that depends on session state is not: statements and writes in sessions ≥ 1, or in
  * session 0 inside (or possibly inside) a transaction; `begin`, `commit`, `rollback`. On a new
  * connection, a non-resendable request is answered from the ledger if it committed, and is
@@ -105,7 +106,14 @@ export function isResendable(
     case "admin":
       // Portable handles and a replacement finish belong to one connection generation.
       // A lost reply must never replay an import or bind a stream to a different snapshot.
-      return request.op?.startsWith("snapshot") !== true;
+      if (request.op?.startsWith("snapshot") === true) return false;
+      // Inspection reads session 0 only when no transaction state can have changed.
+      return (
+        request.session === undefined ||
+        (request.session === 0 &&
+          defaultSession.transaction === "idle" &&
+          defaultSession.unresolvedControl === 0)
+      );
     case "begin":
     case "commit":
     case "rollback":

@@ -83,6 +83,7 @@ for (const seed of seedsFor("next-extent-pair-codecs", [0xb2e1, 0xb2e2]))
                 directory: { extent, offset: 0, length: 0, checksum: k },
                 statistics: { nullCount: 0, min: null, max: null, dictionarySize: null },
                 distinctSketch: null,
+                aggregateSummary: null,
               };
             }),
           };
