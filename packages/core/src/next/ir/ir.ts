@@ -266,8 +266,10 @@ export type Rel =
       /**
        * One tuple of key expressions (constants or params) per probe, each already of the key
        * column's exact type (lowering casts or drops a constant that does not fit). A constant
-       * may also be a `cast` of a literal or param (`DATE '…'`), evaluated once. A tuple with a
-       * NULL key matches nothing (`=` never matches NULL); duplicate tuples return a row once.
+       * may also be a pure `cast` of a literal or param (`DATE '…'`). Such casts may be repeated
+       * for validation and bounded duplicate checks; row-dependent or volatile expressions are
+       * not key inputs. A tuple with a NULL key matches nothing (`=` never matches NULL);
+       * duplicate tuples return a row once.
        */
       readonly keys: ReadonlyArray<readonly ScalarExpr[]>;
       readonly columns: readonly number[];

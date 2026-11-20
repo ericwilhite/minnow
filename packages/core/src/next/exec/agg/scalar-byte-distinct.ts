@@ -7,6 +7,7 @@ import type { Selection, Vector, FlatVector } from "../../vector/vector.js";
 import { IDENTITY } from "../kernels/vectors.js";
 import { Charged, grownCapacity } from "./groups.js";
 import { arrayGrowth, payloadBytes } from "./growth.js";
+import { DecimalSuffixBitmap } from "./decimal-suffix-bitmap.js";
 
 const EMPTY_BYTES = new Uint8Array(0);
 const EMPTY_SLOTS = new Uint32Array(0);
@@ -22,7 +23,8 @@ export class ScalarByteDistinct {
   growthBytes(vector: Vector, rows: number): number {
     return (
       4096 +
-      arrayGrowth(this.#slots.length, (this.#count + rows) / 0.7 + 1, 5, true) +
+      this.#bitmap.growthBytes(rows) +
+      arrayGrowth(this.#slots.length, 2 * (this.#count + rows) + 1, 5, true) +
       arrayGrowth(this.#arena.length, this.#used + payloadBytes(vector) + 8 * rows, 1) +
       (vector.form === "dictionary"
         ? arrayGrowth(this.#translation.length, vector.dictionary.length, 1, true)
@@ -31,6 +33,7 @@ export class ScalarByteDistinct {
   }
 
   readonly #memory: Charged;
+  readonly #bitmap: DecimalSuffixBitmap;
   /** Record offset + 1; a compact byte tag rejects most probes without reading this array. */
   #slots: Uint32Array;
   #tags: Uint8Array;
@@ -48,8 +51,9 @@ export class ScalarByteDistinct {
       throw new TypeError("A scalar byte distinct argument is required");
     const memory = (this.#memory = new Charged(charge));
     try {
-      // Class, tracker, arena DataView, and four typed-array view/buffer pairs.
-      memory.take(11 * OBJECT_OVERHEAD_BYTES);
+      // Raw byte state metadata plus the optional bitmap helper object.
+      memory.take(12 * OBJECT_OVERHEAD_BYTES);
+      this.#bitmap = new DecimalSuffixBitmap(memory, type.kind !== "uuid");
       this.#slots = memory.make(Uint32Array, 1024);
       this.#tags = memory.make(Uint8Array, 1024);
       this.#arena = memory.make(Uint8Array, 4096);
@@ -61,7 +65,15 @@ export class ScalarByteDistinct {
     }
   }
   get count(): number {
-    return this.#count;
+    return this.#count + this.#bitmap.count;
+  }
+
+  /** Count-only diagnostics; no dictionary code is treated as a value ID. */
+  get bitmapCount(): number {
+    return this.#bitmap.count;
+  }
+  get bitmapPages(): number {
+    return this.#bitmap.pages;
   }
 
   #grow(): void {
@@ -127,7 +139,11 @@ export class ScalarByteDistinct {
       if (own.getUint8(record + 8 + b) !== source.getUint8(from + b)) return false;
     return true;
   }
-  #insert(source: DataView, from: number, to: number): boolean {
+  #insert(source: DataView, from: number, to: number, bitmap: boolean): boolean {
+    if (bitmap) {
+      const membership = this.#bitmap.insert(source, from, to);
+      if (membership !== null) return membership;
+    }
     const hash = xxHash32View(source, 0, from, to),
       length = to - from,
       tag = hash >>> 24 || 1;
@@ -191,11 +207,14 @@ export class ScalarByteDistinct {
       yield { group: 0, id: at };
       if ((++count & 511) === 0) yield;
     }
+    yield* this.#bitmap.members();
   }
   memberBytes(id: number): number {
+    if (id < 0) return this.#bitmap.memberBytes(id);
     return 8 + this.#view.getUint32(id + 4, true);
   }
   memberValue(id: number, type: PhysicalType): FlatVector {
+    if (id < 0) return this.#bitmap.memberValue(id, type);
     const length = this.#view.getUint32(id + 4, true);
     if (type.kind === "uuid")
       return {
@@ -265,11 +284,12 @@ export class ScalarByteDistinct {
     }
     this.#memory.take(OBJECT_OVERHEAD_BYTES);
     try {
-      const source = new DataView(data.bytes.buffer, data.bytes.byteOffset, data.bytes.byteLength);
+      const source = new DataView(data.bytes.buffer, data.bytes.byteOffset, data.bytes.byteLength),
+        bitmap = this.#bitmap.active;
       if (constant) {
         const from = data.layout === "varlen" ? (data.offsets[0] ?? 0) : 0;
         const end = data.layout === "varlen" ? (data.offsets[1] ?? 0) : 16;
-        if (this.#insert(source, from, end)) {
+        if (this.#insert(source, from, end, bitmap)) {
           out.rows[0] = active[0] ?? 0;
           out.count = 1;
         }
@@ -282,7 +302,7 @@ export class ScalarByteDistinct {
         if (vector.form === "dictionary" && this.#translation[slot] === 1) continue;
         const from = data.layout === "varlen" ? (data.offsets[slot] ?? 0) : slot * 16;
         const end = data.layout === "varlen" ? (data.offsets[slot + 1] ?? 0) : from + 16;
-        if (this.#insert(source, from, end)) out.rows[out.count++] = row;
+        if (this.#insert(source, from, end, bitmap)) out.rows[out.count++] = row;
         if (vector.form === "dictionary") this.#translation[slot] = 1;
       }
       return out;
@@ -297,6 +317,7 @@ export class ScalarByteDistinct {
     this.#arena = EMPTY_BYTES;
     this.#view = EMPTY_VIEW;
     this.#translation = EMPTY_BYTES;
+    this.#bitmap.close();
     this.#memory.close();
   }
 }

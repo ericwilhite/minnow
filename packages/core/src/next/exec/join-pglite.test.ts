@@ -6,6 +6,7 @@
  */
 import { PGlite } from "@electric-sql/pglite";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { createReach, JOIN_SHORT_SQL_REACH } from "../../testing/reach.js";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import {
   INT,
@@ -15,6 +16,7 @@ import {
   runJoin,
   type Row,
   type Value,
+  type RunResult,
 } from "./join-fixtures.js";
 import type { HashJoinKind, HashJoinSpec } from "./join.js";
 
@@ -152,6 +154,7 @@ async function compareRound(
   build: readonly Row[],
   probe: readonly Row[],
   tight: boolean,
+  observed?: (c: Case, result: RunResult, dictionary: boolean) => void,
 ): Promise<void> {
   const wide = (build[0]?.length ?? probe[0]?.length ?? 3) > 3;
   const types = wide ? [INT, TEXT, INT, TEXT] : [INT, TEXT, INT];
@@ -196,16 +199,20 @@ async function compareRound(
             ...(correlated === undefined ? {} : { correlated }),
           };
           const squeeze = tight || random() < 0.3;
+          const batchRows = 1 + Math.floor(random() * 9);
+          const blockEvery = random() < 0.5 ? 2 : 0;
+          const dictionary = random() < 0.5;
           const ours = await runJoin(spec, build, probe, {
-            batchRows: 1 + Math.floor(random() * 9),
-            blockEvery: random() < 0.5 ? 2 : 0,
-            dictionary: random() < 0.5,
+            batchRows,
+            blockEvery,
+            dictionary,
             ...(squeeze ? { cap: "tight" as const, slack: 0 } : {}),
           });
           const sql = sqlFor(c);
           expect(canonical(ours.rows), sql).toEqual(canonical(await postgres(sql)));
           expect(ours.governor.usedBytes).toBe(0);
           if (tight) expect(ours.join.profile.spilledBytes, sql).toBeGreaterThan(0);
+          observed?.(c, ours, dictionary);
         }
     }
 }
@@ -232,4 +239,55 @@ describe("hash join vs PostgreSQL", () => {
         const random = mulberry32(seed);
         await compareRound(random, table(random, rows, pad), table(random, 6, pad), true);
       }, 300_000);
+});
+
+describe("B9 short text boundaries against PostgreSQL", () => {
+  const reach = createReach("b9-short-join-sql", JOIN_SHORT_SQL_REACH);
+  for (const seed of seedsFor("b9-short-join-sql", [0xb9f75, 0xb9f76]))
+    it(`all kinds, dictionary identity and minimum-grant spill seed ${String(seed)}`, async () => {
+      const random = mulberry32(seed);
+      for (const tight of [false, true]) {
+        reach.beginHistory();
+        const keys = [
+          "",
+          "x".repeat(63),
+          "x".repeat(64),
+          "x".repeat(65),
+          "x".repeat(80),
+          "é".repeat(32),
+          null,
+        ];
+        // Different row order gives independent page-local dictionary codebooks.
+        // Both sides duplicate each key, including NULL, with independently generated payloads.
+        const build = [...keys, ...keys].map((k, i): Row => [
+          i % 3,
+          k,
+          Math.floor(random() * 100) - 50,
+        ]);
+        const probe = [...keys, ...keys]
+          .reverse()
+          .map((k, i): Row => [i % 3, k, Math.floor(random() * 100) - 50]);
+        await compareRound(random, build, probe, tight, (c, result, dictionary) => {
+          reach.reach(c.kind);
+          reach.reach(dictionary ? "dictionary" : "flat");
+          if (c.withResidual) reach.reach("residual ON");
+          if (c.nullSafe.some(Boolean)) reach.reach("null-safe");
+          if (tight && result.join.profile.spilledBytes > 0) reach.reach("minimum-grant spill");
+          // Observe that these exact keys were demanded by a completed text-key join.
+          if (c.keys.includes(1))
+            for (const r of probe) {
+              const key = r[1];
+              if (typeof key !== "string") continue;
+              const bytes = new TextEncoder().encode(key).length;
+              if (bytes === 0) reach.reach("empty");
+              if (bytes === 63) reach.reach("63 bytes");
+              if (bytes === 64) reach.reach("64 bytes");
+              if (bytes === 65) reach.reach("65 bytes");
+              if (bytes === 80) reach.reach("80 bytes");
+              if (key.includes("é")) reach.reach("UTF8");
+            }
+        });
+      }
+    }, 120_000);
+  it("meets declared short-key SQL reach", () => reach.assertReached());
 });

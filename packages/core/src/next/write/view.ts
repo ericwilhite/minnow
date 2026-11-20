@@ -12,7 +12,7 @@ import { hashKey } from "./key-hashes.js";
 import { GroupRead } from "../page/group-read.js";
 import { MemoryReads } from "./memory-read.js";
 import { missingScalar, missingVector } from "./missing-value.js";
-import { planIndexRange } from "./range-plan.js";
+import { planIndexRange, prepareResidentIndexRange } from "./range-plan.js";
 import { StreamingRangeCursor } from "./range-cursor.js";
 import type { Held } from "../format/reachable.js";
 import type { CatalogView, ColumnDef, IndexDef, TableDef } from "../access/catalog.js";
@@ -23,6 +23,7 @@ import {
   type IndexCursor,
   type IndexReader,
   type IndexRangePlan,
+  type ResidentIndexRangePlan,
   type KeyRange,
   type MaybePromise,
   type ProbeOutput,
@@ -1533,6 +1534,13 @@ export class ViewIndex implements IndexReader {
     if (this.def.invalid === true) throw new IndexUnavailableError(this.def.id);
     if (this.def.kind !== "ordered") throw new TypeError("An equality index serves lookups only");
     return planIndexRange(this, range, direction);
+  }
+
+  prepareResidentRange(range: KeyRange, direction: "asc" | "desc"): ResidentIndexRangePlan | null {
+    this.table.snapshot.checkRead();
+    if (this.def.invalid === true) throw new IndexUnavailableError(this.def.id);
+    if (this.def.kind !== "ordered") throw new TypeError("An equality index serves lookups only");
+    return prepareResidentIndexRange(this, range, direction);
   }
 
   range(range: KeyRange, direction: "asc" | "desc"): IndexCursor {

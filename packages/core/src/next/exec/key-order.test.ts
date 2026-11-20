@@ -8,7 +8,6 @@ import { OutputArena } from "./kernels/vectors.js";
 import { IndexOrderSource } from "./key-order.js";
 import { createExecutor } from "./create.js";
 import type { PhysicalPlan } from "../ir/ir.js";
-import { UnsupportedPlanError } from "../errors.js";
 
 it.each(seedsFor("next-key-order-prefix", [0xe103, 0xe104]))(
   "bounds cursor reads and closes once (seed %i)",
@@ -252,7 +251,7 @@ it.each(seedsFor("next-key-order-held-floor", [0xe105, 0xe106]))(
 );
 
 it.each(seedsFor("next-key-order-refusal", [0xe107, 0xe108]))(
-  "gates native query range fields even below LIMIT zero (seed %i)",
+  "admits native query range fields even below LIMIT zero (seed %i)",
   (seed) => {
     const reach = createReach("index range fields", ["lower", "upper", "locator"]);
     fc.assert(
@@ -269,16 +268,33 @@ it.each(seedsFor("next-key-order-refusal", [0xe107, 0xe108]))(
             limit: { kind: "const", value: 0 },
             offset: null,
             input: {
-              id: 1,
-              op: "indexRange",
+              id: 3,
+              op: "project",
               output,
-              tableId: 1,
-              indexId: 1,
-              columns: [1],
-              lower: mask & 1 ? bound : null,
-              upper: mask & 2 ? bound : null,
-              emitLocator: (mask & 4) !== 0,
-              descending: false,
+              exprs: [{ op: "column", index: 0, type }],
+              input: {
+                id: 1,
+                op: "indexRange",
+                output: [
+                  ...output,
+                  ...(mask & 4
+                    ? [
+                        {
+                          name: "_locator",
+                          type: { kind: "locator" as const, tableId: 1 },
+                          nullable: false,
+                        },
+                      ]
+                    : []),
+                ],
+                tableId: 1,
+                indexId: 1,
+                columns: [1],
+                lower: mask & 1 ? bound : null,
+                upper: mask & 2 ? bound : null,
+                emitLocator: (mask & 4) !== 0,
+                descending: false,
+              },
             },
           },
           columns: output,
@@ -289,7 +305,8 @@ it.each(seedsFor("next-key-order-refusal", [0xe107, 0xe108]))(
           catalogVersion: 1,
           volatile: false,
         };
-        expect(() => createExecutor().prepare(plan)).toThrow(UnsupportedPlanError);
+        expect(() => createExecutor().prepare(plan)).not.toThrow();
+        expect(() => createExecutor({ keyOrder: false }).prepare(plan)).not.toThrow();
         expect(() => createExecutor({ keyOrder: true }).prepare(plan)).not.toThrow();
         if (mask & 1) reach.reach("lower");
         if (mask & 2) reach.reach("upper");

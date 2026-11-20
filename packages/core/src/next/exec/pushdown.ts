@@ -197,6 +197,88 @@ function pushable(expr: ScalarExpr, types: readonly PhysicalType[]): PushedPredi
   }
 }
 
+/** Eligibility only: do not copy byte literals, build predicates or renumber expressions.
+ * The ordinary splitter/converter below stays unchanged. Its stored-form contract is
+ * checked against this structural probe by pushdown-eligibility.test.ts.
+ */
+function literalHasConstant(literal: FlatVector, type: PhysicalType): boolean {
+  if (literal.length < 1 || (literal.validity !== null && ((literal.validity[0] ?? 0) & 1) === 0))
+    return false;
+  const layout = literal.data.layout;
+  switch (type.kind) {
+    case "int32":
+    case "date":
+      return layout === "i32";
+    case "int64":
+    case "time":
+    case "timestamp":
+      return layout === "int64";
+    case "float32":
+    case "float64":
+      return layout === "f32" || layout === "f64";
+    case "bool":
+      return layout === "bool";
+    case "decimal":
+      return layout === "decimal";
+    case "text":
+    case "bytes":
+      return layout === "varlen";
+    case "uuid":
+      return layout === "fixed16";
+    default:
+      return false;
+  }
+}
+
+/** Same residual decision as splitFilter, without constructing its descriptors or
+ * copying literal payloads. Only encoded-reduction planning calls this probe; ordinary
+ * scans retain their existing splitter and loop. Walk once per plan, never per page.
+ */
+export function hasResidualFilter(
+  filter: ScalarExpr | null,
+  types: readonly PhysicalType[],
+): boolean {
+  if (filter === null) return false;
+  switch (filter.op) {
+    case "and":
+      for (const arg of filter.args) if (hasResidualFilter(arg, types)) return true;
+      return false;
+    case "compare": {
+      let column: Extract<ScalarExpr, { op: "column" }>;
+      let literal: Extract<ScalarExpr, { op: "literal" }>;
+      if (isColumn(filter.left) && isLiteral(filter.right)) {
+        column = filter.left;
+        literal = filter.right;
+      } else if (isLiteral(filter.left) && isColumn(filter.right)) {
+        column = filter.right;
+        literal = filter.left;
+      } else return true;
+      const type = types[column.index];
+      return (
+        type === undefined ||
+        (type.kind === "text" && !byteOrder(filter.collation)) ||
+        !literalHasConstant(literal.value, type)
+      );
+    }
+    case "inList": {
+      if (filter.negated || !isColumn(filter.arg)) return true;
+      const type = types[filter.arg.index];
+      if (type === undefined || (type.kind === "text" && !byteOrder(filter.collation))) return true;
+      for (const item of filter.list) {
+        if (!isLiteral(item)) return true;
+        // NULL members are dropped by the existing positive IN pushdown too.
+        if (item.value.validity !== null && ((item.value.validity[0] ?? 0) & 1) === 0) continue;
+        if (!literalHasConstant(item.value, type)) return true;
+      }
+      return false;
+    }
+    case "isNull":
+      return !isColumn(filter.arg) || types[filter.arg.index] === undefined;
+    default:
+      return true;
+  }
+}
+
 /** Splits a scan filter's conjuncts into pushed predicates and the residual. */
 export function splitFilter(
   filter: ScalarExpr | null,

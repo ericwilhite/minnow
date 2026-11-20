@@ -28,6 +28,8 @@ import {
   KeyWork,
   bytesEqual,
   equalJob,
+  shortKeyCompare,
+  LONG_KEY_BYTES,
   extractKeys,
   extractKeysJob,
   keyStepRows,
@@ -433,7 +435,8 @@ export class JoinTable {
 
   /**
    * Bytes keys: inserts rows `base … base + count` (keys in `scratch` 0 …), comparing a key with
-   * every slot of equal 64-bit hash through `equalJob`. The chain position and the comparison's
+   * every slot of equal hash. Short compares are bounded inline; long compares use
+   * `equalJob`. The chain position and the comparison's
    * byte offset survive each yield, so a collision chain is bounded work per step.
    */
   *#insertBytesJob(
@@ -470,7 +473,14 @@ export class JoinTable {
           const theirs = this.#buildBytes(head - 1);
           const ts = this.#keyStart;
           const te = this.#keyEnd;
-          const same = yield* equalJob(theirs, ts, te, mine, ms, me, work, slice);
+          let same: boolean;
+          const length = te - ts;
+          if (length !== me - ms) same = false;
+          else if (length <= LONG_KEY_BYTES) {
+            const compared = shortKeyCompare(theirs, ts, mine, ms, length);
+            if (compared !== 0 && work.spend(Math.abs(compared), slice)) yield;
+            same = compared >= 0;
+          } else same = yield* equalJob(theirs, ts, te, mine, ms, me, work, slice);
           if (same) {
             if (!this.#linkDuplicate(row, head)) return false;
             slots[slot] = row + 1;
@@ -799,7 +809,14 @@ export class JoinTable {
             const theirs = this.#buildBytes(h - 1);
             const ts = this.#keyStart;
             const te = this.#keyEnd;
-            const same = yield* equalJob(theirs, ts, te, probe, start, end, work, slice);
+            let same: boolean;
+            const length = te - ts;
+            if (length !== end - start) same = false;
+            else if (length <= LONG_KEY_BYTES) {
+              const compared = shortKeyCompare(theirs, ts, probe, start, length);
+              if (compared !== 0 && work.spend(Math.abs(compared), slice)) yield;
+              same = compared >= 0;
+            } else same = yield* equalJob(theirs, ts, te, probe, start, end, work, slice);
             if (same) {
               head = h;
               break;
