@@ -6,10 +6,11 @@
  */
 import { PGlite } from "@electric-sql/pglite";
 import fc from "fast-check";
-import { afterAll, beforeAll, expect, it } from "vitest";
+import { afterAll, beforeAll, expect, it, vi } from "vitest";
 import { createReach, JOIN_DEMAND_EXPRESSION_REACH } from "../../testing/reach.js";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import { observeJoinGathers } from "../exec/join.js";
+import { StarDictionaryBooks } from "../exec/star-dictionary.js";
 import { oracleRows } from "./differential-adapter.js";
 import { StorageCore } from "./storage-core.js";
 
@@ -76,6 +77,32 @@ beforeAll(async () => {
   core = await new StorageCore(8192).open();
   pg = new PGlite();
   await pg.waitReady;
+  // A star: text-keyed dimensions with primary keys, so the encoded star path is chosen.
+  for (const ddl of [
+    "CREATE TABLE sf (ka TEXT, kb TEXT, v DOUBLE PRECISION)",
+    "CREATE TABLE sa (k TEXT PRIMARY KEY, t TEXT, w DOUBLE PRECISION)",
+    "CREATE TABLE sb (k TEXT PRIMARY KEY, t TEXT, w DOUBLE PRECISION)",
+  ]) {
+    await core.execute(ddl);
+    await pg.exec(ddl);
+  }
+  const keys = Array.from({ length: 6 }, (_, i) => `k${String(i)}`);
+  for (const name of ["sa", "sb"]) {
+    const rows = keys.map((k, i) => ({ k, t: `t${String(i % 3)}`, w: i % 3 }));
+    await core.writeBatch("insertBatch", name, rows);
+    await pg.exec(
+      `INSERT INTO ${name} VALUES ${rows.map((r) => `('${r.k}','${r.t}',${String(r.w)})`).join(",")}`,
+    );
+  }
+  const fact = Array.from({ length: 300 }, (_, i) => ({
+    ka: keys[i % 6] ?? "k0",
+    kb: keys[Math.floor(i / 6) % 6] ?? "k0",
+    v: i / 4,
+  }));
+  await core.writeBatch("insertBatch", "sf", fact);
+  await pg.exec(
+    `INSERT INTO sf VALUES ${fact.map((r) => `('${r.ka}','${r.kb}',${String(r.v)})`).join(",")}`,
+  );
   const random = mulberry32(0x7d3a);
   for (const name of ["a", "b", "d"]) {
     const ddl = `CREATE TABLE ${name} (id DOUBLE PRECISION PRIMARY KEY, k DOUBLE PRECISION, v DOUBLE PRECISION, label TEXT)`;
@@ -138,6 +165,31 @@ async function gathered(sql: string): Promise<number[][]> {
 }
 
 // The optimisation itself, pinned: losing output demand fails here, not only in a benchmark.
+it("passes demand down a nested join", async () => {
+  // The top join reads d.v; the inner join (a, b) supplies only b.v, its parent's key. With
+  // b.label read only by b's filter, each join gathers one build column.
+  expect(
+    await gathered(
+      "SELECT a.id AS aid, d.v AS dv FROM a JOIN b ON a.k = b.k JOIN d ON d.k = b.v WHERE b.label = 'x' ORDER BY aid, dv NULLS FIRST",
+    ),
+  ).toEqual([[1], [1]]);
+});
+
+it("passes demand through dictionary-encoded star joins", async () => {
+  const encode = vi.spyOn(StarDictionaryBooks.prototype, "encode");
+  try {
+    // Each dimension's filter column w is read by its scan only; each join gathers only t.
+    expect(
+      await gathered(
+        "SELECT sa.t AS x, sb.t AS y, COUNT(*) AS n, SUM(sf.v) AS s FROM sf JOIN sa ON sa.k = sf.ka JOIN sb ON sb.k = sf.kb WHERE sa.w > 0 AND sb.w > 0 GROUP BY sa.t, sb.t ORDER BY x, y",
+      ),
+    ).toEqual([[2], [2]]);
+    expect(encode.mock.calls.length, "the encoded star path ran").toBeGreaterThan(0);
+  } finally {
+    encode.mockRestore();
+  }
+});
+
 it("gathers only the build column a projection over the join reads", async () => {
   // b builds k (its key, reused from the probe), label (read only by the scan's filter) and v.
   // Only v is gathered for matched pairs.

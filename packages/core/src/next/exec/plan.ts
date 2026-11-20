@@ -779,12 +779,20 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
     loanSlots: number;
   }> = [];
   const compoundColumns = new Map<number, number>();
-  /** Join output columns its direct parent projection reads (absent: every column). */
+  /**
+   * Join output columns its consumer reads (absent: every column). The consumer is a direct
+   * parent projection, or a parent inner join that passes on its own demand plus its keys.
+   */
   const joinOutputDemand = new Map<number, ReadonlySet<number>>();
+  /** Whether an inner join's demand can narrow what it gathers and what its inputs supply. */
+  const prunable = (join: Extract<Rel, { op: "join" }>): boolean =>
+    (join.kind === "inner" || join.kind === "cross") &&
+    join.residual === null &&
+    (join.filter ?? null) === null;
   /**
    * Build store columns an inner join need not gather: key-only columns it added past the
-   * build input, and input columns its parent projection never reads. Not for a residual,
-   * a filter, an outer/semi/mark join or a star-rewritten join (its outputs move).
+   * build input, and input columns its consumer never reads. Not for a residual, a filter or
+   * an outer/semi/mark join. A star rewrite changes column types only, never positions.
    */
   const unusedBuildOf = (
     join: Rel,
@@ -792,13 +800,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
     buildWidth: number,
     storeWidth: number,
   ): { unusedBuild?: number[] } => {
-    if (
-      join.op !== "join" ||
-      (join.kind !== "inner" && join.kind !== "cross") ||
-      join.residual !== null ||
-      (join.filter ?? null) !== null
-    )
-      return {};
+    if (join.op !== "join" || !prunable(join)) return {};
     const read = joinOutputDemand.get(join.id);
     const unused: number[] = [];
     for (let c = 0; c < storeWidth; c++)
@@ -2905,6 +2907,21 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           throw new UnsupportedPlanError("a keyed nested-loop physical join", {
             construct: "join",
           });
+        // A child join supplies only what this join's demand and keys read.
+        const read = joinOutputDemand.get(rel.id);
+        if (read !== undefined && prunable(rel)) {
+          const width = rel.left.output.length,
+            probe = new Set<number>(),
+            build = new Set<number>();
+          for (const c of read) (c < width ? probe : build).add(c < width ? c : c - width);
+          // Keys the walker cannot classify leave that child fully demanded.
+          const probeRead = columnsRead(rel.leftKeys, probe),
+            buildRead = columnsRead(rel.rightKeys, build);
+          if (rel.left.op === "join" && probeRead !== null)
+            joinOutputDemand.set(rel.left.id, probeRead);
+          if (rel.right.op === "join" && buildRead !== null)
+            joinOutputDemand.set(rel.right.id, buildRead);
+        }
         const left = prepare(rel.left),
           right = prepare(rel.right),
           lt = types(rel.left),
@@ -2973,8 +2990,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
             ),
             // Runtime filters are optional acceleration; scans still evaluate every predicate.
             publishes: [],
-            // A star rewrite moves output positions: only the planned join uses demand.
-            ...(actual === rel ? unusedBuildOf(actual, lt.length, rt.length, rk.types.length) : {}),
+            ...unusedBuildOf(actual, lt.length, rt.length, rk.types.length),
           };
           if (runtime === undefined || grant === null) validateHashJoinSpec(spec);
           const join =
