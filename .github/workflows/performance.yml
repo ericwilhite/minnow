@@ -14,6 +14,7 @@ on:
   workflow_dispatch:
   # Changes to the gate itself, or to the executor it measures, are worth an immediate run.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - ".github/workflows/performance.yml"
       - "package.json"
@@ -30,6 +31,7 @@ permissions:
 jobs:
   gate:
     name: SQL performance gate
+    if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

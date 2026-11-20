@@ -128,8 +128,10 @@ protocol survives it: every broker request is bounded and retried, and each brok
 announces an id so clients resend and owners register again;
 [the SharedWorker restart note](https://github.com/ericwilhite/minnow/blob/main/packages/core/src/next/owner/webkit-sharedworker.md) has the measurements and the repro.
 
-The merge gate and fast SQLLogicTest profile run in `.github/workflows/ci.yml` on every push and pull
-request, spread across parallel jobs. One job runs the format, type, lint, build, API contract,
+The merge gate and fast SQLLogicTest profile run in `.github/workflows/ci.yml` on every push to
+`main` and every pull request that is not a draft, spread across parallel jobs. Draft pull requests
+skip this gate, the release-readiness conformance and the performance gate; marking a draft ready
+for review runs them. One job runs the format, type, lint, build, API contract,
 SQLLogicTest, and heap-plateau checks. The unit suite runs under coverage in seven Vitest parts; a
 final job merges their results and coverage and enforces the coverage floors on the whole suite,
 exactly as `npm run test:coverage` does. The `Format, types, lint, build, unit tests` check requires
