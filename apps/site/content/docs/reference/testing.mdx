@@ -2534,3 +2534,29 @@ campaign checks the exact code, zero writable OPFS handles and writes, and the c
 unchanged native file image for all three frozen directory shapes. The pre-registry archived
 writer still refuses the current root with `MINNOW_MANIFEST_CORRUPT`; its separate check
 preserves root/data payloads, without claiming that obsolete writer has a pre-fence gate.
+
+### Rebuild directory-cache work counts
+
+The unexported 1.0 executor shares parsed column directories between source sizing and scan
+execution. Its generated cache checks count parses and sketch validations, rather than timing
+queries. Repeated reads may reuse a validated immutable blob while it remains cached; a new
+blob identity, eviction, or a restored database requires validation again. Cache hits still
+check the column type and data extent. Non-retaining scans may borrow existing entries without
+promoting them or keeping misses, even when windowed reads are unavailable. The tests also close an owner with a live directory lease
+and check that its final release returns the remaining credit.
+
+`next/page/directory-cache.test.ts` checks full blob identities, valid checksums on invalid
+sketch bodies, hit bounds, refused cache charges, eviction and late releases. The native
+`next/testing/directory-cache-native.test.ts` compares generated query histories with PGlite,
+including updated roots and portable restore. Their seeds replay through `MINNOW_SEED` like
+other generated suites. The late-fetch generator also checks both wide-sort and ordered-index
+payload paths. It primes entries with a retaining scan and compares complete rows with PGlite
+before requiring non-retaining fetches to reuse them without parsing. The existing
+`next/page/manifest.test.ts` also checks refused and throwing
+holder budgets: failed cache hits return their pins and preserve the original error. Its
+payload-funding generator checks dense and sparse HLL bodies, byte statistics, retained charges,
+and refusal before parsing when the copy allowance cannot be funded, including invalid bodies.
+The separate `scripts/directory-cache-cpu.mts` benchmark measures native source sizing with
+independent CPU pairs and a same-build control. It verifies full stored rows outside the clock;
+whole-query measurements remain separate. These checks do not publish performance results or
+change the stored format.

@@ -29,7 +29,7 @@ import { reclaimingReader } from "./reclaim-reader.js";
 import type { ChunkReads } from "./scan.js";
 import type { SpaceReader } from "../access/space.js";
 import { SortOperator, sortMinimumBytes } from "./sort.js";
-import { TableScan } from "./table-scan.js";
+import { TableScan, type TableScanOptions } from "./table-scan.js";
 
 export const ORDINAL_TYPE: PhysicalType = { kind: "float64" };
 
@@ -237,6 +237,8 @@ export interface LateFetchContext {
   readonly grant: Grant;
   readonly restoreGrant: Grant;
   readonly reads: ChunkReads;
+  /** Owner cache supplied before the execution reader is wrapped. */
+  readonly directories?: NonNullable<TableScanOptions["directories"]>;
   readonly spill: SpillService;
   readonly queryId: number;
   readonly targetBytes: number;
@@ -441,6 +443,7 @@ export class LateFetchOperator implements Operator {
         filter: null,
         emitLocator: false,
         pages: payloadPages,
+        ...(context.directories === undefined ? {} : { directories: context.directories }),
         reads: context.onePass
           ? {
               open: (pages, chunk, options) =>
