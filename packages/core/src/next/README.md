@@ -1599,9 +1599,11 @@ and the owner import it directly.
   floors inside a native step) is served before every queued new admission as soon as it fits, FIFO
   among holders, so a holder never waits behind a request only its own release could serve. New
   admissions wait only while holder requests are queued; holders are finite and each finishes.
-  Holder priority changes order, never limits: still no refusal below the cap. Two holders cannot
-  wait on each other on current paths (one writer per governor; a native root queues its own step
-  only after the writer's step has settled). Policy: `holdsCredit` in `memory/governor.ts`; tests:
+  Holder priority changes order, never limits: still no refusal below the cap. The writer and a
+  native root cannot wait on each other (one writer per governor; a native root queues its own step
+  only after the writer's step has settled). Readers are not holders: query preparation is to wait
+  only while holding nothing (a preparation credit, pending), since readers each retaining a source
+  recipe while waiting could otherwise wait on each other. Policy: `holdsCredit` in `memory/governor.ts`; tests:
   `memory/holder-priority.test.ts`, `testing/native-command-fifo.test.ts`. In test runs,
   `MINNOW_GOVERNOR_STALL_MS` turns any wait without governor progress into a `GovernorStallError`
   naming every holder.

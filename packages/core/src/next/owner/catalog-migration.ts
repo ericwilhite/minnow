@@ -66,6 +66,8 @@ export async function migrateCatalog(
             throw new PlanningError("Missing identity migration column", "42703");
           const grant = await governor.admit({
             label: "migration/identity",
+            // Inside a write transaction: the writer holds its floors and the statement its rows.
+            holdsCredit: true,
             minimumBytes: 4 * 1024 * 1024,
             spillable: false,
             ...(options.signal ? { signal: options.signal } : {}),

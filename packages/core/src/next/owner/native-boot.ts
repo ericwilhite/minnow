@@ -141,6 +141,8 @@ async function openResources(
     } else {
       scratchControl = await governor.admit({
         label: "shared scratch control",
+        // The write path is open: its owner minimum stays held through this wait.
+        holdsCredit: true,
         minimumBytes: SCRATCH_CONTROL_BYTES,
         spillable: false,
         ...(options.signal === undefined ? {} : { signal: options.signal }),

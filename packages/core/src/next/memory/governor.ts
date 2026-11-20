@@ -53,6 +53,9 @@ export interface AdmitOptions {
   readonly spillable: boolean;
   /** Cancels a pending admission (rejects with the signal's reason; nothing is held). */
   readonly signal?: AbortSignal;
+  /** The caller holds credit it cannot release until this is served: holder growth
+   * (see NativeGrantGroupOptions.holdsCredit). */
+  readonly holdsCredit?: boolean;
 }
 
 /**
@@ -873,7 +876,7 @@ export class Governor implements MemoryGovernor {
         this.capBytes - this.reserveBytes,
       );
     return this.#enqueue(
-      this.#admissions,
+      options.holdsCredit === true ? this.#holders : this.#admissions,
       {
         bytes: options.minimumBytes,
         loan: false,

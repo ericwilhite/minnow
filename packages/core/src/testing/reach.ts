@@ -11791,6 +11791,14 @@ export const NATIVE_PREPARATION_SCALING_REACH = [
   "large size",
 ] as const;
 
+/** Ordinary writer growth is served before an earlier foreign request its holdings block. */
+export const WRITER_HOLDER_GROWTH_REACH = [
+  "foreign request blocked by the writer's holdings",
+  "foreign request admitted after the writer's statement",
+  "update growth",
+  "no growth at this size",
+] as const;
+
 /** Holder growth is served before queued new admissions; everyone eventually progresses. */
 export const GOVERNOR_HOLDER_PRIORITY_REACH = [
   "holder served ahead of an earlier new admission",

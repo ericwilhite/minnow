@@ -65,6 +65,8 @@ export async function openNativeOwnerEngine(
       label: "native owner startup",
       minimumBytes: 8 << 20,
       spillable: true,
+      // The owner's scratch control grant stays held through this wait.
+      holdsCredit: true,
     });
     space = await openExtentSpace(session, {
       reachable: listedRootExtents(),
