@@ -86,6 +86,17 @@ function buffers(workspace: HashWorkspace) {
   };
 }
 
+/** Governor peak of the pinned history of 17,002 unique 65-byte keys (512 KiB pinned
+ * competitor included): the largest of this property's workloads. Each batch funds its
+ * complete growth bound first (growth.ts arrayGrowth: 4x steps past 2^16 elements, old and
+ * new buffers both counted), so the peak follows that bound. The test records it exactly. */
+const UNIQUE_65_PEAK = 10_375_232;
+/** Every history keeps this much headroom below the budget. */
+const MARGIN = 1.5;
+/** 16 MiB is 1.62x UNIQUE_65_PEAK; a history must peak at or below BUDGET / MARGIN
+ * (11,184,810 bytes). */
+const BUDGET = 16 << 20;
+
 for (const seed of seedsFor("flat-byte-batches", [0xb9fc1, 0xb9fc2]))
   it(`keeps exact IDs and independently funded buffers at batch boundaries seed${String(seed)}`, async () => {
     const reach = createReach("flat byte batches", FLAT_BYTE_BATCH_REACH);
@@ -100,9 +111,7 @@ for (const seed of seedsFor("flat-byte-batches", [0xb9fc1, 0xb9fc2]))
         }),
         async ({ count, width, selected, duplicate, offset }) => {
           reach.beginHistory();
-          // The per-row growth policy peaks near 10.4 MB on 17,000 unique 65-byte keys
-          // (4x arena steps from LARGE_ARRAY); the budget covers it with a pinned competitor.
-          const governor = new Governor(16 << 20);
+          const governor = new Governor(BUDGET);
           const pinned = await governor.admit({
             label: "pinned grouping competitor",
             minimumBytes: 512 << 10,
@@ -236,7 +245,13 @@ for (const seed of seedsFor("flat-byte-batches", [0xb9fc1, 0xb9fc2]))
                 out = table.emitKey(0, from, length);
               for (let i = 0; i < length; i++) expect(valueAt(out, i)).toBe(first[from + i]);
             }
-            expect(governor.peakBytes).toBeLessThanOrEqual(16 << 20);
+            const peak = governor.peakBytes;
+            expect(
+              peak * MARGIN,
+              `peak ${String(peak)} keeps ${String(MARGIN)}x headroom`,
+            ).toBeLessThanOrEqual(BUDGET);
+            if (count === 17002 && width === 65 && !selected && !duplicate)
+              expect(peak, "recorded per-row growth peak").toBe(UNIQUE_65_PEAK);
             reach.reach("pinned competitor");
             reach.reach("second batch");
             reach.reach("NULL then flat");
