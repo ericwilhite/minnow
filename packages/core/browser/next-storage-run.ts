@@ -41,7 +41,12 @@ interface StorageWorker {
   until(ready: () => boolean, what: string, ms?: number): Promise<void>;
   post(message: unknown, transfer?: Transferable[]): void;
   terminate(): void;
+  /** The last steps the worker traced (`{ trace }` messages), oldest first, with page times. */
+  readonly steps: readonly string[];
 }
+
+/** How many traced steps a worker keeps for a stall report. */
+const TRACE_KEEP = 12;
 
 async function spawn(): Promise<StorageWorker> {
   const worker = new Worker(new URL("./next-storage-worker.ts", import.meta.url), {
@@ -54,6 +59,8 @@ async function spawn(): Promise<StorageWorker> {
   let published = 0;
   let failure: Error | null = null;
   let terminated = false;
+  const steps: string[] = [];
+  const born = performance.now();
   /** Waiters checked on every progress message, so no phase can slip by between polls. */
   const watchers = new Set<() => void>();
   await new Promise<void>((resolve, reject) => {
@@ -71,7 +78,13 @@ async function spawn(): Promise<StorageWorker> {
         result?: unknown;
         error?: string;
         progress?: { round: number; phase: PublishPhase };
+        trace?: string;
       };
+      if (data.trace !== undefined) {
+        steps.push(`${String(Math.round(performance.now() - born))} ms: ${data.trace}`);
+        if (steps.length > TRACE_KEEP) steps.shift();
+        return;
+      }
       if (data.progress !== undefined) {
         progress = data.progress;
         if (data.progress.phase === "published") {
@@ -114,6 +127,9 @@ async function spawn(): Promise<StorageWorker> {
     },
     get published() {
       return published;
+    },
+    get steps() {
+      return steps;
     },
     publish(dir, rounds) {
       call({ op: "publish-loop", dir, rounds }).then(
@@ -190,7 +206,52 @@ export interface KillResult {
     readonly round: number;
     readonly previous: number | null;
     readonly openedMs: number;
+    /** Page time from spawning the writer to its kill, and of the whole verification. */
+    readonly writerMs: number;
+    readonly verifyMs: number;
   }>;
+  /** Where the run stopped, if it did: null when every iteration completed. */
+  readonly failure: KillFailure | null;
+}
+
+export interface KillFailure {
+  /** The iteration (0-based) and the phase its kill aimed at. */
+  readonly iteration: number;
+  readonly target: PublishPhase;
+  /** What the page was waiting for: spawning, the writer's phase, or the verification. */
+  readonly stage: string;
+  readonly elapsedMs: number;
+  readonly error: string;
+  /** The last steps the waited-on worker traced (the verifier's platform calls, for example). */
+  readonly steps: readonly string[];
+  /** After a stalled verification: this store's locks and each file's sync handle, probed alone. */
+  readonly diagnosis: unknown;
+}
+
+/**
+ * Per stage of one iteration, the longest the page waits before it reports a stall. Hosted
+ * Firefox completes a whole iteration in about 1 s (reopen 38-232 ms, two CI runs on
+ * 2026-11-20); a loaded 8-core host, in about 5 s. A verification beyond 30 s is a stall.
+ */
+const VERIFY_STALL_MS = 30_000;
+/** How long the stall diagnosis probes each file's sync handle for release. */
+const DIAGNOSIS_PROBE_MS = 10_000;
+
+/** `work`, or a rejection naming `what` once `ms` have passed. */
+async function within<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error(`${what} did not finish in ${String(ms)} ms`));
+        }, ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
@@ -213,31 +274,87 @@ export async function runKillDuringPublish(iterations: number, seed: number): Pr
   for (let iteration = 0; iteration < iterations; iteration++) {
     const target = PUBLISH_PHASES[iteration % PUBLISH_PHASES.length] ?? "publishing";
     const warmup = 2 + Math.floor(random() * 4);
-    const writer = await spawn();
+    const started = performance.now();
+    let stage = "spawning the writer";
+    let waited: StorageWorker | null = null;
+    const stop = async (error: unknown, diagnose: boolean): Promise<KillResult> => {
+      const steps = waited?.steps ?? [];
+      waited?.terminate();
+      // The diagnosis probes OPFS sync handles; the IndexedDB runs have none.
+      const diagnosis =
+        diagnose && store === "opfs"
+          ? await within(
+              withWorker((worker) =>
+                worker.call({ op: "diagnose-opfs", dir, probeMs: DIAGNOSIS_PROBE_MS }),
+              ),
+              DIAGNOSIS_PROBE_MS * 2 + 20_000,
+              "the OPFS diagnosis",
+            ).catch((failure: unknown) => String(failure))
+          : null;
+      return {
+        iterations: results,
+        failure: {
+          iteration,
+          target,
+          stage,
+          elapsedMs: Math.round(performance.now() - started),
+          error: error instanceof Error ? error.message : String(error),
+          steps: [...steps],
+          diagnosis,
+        },
+      };
+    };
+    let killedRound: number;
     try {
-      writer.publish(dir, 1_000_000);
-      await writer.until(
-        () => writer.published >= warmup && writer.progress?.phase === target,
-        `the ${target} phase after ${String(warmup)} rounds`,
-      );
-    } finally {
-      writer.terminate();
+      const writer = await spawn();
+      waited = writer;
+      try {
+        stage = `the writer reaching the ${target} phase after ${String(warmup)} rounds`;
+        writer.publish(dir, 1_000_000);
+        await writer.until(
+          () => writer.published >= warmup && writer.progress?.phase === target,
+          `the ${target} phase after ${String(warmup)} rounds`,
+        );
+      } finally {
+        writer.terminate();
+      }
+      killedRound = writer.progress?.round ?? 0;
+      acked = Math.max(acked, writer.acked);
+    } catch (error) {
+      return stop(error, false);
     }
-    const killedRound = writer.progress?.round ?? 0;
-    acked = Math.max(acked, writer.acked);
-    const verified = await withWorker((worker) =>
-      worker.call<{ round: number; previous: number | null; openedMs: number }>({
-        op: "verify",
-        dir,
-        minAcked: acked,
-      }),
-    );
-    results.push({ target, killedRound, acked, ...verified });
+    const writerMs = performance.now() - started;
+    let verified: { round: number; previous: number | null; openedMs: number };
+    try {
+      stage = "spawning the verifier";
+      const verifier = await spawn();
+      waited = verifier;
+      stage = `verifying after the kill in round ${String(killedRound)}`;
+      try {
+        verified = await within(
+          verifier.call({ op: "verify", dir, minAcked: acked }),
+          VERIFY_STALL_MS,
+          "the verification",
+        );
+      } finally {
+        verifier.terminate();
+      }
+    } catch (error) {
+      return stop(error, true);
+    }
+    results.push({
+      target,
+      killedRound,
+      acked,
+      ...verified,
+      writerMs: Math.round(writerMs),
+      verifyMs: Math.round(performance.now() - started - writerMs),
+    });
     // The verifier published one more round.
     acked = verified.round + 1;
   }
   await withWorker((worker) => worker.call({ op: "remove", dir }));
-  return { iterations: results };
+  return { iterations: results, failure: null };
 }
 
 /** Starts a publish loop in this page's worker and returns the directory (the tab is then closed). */

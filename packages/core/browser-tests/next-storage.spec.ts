@@ -74,6 +74,9 @@ test.describe("rebuild core storage on OPFS", () => {
       body: JSON.stringify(result, null, 2),
       contentType: "application/json",
     });
+    // A stall reports the iteration, the phase its kill aimed at, what the page waited for, the
+    // waited-on worker's last steps and (after a verification) the store's locks and handles.
+    expect(result.failure, JSON.stringify(result.failure, null, 2)).toBeNull();
     expect(result.iterations).toHaveLength(12);
     // Every phase of a round was the moment of a kill, several times (review B1-p2b finding 5).
     for (const phase of ["writing", "publishing", "published"] as const)
@@ -178,6 +181,7 @@ async function indexedDbScenarios(page: Page, iterations: number) {
 
 function expectIndexedDbScenarios(result: Awaited<ReturnType<typeof indexedDbScenarios>>) {
   expect(result.conformance.filter((entry) => entry.error !== null)).toEqual([]);
+  expect(result.kill.failure, JSON.stringify(result.kill.failure, null, 2)).toBeNull();
   for (const phase of ["writing", "publishing", "published"] as const)
     expect(result.kill.iterations.some((iteration) => iteration.target === phase)).toBe(true);
   for (const iteration of result.kill.iterations) {
