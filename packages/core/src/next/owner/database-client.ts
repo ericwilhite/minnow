@@ -22,6 +22,7 @@ import { clientCursor } from "./client-cursor.js";
 import { writeColumns } from "./client-input.js";
 import { ClientClosedError } from "./errors.js";
 import { DEFAULT_RESULT_WINDOW_BYTES } from "./protocol.js";
+import { NativeLiveStore, type NativeLiveOptions } from "./live-store.js";
 export interface ClientLifecycle {
   readonly ready: Promise<void>;
   status?(): ClientStatus;
@@ -233,6 +234,30 @@ class ClientSql implements SqlExecutor {
   }
 }
 export class MinnowDatabaseClient extends ClientSql {
+  readonly #liveStores = new Set<{ close(): Promise<void> }>();
+  liveQuery<R extends object = Row>(
+    sql: string,
+    params: readonly Param[] = [],
+    options: NativeLiveOptions<R> = {},
+  ): NativeLiveStore<R> {
+    this.check();
+    const store = new NativeLiveStore<R>(this.shared.protocol, sql, params, options);
+    // A parameter or options getter can close the client while the store captures its source.
+    if (this.shared.closing) {
+      void this.track(store.close());
+      throw new ClientClosedError();
+    }
+    const close = store.close.bind(store);
+    store.close = async () => {
+      try {
+        await close();
+      } finally {
+        this.#liveStores.delete(store);
+      }
+    };
+    this.#liveStores.add(store);
+    return store;
+  }
   readonly #lifecycle: ClientLifecycle;
   #close: Promise<void> | null = null;
   constructor(protocol: ProtocolClient, lifecycle: ClientLifecycle) {
@@ -342,6 +367,7 @@ export class MinnowDatabaseClient extends ClientSql {
     if (!this.shared.protocol.connected) this.shared.protocol.close();
     return (this.#close = (async () => {
       try {
+        await Promise.allSettled([...this.#liveStores].map((store) => store.close()));
         await Promise.allSettled([...this.shared.cursors].map((cursor) => cursor.close()));
         await Promise.allSettled([...this.shared.calls]);
       } finally {

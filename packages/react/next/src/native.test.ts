@@ -21,7 +21,6 @@ it("reuses the exact structural hook implementation qualified by the existing su
   expect(renderToString(createElement(Rows))).toContain(
     "9007199254740993 2000-02-29T12:34:56.123456",
   );
-  expect(() => native.nativeLiveStore()).toThrow("not yet bound");
 });
 
 it("presents canonical duplicate-label object rows with last-wins semantics", () => {
@@ -64,4 +63,27 @@ it("presents canonical duplicate-label object rows with last-wins semantics", ()
     return createElement("p", null, current.rows[0]?.x);
   }
   expect(renderToString(createElement(Rows))).toBe("<p>2</p>");
+});
+
+it("renders canonical rows from the native runtime and releases the store", async () => {
+  const { MinnowDatabase } = await import("../../../core/dist/next/owner/database.js");
+  const { MemoryBackend } = await import("../../../core/dist/next/storage/memory-store.js");
+  const { SimLocks } = await import("../../../core/dist/next/storage/sim-disk.js");
+  const db = await MinnowDatabase.open({
+    backend: new MemoryBackend({ locks: new SimLocks() }),
+    memoryLimitBytes: 64 << 20,
+  });
+  const store = native.nativeLiveStore<{ n: bigint }>(db, "SELECT 9007199254740993::bigint n");
+  try {
+    await store.refresh();
+    function Rows() {
+      const snapshot = native.useSuspenseLiveQuery(store);
+      return createElement("p", null, String(snapshot.rows[0]?.n));
+    }
+    expect(renderToString(createElement(Rows))).toBe("<p>9007199254740993</p>");
+  } finally {
+    await store.close();
+    await db.close();
+  }
+  expect(store.usedBytes).toBe(0);
 });

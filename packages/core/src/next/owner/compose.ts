@@ -547,6 +547,12 @@ class ComposedEngine implements CatalogOwnerEngine {
     return (this.#live ??= new LiveRuntime(this, this.#options.governor, feed));
   }
 
+  async retireLive(): Promise<void> {
+    const live = this.#live;
+    await live?.close();
+    this.#live = null;
+  }
+
   onCommit(listener: (tables: readonly number[]) => void): () => void {
     const feed = this.#options.writePath.changes;
     if (feed !== undefined)

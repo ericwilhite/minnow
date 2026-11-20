@@ -54,6 +54,7 @@ export default async function createRootComponent(
         directory: { extent, offset: 128, length: 0, checksum: 0 },
         statistics: { nullCount: 0, min: g, max: g + c, dictionarySize: null },
         distinctSketch: null,
+        aggregateSummary: null,
       };
     }),
   }));

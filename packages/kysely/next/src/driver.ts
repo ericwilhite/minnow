@@ -76,6 +76,7 @@ function rows<R>(result: Result<R>, options: NativeResultDecoding): R[] {
     return row as R;
   });
 }
+export { parameters as nativeParameters, rows as nativeRows };
 interface Deferred<T> {
   promise: Promise<T>;
   resolve(value: T): void;
