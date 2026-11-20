@@ -8,9 +8,9 @@
 name: Head-to-head
 
 on:
-  # SCRATCH BRANCH ONLY: screens B9 admission sizing (perf/p1-b9-admission) against main. Never merge.
+  # SCRATCH BRANCH ONLY: screens B9 streaming star (perf/p1-b9-star) against main. Never merge.
   push:
-    branches: [ci/p1-screen-b9-admission]
+    branches: [ci/p1-screen-b9-star]
   schedule:
     # 05:00 UTC daily, before the Node and browser performance lanes.
     - cron: "0 5 * * *"
@@ -47,7 +47,7 @@ jobs:
     env:
       SHIPPED: ${{ inputs.shipped || '0.20.0' }}
       ROUNDS: ${{ inputs.rounds || '9' }}
-      CANDIDATE: ${{ inputs.candidate || '05dba97373f3f151c2c7ea4dc6e9581bc15aa74f' }}
+      CANDIDATE: ${{ inputs.candidate || '41d376fa0b68d16648038311cb2597d32a7ba73e' }}
     steps:
       - uses: actions/checkout@v5
         with:
