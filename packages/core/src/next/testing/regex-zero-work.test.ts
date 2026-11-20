@@ -10,7 +10,7 @@ import { createReach, REGEX_ZERO_WORK_REACH } from "../../testing/reach.js";
 import { shapes, scenarioFields, examples, regexWorkCase } from "./regex-work.test-support.js";
 
 beforeAll(() => {
-  vi.spyOn(captures, "captureSpans").mockImplementation(() => {
+  vi.spyOn(captures, "captureSpansJob").mockImplementation(() => {
     throw new Error("A capture-free path entered capture dissection");
   });
 });

@@ -8,7 +8,14 @@ import {
 } from "./limits.js";
 
 import {
-  captureSpans,
+  REGEX_SLICE_STEPS,
+  runRegex,
+  unpaused,
+  type RegexControl,
+  type RegexJob,
+} from "./control.js";
+import {
+  captureSpansJob,
   type RegexNode as Node,
   type RegexInstruction as Instruction,
   type RegexNodeRange,
@@ -342,43 +349,58 @@ export class SqlRegex {
     this.#captureRoot = groups && describe(root).captures ? root : null;
   }
 
-  #search(
+  /** The VM search. Yields every `control.slice` steps (pattern/control.ts); a synchronous
+   * caller drives it with `runRegex`. Its visited states and branch stack are registered with
+   * `control.scratch` so a resumable caller can fund their growth before each slice. */
+  *#search(
     input: RegexInput,
     from: number,
-    capture: false,
-    work?: { remaining: number },
+    capture: boolean,
+    control: RegexControl,
     trace?: MatchTrace,
-  ): boolean;
-  #search(
-    input: RegexInput,
-    from: number,
-    capture?: true,
-    work?: { remaining: number },
-    trace?: MatchTrace,
-  ): number[] | null;
-  #search(
-    input: RegexInput,
-    from: number,
-    capture = true,
-    work = { remaining: MAX_SQL_PATTERN_MATCH_STEPS },
-    trace?: MatchTrace,
-  ): number[] | null | boolean {
+  ): RegexJob<number[] | null | boolean> {
     if (input.length > input.limit)
       throw new RangeError("Regular expression input exceeds scalar size limit");
     // Captures do not affect this language. The whole VM owns only pc/position
     // states; submatch priority is resolved by the same dissection afterward.
     const visited = new Map<number, number>();
+    let stack: Array<{ pc: number; position: number; previous: number }> = [];
+    const untrack = control.scratch?.track(() => visited.size + stack.length);
+    try {
+      return yield* this.#searchFrom(input, from, capture, control, visited, trace, (next) => {
+        stack = next;
+      });
+    } finally {
+      untrack?.();
+    }
+  }
+
+  *#searchFrom(
+    input: RegexInput,
+    from: number,
+    capture: boolean,
+    control: RegexControl,
+    visited: Map<number, number>,
+    trace: MatchTrace | undefined,
+    expose: (stack: Array<{ pc: number; position: number; previous: number }>) => void,
+  ): RegexJob<number[] | null | boolean> {
+    const work = control.work;
     for (let start = from; start <= input.length;) {
       if (capture) visited.clear();
       trace?.predecessors.clear();
       const stack: Array<{ pc: number; position: number; previous: number }> = [
         { pc: this.#start, position: start, previous: -1 },
       ];
+      expose(stack);
       let bestEnd = -1;
       while (stack.length) {
         let { pc, position, previous } = required(stack.pop());
         for (;;) {
           this.spend(work);
+          if (--control.slice <= 0) {
+            control.slice = REGEX_SLICE_STEPS;
+            yield;
+          }
           const key = position * 65536 + pc;
           if (visited.has(key)) break;
           if (visited.size >= 65536)
@@ -427,9 +449,30 @@ export class SqlRegex {
     from = 0,
     work = { remaining: MAX_SQL_PATTERN_MATCH_STEPS },
   ): number[] | null {
+    return runRegex(this.spansJob(input, from, unpaused(work)));
+  }
+
+  /** `spans` as a resumable job: yields every `control.slice` steps; all scratch it grows is
+   * registered with `control.scratch`. */
+  *spansJob(input: RegexInput, from: number, control: RegexControl): RegexJob<number[] | null> {
     const trace: MatchTrace | undefined =
       this.#captureRoot === null ? undefined : { predecessors: new Map(), last: -1 };
-    const whole = this.#search(input, from, true, work, trace);
+    const untrack = trace && control.scratch?.track(() => trace.predecessors.size);
+    try {
+      return yield* this.#spansTraced(input, from, control, trace);
+    } finally {
+      untrack?.();
+    }
+  }
+
+  *#spansTraced(
+    input: RegexInput,
+    from: number,
+    control: RegexControl,
+    trace: MatchTrace | undefined,
+  ): RegexJob<number[] | null> {
+    const work = control.work;
+    const whole = (yield* this.#search(input, from, true, control, trace)) as number[] | null;
     if (whole === null) return null;
     if (this.#captureRoot === null || this.#ranges === null) {
       if (this.#slots === 2) return whole;
@@ -439,7 +482,7 @@ export class SqlRegex {
       empty[1] = required(whole[1]);
       return empty;
     }
-    return captureSpans(
+    return yield* captureSpansJob(
       this.#captureRoot,
       this.#ranges,
       this.#instructions,
@@ -447,7 +490,11 @@ export class SqlRegex {
       required(whole[0]),
       required(whole[1]),
       this.#slots,
-      () => this.spend(work),
+      () => {
+        this.spend(work);
+        return --control.slice <= 0;
+      },
+      control,
       trace,
     );
   }
@@ -463,7 +510,14 @@ export class SqlRegex {
     return Object.assign(result, { index: required(spans[0]), input }) as RegExpExecArray;
   }
   test(input: string): boolean {
-    return this.#search(new StringRegexInput(input, MAX_SQL_SCALAR_RESULT_CHARACTERS), 0, false);
+    return runRegex(
+      this.#search(
+        new StringRegexInput(input, MAX_SQL_SCALAR_RESULT_CHARACTERS),
+        0,
+        false,
+        unpaused({ remaining: MAX_SQL_PATTERN_MATCH_STEPS }),
+      ),
+    ) as boolean;
   }
 
   [Symbol.replace](input: string, replacement: string): string {

@@ -25,7 +25,7 @@ import {
 
 let pg: PGlite, db: MinnowDatabase;
 let captureSpends = 0;
-const actualCapture = captureModule.captureSpans;
+const actualCapture = captureModule.captureSpansJob;
 const profiles: Array<{
   seed: number;
   shape: string;
@@ -36,8 +36,8 @@ const profiles: Array<{
   total: number;
 }> = [];
 beforeAll(async () => {
-  vi.spyOn(captureModule, "captureSpans").mockImplementation(
-    (root, ranges, program, input, from, to, slots, spend, trace) =>
+  vi.spyOn(captureModule, "captureSpansJob").mockImplementation(
+    (root, ranges, program, input, from, to, slots, tick, control, trace) =>
       actualCapture(
         root,
         ranges,
@@ -48,8 +48,9 @@ beforeAll(async () => {
         slots,
         () => {
           captureSpends++;
-          spend();
+          return tick();
         },
+        control,
         trace,
       ),
   );

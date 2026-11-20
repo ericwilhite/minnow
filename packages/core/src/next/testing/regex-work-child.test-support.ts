@@ -24,6 +24,7 @@ export function isolatedRegexWork(
     const sources = {
       limits: new URL("../../pattern/limits.ts", import.meta.url),
       input: new URL("../../pattern/input.ts", import.meta.url),
+      control: new URL("../../pattern/control.ts", import.meta.url),
       captures: new URL("../../pattern/captures.ts", import.meta.url),
       regex: new URL("../../pattern/regex.ts", import.meta.url),
       "cache-limits": new URL("../../engine/cache-limits.ts", import.meta.url),
@@ -37,6 +38,7 @@ export function isolatedRegexWork(
         .replaceAll("../pattern/limits.js", "./limits.mjs")
         .replaceAll("./limits.js", "./limits.mjs")
         .replaceAll("./input.js", "./input.mjs")
+        .replaceAll("./control.js", "./control.mjs")
         .replaceAll("./captures.js", "./captures.mjs")
         .replaceAll("./cache-limits.js", "./cache-limits.mjs");
       writeFileSync(join(directory, name + ".mjs"), linked);

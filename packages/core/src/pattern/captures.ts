@@ -1,4 +1,5 @@
 import type { RegexInput } from "./input.js";
+import { REGEX_SLICE_STEPS, type RegexControl, type RegexJob } from "./control.js";
 
 /** ARE submatch dissection after the bounded VM has selected the whole match.
  * No pattern backreferences: membership is independent of captures. See PostgreSQL
@@ -47,7 +48,7 @@ function previous(input: RegexInput, at: number): number {
  * there are O(n) splits per AST node. Each split pins one prefix walk and probes
  * at most n suffix starts; each walk visits O(n) VM states for a fixed program.
  * No candidate endpoint restarts its prefix. Cache eviction cannot unpin it. */
-export function captureSpans(
+export function* captureSpansJob(
   root: RegexNode,
   ranges: ReadonlyMap<RegexNode, RegexNodeRange>,
   program: readonly RegexInstruction[],
@@ -55,11 +56,23 @@ export function captureSpans(
   begin: number,
   end: number,
   slots: number,
-  spend: () => void,
+  /** Spends one work step; true when the current slice is used up and the job should yield. */
+  tick: () => boolean,
+  control: RegexControl,
   trace?: MatchTrace,
-): number[] {
+): RegexJob<number[]> {
+  // Work inside bounded helpers (alphabet predicates) still counts; the next loop pauses.
+  const spend = (): void => {
+    tick();
+  };
+  function* pause(): RegexJob<void> {
+    control.slice = REGEX_SLICE_STEPS;
+    yield;
+  }
   const memo = new Map<string, { ends: ReadonlySet<number>; maximum: number }>(),
     captures = new Array<number>(slots).fill(-1);
+  // The endpoint walk in progress, counted while `endpoints` runs.
+  let walkEntries = 0;
   // Index just one accepted path in one backwards pass. Shared suffix proofs
   // avoid re-running the full tail at every nested sequence boundary.
   const ordinals = new Map<number, number>(),
@@ -68,7 +81,7 @@ export function captureSpans(
     let key = trace.last,
       ordinal = 0;
     while (key >= 0) {
-      spend();
+      if (tick()) yield* pause();
       const pc = key % 65536,
         list = occurrences.get(pc) ?? [];
       list.push(key);
@@ -108,6 +121,12 @@ export function captureSpans(
   // Cache endpoints by range/start, not (range,start,candidate end). A greedy
   // split can probe thousands of decreasing ends; each shares this one walk.
   let memoCells = 0;
+  // Scratch this dissection grows: memo keys and endpoint cells, the path index (one ordinal and
+  // one occurrence slot per path state), and the endpoint walk in progress. A job that throws is
+  // dropped with its per-attempt tracker.
+  const untrack = control.scratch?.track(
+    () => memo.size + memoCells + 2 * ordinals.size + walkEntries,
+  );
   let pinned: string | null = null;
   const room = (working: number): void => {
     while (memoCells + working > 65536 && memo.size) {
@@ -126,8 +145,11 @@ export function captureSpans(
   };
   const keyOf = (part: RegexRange, from: number): string =>
     `${String(part.start)}:${String(part.stop)}:${String(from)}`;
-  const endpoints = (part: RegexRange, from: number) => {
-    spend();
+  const endpoints = function* (
+    part: RegexRange,
+    from: number,
+  ): RegexJob<{ ends: ReadonlySet<number>; maximum: number }> {
+    if (tick()) yield* pause();
     const key = keyOf(part, from),
       cached = memo.get(key);
     if (cached) return cached;
@@ -139,8 +161,12 @@ export function captureSpans(
       const state = stack.pop();
       if (!state) throw new Error("Missing regex state");
       let { pc, position } = state;
+      walkEntries = visited.size + ends.size + stack.length;
       for (;;) {
-        spend();
+        if (tick()) {
+          walkEntries = visited.size + ends.size + stack.length;
+          yield* pause();
+        }
         if (pc === part.stop) {
           if (!ends.has(position)) {
             room(visited.size + ends.size + 1);
@@ -183,17 +209,18 @@ export function captureSpans(
     // Evict optional old answers before refusing the active walk. Count retained
     // endpoints and keys, not just the number of sets, under the same state bound.
     visited.clear();
+    walkEntries = 0;
     room(ends.size + 1);
     const answer = { ends, maximum };
     memo.set(key, answer);
     memoCells += ends.size + 1;
     return answer;
   };
-  const exact = (part: RegexRange, from: number, to: number): boolean => {
-    spend();
+  const exact = function* (part: RegexRange, from: number, to: number): RegexJob<boolean> {
+    if (tick()) yield* pause();
     if (from > to || to > end) return false;
     if (part.start === part.stop) return from === to;
-    return witness(part, from) === to || endpoints(part, from).ends.has(to);
+    return witness(part, from) === to || (yield* endpoints(part, from)).ends.has(to);
   };
   const cannotExtend = (node: RegexNode | undefined, at: number, to: number): boolean => {
     if (!node || at >= to) return false;
@@ -201,14 +228,14 @@ export function captureSpans(
     const point = input.codePointAt(at);
     return point === undefined || !predicate(String.fromCodePoint(point), spend);
   };
-  const split = (
+  const split = function* (
     part: RegexRange,
     tail: RegexRange,
     from: number,
     to: number,
     node?: RegexNode,
-  ): number | null => {
-    spend();
+  ): RegexJob<number | null> {
+    if (tick()) yield* pause();
     const known = witness(part, from);
     if (
       known !== undefined &&
@@ -216,13 +243,16 @@ export function captureSpans(
       witness(tail, known) === to
     )
       return known;
-    const answer = endpoints(part, from);
+    const answer = yield* endpoints(part, from);
     pinned = keyOf(part, from);
     try {
       let middle = Math.min(to, answer.maximum);
       while (middle >= from) {
-        spend();
-        if (answer.ends.has(middle) && (witness(tail, middle) === to || exact(tail, middle, to)))
+        if (tick()) yield* pause();
+        if (
+          answer.ends.has(middle) &&
+          (witness(tail, middle) === to || (yield* exact(tail, middle, to)))
+        )
           return middle;
         if (middle === from) break;
         middle = previous(input, middle);
@@ -232,32 +262,32 @@ export function captureSpans(
       pinned = null;
     }
   };
-  const clear = (info: RegexNodeRange): void => {
-    spend();
+  const clear = function* (info: RegexNodeRange): RegexJob<void> {
+    if (tick()) yield* pause();
     // Group IDs are contiguous within a subtree. Never walk capture-free AST
     // siblings just to clear at most 32 slots.
     for (let group = info.firstGroup; group > 0 && group <= info.lastGroup; group++)
       if (captures[group * 2] !== -1 || captures[group * 2 + 1] !== -1) {
-        spend();
+        if (tick()) yield* pause();
         captures[group * 2] = -1;
         captures[group * 2 + 1] = -1;
       }
   };
-  const visit = (node: RegexNode, from: number, to: number): void => {
-    spend();
+  const visit = function* (node: RegexNode, from: number, to: number): RegexJob<void> {
+    if (tick()) yield* pause();
     const info = range(node);
     if (!info.captures) return;
     if (node.kind === "character" || node.kind === "assert") return;
     if (node.kind === "group") {
-      if (range(node.child).captures) visit(node.child, from, to);
+      if (range(node.child).captures) yield* visit(node.child, from, to);
       captures[node.group * 2] = from;
       captures[node.group * 2 + 1] = to;
       return;
     }
     if (node.kind === "alternative") {
       for (const child of node.children)
-        if (exact(range(child), from, to)) {
-          visit(child, from, to);
+        if (yield* exact(range(child), from, to)) {
+          yield* visit(child, from, to);
           return;
         }
     } else if (node.kind === "sequence") {
@@ -272,18 +302,24 @@ export function captureSpans(
         if (fixed !== null) {
           middle = position;
           for (let n = 0; n < fixed; n++) {
-            spend();
+            if (tick()) yield* pause();
             const point = input.codePointAt(middle);
             if (point === undefined || middle >= to)
               throw new Error("Invalid fixed regex dissection");
             middle = input.advance(middle, point);
           }
         } else {
-          const selected = split(part, { start: tail, stop: info.stop }, position, to, child);
+          const selected = yield* split(
+            part,
+            { start: tail, stop: info.stop },
+            position,
+            to,
+            child,
+          );
           if (selected === null) throw new Error("Invalid regex sequence dissection");
           middle = selected;
         }
-        if (range(child).captures) visit(child, position, middle);
+        if (range(child).captures) yield* visit(child, position, middle);
         position = middle;
       }
       return;
@@ -292,12 +328,12 @@ export function captureSpans(
       if (fixed !== null && fixed > 0) {
         let last = to;
         for (let i = 0; i < fixed; i++) {
-          spend();
+          if (tick()) yield* pause();
           last = previous(input, last);
         }
         if (last < from) throw new Error("Invalid fixed regex repeat dissection");
-        clear(info);
-        visit(node.child, last, to);
+        yield* clear(info);
+        yield* visit(node.child, last, to);
         return;
       }
       // For one-or-more unbounded atoms, an accepted loop boundary at the
@@ -307,7 +343,7 @@ export function captureSpans(
       if (node.min === 1 && node.max === Infinity && minimum > 0 && witness(info, from) === to) {
         let last = to;
         for (let i = 0; i < minimum; i++) {
-          spend();
+          if (tick()) yield* pause();
           last = previous(input, last);
         }
         const loop = info.prefix === null ? undefined : program[info.prefix.start];
@@ -317,8 +353,8 @@ export function captureSpans(
           info.prefix !== null &&
           (last === from || witness({ start: loop.first, stop: info.prefix.start }, last) === to)
         ) {
-          clear(info);
-          visit(node.child, last, to);
+          yield* clear(info);
+          yield* visit(node.child, last, to);
           return;
         }
       }
@@ -326,13 +362,13 @@ export function captureSpans(
       // takes priority; captures belong only to that final atom, including NULLs.
       const prefix = info.prefix;
       if (!prefix) throw new Error("Missing regex repeat prefix");
-      const middle = split(prefix, range(node.child), from, to);
+      const middle = yield* split(prefix, range(node.child), from, to);
       if (middle === null) throw new Error("Invalid regex repeat dissection");
-      clear(info);
-      visit(node.child, middle, to);
+      yield* clear(info);
+      yield* visit(node.child, middle, to);
       return;
     } else {
-      clear(info);
+      yield* clear(info);
       if (node.max === 0 || (from === to && range(node.child).minimum > 0)) return;
       const fixed = range(node.child).width;
       // A fixed-width atom has exactly one possible final iteration. Previous
@@ -340,10 +376,10 @@ export function captureSpans(
       if (fixed !== null && fixed > 0 && from < to) {
         let last = to;
         for (let i = 0; i < fixed; i++) {
-          spend();
+          if (tick()) yield* pause();
           last = previous(input, last);
         }
-        visit(node.child, last, to);
+        yield* visit(node.child, last, to);
         return;
       }
       let position = from,
@@ -354,10 +390,10 @@ export function captureSpans(
         const remaining = node.max === Infinity ? pc : choice.second;
         const part = { start: choice.first, stop: remaining },
           tail = { start: remaining, stop: info.stop };
-        const middle = split(part, tail, position, to);
+        const middle = yield* split(part, tail, position, to);
         if (middle === null) return;
-        clear(info);
-        visit(node.child, position, middle);
+        yield* clear(info);
+        yield* visit(node.child, position, middle);
         position = middle;
         if (position === to) return;
         pc = remaining;
@@ -368,6 +404,7 @@ export function captureSpans(
   };
   captures[0] = begin;
   captures[1] = end;
-  visit(root, begin, end);
+  yield* visit(root, begin, end);
+  untrack?.();
   return captures;
 }

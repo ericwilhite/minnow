@@ -1,6 +1,6 @@
 /** Compatibility exports for the shared ARE dissection types. */
 export {
-  captureSpans,
+  captureSpansJob,
   type RegexNode,
   type RegexInstruction,
   type RegexRange,
