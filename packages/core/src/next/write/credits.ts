@@ -23,7 +23,17 @@ export interface WriteMinimum {
   readonly merge: number;
 }
 
+/** One complete-minimum decision: the bytes a step needs held at once, against its capacity. */
+export interface CompleteMinimumStep {
+  readonly label: string;
+  readonly complete: number;
+  readonly capacity: number;
+}
+
 export class WriteCredits {
+  /** Test observation only: each complete-minimum decision, before it refuses or waits.
+   * Boundary tests size real holdings from it; production never sets it. */
+  static observeComplete: ((step: CompleteMinimumStep) => void) | null = null;
   readonly rows: Grant;
   readonly metadata: Grant;
   readonly commits: Grant;
@@ -226,6 +236,7 @@ export class WriteCredits {
     if (holdings !== undefined) {
       const total = minimum.rows + minimum.metadata + minimum.commits + minimum.merge + holdings();
       const capacity = governor.capBytes - governor.reserveBytes;
+      WriteCredits.observeComplete?.({ label: "write owner minimum", complete: total, capacity });
       if (total > capacity) throw new MemoryAdmissionError("write owner minimum", total, capacity);
     }
     const grants = await governor.admitGroup({
@@ -520,6 +531,15 @@ export class WriteCredits {
         accounts.reduce((sum, account) => sum + account.loaned, 0) +
         (this.#mergeActive?.loaned ?? 0);
       const ordinary = this.governor.capBytes - this.governor.reserveBytes;
+      WriteCredits.observeComplete?.(
+        includesProgress
+          ? { label: `complete grow ${grant.label}`, complete, capacity: this.governor.capBytes }
+          : {
+              label: `complete grow ${grant.label}`,
+              complete: complete - loaned,
+              capacity: Math.min(ordinary, this.governor.capBytes - loaned),
+            },
+      );
       if (complete > this.governor.capBytes)
         throw new MemoryAdmissionError(
           `complete grow ${grant.label}`,

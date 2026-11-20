@@ -11558,6 +11558,24 @@ export const WRITE_OPEN_HOLDINGS_REACH = [
   "zero final charge",
 ] as const;
 
+export const WRITE_PINNED_BOUNDARY_REACH = [
+  "waited while the reader held its pins",
+  "proceeded after the pins were released",
+  "crash recovery",
+  "clean restart",
+  "zero final charge",
+] as const;
+
+export const WRITE_OWNER_BOUNDARY_REACH = [
+  "refused at the owner minimum (before construction)",
+  "refusal left only the owner grant",
+  "retry recovered every row",
+  "exact cap reopened",
+  "one byte under reopened",
+  "crash recovery",
+  "clean restart",
+] as const;
+
 export const WRITE_RECOVERY_HOLDINGS_REACH = [
   "crash recovery growth",
   "clean reopen growth",
