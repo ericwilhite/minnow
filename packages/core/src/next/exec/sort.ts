@@ -835,7 +835,8 @@ class Sorter {
     // Rows stored before compare mode get their operands first (or the store is spilled).
     const decoding = this.mode === "compare" && this.decodes;
     while (done < n && (!decoding || this.#decodeStore() === 0)) {
-      const want = Math.min(n - done, 2048);
+      // A row-progress loan funds one row, not a fresh whole-batch varlen arena.
+      const want = Math.min(n - done, this.#rowStep === null ? 2048 : 1);
       if (!this.#reserve(this.store.rows + want)) break;
       // Top-N: rows go in only while the next compaction's store stays in reserve.
       if (

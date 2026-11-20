@@ -570,6 +570,10 @@ export interface SpaceStats {
   /** Space-owned prepaid arena/workspace/root credit and fallback pins. Caller-budget pins
    * remain charged to their snapshot owner. No resident per-retirement index. */
   readonly retainedBytes: number;
+  /** `retainedBytes` without fallback pins: the workspace, extent map and root memory the
+   * space keeps for as long as it is open. Budgetless pins are refunded when their reader
+   * releases them, so they are not part of an owner's permanent floor. */
+  readonly permanentBytes: number;
   readonly cache: {
     readonly residentBytes: number;
     /** Idle pooled one-pass buffers (`ReadOptions.reuseBuffers`), charged to the cache. */

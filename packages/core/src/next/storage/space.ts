@@ -548,6 +548,7 @@ class Space implements ExtentSpace {
       releasingBytes: this.#releasingBytes,
       relocations: this.#relocations,
       retainedBytes: this.workspace.bytes + this.#map.bytes + this.roots.bytes + this.#ledger.bytes,
+      permanentBytes: this.workspace.bytes + this.#map.bytes + this.roots.bytes,
       pinCount: this.#ledger.pinCount,
       oldestPin: this.#ledger.oldestPin,
       cache: this.#cache.stats,

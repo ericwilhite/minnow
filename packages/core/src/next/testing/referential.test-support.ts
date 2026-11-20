@@ -66,9 +66,36 @@ export async function referentialFixture(
   const tx = await path.begin(),
     stop = new AbortController(),
     signal = stop.signal;
+  await options.prior?.(tx);
+  const catalog = tx.catalog;
+  function bindRules(charge: Grant) {
+    return catalog.tables.map((table) => {
+      const expr = core.lowerer.lowerTableRules(table, catalog),
+        rules = compileTableRules(table, catalog.version, expr);
+      return { table, expr, rules: bindTableRules(rules, charge, { capacity: 1, signal }) };
+    });
+  }
+  let tables: ReturnType<typeof bindRules> = [];
+  const statement = tx.statement({
+    signal,
+    rules: (id) => {
+      const binding = tables.find((binding) => binding.table.id === id);
+      if (!binding) throw new Error("missing native rules");
+      return binding.rules;
+    },
+  });
+  if (!(statement instanceof StatementImpl)) throw new Error("missing native statement");
   let sourceMinimum = 0;
-  for (const table of tx.catalog.tables)
+  for (const table of catalog.tables)
     sourceMinimum = Math.max(sourceMinimum, nativePrefixSourceBytes(table));
+  // Match owner dispatch: fund native companion credit before the root's
+  // workspace and any later competing execution take ordinary capacity.
+  const native = await statement.prepareNativeStep(4 * 1024 * 1024 + sourceMinimum, signal);
+  try {
+    native.check();
+  } finally {
+    native.release();
+  }
   const grants = await governor.admitGroup({
       label: "complete native RI root",
       signal,
@@ -91,22 +118,7 @@ export async function referentialFixture(
       signal.throwIfAborted();
     }
   }
-  await options.prior?.(tx);
-  const catalog = tx.catalog,
-    tables = catalog.tables.map((table) => {
-      const expr = core.lowerer.lowerTableRules(table, catalog),
-        rules = compileTableRules(table, catalog.version, expr);
-      return { table, expr, rules: bindTableRules(rules, charge, { capacity: 1, signal }) };
-    }),
-    statement = tx.statement({
-      signal,
-      rules: (id) => {
-        const binding = tables.find((binding) => binding.table.id === id);
-        if (!binding) throw new Error("missing native rules");
-        return binding.rules;
-      },
-    });
-  if (!(statement instanceof StatementImpl)) throw new Error("missing native statement");
+  tables = bindRules(charge);
   const preparedTriggers = catalog.triggers.map((definition) => {
     const owner = catalog.table(definition.tableId);
     if (!owner) throw new Error("Missing fixture trigger owner");

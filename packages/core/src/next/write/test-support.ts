@@ -152,6 +152,8 @@ export class Harness {
   path!: WritePathImpl;
   /** The R25 extent-delta sink passed to every open (access/write-path.ts `ExtentDeltaSink`). */
   extentDeltas: ExtentDeltaSink | null = null;
+  /** Permanent owner grants passed to every open (`EngineInput.ownerHoldings`). */
+  ownerHoldings: (() => number) | null = null;
   /** Called with the extent space before the write path opens over it (tests instrument reads). */
   onSpace: ((space: ExtentSpace) => void) | null = null;
   /** Wall time of the last open's two phases: the extent space (its walk), then the write path. */
@@ -202,6 +204,7 @@ export class Harness {
         governor: this.governor,
         options: { durability: this.durability },
         ...(this.extentDeltas === null ? {} : { extentDeltas: this.extentDeltas }),
+        ...(this.ownerHoldings === null ? {} : { ownerHoldings: this.ownerHoldings }),
         tuning: {
           ...this.tuning,
           ...(this.memtableRows === undefined ? {} : { memtableRows: this.memtableRows }),
@@ -231,6 +234,7 @@ export class Harness {
   /** Abandons the write path without closing it (no final header), then opens again. */
   async crash(): Promise<WritePathImpl> {
     await this.path.flush();
+    WritePathImpl.abandonForCrash(this.path);
     await this.#release?.();
     if (this.backend instanceof SimBackend) this.backend.restart();
     return this.open();

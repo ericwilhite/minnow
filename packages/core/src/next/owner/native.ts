@@ -77,6 +77,8 @@ export async function openNativeOwnerEngine(
       space,
       governor,
       options: input.options ?? { durability: "strict" },
+      // The owner's scratch control is held before and during open and recovery.
+      ownerHoldings: () => spillCredit.held,
     });
     startup.release(startup.held - startup.allocated - startup.loaned);
     path = await opening;

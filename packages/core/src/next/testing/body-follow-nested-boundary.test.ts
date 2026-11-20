@@ -9,6 +9,7 @@ import {
 } from "../../testing/reach.js";
 import { NativePrimaryAdapter } from "../write/primary-command.js";
 import { commandRootFixture } from "./command-root.test-support.js";
+import { yieldTask } from "../task.js";
 import { oracleRows } from "./differential-adapter.js";
 
 for (const seed of seedsFor("next-follow-nested-pressure", [0xb705, 0xb706]))
@@ -42,6 +43,30 @@ for (const seed of seedsFor("next-follow-nested-pressure", [0xb705, 0xb706]))
             spillable: false,
           });
         expect(competitor.allocate(competitor.held)).toBe(true);
+        const held = competitor.held;
+        const admitGroup = gov.admitGroup.bind(gov);
+        const admission = vi.spyOn(gov, "admitGroup").mockImplementation(async (options) => {
+          const pending = admitGroup(options);
+          if (
+            options.grants.some(
+              (part) => part.label.startsWith("write growth ") && part.minimumBytes > 0,
+            )
+          ) {
+            const state = { settled: false };
+            void pending.then(
+              () => {
+                state.settled = true;
+              },
+              () => {
+                state.settled = true;
+              },
+            );
+            for (let turn = 0; turn < 32 && !state.settled; turn++) await yieldTask();
+            if (!state.settled)
+              f.stop.abort(new Error("Prepaid native writer waited for competing credit"));
+          }
+          return pending;
+        });
         let active = 0,
           peak = 0,
           total = 0;
@@ -64,6 +89,8 @@ for (const seed of seedsFor("next-follow-nested-pressure", [0xb705, 0xb706]))
           });
         try {
           expect(await f.root.run({ slots: [] })).toBe(count);
+          expect(competitor.held).toBe(held);
+          reach.reach("prepaid writer progresses with competitor retained");
           await f.commit();
           competitor.close();
           await f.retire();
@@ -91,6 +118,7 @@ for (const seed of seedsFor("next-follow-nested-pressure", [0xb705, 0xb706]))
           reach.reach("bounded active files");
           reach.reach("deferred FIFO exact");
         } finally {
+          admission.mockRestore();
           files.mockRestore();
           competitor.close();
           await f.close();

@@ -51,6 +51,7 @@ it.each(seedsFor("next-executor-pk-offset", [0xe141, 0xe142]))(
       "admitted",
       "skip once",
       "survivors only",
+      "resident generic",
       "PG exact",
       "released",
     ]);
@@ -176,7 +177,10 @@ it.each(seedsFor("next-executor-pk-offset", [0xe141, 0xe142]))(
               if (!("batches" in result)) throw new Error("Query result expected");
               const actual = oracleRows(result);
               expect(actual).toEqual(expected);
-              const eligible = kind === "memory" || kind === "stored" || kind === "composite";
+              // The retained 257-row memory input fits one chunk. Its documented
+              // ordinary-sort recipe avoids an index plus an unused restore sort.
+              // Stored/composite controls still require exact cursor skip/fetch.
+              const eligible = kind === "stored" || kind === "composite";
               if (!omitLimit && limit === 0) {
                 expect(stats.opens).toBe(0);
                 reach.reach("zero unopened");
@@ -202,8 +206,10 @@ it.each(seedsFor("next-executor-pk-offset", [0xe141, 0xe142]))(
                 reach.reach("survivors only");
               } else {
                 expect(stats.opens).toBe(0);
-                reach.reach(`${kind} fallback`);
+                if (kind === "memory") reach.reach("resident generic");
+                else reach.reach(`${kind} fallback`);
               }
+              if (kind === "memory") reach.reach("memory");
               reach.reach("PG exact");
             }
             reach.reach(descending ? "descending" : "ascending");
@@ -219,7 +225,7 @@ it.each(seedsFor("next-executor-pk-offset", [0xe141, 0xe142]))(
         ),
         {
           seed,
-          numRuns: 31,
+          numRuns: 32,
           examples: [
             ["stored", 2, 1, false, false, false],
             ["memory", 1, 1, false, true, true],
@@ -240,6 +246,7 @@ it.each(seedsFor("next-executor-pk-offset", [0xe141, 0xe142]))(
             ["memory", 0, 1, false, false, false],
             ["stored", 1, 0, false, false, false],
             ["memory", 3, 1, false, false, false],
+            ["stored", 3, 1, false, false, false],
           ],
         },
       );
