@@ -79,7 +79,7 @@ for (const codec of CODECS) for (const op of codecOps[codec]) reachStates.push(`
 for (const op of OPS) reachStates.push(`pruned:${op}`, `kept:${op}`);
 for (const codec of CODECS)
   if (codec !== "allNull") reachStates.push(`sparse:${codec}`, `dense:${codec}`);
-// Every single-range selection kernel (select.ts rangeKernel), branch-free since B-select.
+// Every single-range selection kernel (select.ts rangeKernel).
 const KERNELS = [
   "kernel:scan8",
   "kernel:scan16",
