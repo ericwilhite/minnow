@@ -70,6 +70,14 @@ it("32 MiB retains the native cancellable minimum with no query holding", async 
   await core.open();
   try {
     await fixture(core, 8);
+    // The wait is constructed, not assumed: smaller query minimums now fit a free 32 MiB
+    // governor, so a competitor leaves 1 MiB, below the star query's complete minimum.
+    const competitor = governor.tryAdmit({
+      label: "competing holder",
+      minimumBytes: governor.capBytes - governor.reserveBytes - governor.usedBytes - (1 << 20),
+      spillable: false,
+    });
+    if (competitor === null) throw new Error("competitor admission");
     const stop = new AbortController(),
       admission = cancelPendingAdmission(governor, stop);
     try {
@@ -79,6 +87,7 @@ it("32 MiB retains the native cancellable minimum with no query holding", async 
       expect(admission.observed.heldAboveBaseline).toBeLessThanOrEqual(0);
     } finally {
       admission.restore();
+      competitor.close();
     }
   } finally {
     await core.close();

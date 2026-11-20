@@ -1587,7 +1587,8 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                   (filter) => filter.abort(undefined),
                 );
           fixed(rel, (cap) => kernelBytes + batchTargetFor(cap, 4) + BATCH_ROWS * 16);
-          return (runtime, downstream, stops, rowsNeeded) => {
+          // Star lookups compose registered scan recipes (scanRecipes), on either path.
+          const ordinaryScan: Recipe = (runtime, downstream, stops, rowsNeeded) => {
             if (stops.some((stop) => stop())) return downstream.finish();
             const target = batchTargetFor(runtime.request.governor.capBytes, 4);
             return instantiate(
@@ -1655,6 +1656,8 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                 }),
             );
           };
+          scanRecipes.set(rel.id, ordinaryScan);
+          return ordinaryScan;
         }
         const input = types(rel).slice(0, rel.columns.length),
           filter = rel.filter,
