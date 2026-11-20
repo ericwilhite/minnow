@@ -89,6 +89,11 @@ describe("extent deltas (ruling R25)", () => {
     it(`replaying the deltas gives each root's reachable extents (seed ${String(seed)})`, async () => {
       const random = mulberry32(seed);
       const int = (n: number) => Math.floor(random() * n);
+      // Background hooks fire a timing-dependent number of times (flush and merge
+      // scheduling varies with host load and coverage). They draw from their own
+      // stream so the generated history itself replays exactly from its seed.
+      const hookRandom = mulberry32(seed ^ 0x5bd1e995);
+      const hookInt = (n: number) => Math.floor(hookRandom() * n);
       // Some merge attempts fail after their prepare, at the encode step (a hook) or at metadata
       // admission (the next allocation refused): the attempt aborts, the merge retries, the path
       // goes on (review B3-p2b-3 C2).
@@ -99,11 +104,12 @@ describe("extent deltas (ruling R25)", () => {
         idleGarbageBytes: 1,
         // Some flushes wait a few tasks before publishing, so a drop can commit while they write.
         beforeFlushPublish: async () => {
-          for (let turns = random() < 0.5 ? int(12) : 0; turns > 0; turns--) await yieldTask();
+          for (let turns = hookRandom() < 0.5 ? hookInt(12) : 0; turns > 0; turns--)
+            await yieldTask();
         },
         afterDeltaPrepared: (kind) => {
           if (kind !== "merge") return;
-          const roll = random();
+          const roll = hookRandom();
           if (roll < 0.2) throw new Error("injected failure at encode");
           if (roll < 0.4) refuseNextAllocation = true;
         },
