@@ -249,8 +249,8 @@ triggers"): FOR EACH ROW BEFORE/AFTER bodies in PostgreSQL trigger-name and FK o
 cascade level (54001 beyond it), and whole-statement rollback. FOR EACH STATEMENT and transaction
 control in bodies are syntax refusals. RETURNING/conflict/MERGE roots, volatile/FTS/init-plan
 inputs, auto-increment or indexed domains without native preflight, parameterized or growing
-CHECK/generated workspace, and GROUPING SETS/ROLLUP/CUBE bodies refuse with typed 0A000; a
-preparation whose static memory bound exceeds the cap refuses with 53200. Rule admission
+CHECK/generated workspace, and multi-set grouping in body subqueries refuse with typed 0A000;
+a preparation whose metered memory need exceeds the cap refuses with 53200. Rule admission
 walks stable trigger target IDs and referential edges with event, assigned columns and remaining
 body budget; informational update-follow edges and generated keys are included. Unrelated writes
 keep their existing execution path. FTS declarations persist without making an index ready. Snapshot catalog frame
@@ -5099,23 +5099,23 @@ The internal ordinary owner dispatches qualified INSERT/UPDATE/DELETE commands t
 and row-rule funding stay separate. Graph I/O and leases retire before rules and credit.
 There is no public override, package-entry change or default-engine switch.
 
-Preparation admits its complete working set before anything is built and never waits while
-holding preparation. `owner/native-preparation-bound.ts` computes a static upper bound for every
-lowered rule program and trigger body from catalog metadata only: SQL token and character
-counts, OLD/NEW bindings, and the columns, stored DEFAULT/generated text and keys of each table
-the text names. Trigger bodies cannot name views and INSERT bodies use VALUES, so lowering grows
-linearly in those terms except where the shared parser copies a subtree (simple CASE operands,
-BETWEEN, row comparisons, VARIANCE/STDDEV, explicit DEFAULT cells, select-item and USING
-references in subqueries); the scan mirrors each copy site, and copies nest multiplicatively.
-The first admission covers the bound of a static reach superset (the root table, triggers on
-reached tables within the body budget, body targets and FK children), so it never depends on
-building the reach first. One admission covers the whole bound (or fails with a typed
-53200 when the bound exceeds the cap), every build runs inside it, and an item that retains more
-than its bound fails loudly. Setup, rule and parameter workspaces can only be sized from the
-built preparation; if held credit does not cover them, every attempt object and charge is
-released and the complete, now-known working set is admitted from nothing before building
-again. That release happens at most once per statement: a second shortfall throws rather than
-looping. The learned working set is kept per cached root plan, so later executions admit it at once.
+Preparation is metered under a growing reservation and never waits while holding preparation.
+Each table rule set and trigger body is charged a base share, linear in stored text
+(`owner/native-preparation-bound.ts`: SQL tokens and characters, bindings, and the columns,
+stored DEFAULT/generated text and keys of each table the text names), before it is built. Every
+copy of one source subtree that the shared parser, optimizer or lowering makes is charged as it
+happens: the private-rebuild copy meter (`engine/copy-meter.ts`) is installed only around native
+preparation, and the copy helpers (`cloneTreeValue`, the expression copy sites such as simple
+CASE operands, BETWEEN, row predicates, statistical aggregates, alias and merged-column
+references and grouping sets, and repeated DEFAULT cells in lowering) charge each node before
+copying it. The released engine installs no meter, so its parse and compile are unchanged.
+When a charge does not fit, the attempt is abandoned: every attempt object and charge is
+released, and the reservation is admitted again from nothing at max(known need, min(2 x
+previous, cap)). A reservation the cap cannot grant beside the writer is reduced to the largest
+that fits, so only a known need above it is a typed 53200. Setup, rule and parameter
+workspaces, sized from the built preparation, take the same path. Attempts are at most
+ceil(log2(cap / first reservation)) + 1, and the final reservation is kept per cached root
+plan, so a later execution admits it at once.
 
 The same funded/SQL histories run at 32 MiB with `MINNOW_TRIGGER_CAP_MIB=32` and at
 64 MiB by default. They compare PostgreSQL BEFORE/AFTER name order, RI and nested bodies,
@@ -5132,9 +5132,10 @@ ordering around that family; native suffixes are not PostgreSQL OID spellings.
 
 Typed 0A000 refusals remain for RETURNING/conflict/MERGE roots, volatile/FTS/init-plan inputs,
 auto-increment or indexed domains missing native preflight, parameterized or growing/
-structural CHECK/generated workspace, and GROUPING SETS/ROLLUP/CUBE trigger bodies (refused
-before lowering: their copies grow with the set count). Raw executor calls do not install this
-owner controller.
+structural CHECK/generated workspace. A trigger body subquery with more than one grouping set
+(ROLLUP, CUBE, or GROUPING SETS with several members) keeps the executor's existing set-operation
+refusal; a single grouping set runs as an ordinary grouped subquery. Raw executor calls do not
+install this owner controller.
 
 ### Native compiled-input phase memory
 

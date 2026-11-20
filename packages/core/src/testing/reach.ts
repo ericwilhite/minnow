@@ -11678,6 +11678,13 @@ export const NATIVE_PREPARATION_BOUND_REACH = [
   "copies variance",
   "copies groupRefs",
   "copies usingJoin",
+  "copies rowNotIn",
+  "copies notBetween",
+  "copies betweenInCase",
+  "copies quotedKeywords",
+  "copies groupingSet",
+  "copies rollup",
+  "copies rowNotInLiteral",
 ] as const;
 
 /** Native trigger preparation admits its whole bound before building and never waits holding it. */
@@ -11688,7 +11695,7 @@ export const NATIVE_COMMAND_PREPARATION_REACH = [
   "waited holding nothing",
   "admissions checked",
   "released and retried",
-  "above-cap refusal before building",
+  "above-cap refusal at the cap",
   "learned working set in one attempt",
   "exact PG rows",
   "large body",

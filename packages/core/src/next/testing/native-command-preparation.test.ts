@@ -1,26 +1,27 @@
-/** Native trigger preparation admits its whole static bound before building anything, and never
- * waits while holding preparation. The real allocation sites (rule lowering, rule compilation,
- * body lowering) are instrumented: each must run inside admitted credit that covers its item's
- * bound, and every governor admission during preparation must begin with no preparation charge
- * held. Large generated bodies and wide default rules run free, under a competing grant that
- * fills the cap (released or cancelled while the root waits), and above the cap, where the bound
- * alone is refused with a typed 53200 before any build. */
+/** Native trigger preparation is metered under a growing reservation. The real allocation sites
+ * (rule and body lowering) are instrumented: each runs only after its item's base share was
+ * charged, every copy inside is charged by the copy meter before it is allocated, and every
+ * governor admission during preparation must begin with no preparation charge held. Attempts
+ * stay within ceil(log2(cap / initial)) + 1, a reused plan admits once, and 53200 appears only
+ * above the cap. Large generated bodies and wide default rules run free, under a competing grant
+ * that fills the cap (released or cancelled while the root waits), and above the cap. */
 import { PGlite } from "@electric-sql/pglite";
 import fc from "fast-check";
 import { expect, it, vi } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach, NATIVE_COMMAND_PREPARATION_REACH } from "../../testing/reach.js";
-import * as rules from "../exec/rules.js";
-import { executeNativeCommand } from "../owner/native-command.js";
+import { executeNativeCommand, PREPARATION_INITIAL_FACTOR } from "../owner/native-command.js";
 import { NativeCommandReach } from "../owner/command-reach.js";
 import { NativeCommandRoot } from "../owner/command-root.js";
 import { NATIVE_ROOT_CREDIT_BYTES } from "../owner/native-root-credits.js";
-import { bodyPreparationBound, rulePreparationBound } from "../owner/native-preparation-bound.js";
+import {
+  bodyPreparationBound,
+  closurePreparationBound,
+  rulePreparationBound,
+} from "../owner/native-preparation-bound.js";
+import { nativeCommandReachBytes } from "../owner/command-reach.js";
 import { Governor, MemoryAdmissionError, type Grant } from "../memory/governor.js";
 import type { Lowerer } from "../lower/lowerer.js";
-import type { TableDef } from "../access/catalog.js";
-import type { TableRules } from "../access/modify.js";
-import type { TableRuleExpressions } from "../ir/rules.js";
 import { ChunkReader } from "../page/reader.js";
 import { StorageCore } from "./storage-core.js";
 import { oracleRows } from "./differential-adapter.js";
@@ -110,6 +111,7 @@ for (const seed of seedsFor("next-native-command-preparation", [49701, 49702]))
               builds = 0,
               waits = 0,
               reaches = 0,
+              firstAdmitted: number | undefined = undefined,
               settled = false;
             try {
               await pg.exec("DROP TABLE IF EXISTS p,log,w CASCADE");
@@ -120,7 +122,10 @@ for (const seed of seedsFor("next-native-command-preparation", [49701, 49702]))
                 context = { ...core.context(), catalog },
                 lowered = core.lowerer.lower(s.mutation, context);
               if (lowered.kind !== "modify") throw new TypeError("Missing mutation plan");
-              // An allocation site may run only inside admitted credit covering its item.
+              const rootTableId = (lowered.plan.root as { readonly tableId: number }).tableId;
+              // An allocation site runs only after its item's base share was charged to admitted
+              // credit; the copies it makes are charged by the meter as they happen.
+              let lastCharge = 0;
               const site = (what: string, bound: number) => {
                 if (!preparing) return;
                 builds++;
@@ -128,10 +133,9 @@ for (const seed of seedsFor("next-native-command-preparation", [49701, 49702]))
                   violations.push(`${what} before the root opened`);
                   return;
                 }
-                const free = accounts.metadata.held - accounts.metadata.allocated;
-                if (free < bound)
+                if (lastCharge < bound)
                   violations.push(
-                    `${what} built with ${String(free)}B admitted < bound ${String(bound)}B`,
+                    `${what} built after a ${String(lastCharge)}B charge < base ${String(bound)}B`,
                   );
               };
               const bodyBound = (text: string) => {
@@ -149,23 +153,11 @@ for (const seed of seedsFor("next-native-command-preparation", [49701, 49702]))
                 site("rule expressions", rulePreparationBound(table));
                 return core.lowerer.lowerTableRules(table, view);
               };
-              const compile = rules.compileTableRules;
-              // The command uses the three-argument form; the overload set is not spy-typed.
-              const compileRules = (
-                table: TableDef,
-                version: number,
-                expr: TableRuleExpressions,
-              ): TableRules => {
-                site("rule program", rulePreparationBound(table));
-                return compile(table, version, expr);
-              };
-              vi.spyOn(rules, "compileTableRules").mockImplementation(
-                compileRules as unknown as typeof rules.compileTableRules,
-              );
               const prepareReach = NativeCommandReach.prepare.bind(NativeCommandReach);
               vi.spyOn(NativeCommandReach, "prepare").mockImplementation(
                 (view, root, charge, work) => {
                   reaches++;
+                  firstAdmitted ??= accounts?.metadata.held;
                   return prepareReach(view, root, charge, work);
                 },
               );
@@ -203,6 +195,12 @@ for (const seed of seedsFor("next-native-command-preparation", [49701, 49702]))
                   const [metadata, , ruleGrant, parameters] = grants;
                   if (!metadata || !ruleGrant || !parameters) throw new Error("Missing accounts");
                   accounts = { metadata, rules: ruleGrant, parameters };
+                  const allocate = metadata.allocate.bind(metadata);
+                  metadata.allocate = (bytes: number) => {
+                    const ok = allocate(bytes);
+                    if (ok) lastCharge = bytes;
+                    return ok;
+                  };
                   preparing = true;
                   if (mode === "release" || mode === "cancel") {
                     const [grant] = await admit({
@@ -257,22 +255,28 @@ for (const seed of seedsFor("next-native-command-preparation", [49701, 49702]))
               preparing = false;
               vi.restoreAllMocks();
               expect(violations.join("\n"), "preparation admission laws").toBe("");
-              // At most one released attempt per statement: never a third reach.
-              expect(reaches).toBeLessThanOrEqual(2);
+              // Doubling from the first admitted reservation (the static estimate, or the largest
+              // reservation that fits beside the writer) reaches the cap within this many attempts.
+              const estimate = Math.min(
+                capBytes,
+                NATIVE_ROOT_CREDIT_BYTES +
+                  nativeCommandReachBytes(catalog) +
+                  PREPARATION_INITIAL_FACTOR * closurePreparationBound(catalog, rootTableId).bytes,
+              );
+              const initial = (firstAdmitted as number | undefined) ?? estimate;
+              expect(initial).toBeLessThanOrEqual(estimate);
+              expect(reaches).toBeLessThanOrEqual(Math.ceil(Math.log2(capBytes / initial)) + 1);
               const refusal =
                 "error" in completed && completed.error instanceof MemoryAdmissionError
                   ? completed.error
                   : null;
               if (mode === "oversize") {
-                // The bound alone is above the cap: refused before anything is built.
+                // The metered need grows past the cap: a typed 53200 only once it is above it.
                 expect(refusal?.sqlState).toBe("53200");
                 expect(refusal?.bytes ?? 0).toBeGreaterThan(refusal?.capacity ?? Infinity);
-                expect(builds).toBe(0);
-                // Refused at the first admission, before even the reach is built.
-                expect(reaches).toBe(0);
                 tx.rollback();
                 tx = null;
-                reach.reach("above-cap refusal before building");
+                reach.reach("above-cap refusal at the cap");
               } else if (refusal) {
                 // Only the largest generated bodies at 32 MiB; never below the cap.
                 expect(refusal.sqlState).toBe("53200");

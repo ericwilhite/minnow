@@ -1,20 +1,25 @@
-/** The static preparation bounds (owner/native-preparation-bound.ts) cover what the real lowerer
- * and rule compiler retain, over generated trigger bodies and table rules: long expression
- * chains, CASE nesting, IN lists, ASCII and non-BMP string literals, OLD/NEW bindings, base-table
- * subqueries with `*`, wide targets with DEFAULT/generated text, and CHECK constraints. */
+/** Metered preparation is sound: for every generated trigger body and table rule set, what the
+ * real parser, optimizer, lowerer and rule compiler retain stays within the base share
+ * (owner/native-preparation-bound.ts) plus every copy the copy meter (engine/copy-meter.ts)
+ * charged while lowering it. Generated: long chains, CASE nesting, IN lists, ASCII and non-BMP
+ * literals, OLD/NEW bindings, base-table subqueries with `*`, wide targets with DEFAULT,
+ * generated and CHECK text, row count x DEFAULT cells x default size, every parser copy site
+ * including negated forms (row NOT IN, NOT BETWEEN), nesting, grouping sets, and quoted keyword
+ * identifiers (`"cube"`, `"rollup"`). A copy that bypasses the meter fails this check. */
+import { PGlite } from "@electric-sql/pglite";
 import fc from "fast-check";
-import { expect, it, vi } from "vitest";
+import { expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach, NATIVE_PREPARATION_BOUND_REACH } from "../../testing/reach.js";
 import { compileTableRules } from "../exec/rules.js";
 import {
-  bodyPreparation,
-  bodyPreparationBound,
   bodyRetainedBytes,
   rulePreparationBound,
   ruleRetainedBytes,
   scanSql,
 } from "../owner/native-preparation-bound.js";
+import { lowerBodyMetered } from "../owner/native-command.js";
+import { withCopyMeter, type CopyMeter } from "../../engine/copy-meter.js";
 import { StorageCore } from "./storage-core.js";
 import { MinnowDatabaseClient } from "../owner/database-client.js";
 import { publicOwner } from "./public-owner.test.fixture.js";
@@ -50,6 +55,13 @@ const shape = fc.record({
     "variance" as const,
     "groupRefs" as const,
     "usingJoin" as const,
+    "rowNotIn" as const,
+    "notBetween" as const,
+    "betweenInCase" as const,
+    "quotedKeywords" as const,
+    "groupingSet" as const,
+    "rollup" as const,
+    "rowNotInLiteral" as const,
   ),
   operand: fc.integer({ min: 0, max: 60 }),
   arms: fc.integer({ min: 1, max: 30 }),
@@ -73,6 +85,7 @@ function setup(h: Shape): string[] {
     `CREATE TABLE t(id INT PRIMARY KEY, note TEXT DEFAULT '${"d".repeat(h.defaultText)}'${extra}${gen}${checks})`,
     `CREATE TABLE u(k INT PRIMARY KEY, w INT${extra})`,
     "CREATE TABLE one(k INT PRIMARY KEY)",
+    'CREATE TABLE "cube"(k INT PRIMARY KEY, "rollup" INT)',
   ];
 }
 
@@ -106,6 +119,35 @@ function copied(h: Shape): { readonly value: string | null; readonly predicate: 
       return {
         value: null,
         predicate: ` AND id IN (SELECT k + ${x} AS kk FROM u GROUP BY 1 ORDER BY kk)`,
+      };
+    case "rowNotInLiteral":
+      return {
+        value: null,
+        predicate: ` AND (note, '${"x".repeat(h.literal)}') NOT IN (${Array.from({ length: h.arms }, (_, i) => `('a${String(i)}', 'b')`).join(", ")})`,
+      };
+    case "rowNotIn":
+      return { value: null, predicate: ` AND (id, ${x}) NOT IN (${items})` };
+    case "notBetween":
+      return { value: null, predicate: ` AND ${x} NOT BETWEEN 100 AND ${x}` };
+    case "betweenInCase":
+      return {
+        value: `CASE (${x} BETWEEN 0 AND ${x}) ${Array.from({ length: h.arms }, (_, i) => `WHEN ${i % 2 === 0 ? "true" : "false"} THEN ${String(i)}`).join(" ")} ELSE 0 END`,
+        predicate: "",
+      };
+    case "quotedKeywords":
+      return {
+        value: null,
+        predicate: ` AND id IN (SELECT "rollup" FROM "cube" WHERE "rollup" > ${x})`,
+      };
+    case "groupingSet":
+      return {
+        value: null,
+        predicate: ` AND id IN (SELECT k FROM u WHERE w > ${x} GROUP BY GROUPING SETS ((k)))`,
+      };
+    case "rollup":
+      return {
+        value: null,
+        predicate: ` AND id IN (SELECT k FROM u WHERE w > ${x} GROUP BY ROLLUP (k, w))`,
       };
     case "usingJoin":
       return {
@@ -157,7 +199,24 @@ const COPY_SITES = [
   "variance",
   "groupRefs",
   "usingJoin",
+  "rowNotIn",
+  "notBetween",
+  "betweenInCase",
+  "quotedKeywords",
+  "groupingSet",
+  "rollup",
+  "rowNotInLiteral",
 ] as const;
+/** An unlimited meter that only sums its charges. */
+function counting(): CopyMeter & { charged: number } {
+  const meter = {
+    charged: 0,
+    charge(bytes: number) {
+      meter.charged += bytes;
+    },
+  };
+  return meter;
+}
 let worst = 0;
 for (const seed of seedsFor("next-native-preparation-bound", [49721, 49722]))
   it(`static preparation bounds cover real lowering seed${String(seed)}`, async () => {
@@ -174,18 +233,23 @@ for (const seed of seedsFor("next-native-preparation-bound", [49721, 49722]))
           const catalog = core.harness.path.catalog;
           for (const definition of catalog.triggers)
             for (const stored of definition.statements) {
-              const lowered = core.lowerer.lower(stored.sql, {
-                ...core.context(),
-                parameterTypes: stored.bindings.map((binding) => binding.type),
-              });
+              const meter = counting();
+              const lowered = lowerBodyMetered(
+                { planner: core.lowerer, context: core.context() },
+                catalog,
+                stored,
+                meter,
+              );
               if (lowered.kind !== "modify") throw new Error("modify body required");
               const actual = bodyRetainedBytes(lowered.plan, stored.bindings.length),
-                bound = bodyPreparationBound(stored, catalog);
+                bound = meter.charged;
               expect(actual, stored.sql.slice(0, 120)).toBeLessThanOrEqual(bound);
               worst = Math.max(worst, actual / bound);
             }
           for (const table of catalog.tables) {
-            const expr = core.lowerer.lowerTableRules(table, catalog),
+            const meter = counting();
+            meter.charge(rulePreparationBound(table));
+            const expr = withCopyMeter(meter, () => core.lowerer.lowerTableRules(table, catalog)),
               program = compileTableRules(table, catalog.version, expr);
             const defaults = table.columns
               .filter((column) => column.generatedSql === null)
@@ -195,7 +259,7 @@ for (const seed of seedsFor("next-native-preparation-bound", [49721, 49722]))
                 expr: expr.defaults?.find((d) => d.columnId === column.id)?.expr ?? null,
               }));
             const actual = ruleRetainedBytes({ expr, program, defaults }),
-              bound = rulePreparationBound(table);
+              bound = meter.charged;
             expect(actual, table.name).toBeLessThanOrEqual(bound);
             worst = Math.max(worst, actual / bound);
           }
@@ -225,7 +289,7 @@ for (const seed of seedsFor("next-native-preparation-bound", [49721, 49722]))
       }),
       {
         seed,
-        numRuns: 20,
+        numRuns: 40,
         examples: [
           [
             {
@@ -343,6 +407,30 @@ for (const seed of seedsFor("next-native-preparation-bound", [49721, 49722]))
               arms: copies === "nestedCase" ? 12 : 30,
             },
           ]) as Array<[Shape]>),
+          // Review scenario: (note, 100,000 x) NOT IN 100 two-column rows, in a DELETE body.
+          [
+            {
+              kind: "delete",
+              chain: 0,
+              caseDepth: 0,
+              list: 0,
+              literal: 100000,
+              wideChar: "a",
+              subquery: "none",
+              width: 1,
+              defaultTerms: 0,
+              generated: 0,
+              checks: 0,
+              bodies: 1,
+              rows: 1,
+              defaultCells: 0,
+              defaultText: 0,
+              defaultValues: false,
+              copies: "rowNotInLiteral",
+              operand: 0,
+              arms: 100,
+            },
+          ],
           // Review scenario: ten DEFAULT rows of a 100,000-character text default.
           [
             {
@@ -401,40 +489,60 @@ it("counts tokens without building them", () => {
   expect(scan.tokens).toBe(23);
 });
 
-it("refuses grouping-set bodies before lowering them", async () => {
+it("runs single-set grouping and quoted keyword bodies like PostgreSQL", async () => {
   const owner = await publicOwner({ capBytes: 64 << 20 }),
-    db = new MinnowDatabaseClient(owner.client, { ready: Promise.resolve() });
-  let lowered = 0;
+    db = new MinnowDatabaseClient(owner.client, { ready: Promise.resolve() }),
+    pg = new PGlite();
+  const schema = [
+    "CREATE TABLE p(id INT PRIMARY KEY)",
+    "CREATE TABLE t(k INT PRIMARY KEY, v INT)",
+    "CREATE TABLE u(k INT PRIMARY KEY, w INT)",
+    'CREATE TABLE "cube"(k INT, "rollup" INT)',
+    "INSERT INTO p VALUES (1), (2)",
+    "INSERT INTO t VALUES (1, 1), (2, 2), (3, 3)",
+    "INSERT INTO u VALUES (1, 10), (3, 30)",
+  ];
+  const bodies = [
+    "UPDATE t SET v = v + 100 WHERE k IN (SELECT k FROM u GROUP BY GROUPING SETS ((k)))",
+    'INSERT INTO "cube" VALUES (OLD.id, OLD.id * 10)',
+  ];
+  const state = [
+    "SELECT * FROM t ORDER BY k",
+    'SELECT * FROM "cube" ORDER BY k, "rollup"',
+    "SELECT * FROM p ORDER BY id",
+  ];
   try {
-    for (const sql of [
-      "CREATE TABLE p(id INT PRIMARY KEY)",
-      "CREATE TABLE t(k INT PRIMARY KEY, v INT)",
-      "CREATE TABLE u(k INT PRIMARY KEY, w INT)",
-      "INSERT INTO p VALUES (1)",
-      "INSERT INTO t VALUES (1, 1)",
-      "CREATE TRIGGER r AFTER UPDATE ON p BEGIN UPDATE t SET v = 2 WHERE k IN (SELECT k FROM u GROUP BY ROLLUP (k, w)); END",
-    ])
+    for (const sql of schema) {
       await db.execute(sql);
-    const catalog = owner.core.harness.path.catalog,
-      body = catalog.triggers[0]?.statements[0];
-    if (!body) throw new Error("Missing body");
-    expect(bodyPreparation(body, catalog).groupingSets).toBe(true);
-    const lower = owner.core.lowerer.lower.bind(owner.core.lowerer);
-    vi.spyOn(owner.core.lowerer, "lower").mockImplementation((text, context) => {
-      if (text === body.sql) lowered++;
-      return lower(text, context);
-    });
-    const error = await db.execute("UPDATE p SET id = id").then(
+      await pg.exec(sql);
+    }
+    for (const [i, body] of bodies.entries()) {
+      await db.execute(`CREATE TRIGGER g${String(i)} AFTER UPDATE ON p BEGIN ${body}; END`);
+      await pg.exec(
+        `CREATE FUNCTION g${String(i)}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN ${body}; RETURN NEW; END $$;
+         CREATE TRIGGER g${String(i)} AFTER UPDATE ON p FOR EACH ROW EXECUTE FUNCTION g${String(i)}()`,
+      );
+    }
+    const mutation = "UPDATE p SET id = id + 10";
+    expect((await db.execute(mutation)).affectedRows).toBe(2);
+    await pg.exec(mutation);
+    for (const sql of state)
+      expect((await db.query(sql)).rows(), sql).toEqual((await pg.query(sql)).rows);
+    // A multi-set ROLLUP keeps the executor's existing unsupported refusal and changes nothing.
+    await db.execute(
+      "CREATE TRIGGER r AFTER UPDATE ON p BEGIN UPDATE t SET v = 0 WHERE k IN (SELECT k FROM u GROUP BY ROLLUP (k, w)); END",
+    );
+    const error = await db.execute(mutation).then(
       () => null,
       (e: unknown) => e as { sqlState?: string; message?: string },
     );
     expect(error?.sqlState).toBe("0A000");
-    expect(error?.message).toMatch(/GROUPING SETS, ROLLUP or CUBE/u);
-    expect(lowered).toBe(0);
-    expect((await db.query("SELECT * FROM t")).rows()).toEqual([{ k: 1, v: 1 }]);
+    expect(error?.message).toMatch(/set operation other than binary EXCEPT/u);
+    for (const sql of state)
+      expect((await db.query(sql)).rows(), sql).toEqual((await pg.query(sql)).rows);
   } finally {
-    vi.restoreAllMocks();
     await db.close();
     await owner.close();
+    await pg.close();
   }
 });
