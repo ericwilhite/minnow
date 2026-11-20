@@ -1612,16 +1612,22 @@ and the owner import it directly.
   FIFO admission waits while holding no partial reservation. A minimum above the whole cap
   raises `MemoryAdmissionError`. See [the bounded read-step contract](memory/README.md).
 - Holder priority. New admissions (owners holding nothing) are served FIFO. Growth from an owner
-  that holds credit it cannot release (`holdsCredit`: a native root's retained base, the writer's
-  floors inside a native step) is served before every queued new admission as soon as it fits, FIFO
-  among holders, so a holder never waits behind a request only its own release could serve. New
-  admissions wait only while holder requests are queued; holders are finite and each finishes.
-  Holder priority changes order, never limits: still no refusal below the cap. The writer and a
-  native root cannot wait on each other (one writer per governor; a native root queues its own step
-  only after the writer's step has settled). Readers are not holders: query preparation is to wait
-  only while holding nothing (a preparation credit, pending), since readers each retaining a source
-  recipe while waiting could otherwise wait on each other. Policy: `holdsCredit` in `memory/governor.ts`; tests:
-  `memory/holder-priority.test.ts`, `testing/native-command-fifo.test.ts`. In test runs,
+  that holds credit it cannot release (`holdsCredit`: all writer growth, a native root's retained
+  base, and the other holder sites the policy audit lists) is served before every queued new
+  admission as soon as it fits, FIFO among holders, so a holder never waits behind a request only
+  its own release could serve. Callouts (reclaim, eviction) that enqueue during a drain are
+  re-checked before any grant. Holder priority changes order, never limits. Lifetime holdings (the
+  native owner's scratch control) are registered as permanent: an admission needing more than the
+  cap (or `cap - reserve`) less those holdings can never be served, so it gets 53200 at once rather
+  than an endless wait, and queued requests are re-checked when a registration changes. An admission
+  within that usable cap is served once the finite holder chains ahead of it finish. The writer's
+  floors are revocable when idle, so they are not counted as permanent. The writer and a native root
+  cannot wait on each other (one writer per governor; a native root queues its own step only after
+  the writer's step has settled). Readers are not holders: query preparation is to wait only while
+  holding nothing (a preparation credit, pending), since readers each retaining a source recipe
+  while waiting could otherwise wait on each other. Policy: `holdsCredit` and `registerPermanent` in
+  `memory/governor.ts`; tests: `memory/holder-priority.test.ts`,
+  `memory/wait-policy-regressions.test.ts`, `testing/native-command-fifo.test.ts`. In test runs,
   `MINNOW_GOVERNOR_STALL_MS` turns any wait without governor progress into a `GovernorStallError`
   naming every holder.
 - A grant _holds_ bytes, and its operator _allocates_ buffers out of them, so a non-spillable

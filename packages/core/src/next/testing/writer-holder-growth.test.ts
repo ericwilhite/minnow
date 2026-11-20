@@ -18,7 +18,8 @@ for (const seed of seedsFor("next-writer-holder-growth", [50111, 50112]))
   it(`serves ordinary writer growth before an earlier foreign request (${String(seed)})`, async () => {
     const reach = createReach("writer holder growth", WRITER_HOLDER_GROWTH_REACH);
     const previousStall = Governor.stallAfterMs;
-    Governor.stallAfterMs = 5_000;
+    // MINNOW_GOVERNOR_STALL_MS (the governor-law suites' setting) when set; 5 s otherwise.
+    Governor.stallAfterMs = previousStall ?? 5_000;
     try {
       await fc.assert(
         fc.asyncProperty(

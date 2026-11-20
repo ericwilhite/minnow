@@ -133,6 +133,14 @@ export interface MemoryGovernor {
   admit(options: AdmitOptions): Promise<Grant>;
   /** One FIFO admission, then an atomic split. A zero-total group needs no shared capacity. */
   admitGroup(options: NativeGrantGroupOptions): Promise<readonly Grant[]>;
+  /**
+   * Registers holdings an owner keeps for its lifetime (non-spillable, never released on a
+   * reclaim request: the native owner's scratch control). An admission whose need exceeds the
+   * capacity less every registered permanent holding can never be served while they persist,
+   * so it is refused at once with 53200, never left waiting; queued requests are re-checked when
+   * registrations change. Returns the unregistration. Optional for wrapping governors.
+   */
+  registerPermanent?(bytes: () => number): () => void;
   /** Moves idle ordinary credit within this owner. No allocation or global admission occurs. */
   transferCredit(source: Grant, target: Grant, bytes: number): boolean;
   /**
@@ -395,6 +403,44 @@ export class Governor implements MemoryGovernor {
   peakBytes = 0;
   /** Counts governor progress for `stallAfterMs`. */
   #progress = 0;
+  readonly #permanent = new Set<() => number>();
+
+  registerPermanent(bytes: () => number): () => void {
+    this.#permanent.add(bytes);
+    this.#drain();
+    return () => {
+      this.#permanent.delete(bytes);
+      this.#drain();
+    };
+  }
+
+  /** Lifetime holdings registered by owners (`registerPermanent`). */
+  get permanentBytes(): number {
+    let total = 0;
+    for (const bytes of this.#permanent) total += bytes();
+    return total;
+  }
+
+  /** The most a request may ever be granted while the permanent holdings persist. */
+  #usable(includesProgress: boolean): number {
+    return (
+      (includesProgress ? this.capBytes : this.capBytes - this.reserveBytes) - this.permanentBytes
+    );
+  }
+
+  /** A queued request that can never be served while the permanent holdings persist: 53200. */
+  #refuseUnservable(): void {
+    for (const queue of [this.#holders, this.#admissions])
+      for (const request of [...queue]) {
+        const usable = this.#usable(request.includesProgress);
+        if (request.bytes > usable)
+          this.#reject(
+            queue,
+            request,
+            new MemoryAdmissionError(request.label, request.bytes, usable),
+          );
+      }
+  }
   readonly #caches: EvictableCache[] = [];
   readonly #grants = new Set<GrantImpl>();
   readonly #idleCredit = new Set<GrantImpl>();
@@ -620,6 +666,7 @@ export class Governor implements MemoryGovernor {
     try {
       do {
         this.#again = false;
+        if (this.#permanent.size > 0) this.#refuseUnservable();
         this.#serve(this.#loans, true);
         if (this.#loans.length === 0) {
           this.#serve(this.#reads, false);
@@ -634,6 +681,16 @@ export class Governor implements MemoryGovernor {
     } finally {
       this.#draining = false;
     }
+  }
+
+  /** Whether a queue served before `queue` holds a request: loans, then reads, then holder
+   * growth, then new admissions (GOVERNOR-WAIT-POLICY). */
+  #preempted(queue: Request[]): boolean {
+    for (const higher of [this.#loans, this.#reads, this.#holders]) {
+      if (higher === queue) return false;
+      if (higher.length > 0) return true;
+    }
+    return false;
   }
 
   #serve(queue: Request[], loan: boolean): void {
@@ -714,6 +771,9 @@ export class Governor implements MemoryGovernor {
       }
       // A callback may have cancelled or served the head while we asked for room.
       if (queue[0] !== request) continue;
+      // Or queued a higher-priority request (reclaim and eviction callouts can enqueue): grant
+      // nothing from this queue then; the drain serves the higher queue first.
+      if (this.#preempted(queue)) return;
       this.#progress++;
       queue.shift();
       request.detach();
@@ -869,12 +929,8 @@ export class Governor implements MemoryGovernor {
   }
 
   async admit(options: AdmitOptions): Promise<Grant> {
-    if (options.minimumBytes > this.capBytes - this.reserveBytes)
-      throw new MemoryAdmissionError(
-        options.label,
-        options.minimumBytes,
-        this.capBytes - this.reserveBytes,
-      );
+    if (options.minimumBytes > this.#usable(false))
+      throw new MemoryAdmissionError(options.label, options.minimumBytes, this.#usable(false));
     return this.#enqueue(
       options.holdsCredit === true ? this.#holders : this.#admissions,
       {
@@ -907,7 +963,8 @@ export class Governor implements MemoryGovernor {
       if (!Number.isSafeInteger(total)) throw new RangeError("Native grant total overflow");
     }
     signal?.throwIfAborted();
-    const capacity = includesProgress === true ? this.capBytes : this.capBytes - this.reserveBytes;
+    // The cap less every registered permanent holding: above it, this can never be served.
+    const capacity = this.#usable(includesProgress === true);
     if (total > capacity) throw new MemoryAdmissionError(label, total, capacity);
     const pool = options.idleCredit;
     if (pool !== undefined) {

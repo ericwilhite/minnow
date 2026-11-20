@@ -12,7 +12,8 @@ import { StorageCore } from "./storage-core.js";
 
 it("serves a native root's step before an earlier foreign request only its release can serve", async () => {
   const previousStall = Governor.stallAfterMs;
-  Governor.stallAfterMs = 5_000;
+  // MINNOW_GOVERNOR_STALL_MS (the governor-law suites' setting) when set; 5 s otherwise.
+  Governor.stallAfterMs = previousStall ?? 5_000;
   const governor = new Governor(64 << 20),
     core = new StorageCore(64);
   Object.defineProperty(core.harness, "governor", { value: governor });

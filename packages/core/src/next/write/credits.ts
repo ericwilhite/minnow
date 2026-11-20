@@ -241,6 +241,8 @@ export class WriteCredits {
     }
     const grants = await governor.admitGroup({
       label: "write owner minimum",
+      // The owner keeps its permanent holdings (scratch control) through this wait: holder growth.
+      ...(holdings !== undefined && holdings() > 0 ? { holdsCredit: true } : {}),
       grants: [
         { label: "write path", minimumBytes: minimum.rows, spillable: true },
         { label: "write path metadata", minimumBytes: minimum.metadata, spillable: true },

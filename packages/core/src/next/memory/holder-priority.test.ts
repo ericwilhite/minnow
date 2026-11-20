@@ -32,7 +32,8 @@ for (const seed of seedsFor("next-governor-holder-priority", [50101, 50102]))
   it(`serves holder growth first and every new admission eventually (${String(seed)})`, async () => {
     const reach = createReach("governor holder priority", GOVERNOR_HOLDER_PRIORITY_REACH);
     const previousStall = Governor.stallAfterMs;
-    Governor.stallAfterMs = 2_000;
+    // MINNOW_GOVERNOR_STALL_MS (the governor-law suites' setting) when set; 2 s otherwise.
+    Governor.stallAfterMs = previousStall ?? 2_000;
     try {
       await fc.assert(
         fc.asyncProperty(
@@ -54,7 +55,17 @@ for (const seed of seedsFor("next-governor-holder-priority", [50101, 50102]))
             }),
             { minLength: 1, maxLength: 6 },
           ),
-          async (capMib, chains, clients) => {
+          // Reentrant owners: a spillable grant whose reclaim callback queues holder growth for
+          // its owner and releases part of the grant, inside the governor's callout.
+          fc.array(
+            fc.record({
+              percent: fc.integer({ min: 5, max: 60 }),
+              grow: fc.integer({ min: 1, max: 10 }),
+              release: fc.integer({ min: 0, max: 100 }),
+            }),
+            { maxLength: 3 },
+          ),
+          async (capMib, chains, clients, reentrant) => {
             reach.beginHistory();
             const governor = new Governor(capMib << 20),
               ordinary = governor.capBytes - governor.reserveBytes,
@@ -118,7 +129,51 @@ for (const seed of seedsFor("next-governor-holder-priority", [50101, 50102]))
               await pause(client.hold);
               for (const grant of grants) grant.close();
             };
+            // Reentrant owners: admitted first (new admissions), then each holds a spillable grant;
+            // asked to reclaim, it queues its own holder growth and releases part of the grant.
+            const background = await Promise.all(
+              reentrant.map(async (owner, o) => {
+                const bytes = Math.max(KIB, Math.floor((ordinary * owner.percent) / 100 / 2));
+                const [grant] = await governor.admitGroup({
+                  label: `owner ${String(o)}`,
+                  grants: [{ label: `owner ${String(o)}`, minimumBytes: bytes, spillable: true }],
+                });
+                if (!grant) throw new Error("Missing owner grant");
+                const half = Math.floor(grant.held / 2);
+                if (!grant.allocate(half)) throw new Error("Missing owner allocation");
+                let growth: Promise<void> | null = null,
+                  closed = false;
+                grant.onReclaimRequest(() => {
+                  if (growth !== null) return;
+                  growth = request(
+                    "holder",
+                    `owner ${String(o)} growth`,
+                    Math.max(KIB, Math.floor((ordinary * owner.grow) / 100 / 4)),
+                    { holdsCredit: true },
+                  ).then((grants) => {
+                    for (const extra of grants) extra.close();
+                    grant.free(half);
+                    grant.close();
+                    closed = true;
+                  });
+                  grant.release(Math.floor(((grant.held - grant.allocated) * owner.release) / 100));
+                  reach.reach("holder queued inside a reclaim callout");
+                });
+                return {
+                  grant,
+                  settle: async () => {
+                    await growth;
+                    if (!closed) {
+                      grant.free(half);
+                      grant.close();
+                      closed = true;
+                    }
+                  },
+                };
+              }),
+            );
             await Promise.all([runChains(), ...clients.map((client, c) => runClient(c, client))]);
+            for (const owner of background) await owner.settle();
             expect(peak).toBeLessThanOrEqual(governor.capBytes);
             expect(governor.usedBytes).toBe(0);
             expect(events.every((event) => event.served !== null)).toBe(true);
@@ -148,8 +203,15 @@ for (const seed of seedsFor("next-governor-holder-priority", [50101, 50102]))
           examples: [
             [
               8,
+              [{ base: 10, growths: [5], progress: false, hold: 1 }],
+              [{ percent: 95, delay: 0, hold: 1 }],
+              [{ percent: 40, grow: 2, release: 50 }],
+            ],
+            [
+              8,
               [{ base: 10, growths: [5, 5], progress: true, hold: 2 }],
               [{ percent: 95, delay: 1, hold: 1 }],
+              [],
             ],
           ],
         },
