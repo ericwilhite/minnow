@@ -1,0 +1,1578 @@
+{
+  "base": "84d10cff312e5c42dfa9602b3eb83423859db0b0",
+  "piece": "Incremental borrowed-view hash after bounded short-key dispatch",
+  "status": "WORKING PATCH; full hosted gates/whole cells pending",
+  "Law": "Join key checksum equals xxHash32 with the same seed and byte range, per join-keys.ts equality contract, xxHash32View contract and independent published/spec vectors. SQL equality, NULLs, every duplicate and native match order remain exact; spend key work and honor due yields before publishing progress. A DataView borrows an existing charged backing; no new backing or grant bypass.",
+  "RED": "Actual short-dispatch parent plus extended generated test/reach: original hash/equality results pass, view-path observer sees0 calls. Physical-path RED only; no pre-existing parent SQL defect is claimed.",
+  "GREEN": "321 broad join checks19files,38 key/hash checks3files and15 restored key/PG/seeds checks PASS. Existing caps/seeds/run counts/deadlines unchanged. Final full gates require hosted execution.",
+  "Mutant": [
+    {
+      "name": "wrong-short-hash",
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "--maxWorkers=2",
+        "packages/core/src/next/exec/join-short-key.test.ts",
+        "--reporter=verbose"
+      ],
+      "exit": 1,
+      "seconds": 4.305587530136108,
+      "intendedReject": true,
+      "expected": "to be"
+    },
+    {
+      "name": "skip-comparison-work",
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "--maxWorkers=2",
+        "packages/core/src/next/exec/join-short-key.test.ts",
+        "--reporter=verbose"
+      ],
+      "exit": 1,
+      "seconds": 3.957834005355835,
+      "intendedReject": true,
+      "expected": "to be"
+    },
+    {
+      "name": "ignore-comparison-yield",
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "--maxWorkers=2",
+        "packages/core/src/next/exec/join-short-key.test.ts",
+        "--reporter=verbose"
+      ],
+      "exit": 1,
+      "seconds": 4.029077053070068,
+      "intendedReject": true,
+      "expected": "ignored spend's yield"
+    },
+    {
+      "name": "miss-final-byte",
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "--maxWorkers=2",
+        "packages/core/src/next/exec/join-short-key.test.ts",
+        "--reporter=verbose"
+      ],
+      "exit": 1,
+      "seconds": 3.9952502250671387,
+      "intendedReject": true,
+      "expected": "to deeply equal"
+    },
+    {
+      "name": "ignore-length",
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "--maxWorkers=2",
+        "packages/core/src/next/exec/join-short-key.test.ts",
+        "--reporter=verbose"
+      ],
+      "exit": 1,
+      "seconds": 4.083931922912598,
+      "intendedReject": true,
+      "expected": "to deeply equal"
+    },
+    {
+      "name": "ignore-view-byteOffset",
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "--maxWorkers=2",
+        "packages/core/src/next/exec/join-short-key.test.ts",
+        "--reporter=verbose"
+      ],
+      "exit": 1,
+      "seconds": 4.326250076293945,
+      "intendedReject": true,
+      "expected": "to be"
+    },
+    {
+      "name": "ignore-view-range",
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "--maxWorkers=2",
+        "packages/core/src/next/exec/join-short-key.test.ts",
+        "--reporter=verbose"
+      ],
+      "exit": 1,
+      "seconds": 4.08310604095459,
+      "intendedReject": true,
+      "expected": "to be"
+    },
+    {
+      "name": "disable-view-route",
+      "command": [
+        "node",
+        "node_modules/vitest/vitest.mjs",
+        "run",
+        "--maxWorkers=2",
+        "packages/core/src/next/exec/join-short-key.test.ts",
+        "--reporter=verbose"
+      ],
+      "exit": 1,
+      "seconds": 4.101605653762817,
+      "intendedReject": true,
+      "expected": "to be greater than"
+    }
+  ],
+  "Reach": "JOIN_SHORT_KEY_REACH gains view hash, source byte offset and source offset base; existing seedsFor lists and24 runs+examples retained. Forced collisions cover both xxHash32 and xxHash32View with unchanged expected comparison work.",
+  "component": {
+    "clock": "process user+system CPU; natural GC",
+    "scope": "isolated key/table work, no admission waits, scan/decode, payload gather, aggregate, owner or I/O",
+    "results": [
+      {
+        "keyCase": "flat36",
+        "phase": "hash-and-probe",
+        "rows": 32768,
+        "repetitions": 4,
+        "warmups": 3,
+        "rounds": 9,
+        "raw": [
+          {
+            "round": 0,
+            "arm": "parent",
+            "cpuMs": 37.335
+          },
+          {
+            "round": 0,
+            "arm": "candidate",
+            "cpuMs": 31.437
+          },
+          {
+            "round": 1,
+            "arm": "candidate",
+            "cpuMs": 33.374
+          },
+          {
+            "round": 1,
+            "arm": "parent",
+            "cpuMs": 40.535
+          },
+          {
+            "round": 2,
+            "arm": "parent",
+            "cpuMs": 35.988
+          },
+          {
+            "round": 2,
+            "arm": "candidate",
+            "cpuMs": 33.736
+          },
+          {
+            "round": 3,
+            "arm": "candidate",
+            "cpuMs": 33.08
+          },
+          {
+            "round": 3,
+            "arm": "parent",
+            "cpuMs": 35.663
+          },
+          {
+            "round": 4,
+            "arm": "parent",
+            "cpuMs": 35.187
+          },
+          {
+            "round": 4,
+            "arm": "candidate",
+            "cpuMs": 33.643
+          },
+          {
+            "round": 5,
+            "arm": "candidate",
+            "cpuMs": 33.977
+          },
+          {
+            "round": 5,
+            "arm": "parent",
+            "cpuMs": 35.557
+          },
+          {
+            "round": 6,
+            "arm": "parent",
+            "cpuMs": 36.778
+          },
+          {
+            "round": 6,
+            "arm": "candidate",
+            "cpuMs": 34.766
+          },
+          {
+            "round": 7,
+            "arm": "candidate",
+            "cpuMs": 33.667
+          },
+          {
+            "round": 7,
+            "arm": "parent",
+            "cpuMs": 36.885
+          },
+          {
+            "round": 8,
+            "arm": "parent",
+            "cpuMs": 37.252
+          },
+          {
+            "round": 8,
+            "arm": "candidate",
+            "cpuMs": 37.238
+          }
+        ],
+        "comparison": {
+          "pairs": [
+            {
+              "control": 37.335,
+              "candidate": 31.437,
+              "delta": -5.898
+            },
+            {
+              "control": 40.535,
+              "candidate": 33.374,
+              "delta": -7.160999999999994
+            },
+            {
+              "control": 35.988,
+              "candidate": 33.736,
+              "delta": -2.2520000000000024
+            },
+            {
+              "control": 35.663,
+              "candidate": 33.08,
+              "delta": -2.5829999999999984
+            },
+            {
+              "control": 35.187,
+              "candidate": 33.643,
+              "delta": -1.543999999999997
+            },
+            {
+              "control": 35.557,
+              "candidate": 33.977,
+              "delta": -1.5800000000000054
+            },
+            {
+              "control": 36.778,
+              "candidate": 34.766,
+              "delta": -2.0120000000000005
+            },
+            {
+              "control": 36.885,
+              "candidate": 33.667,
+              "delta": -3.2179999999999964
+            },
+            {
+              "control": 37.252,
+              "candidate": 37.238,
+              "delta": -0.014000000000002899
+            }
+          ],
+          "medianDeltaMs": -2.2520000000000024,
+          "q1DeltaMs": -3.2179999999999964,
+          "q3DeltaMs": -1.5800000000000054,
+          "iqrDeltaMs": 1.637999999999991,
+          "minDeltaMs": -7.160999999999994,
+          "maxDeltaMs": -0.014000000000002899,
+          "rangeDeltaMs": 7.146999999999991,
+          "spreadDeltaMs": 7.146999999999991,
+          "favoursCandidate": 9,
+          "favoursControl": 0,
+          "requiredFavourable": 7,
+          "acceptedGain": true,
+          "significantRegression": false,
+          "noRegression": true
+        },
+        "modules": [
+          {
+            "name": "parent",
+            "root": "/home/eric/.cache/minnow-b9-prototypes/j2-short-byte-final-84d/candidate",
+            "hashes": {
+              "join-keys": "603d318aa88b8256c71cfe3151030db9f1d0d4579bed301995d3e4b1ec1a7670",
+              "join-table": "6614fa623cd24fd6fea8fa6167b9182d6b6175c709f51521a89560c8eefcb06e"
+            },
+            "peak": 3059776
+          },
+          {
+            "name": "candidate",
+            "root": "/home/eric/.cache/minnow-b9-prototypes/j2-key-view-v1/candidate",
+            "hashes": {
+              "join-keys": "42fd562169304a47062c02ca7c12b69bb4a8564dbc3f8917d18bacb279163705",
+              "join-table": "6614fa623cd24fd6fea8fa6167b9182d6b6175c709f51521a89560c8eefcb06e"
+            },
+            "peak": 3059776
+          }
+        ]
+      },
+      {
+        "keyCase": "flat36",
+        "phase": "build",
+        "rows": 32768,
+        "repetitions": 4,
+        "warmups": 3,
+        "rounds": 9,
+        "raw": [
+          {
+            "round": 0,
+            "arm": "parent",
+            "cpuMs": 22.384
+          },
+          {
+            "round": 0,
+            "arm": "candidate",
+            "cpuMs": 18.293
+          },
+          {
+            "round": 1,
+            "arm": "candidate",
+            "cpuMs": 16.999
+          },
+          {
+            "round": 1,
+            "arm": "parent",
+            "cpuMs": 22.684
+          },
+          {
+            "round": 2,
+            "arm": "parent",
+            "cpuMs": 20.437
+          },
+          {
+            "round": 2,
+            "arm": "candidate",
+            "cpuMs": 14.054
+          },
+          {
+            "round": 3,
+            "arm": "candidate",
+            "cpuMs": 18.355
+          },
+          {
+            "round": 3,
+            "arm": "parent",
+            "cpuMs": 21.228
+          },
+          {
+            "round": 4,
+            "arm": "parent",
+            "cpuMs": 20.339
+          },
+          {
+            "round": 4,
+            "arm": "candidate",
+            "cpuMs": 16.676
+          },
+          {
+            "round": 5,
+            "arm": "candidate",
+            "cpuMs": 26.974
+          },
+          {
+            "round": 5,
+            "arm": "parent",
+            "cpuMs": 19.529
+          },
+          {
+            "round": 6,
+            "arm": "parent",
+            "cpuMs": 18.002
+          },
+          {
+            "round": 6,
+            "arm": "candidate",
+            "cpuMs": 16.032
+          },
+          {
+            "round": 7,
+            "arm": "candidate",
+            "cpuMs": 14.066
+          },
+          {
+            "round": 7,
+            "arm": "parent",
+            "cpuMs": 19.448
+          },
+          {
+            "round": 8,
+            "arm": "parent",
+            "cpuMs": 22.654
+          },
+          {
+            "round": 8,
+            "arm": "candidate",
+            "cpuMs": 20.449
+          }
+        ],
+        "comparison": {
+          "pairs": [
+            {
+              "control": 22.384,
+              "candidate": 18.293,
+              "delta": -4.091000000000001
+            },
+            {
+              "control": 22.684,
+              "candidate": 16.999,
+              "delta": -5.685000000000002
+            },
+            {
+              "control": 20.437,
+              "candidate": 14.054,
+              "delta": -6.383000000000001
+            },
+            {
+              "control": 21.228,
+              "candidate": 18.355,
+              "delta": -2.873000000000001
+            },
+            {
+              "control": 20.339,
+              "candidate": 16.676,
+              "delta": -3.6630000000000003
+            },
+            {
+              "control": 19.529,
+              "candidate": 26.974,
+              "delta": 7.445
+            },
+            {
+              "control": 18.002,
+              "candidate": 16.032,
+              "delta": -1.9699999999999989
+            },
+            {
+              "control": 19.448,
+              "candidate": 14.066,
+              "delta": -5.382
+            },
+            {
+              "control": 22.654,
+              "candidate": 20.449,
+              "delta": -2.2049999999999983
+            }
+          ],
+          "medianDeltaMs": -3.6630000000000003,
+          "q1DeltaMs": -5.382,
+          "q3DeltaMs": -2.2049999999999983,
+          "iqrDeltaMs": 3.1770000000000014,
+          "minDeltaMs": -6.383000000000001,
+          "maxDeltaMs": 7.445,
+          "rangeDeltaMs": 13.828000000000001,
+          "spreadDeltaMs": 13.828000000000001,
+          "favoursCandidate": 8,
+          "favoursControl": 1,
+          "requiredFavourable": 7,
+          "acceptedGain": true,
+          "significantRegression": false,
+          "noRegression": true
+        },
+        "modules": [
+          {
+            "name": "parent",
+            "root": "/home/eric/.cache/minnow-b9-prototypes/j2-short-byte-final-84d/candidate",
+            "hashes": {
+              "join-keys": "603d318aa88b8256c71cfe3151030db9f1d0d4579bed301995d3e4b1ec1a7670",
+              "join-table": "6614fa623cd24fd6fea8fa6167b9182d6b6175c709f51521a89560c8eefcb06e"
+            },
+            "peak": 3846208
+          },
+          {
+            "name": "candidate",
+            "root": "/home/eric/.cache/minnow-b9-prototypes/j2-key-view-v1/candidate",
+            "hashes": {
+              "join-keys": "42fd562169304a47062c02ca7c12b69bb4a8564dbc3f8917d18bacb279163705",
+              "join-table": "6614fa623cd24fd6fea8fa6167b9182d6b6175c709f51521a89560c8eefcb06e"
+            },
+            "peak": 3846208
+          }
+        ]
+      },
+      {
+        "keyCase": "flat80",
+        "phase": "hash-and-probe",
+        "rows": 32768,
+        "repetitions": 4,
+        "warmups": 3,
+        "rounds": 9,
+        "raw": [
+          {
+            "round": 0,
+            "arm": "parent",
+            "cpuMs": 124.361
+          },
+          {
+            "round": 0,
+            "arm": "candidate",
+            "cpuMs": 123.495
+          },
+          {
+            "round": 1,
+            "arm": "candidate",
+            "cpuMs": 124.224
+          },
+          {
+            "round": 1,
+            "arm": "parent",
+            "cpuMs": 139.411
+          },
+          {
+            "round": 2,
+            "arm": "parent",
+            "cpuMs": 128.045
+          },
+          {
+            "round": 2,
+            "arm": "candidate",
+            "cpuMs": 126.865
+          },
+          {
+            "round": 3,
+            "arm": "candidate",
+            "cpuMs": 134.067
+          },
+          {
+            "round": 3,
+            "arm": "parent",
+            "cpuMs": 133.146
+          },
+          {
+            "round": 4,
+            "arm": "parent",
+            "cpuMs": 138.267
+          },
+          {
+            "round": 4,
+            "arm": "candidate",
+            "cpuMs": 162.683
+          },
+          {
+            "round": 5,
+            "arm": "candidate",
+            "cpuMs": 138.256
+          },
+          {
+            "round": 5,
+            "arm": "parent",
+            "cpuMs": 188.435
+          },
+          {
+            "round": 6,
+            "arm": "parent",
+            "cpuMs": 145.415
+          },
+          {
+            "round": 6,
+            "arm": "candidate",
+            "cpuMs": 157.607
+          },
+          {
+            "round": 7,
+            "arm": "candidate",
+            "cpuMs": 127.7
+          },
+          {
+            "round": 7,
+            "arm": "parent",
+            "cpuMs": 127.758
+          },
+          {
+            "round": 8,
+            "arm": "parent",
+            "cpuMs": 133.98
+          },
+          {
+            "round": 8,
+            "arm": "candidate",
+            "cpuMs": 141.872
+          }
+        ],
+        "comparison": {
+          "pairs": [
+            {
+              "control": 124.361,
+              "candidate": 123.495,
+              "delta": -0.8659999999999997
+            },
+            {
+              "control": 139.411,
+              "candidate": 124.224,
+              "delta": -15.186999999999998
+            },
+            {
+              "control": 128.045,
+              "candidate": 126.865,
+              "delta": -1.1799999999999926
+            },
+            {
+              "control": 133.146,
+              "candidate": 134.067,
+              "delta": 0.9210000000000207
+            },
+            {
+              "control": 138.267,
+              "candidate": 162.683,
+              "delta": 24.415999999999997
+            },
+            {
+              "control": 188.435,
+              "candidate": 138.256,
+              "delta": -50.179
+            },
+            {
+              "control": 145.415,
+              "candidate": 157.607,
+              "delta": 12.192000000000007
+            },
+            {
+              "control": 127.758,
+              "candidate": 127.7,
+              "delta": -0.057999999999992724
+            },
+            {
+              "control": 133.98,
+              "candidate": 141.872,
+              "delta": 7.892000000000024
+            }
+          ],
+          "medianDeltaMs": -0.057999999999992724,
+          "q1DeltaMs": -1.1799999999999926,
+          "q3DeltaMs": 7.892000000000024,
+          "iqrDeltaMs": 9.072000000000017,
+          "minDeltaMs": -50.179,
+          "maxDeltaMs": 24.415999999999997,
+          "rangeDeltaMs": 74.595,
+          "spreadDeltaMs": 74.595,
+          "favoursCandidate": 5,
+          "favoursControl": 4,
+          "requiredFavourable": 7,
+          "acceptedGain": false,
+          "significantRegression": false,
+          "noRegression": true
+        },
+        "modules": [
+          {
+            "name": "parent",
+            "root": "/home/eric/.cache/minnow-b9-prototypes/j2-short-byte-final-84d/candidate",
+            "hashes": {
+              "join-keys": "603d318aa88b8256c71cfe3151030db9f1d0d4579bed301995d3e4b1ec1a7670",
+              "join-table": "6614fa623cd24fd6fea8fa6167b9182d6b6175c709f51521a89560c8eefcb06e"
+            },
+            "peak": 5156928
+          },
+          {
+            "name": "candidate",
+            "root": "/home/eric/.cache/minnow-b9-prototypes/j2-key-view-v1/candidate",
+            "hashes": {
+              "join-keys": "42fd562169304a47062c02ca7c12b69bb4a8564dbc3f8917d18bacb279163705",
+              "join-table": "6614fa623cd24fd6fea8fa6167b9182d6b6175c709f51521a89560c8eefcb06e"
+            },
+            "peak": 5156928
+          }
+        ]
+      },
+      {
+        "keyCase": "flat80",
+        "phase": "build",
+        "rows": 32768,
+        "repetitions": 4,
+        "warmups": 3,
+        "rounds": 9,
+        "raw": [
+          {
+            "round": 0,
+            "arm": "parent",
+            "cpuMs": 56.394
+          },
+          {
+            "round": 0,
+            "arm": "candidate",
+            "cpuMs": 57.675
+          },
+          {
+            "round": 1,
+            "arm": "candidate",
+            "cpuMs": 46.546
+          },
+          {
+            "round": 1,
+            "arm": "parent",
+            "cpuMs": 49.311
+          },
+          {
+            "round": 2,
+            "arm": "parent",
+            "cpuMs": 53.13
+          },
+          {
+            "round": 2,
+            "arm": "candidate",
+            "cpuMs": 49.549
+          },
+          {
+            "round": 3,
+            "arm": "candidate",
+            "cpuMs": 60.393
+          },
+          {
+            "round": 3,
+            "arm": "parent",
+            "cpuMs": 63.842
+          },
+          {
+            "round": 4,
+            "arm": "parent",
+            "cpuMs": 48.64
+          },
+          {
+            "round": 4,
+            "arm": "candidate",
+            "cpuMs": 51.963
+          },
+          {
+            "round": 5,
+            "arm": "candidate",
+            "cpuMs": 53.47
+          },
+          {
+            "round": 5,
+            "arm": "parent",
+            "cpuMs": 50.038
+          },
+          {
+            "round": 6,
+            "arm": "parent",
+            "cpuMs": 48.302
+          },
+          {
+            "round": 6,
+            "arm": "candidate",
+            "cpuMs": 56.451
+          },
+          {
+            "round": 7,
+            "arm": "candidate",
+            "cpuMs": 55.147
+          },
+          {
+            "round": 7,
+            "arm": "parent",
+            "cpuMs": 49.539
+          },
+          {
+            "round": 8,
+            "arm": "parent",
+            "cpuMs": 50.11
+          },
+          {
+            "round": 8,
+            "arm": "candidate",
+            "cpuMs": 49.687
+          }
+        ],
+        "comparison": {
+          "pairs": [
+            {
+              "control": 56.394,
+              "candidate": 57.675,
+              "delta": 1.2809999999999988
+            },
+            {
+              "control": 49.311,
+              "candidate": 46.546,
+              "delta": -2.7650000000000006
+            },
+            {
+              "control": 53.13,
+              "candidate": 49.549,
+              "delta": -3.581000000000003
+            },
+            {
+              "control": 63.842,
+              "candidate": 60.393,
+              "delta": -3.448999999999998
+            },
+            {
+              "control": 48.64,
+              "candidate": 51.963,
+              "delta": 3.3230000000000004
+            },
+            {
+              "control": 50.038,
+              "candidate": 53.47,
+              "delta": 3.432000000000002
+            },
+            {
+              "control": 48.302,
+              "candidate": 56.451,
+              "delta": 8.149000000000001
+            },
+            {
+              "control": 49.539,
+              "candidate": 55.147,
+              "delta": 5.607999999999997
+            },
+            {
+              "control": 50.11,
+              "candidate": 49.687,
+              "delta": -0.4230000000000018
+            }
+          ],
+          "medianDeltaMs": 1.2809999999999988,
+          "q1DeltaMs": -2.7650000000000006,
+          "q3DeltaMs": 3.432000000000002,
+          "iqrDeltaMs": 6.197000000000003,
+          "minDeltaMs": -3.581000000000003,
+          "maxDeltaMs": 8.149000000000001,
+          "rangeDeltaMs": 11.730000000000004,
+          "spreadDeltaMs": 11.730000000000004,
+          "favoursCandidate": 4,
+          "favoursControl": 5,
+          "requiredFavourable": 7,
+          "acceptedGain": false,
+          "significantRegression": false,
+          "noRegression": true
+        },
+        "modules": [
+          {
+            "name": "parent",
+            "root": "/home/eric/.cache/minnow-b9-prototypes/j2-short-byte-final-84d/candidate",
+            "hashes": {
+              "join-keys": "603d318aa88b8256c71cfe3151030db9f1d0d4579bed301995d3e4b1ec1a7670",
+              "join-table": "6614fa623cd24fd6fea8fa6167b9182d6b6175c709f51521a89560c8eefcb06e"
+            },
+            "peak": 5943360
+          },
+          {
+            "name": "candidate",
+            "root": "/home/eric/.cache/minnow-b9-prototypes/j2-key-view-v1/candidate",
+            "hashes": {
+              "join-keys": "42fd562169304a47062c02ca7c12b69bb4a8564dbc3f8917d18bacb279163705",
+              "join-table": "6614fa623cd24fd6fea8fa6167b9182d6b6175c709f51521a89560c8eefcb06e"
+            },
+            "peak": 5943360
+          }
+        ]
+      },
+      {
+        "keyCase": "duplicates36",
+        "phase": "hash-and-probe",
+        "rows": 32768,
+        "repetitions": 4,
+        "warmups": 3,
+        "rounds": 9,
+        "raw": [
+          {
+            "round": 0,
+            "arm": "parent",
+            "cpuMs": 34.392
+          },
+          {
+            "round": 0,
+            "arm": "candidate",
+            "cpuMs": 30.723
+          },
+          {
+            "round": 1,
+            "arm": "candidate",
+            "cpuMs": 30.837
+          },
+          {
+            "round": 1,
+            "arm": "parent",
+            "cpuMs": 34.856
+          },
+          {
+            "round": 2,
+            "arm": "parent",
+            "cpuMs": 34.512
+          },
+          {
+            "round": 2,
+            "arm": "candidate",
+            "cpuMs": 30.127
+          },
+          {
+            "round": 3,
+            "arm": "candidate",
+            "cpuMs": 30.357
+          },
+          {
+            "round": 3,
+            "arm": "parent",
+            "cpuMs": 33.412
+          },
+          {
+            "round": 4,
+            "arm": "parent",
+            "cpuMs": 37.385
+          },
+          {
+            "round": 4,
+            "arm": "candidate",
+            "cpuMs": 30.725
+          },
+          {
+            "round": 5,
+            "arm": "candidate",
+            "cpuMs": 31.778
+          },
+          {
+            "round": 5,
+            "arm": "parent",
+            "cpuMs": 33.305
+          },
+          {
+            "round": 6,
+            "arm": "parent",
+            "cpuMs": 34.308
+          },
+          {
+            "round": 6,
+            "arm": "candidate",
+            "cpuMs": 29.664
+          },
+          {
+            "round": 7,
+            "arm": "candidate",
+            "cpuMs": 31.836
+          },
+          {
+            "round": 7,
+            "arm": "parent",
+            "cpuMs": 35.361
+          },
+          {
+            "round": 8,
+            "arm": "parent",
+            "cpuMs": 34.535
+          },
+          {
+            "round": 8,
+            "arm": "candidate",
+            "cpuMs": 31.674
+          }
+        ],
+        "comparison": {
+          "pairs": [
+            {
+              "control": 34.392,
+              "candidate": 30.723,
+              "delta": -3.669000000000004
+            },
+            {
+              "control": 34.856,
+              "candidate": 30.837,
+              "delta": -4.019000000000002
+            },
+            {
+              "control": 34.512,
+              "candidate": 30.127,
+              "delta": -4.385000000000002
+            },
+            {
+              "control": 33.412,
+              "candidate": 30.357,
+              "delta": -3.0549999999999997
+            },
+            {
+              "control": 37.385,
+              "candidate": 30.725,
+              "delta": -6.659999999999997
+            },
+            {
+              "control": 33.305,
+              "candidate": 31.778,
+              "delta": -1.527000000000001
+            },
+            {
+              "control": 34.308,
+              "candidate": 29.664,
+              "delta": -4.643999999999998
+            },
+            {
+              "control": 35.361,
+              "candidate": 31.836,
+              "delta": -3.5249999999999986
+            },
+            {
+              "control": 34.535,
+              "candidate": 31.674,
+              "delta": -2.860999999999997
+            }
+          ],
+          "medianDeltaMs": -3.669000000000004,
+          "q1DeltaMs": -4.385000000000002,
+          "q3DeltaMs": -3.0549999999999997,
+          "iqrDeltaMs": 1.3300000000000018,
+          "minDeltaMs": -6.659999999999997,
+          "maxDeltaMs": -1.527000000000001,
+          "rangeDeltaMs": 5.132999999999996,
+          "spreadDeltaMs": 5.132999999999996,
+          "favoursCandidate": 9,
+          "favoursControl": 0,
+          "requiredFavourable": 7,
+          "acceptedGain": true,
+          "significantRegression": false,
+          "noRegression": true
+        },
+        "modules": [
+          {
+            "name": "parent",
+            "root": "/home/eric/.cache/minnow-b9-prototypes/j2-short-byte-final-84d/candidate",
+            "hashes": {
+              "join-keys": "603d318aa88b8256c71cfe3151030db9f1d0d4579bed301995d3e4b1ec1a7670",
+              "join-table": "6614fa623cd24fd6fea8fa6167b9182d6b6175c709f51521a89560c8eefcb06e"
+            },
+            "peak": 3190848
+          },
+          {
+            "name": "candidate",
+            "root": "/home/eric/.cache/minnow-b9-prototypes/j2-key-view-v1/candidate",
+            "hashes": {
+              "join-keys": "42fd562169304a47062c02ca7c12b69bb4a8564dbc3f8917d18bacb279163705",
+              "join-table": "6614fa623cd24fd6fea8fa6167b9182d6b6175c709f51521a89560c8eefcb06e"
+            },
+            "peak": 3190848
+          }
+        ]
+      },
+      {
+        "keyCase": "duplicates36",
+        "phase": "build",
+        "rows": 32768,
+        "repetitions": 4,
+        "warmups": 3,
+        "rounds": 9,
+        "raw": [
+          {
+            "round": 0,
+            "arm": "parent",
+            "cpuMs": 29.651
+          },
+          {
+            "round": 0,
+            "arm": "candidate",
+            "cpuMs": 28.114
+          },
+          {
+            "round": 1,
+            "arm": "candidate",
+            "cpuMs": 27.088
+          },
+          {
+            "round": 1,
+            "arm": "parent",
+            "cpuMs": 32.341
+          },
+          {
+            "round": 2,
+            "arm": "parent",
+            "cpuMs": 34.28
+          },
+          {
+            "round": 2,
+            "arm": "candidate",
+            "cpuMs": 30.835
+          },
+          {
+            "round": 3,
+            "arm": "candidate",
+            "cpuMs": 40.591
+          },
+          {
+            "round": 3,
+            "arm": "parent",
+            "cpuMs": 55.922
+          },
+          {
+            "round": 4,
+            "arm": "parent",
+            "cpuMs": 46.758
+          },
+          {
+            "round": 4,
+            "arm": "candidate",
+            "cpuMs": 32.245
+          },
+          {
+            "round": 5,
+            "arm": "candidate",
+            "cpuMs": 36.984
+          },
+          {
+            "round": 5,
+            "arm": "parent",
+            "cpuMs": 45.98
+          },
+          {
+            "round": 6,
+            "arm": "parent",
+            "cpuMs": 42.08
+          },
+          {
+            "round": 6,
+            "arm": "candidate",
+            "cpuMs": 28.378
+          },
+          {
+            "round": 7,
+            "arm": "candidate",
+            "cpuMs": 28.733
+          },
+          {
+            "round": 7,
+            "arm": "parent",
+            "cpuMs": 70.305
+          },
+          {
+            "round": 8,
+            "arm": "parent",
+            "cpuMs": 29.525
+          },
+          {
+            "round": 8,
+            "arm": "candidate",
+            "cpuMs": 27.749
+          }
+        ],
+        "comparison": {
+          "pairs": [
+            {
+              "control": 29.651,
+              "candidate": 28.114,
+              "delta": -1.536999999999999
+            },
+            {
+              "control": 32.341,
+              "candidate": 27.088,
+              "delta": -5.253
+            },
+            {
+              "control": 34.28,
+              "candidate": 30.835,
+              "delta": -3.4450000000000003
+            },
+            {
+              "control": 55.922,
+              "candidate": 40.591,
+              "delta": -15.330999999999996
+            },
+            {
+              "control": 46.758,
+              "candidate": 32.245,
+              "delta": -14.513000000000005
+            },
+            {
+              "control": 45.98,
+              "candidate": 36.984,
+              "delta": -8.995999999999995
+            },
+            {
+              "control": 42.08,
+              "candidate": 28.378,
+              "delta": -13.701999999999998
+            },
+            {
+              "control": 70.305,
+              "candidate": 28.733,
+              "delta": -41.572
+            },
+            {
+              "control": 29.525,
+              "candidate": 27.749,
+              "delta": -1.7759999999999998
+            }
+          ],
+          "medianDeltaMs": -8.995999999999995,
+          "q1DeltaMs": -14.513000000000005,
+          "q3DeltaMs": -3.4450000000000003,
+          "iqrDeltaMs": 11.068000000000005,
+          "minDeltaMs": -41.572,
+          "maxDeltaMs": -1.536999999999999,
+          "rangeDeltaMs": 40.035000000000004,
+          "spreadDeltaMs": 40.035000000000004,
+          "favoursCandidate": 9,
+          "favoursControl": 0,
+          "requiredFavourable": 7,
+          "acceptedGain": false,
+          "significantRegression": false,
+          "noRegression": true
+        },
+        "modules": [
+          {
+            "name": "parent",
+            "root": "/home/eric/.cache/minnow-b9-prototypes/j2-short-byte-final-84d/candidate",
+            "hashes": {
+              "join-keys": "603d318aa88b8256c71cfe3151030db9f1d0d4579bed301995d3e4b1ec1a7670",
+              "join-table": "6614fa623cd24fd6fea8fa6167b9182d6b6175c709f51521a89560c8eefcb06e"
+            },
+            "peak": 4108352
+          },
+          {
+            "name": "candidate",
+            "root": "/home/eric/.cache/minnow-b9-prototypes/j2-key-view-v1/candidate",
+            "hashes": {
+              "join-keys": "42fd562169304a47062c02ca7c12b69bb4a8564dbc3f8917d18bacb279163705",
+              "join-table": "6614fa623cd24fd6fea8fa6167b9182d6b6175c709f51521a89560c8eefcb06e"
+            },
+            "peak": 4108352
+          }
+        ]
+      }
+    ]
+  },
+  "incrementalProvenance": {
+    "ordinaryBuild": true,
+    "parent": "/home/eric/.cache/minnow-b9-prototypes/j2-short-byte-final-84d/candidate",
+    "candidate": "/home/eric/.cache/minnow-b9-prototypes/j2-key-view-v1/candidate",
+    "base": "84d10cff312e5c42dfa9602b3eb83423859db0b0+short-dispatch-working-patch",
+    "runtimeChanges": ["next/exec/join-keys.js"],
+    "allChanges": ["next/exec/join-keys.js", "next/exec/join-short-key.test.js"],
+    "modules": {
+      "next/exec/join-keys.js": "42fd562169304a47062c02ca7c12b69bb4a8564dbc3f8917d18bacb279163705"
+    },
+    "limits": "Incremental comparison against existing short dispatch, not original84d. Existing prototype untouched."
+  },
+  "profileShare": {
+    "source": "Hosted44497039678, main84d W1M text fact/fact, flat raw36 TEXT and1M build keys",
+    "joinKeysSelfPercent": 36.7,
+    "joinTableSelfPercent": 36.0,
+    "columnStoreSelfPercent": 8.8,
+    "limits": "Main-isolate self-file samples; function subsets overlap file totals, not CPU."
+  },
+  "Limits": "Incremental component parent is the ordinary short-dispatch WIP, not84d main; full cumulative candidate is measured against84d/frozen in hosted probe. Four repetitions per CPU sample are NOT divided out (4x32768 key work). No whole-cell benefit inferred from a component. Source/harness are uncommitted until hosted gates qualify; no checksum/format/codec/scan/arithmetic/compiler/sort edit.",
+  "smallCells": {
+    "comparisons": 50,
+    "bitExact": true,
+    "samePlanTriples": 100,
+    "samePlanRuns": 300,
+    "selectedStarWitnesses": 0,
+    "sparseSmallStarFallbacks": 2,
+    "joinSideSchemaWitnesses": 58,
+    "checks": [
+      {
+        "control": "main",
+        "dataset": "W",
+        "id": "agg_3dims_20aggs",
+        "exact": true
+      },
+      {
+        "control": "main",
+        "dataset": "W",
+        "id": "agg_count_distinct",
+        "exact": true
+      },
+      {
+        "control": "main",
+        "dataset": "W",
+        "id": "agg_highcard_int",
+        "exact": true
+      },
+      {
+        "control": "main",
+        "dataset": "W",
+        "id": "agg_highcard_text",
+        "exact": true
+      },
+      {
+        "control": "main",
+        "dataset": "W",
+        "id": "join_anti_not_exists",
+        "exact": true
+      },
+      {
+        "control": "main",
+        "dataset": "W",
+        "id": "join_fact_fact_int",
+        "exact": true
+      },
+      {
+        "control": "main",
+        "dataset": "W",
+        "id": "join_fact_fact_text",
+        "exact": true
+      },
+      {
+        "control": "main",
+        "dataset": "W",
+        "id": "join_semi_exists",
+        "exact": true
+      },
+      {
+        "control": "main",
+        "dataset": "W",
+        "id": "join_star_3dims",
+        "exact": true
+      },
+      {
+        "control": "main",
+        "dataset": "S",
+        "id": "S_anti",
+        "exact": true
+      },
+      {
+        "control": "main",
+        "dataset": "S",
+        "id": "S_fact_fact",
+        "exact": true
+      },
+      {
+        "control": "main",
+        "dataset": "S",
+        "id": "S_m2m",
+        "exact": true
+      },
+      {
+        "control": "main",
+        "dataset": "S",
+        "id": "S_q10",
+        "exact": true
+      },
+      {
+        "control": "main",
+        "dataset": "S",
+        "id": "S_q11",
+        "exact": true
+      },
+      {
+        "control": "main",
+        "dataset": "S",
+        "id": "S_q14",
+        "exact": true
+      },
+      {
+        "control": "main",
+        "dataset": "S",
+        "id": "S_q15",
+        "exact": true
+      },
+      {
+        "control": "main",
+        "dataset": "S",
+        "id": "S_q2",
+        "exact": true
+      },
+      {
+        "control": "main",
+        "dataset": "S",
+        "id": "S_q3",
+        "exact": true
+      },
+      {
+        "control": "main",
+        "dataset": "S",
+        "id": "S_q4",
+        "exact": true
+      },
+      {
+        "control": "main",
+        "dataset": "S",
+        "id": "S_q5",
+        "exact": true
+      },
+      {
+        "control": "main",
+        "dataset": "S",
+        "id": "S_q6",
+        "exact": true
+      },
+      {
+        "control": "main",
+        "dataset": "S",
+        "id": "S_q7",
+        "exact": true
+      },
+      {
+        "control": "main",
+        "dataset": "S",
+        "id": "S_q8",
+        "exact": true
+      },
+      {
+        "control": "main",
+        "dataset": "S",
+        "id": "S_q9",
+        "exact": true
+      },
+      {
+        "control": "main",
+        "dataset": "S",
+        "id": "S_semi",
+        "exact": true
+      },
+      {
+        "control": "frozen",
+        "dataset": "W",
+        "id": "agg_3dims_20aggs",
+        "exact": true
+      },
+      {
+        "control": "frozen",
+        "dataset": "W",
+        "id": "agg_count_distinct",
+        "exact": true
+      },
+      {
+        "control": "frozen",
+        "dataset": "W",
+        "id": "agg_highcard_int",
+        "exact": true
+      },
+      {
+        "control": "frozen",
+        "dataset": "W",
+        "id": "agg_highcard_text",
+        "exact": true
+      },
+      {
+        "control": "frozen",
+        "dataset": "W",
+        "id": "join_anti_not_exists",
+        "exact": true
+      },
+      {
+        "control": "frozen",
+        "dataset": "W",
+        "id": "join_fact_fact_int",
+        "exact": true
+      },
+      {
+        "control": "frozen",
+        "dataset": "W",
+        "id": "join_fact_fact_text",
+        "exact": true
+      },
+      {
+        "control": "frozen",
+        "dataset": "W",
+        "id": "join_semi_exists",
+        "exact": true
+      },
+      {
+        "control": "frozen",
+        "dataset": "W",
+        "id": "join_star_3dims",
+        "exact": true
+      },
+      {
+        "control": "frozen",
+        "dataset": "S",
+        "id": "S_anti",
+        "exact": true
+      },
+      {
+        "control": "frozen",
+        "dataset": "S",
+        "id": "S_fact_fact",
+        "exact": true
+      },
+      {
+        "control": "frozen",
+        "dataset": "S",
+        "id": "S_m2m",
+        "exact": true
+      },
+      {
+        "control": "frozen",
+        "dataset": "S",
+        "id": "S_q10",
+        "exact": true
+      },
+      {
+        "control": "frozen",
+        "dataset": "S",
+        "id": "S_q11",
+        "exact": true
+      },
+      {
+        "control": "frozen",
+        "dataset": "S",
+        "id": "S_q14",
+        "exact": true
+      },
+      {
+        "control": "frozen",
+        "dataset": "S",
+        "id": "S_q15",
+        "exact": true
+      },
+      {
+        "control": "frozen",
+        "dataset": "S",
+        "id": "S_q2",
+        "exact": true
+      },
+      {
+        "control": "frozen",
+        "dataset": "S",
+        "id": "S_q3",
+        "exact": true
+      },
+      {
+        "control": "frozen",
+        "dataset": "S",
+        "id": "S_q4",
+        "exact": true
+      },
+      {
+        "control": "frozen",
+        "dataset": "S",
+        "id": "S_q5",
+        "exact": true
+      },
+      {
+        "control": "frozen",
+        "dataset": "S",
+        "id": "S_q6",
+        "exact": true
+      },
+      {
+        "control": "frozen",
+        "dataset": "S",
+        "id": "S_q7",
+        "exact": true
+      },
+      {
+        "control": "frozen",
+        "dataset": "S",
+        "id": "S_q8",
+        "exact": true
+      },
+      {
+        "control": "frozen",
+        "dataset": "S",
+        "id": "S_q9",
+        "exact": true
+      },
+      {
+        "control": "frozen",
+        "dataset": "S",
+        "id": "S_semi",
+        "exact": true
+      }
+    ],
+    "crossPlanIdentity": "Only planIdentity provenance excluded across different builds; all raw values/schema/eligibility/version exact. Same-plan comparisons retain identity too.",
+    "limits": "W1000/S0.334 harness/correctness only, not W1M/S1 CPU acceptance."
+  },
+  "compiledCalibration": {
+    "base": "84d10cff312e5c42dfa9602b3eb83423859db0b0",
+    "ordinaryBuild": true,
+    "measuredKeyTableByteExact": true,
+    "changedProductionModules": ["next/exec/join-keys.js", "next/exec/join-table.js"],
+    "changedModules": ["next/exec/join-keys.js", "next/exec/join-table.js", "testing/reach.js"],
+    "authority": "Ordinary final core build;508 module witnesses includes previous owner/join seams and complete aggregate static import closure. Only two production join modules differ from84d; reach metadata separately classified."
+  },
+  "localChecks": "Ordinary core build, scoped source lint and format PASS.321 join checks19files +38 key/hash checks +15 restored PG/seeds. Full engine gates require hosted execution.",
+  "provenanceNote": "The new broad JSON report is j2-key-view-broad.json. Reuse of the old short-dispatch output-file path was corrected; original stdout/committed gate evidence retained and old JSON path now records the notice. Small-cell v0 outputs also retained: its old probe worker omitted join-role schema records. Backported the current worker and reran all50 strict current/frozen comparisons and100 same-plan triples; those final records are used here."
+}
