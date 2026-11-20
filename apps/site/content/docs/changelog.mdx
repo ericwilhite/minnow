@@ -10,6 +10,8 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The unexported 1.0 rebuild's streaming star join keeps each source's native read demand: it passes each prefix of the last dimension's matches through the ordinary aggregate before reading more input, so errors keep their PostgreSQL order. Results and errors are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.
+
 The unexported 1.0 rebuild reserves wide sort merge workspace independently of source batch size, including encoded keys and the `WITH TIES` boundary row when a competing query forces a smaller source recipe.
 
 The private 1.0 writer preserves exact BIGINT values when updating or deleting persisted
