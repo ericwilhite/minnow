@@ -11967,3 +11967,125 @@ export const GROUP_AGGREGATE_PACK_CANCEL_REACH = [
   "no partial group",
   "zero charges",
 ] as const;
+
+export const PUBLIC_INSPECTION_REACH = [
+  "PG catalog types and names",
+  "funded metadata delivery",
+  "detached caller metadata",
+  "queued reply owns credit",
+  "explain never executes",
+  "explain hides literal payload",
+  "private DDL and rollback",
+  "catalog drift during admission",
+] as const;
+
+export const INSPECTION_ADMISSION_REACH = [
+  "cancel queued admission",
+  "retry changed source",
+  "retry changed recipe",
+  "idempotent relinquish",
+  "failed build releases charge",
+] as const;
+
+export const INSPECTION_RECEIPT_REACH = [
+  "connection end releases reply",
+  "cancel posted reply releases credit",
+  "paused receipt retains credit",
+] as const;
+
+export const INSPECTION_RECONNECT_REACH = [
+  "lost private inspection refuses",
+  "idle inspection resends",
+  "rollback restores inspection",
+] as const;
+
+export const NATIVE_DEVTOOLS_REACH = [
+  "JSON and JSONB spelling",
+  "exact bigint",
+  "numeric scale",
+  "microsecond timestamp",
+  "binary and arrays",
+  "nested arrays",
+  "duplicate positional labels",
+  "object last wins",
+  "NULL marker",
+  "catalog metadata",
+  "quoted completion",
+  "logical explain",
+  "cursor close",
+  "live not bound",
+  "empty result",
+  "lazy display",
+  "preview bound",
+  "native owner retired",
+] as const;
+
+export const INSPECTION_LIVENESS_REACH = [
+  "live reply retained",
+  "non-live became live",
+  "lost liveness swept",
+  "zero reply ownership",
+] as const;
+
+export const INSPECTION_RETIREMENT_REACH = [
+  "funded before retirement",
+  "closed before reply arrival",
+  "cancelled before reply arrival",
+  "no late ownership",
+] as const;
+
+export const NATIVE_PREVIEW_DECODE_REACH = [
+  "flat",
+  "constant",
+  "dictionary",
+  "multiple frames",
+  "one-cell decode",
+  "visible-only decoding",
+  "empty preview",
+  "bounded preview",
+  "cached entry reuse",
+  "off-screen refusal",
+] as const;
+
+export const DIRECTORY_OPENER_SETTLEMENT_REACH = [
+  "success before owner work",
+  "failure before owner work",
+  "success after owner work",
+  "failure after owner work",
+  "deferred consumer",
+  "original error retained",
+] as const;
+
+export const PARAMETER_UTF8_REACH = [
+  "one byte",
+  "two bytes",
+  "three bytes",
+  "four bytes",
+  "lone high",
+  "lone low",
+  "pair crosses 8192",
+  "pair before 8192",
+  "pair after 8192",
+  "mixed slots",
+  "null slot",
+  "enum slot",
+  "text first",
+  "text middle",
+  "text last",
+  "sizing and binding yield",
+  "short write",
+  "zero retained",
+] as const;
+
+export const PARAMETER_RESULT_PROGRESS_REACH = [
+  "join",
+  "except",
+  "ASCII",
+  "multibyte",
+  "additional scalar columns",
+  "three columns",
+  "five MiB",
+  "occupied credit",
+  "frame progress",
+  "zero retained",
+] as const;
