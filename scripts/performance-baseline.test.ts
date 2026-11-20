@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
 import {
+  cpuPerformanceModel,
   hasPerformanceRegression,
   parsePerformanceBaseline,
   performanceRatioRange,
@@ -20,11 +22,57 @@ const baseline: PerformanceBaselineFile = {
 };
 
 describe("performance baseline profiles", () => {
-  it("keys calibration by platform, architecture, and Node major", () => {
-    expect(runtimePerformanceProfile("linux", "x64", "24.12.0")).toBe("linux-x64-node24");
-    expect(() => runtimePerformanceProfile("linux", "x64", "next")).toThrow(
+  it("keys calibration by platform, architecture, Node major and CPU model", () => {
+    expect(
+      runtimePerformanceProfile("linux", "x64", "24.12.0", "AMD EPYC 9V45 96-Core Processor"),
+    ).toBe("linux-x64-node24-amd-epyc-9v45-96-core");
+    expect(runtimePerformanceProfile("linux", "x64", "24.12.0", "Intel(R) Xeon(R) 6975P-C")).toBe(
+      "linux-x64-node24-intel-xeon-6975p-c",
+    );
+    expect(cpuPerformanceModel("Intel(R) Core(TM) i5-8279U CPU @ 2.40GHz")).toBe(
+      "intel-core-i5-8279u",
+    );
+    expect(() => runtimePerformanceProfile("linux", "x64", "next", "AMD EPYC 7763")).toThrow(
       "Cannot identify the Node major",
     );
+  });
+
+  it("refuses a host whose CPU cannot be identified", () => {
+    for (const model of [undefined, "", "unknown", "(R)"])
+      expect(() => cpuPerformanceModel(model)).toThrow("Cannot identify the CPU model");
+    expect(() => runtimePerformanceProfile("linux", "x64", "24.12.0", "")).toThrow(
+      "Cannot identify the CPU model",
+    );
+  });
+
+  it("never compares one CPU model's run with another's thresholds", () => {
+    const amd = runtimePerformanceProfile(
+      "linux",
+      "x64",
+      "24.1.0",
+      "AMD EPYC 9V45 96-Core Processor",
+    );
+    const intel = runtimePerformanceProfile("linux", "x64", "24.1.0", "Intel(R) Xeon(R) 6975P-C");
+    const file = updatedPerformanceBaseline(undefined, 200_000, amd, {
+      scan: { sqlite: 0.5, pglite: 0.2 },
+    });
+    expect(selectPerformanceThresholds(file, amd, ["scan"], false)).toEqual({
+      scan: { sqlite: 0.5, pglite: 0.2 },
+    });
+    expect(() => selectPerformanceThresholds(file, intel, ["scan"], false)).toThrow(
+      `No performance baseline for ${intel}`,
+    );
+  });
+
+  it("names every checked-in profile by its CPU model", () => {
+    const file = parsePerformanceBaseline(
+      JSON.parse(
+        readFileSync(new URL("../packages/core/perf-baseline.json", import.meta.url), "utf8"),
+      ),
+      200_000,
+    );
+    for (const name of Object.keys(file.profiles))
+      expect(name).toMatch(/^(?:linux|darwin|win32)-[a-z0-9]+-node\d+-[a-z0-9-]+$/);
   });
 
   it("validates the schema, row count, and finite positive thresholds", () => {

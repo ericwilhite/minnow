@@ -16,6 +16,11 @@ residual filter) straight from encoded column pages instead of building row batc
 query keeps its existing path unchanged. Results are unchanged; released 0.x behavior is unchanged;
 no stored-format change or migration is required.
 
+The Node SQL performance gate (`npm run benchmark:gate`) keys its regression thresholds by CPU
+model as well as OS, architecture and Node major version, and refuses a host whose CPU model
+has no calibrated profile instead of comparing it with another machine's thresholds. No package
+code or stored format changes.
+
 The unexported 1.0 rebuild reserves wide sort merge workspace independently of source batch size, including encoded keys and the `WITH TIES` boundary row when a competing query forces a smaller source recipe.
 
 The private 1.0 writer preserves exact BIGINT values when updating or deleting persisted
@@ -35,6 +40,14 @@ The private 1.0 storage writer keeps space statistics exact while aborting a wri
 including when releasing part of its reserved space fails. Idle maintenance can read
 those statistics without a reservation error. Released 0.x behavior is unchanged;
 no stored-format change or migration is required.
+
+The private 1.0 core uses one UTF-8 progress helper for parameter binding, varlen
+builders and write codecs. Exact-capacity destinations remain byte-exact when
+Node 26's encoder returns a short write; the helper completes the tail in the
+same buffer without padding or temporary copies. Undersized destinations get
+the typed `MINNOW_UTF8_CAPACITY` error. Stored strings also retain a leading
+U+FEFF character. Released 0.x behavior and stored-format grammars are unchanged;
+no migration is required.
 
 The private 1.0 executor handles short UTF-8 encoder writes, including Node 26's
 exact-capacity tail behavior, without truncating or refusing valid text parameters.
