@@ -27,6 +27,9 @@
     },
     {
       "path": "packages/export/next"
+    },
+    {
+      "path": "packages/devtools/next"
     }
   ]
 }

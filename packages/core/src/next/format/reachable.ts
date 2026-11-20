@@ -102,6 +102,7 @@ export type ReachableKind =
   | "chunk-data"
   | "page-directory"
   | "distinct-sketch"
+  | "aggregate-summary"
   | "index-entries"
   | "index-fences"
   | "index-bloom";
@@ -294,6 +295,8 @@ async function* groupsOf(
           yield { ref: chunk.directory, kind: "page-directory", tableId };
           if (chunk.distinctSketch !== null)
             yield { ref: chunk.distinctSketch, kind: "distinct-sketch", tableId };
+          if (chunk.aggregateSummary !== null)
+            yield { ref: chunk.aggregateSummary, kind: "aggregate-summary", tableId };
         }
       }
     } finally {

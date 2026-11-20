@@ -26,6 +26,12 @@ export { rangeSide } from "./range-bound.js";
 import { rangeSide } from "./range-bound.js";
 import { RangeDirectory } from "./range-directory.js";
 
+/** Ownership of existing paid arrays, transferable once into an admitted iterator. */
+export interface RetainedDeltaInput {
+  readonly delta: KeyDelta;
+  readonly release: () => void;
+}
+
 /** Version-aware position: writes may split leaves or grow arenas while a snapshot is pinned. */
 export class DeltaRangeInput implements RangeInput {
   #position = -1;
@@ -44,8 +50,11 @@ export class DeltaRangeInput implements RangeInput {
     readonly range: KeyRange,
     readonly direction: number,
     readonly signal?: AbortSignal,
+    retained?: RetainedDeltaInput,
   ) {
-    this.#release = delta.retain();
+    if (retained && retained.delta !== delta)
+      throw new TypeError("Retained index input names another delta");
+    this.#release = retained?.release ?? delta.retain();
   }
   key(): Uint8Array {
     return this.delta.keyBytes(this.#slot);

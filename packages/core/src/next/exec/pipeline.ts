@@ -57,6 +57,7 @@
 import type { ByteBudget } from "../access/space.js";
 import type { MaybePromise } from "../access/key-index.js";
 import type { Batch } from "../vector/vector.js";
+import type { ScanPageConsumer } from "./page-consumer.js";
 
 export type PushResult = "ready" | "blocked";
 
@@ -86,6 +87,8 @@ export interface Transfer {
 }
 
 export interface Operator {
+  /** Optional direct selected-page capability; ordinary borrowed batches remain supported. */
+  readonly pageConsumer?: ScanPageConsumer | undefined;
   /** Dedicated output may move into this chain. It copies or prepays/reclassifies before
    * readiness and returns the source token by then; it never retains source-account credit. */
   readonly reclassifiesTransfers?: boolean;

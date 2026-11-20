@@ -9,6 +9,7 @@ import { Governor, type Grant } from "../memory/governor.js";
 import type { TableReadRecipe } from "../access/snapshot.js";
 import type { StatementImpl } from "../write/transaction.js";
 import { batch, ints, texts, rules, watchGrants } from "../write/test-support.js";
+import { WriteCredits } from "../write/credits.js";
 import { NativeWriteSteps } from "../write/native-step.js";
 import { yieldTask } from "../task.js";
 import { StorageCore } from "./storage-core.js";
@@ -61,7 +62,8 @@ for (const seed of seedsFor("next-native-write-owner-borrow", [0xb711, 0xb712]))
             tx: Awaited<ReturnType<typeof core.harness.path.begin>> | null = null,
             s: StatementImpl | null = null,
             done: Promise<unknown> | null = null,
-            waitSpy: { mockRestore(): void } | null = null;
+            waitSpy: { mockRestore(): void } | null = null,
+            reclaimSpy: { mockRestore(): void } | null = null;
           const stop = new AbortController(),
             reason = new Error("foreign-buffer wait cancelled");
           const beginOwner = async () => {
@@ -132,10 +134,22 @@ for (const seed of seedsFor("next-native-write-owner-borrow", [0xb711, 0xb712]))
               expect(borrowed).toBe(0);
               const rootBytes = before.capacityBytes - before.protectedWriteBytes + 512;
               before.release();
+              let attempts = 0;
+              const reclaim = Reflect.get(WriteCredits.prototype, "reclaimNativeStep");
+              reclaimSpy = vi
+                .spyOn(WriteCredits.prototype, "reclaimNativeStep")
+                .mockImplementation(function (this: WriteCredits, ...args) {
+                  expect(
+                    ++attempts,
+                    "intrinsic native refusal has bounded funding work",
+                  ).toBeLessThan(64);
+                  return reclaim.apply(this, args);
+                });
               await expect(
                 s.prepareNativeStep(rootBytes, stop.signal, { includesProgress: true }),
               ).rejects.toMatchObject({ code: "MINNOW_MEMORY_ADMISSION", sqlState: "53200" });
               reach.reach("own locator pin is not foreign pressure");
+              reach.reach("unfunded headroom refusal has bounded work");
             } else {
               expect(borrowed).toBeGreaterThan(0);
               const allocated = observed.rows?.allocated ?? 0,
@@ -211,6 +225,7 @@ for (const seed of seedsFor("next-native-write-owner-borrow", [0xb711, 0xb712]))
             }
             reach.reach(cap === 32 ? "32 MiB" : "64 MiB");
           } finally {
+            reclaimSpy?.mockRestore();
             stop.abort(reason);
             resume.resolve();
             recipe?.close();

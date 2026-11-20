@@ -62,9 +62,13 @@ for (const seed of seedsFor("next-exec-call-lists", [47409, 47410]))
             volatile: false,
           };
           const bound = await prepareParameters(plan, values);
-          const maximum = length === 0 ? 0 : 536 + 4 * width;
+          // Per-slot extents describe retained UTF8, not the shared temporary UTF16 slice.
+          const maximum = length === 0 ? 0 : 512 + 2 * width;
           expect(bound.largestSlot).toBe(maximum);
-          expect(bound.bytes).toBe(length === 0 ? 0 : 512 * (length - 1) + maximum);
+          expect(bound.logicalBytes).toBe(length === 0 ? 0 : 512 * (length - 1) + maximum);
+          expect(bound.bytes).toBe(
+            length === 0 ? 0 : 512 * (length - 1) + maximum + 2 * width + 24,
+          );
           expect(bound.slotBytes).toHaveLength(length);
           reach.reach("parameter maximum and sum");
           const keys = Array<number>(length).fill(0);

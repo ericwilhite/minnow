@@ -1,6 +1,15 @@
+import { MODIFY_TARGET_SET_BYTES } from "./modify-target-set.js";
 import { NativeTargetGuard } from "./native-target-guard.js";
 import { statementRuleReach } from "./statement-reach.js";
-import { cursorMinimum, runIndexAccess, indexExpressions, indexMetadata } from "./index-access.js";
+import {
+  cursorMinimum,
+  runIndexAccess,
+  indexTuples,
+  indexMetadata,
+  indexFetchTarget,
+  INDEX_KEY_FIXED_SLACK,
+  SMALL_INDEX_IN_KEYS,
+} from "./index-access.js";
 import {
   UpsertWriter,
   UpsertExpressions,
@@ -131,7 +140,7 @@ import {
   OrderedSetOperator,
 } from "./agg/ordered-set.js";
 import { UnsupportedPlanError } from "./errors.js";
-import { FilterOperator, ProjectOperator } from "./filter.js";
+import { FilterOperator, ProjectOperator, PageProjectOperator } from "./filter.js";
 import {
   HashJoin,
   hashJoinMinimumBytes,
@@ -146,6 +155,8 @@ import { ReservedGrant } from "./admission.js";
 import { LimitOperator } from "./limit.js";
 import { nullParameter, integerParameterBytes } from "./parameters.js";
 import { drive, isPromise, type BatchSource, type Operator } from "./pipeline.js";
+import type { ScanPageConsumer } from "./page-consumer.js";
+import { hasResidualFilter } from "./pushdown.js";
 import type { QueryRuntime, Program, OperatorIdentity } from "./run.js";
 import { lateSortShape, type LateSortShape } from "./late-sort.js";
 import { LateFetchOperator, ORDINAL_TYPE } from "./late-fetch.js";
@@ -160,10 +171,11 @@ import {
   remapWindowFunction,
   literalWindowAmount,
 } from "./window-input.js";
-import { TableScan, memoryScanBufferBytes } from "./table-scan.js";
+import { TableScan, EncodedTableScan, memoryScanBufferBytes } from "./table-scan.js";
 import {
   orderedSort,
   indexMinimums,
+  indexReadTarget,
   admittedIndexMinimums,
   planIndexRange,
   runIndexOrder,
@@ -180,6 +192,16 @@ import {
 
 import { windowSuppliesOrder } from "./window-order.js";
 
+/** Retained rows choose a real byte target, not an asserted value-width bound. */
+function sourceTarget(
+  runtime: QueryRuntime,
+  tableId: number,
+  input: readonly PhysicalType[],
+): number {
+  const rows = runtime.residentSourceRows(tableId),
+    cap = runtime.request.governor.capBytes;
+  return rows === null ? batchTargetFor(cap, 4) : indexReadTarget(input, cap, rows);
+}
 type Stop = () => boolean;
 type Recipe = (
   runtime: QueryRuntime,
@@ -401,6 +423,40 @@ function counted(runtime: QueryRuntime, rel: OperatorIdentity, sink: Operator): 
     finish: () => sink.finish(),
     abort: (reason) => sink.abort(reason),
   };
+}
+
+function countedPages(runtime: QueryRuntime, rel: OperatorIdentity, sink: Operator): Operator {
+  const profile = runtime.profile(rel);
+  const output: Operator & ScanPageConsumer = {
+    get pageConsumer() {
+      return sink.pageConsumer ? output : undefined;
+    },
+    canConsumePages(columns, rows, count, columnsMap) {
+      return sink.pageConsumer?.canConsumePages(columns, rows, count, columnsMap) ?? false;
+    },
+    consumePages(columns, rows, count, columnsMap) {
+      runtime.signal.throwIfAborted();
+      runtime.readBoundary();
+      profile.rowsOut += count;
+      profile.batchesOut++;
+      const consumer = sink.pageConsumer;
+      if (!consumer) throw new Error("Page consumer changed after preflight");
+      return consumer.consumePages(columns, rows, count, columnsMap);
+    },
+    get reclassifiesTransfers() {
+      return sink.reclassifiesTransfers === true;
+    },
+    push(batch, transfer) {
+      runtime.readBoundary();
+      profile.rowsOut += batch.selection?.count ?? batch.length;
+      profile.batchesOut++;
+      return sink.push(batch, transfer);
+    },
+    ready: () => sink.ready(),
+    finish: () => sink.finish(),
+    abort: (reason) => sink.abort(reason),
+  };
+  return output;
 }
 
 /** Add non-column keys once, preserving the original columns at their original positions. */
@@ -641,6 +697,50 @@ export interface CompileOptions {
   /** Parent control for literal-amount gather benchmarks. */
   readonly windowScalarArguments?: boolean;
 }
+// Page capability is selected at the aggregate recipe, then propagated only
+// through its proved direct-column projections. No ordinary scan/project
+// constructs page bindings, asks a capability getter or dispatches per batch.
+function pageSource(rel: Rel, ftsEnabled: boolean): boolean {
+  while (rel.op === "project") {
+    const input = types(rel.input);
+    if (
+      !rel.exprs.every((expr) => {
+        if (expr.op !== "column") return false;
+        const type = input[expr.index];
+        return type !== undefined && samePhysicalType(expr.type, type);
+      })
+    )
+      return false;
+    rel = rel.input;
+  }
+  return (
+    rel.op === "scan" &&
+    !rel.emitLocator &&
+    !ftsEnabled &&
+    !hasResidualFilter(rel.filter, types(rel))
+  );
+}
+function pageReduction(rel: Extract<Rel, { op: "aggregate" }>, ftsEnabled: boolean): boolean {
+  return (
+    rel.groupBy.length === 0 &&
+    rel.aggregates.length > 0 &&
+    (rel.groupingSets === null ||
+      (rel.groupingSets.length === 1 && rel.groupingSets[0]?.length === 0)) &&
+    rel.aggregates.every((call) => {
+      if (call.distinct || call.filter !== null || call.orderBy.length !== 0) return false;
+      if (call.fn === "count_star") return call.args.length === 0;
+      const arg = call.args[0];
+      if (call.args.length !== 1 || arg?.op !== "column") return false;
+      return (
+        call.fn === "count" ||
+        (arg.type.kind === "int32" && (call.fn === "sum" || call.fn === "avg")) ||
+        (arg.type.kind === "float64" && call.fn === "sum")
+      );
+    }) &&
+    pageSource(rel.input, ftsEnabled)
+  );
+}
+
 export function compilePlan(plan: PhysicalPlan, options: CompileOptions = {}): Program {
   return compileRecipe(plan, options, false);
 }
@@ -679,6 +779,32 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
   }> = [];
   const compoundColumns = new Map<number, number>();
   const compoundCopies = new Map<number, number>();
+  const indexFetchOwners = new Set<number>();
+  interface IndexWorkspace {
+    identity: OperatorIdentity;
+    members: Array<{
+      owner: number;
+      rel: Extract<Rel, { op: "keyLookup" | "indexRange" }>;
+      minimum: (cap: number, runtime: QueryRuntime) => number;
+    }>;
+    grants: WeakMap<QueryRuntime, MaybePromise<Grant>>;
+  }
+  const indexKeyPlans = new Map<number, IndexWorkspace>();
+  const indexActive = new WeakMap<QueryRuntime, ReadonlySet<number>>();
+  // These producers are serial: join builds its right input before probing its
+  // left, and every wrapper completes its child before another producer starts.
+  // Replay, recursion, windows and volatile plans retain independent workspaces.
+  const serialIndexes = (rel: Rel): boolean => {
+    if (["scan", "values", "keyLookup", "indexRange"].includes(rel.op)) return true;
+    if (rel.op === "join") return serialIndexes(rel.left) && serialIndexes(rel.right);
+    if (rel.op === "setOp")
+      return rel.kind === "except" && rel.inputs.length === 2 && rel.inputs.every(serialIndexes);
+    if (["filter", "project", "sort", "limit", "modify"].includes(rel.op) && "input" in rel)
+      return serialIndexes(rel.input);
+    return false;
+  };
+  const shareIndexes = !plan.volatile && serialIndexes(plan.root);
+  let sharedIndexWorkspace: IndexWorkspace | null = null;
   const optionalIndexSorts = new Map<number, (runtime: QueryRuntime) => boolean>();
   const sortRows = new Map<
     number,
@@ -910,18 +1036,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
     terminalInput.exprs.every((expr, k) => expr.op === "column" && expr.index === k)
   )
     terminalInput = terminalInput.input;
-  // Only the single source path of a modification input has the reviewed cursor
-  // recipe. Crossing a join/set branch requires a separate complete-minimum proof.
-  let modifyIndexInput: number | null = null;
-  if (plan.root.op === "modify") {
-    let input = plan.root.input;
-    for (;;) {
-      if (input.op === "keyLookup" || input.op === "indexRange") modifyIndexInput = input.id;
-      if (!("input" in input)) break;
-      input = input.input;
-    }
-  }
-  const prepare = (rel: Rel): Recipe => {
+  const prepare = (rel: Rel, pageScan = false): Recipe => {
     if (rel.op === "sort" && !rel.withTies && windowSuppliesOrder(rel.input, rel.keys))
       rel = { ...rel, op: "limit" };
 
@@ -1176,16 +1291,9 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
       }
       case "keyLookup":
       case "indexRange": {
-        // A cursor on the direct single-source modify input path joins the admitted
-        // producer. Query roots and cursors under branching inputs remain diagnostic;
-        // neither a MODIFY ancestor nor LIMIT zero grants an unreviewed minimum.
-        if (modifyIndexInput !== rel.id && options.keyOrder !== true)
-          throw new UnsupportedPlanError(
-            `${rel.op} requires diagnostic opt-in outside admitted modification input`,
-            {
-              construct: rel.op,
-            },
-          );
+        // Native index sources join the same whole-query reservation as scans. Key
+        // materialisation/cursor and row-fetch loans are distinct: a live encoded
+        // bound must never own the fetch borrower's only progress slot.
         if (
           options.keyOrder === true &&
           rel.op === "indexRange" &&
@@ -1214,16 +1322,73 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
             );
         }
         const input = types(rel).slice(0, rel.columns.length);
-        const compiler = measureCompilerBuffers(
-          compilation,
-          [],
-          BATCH_ROWS,
-          (context) => indexExpressions(rel, context),
-          () => undefined,
-        );
-        const extra = indexMetadata(rel) + compiler + BATCH_ROWS * 32 + 32768;
+        let compiler = 0;
+        for (const tuple of indexTuples(rel))
+          compiler = Math.max(
+            compiler,
+            measureCompilerBuffers(
+              compilation,
+              [],
+              1,
+              (context) => tuple.map((expr) => compileExpr(expr, context)),
+              () => undefined,
+            ),
+          );
+        const keyMinimum = (_cap: number, runtime: QueryRuntime) =>
+          indexMetadata(rel) + compiler + 16384 + cursorMinimum(runtime, rel);
+        let workspace = shareIndexes ? sharedIndexWorkspace : null;
+        if (workspace === null) {
+          workspace = {
+            identity: { id: nextPhysicalId++, op: rel.op, profileAs: rel },
+            members: [],
+            grants: new WeakMap(),
+          };
+          const group = workspace;
+          indexKeyPlans.set(group.identity.id, group);
+          if (shareIndexes) sharedIndexWorkspace = group;
+          fixed(
+            group.identity,
+            (cap, runtime) => {
+              const live = indexActive.get(runtime);
+              let bytes = 0;
+              for (const member of group.members)
+                if (live?.has(member.owner) !== false)
+                  bytes = Math.max(bytes, member.minimum(cap, runtime));
+              return bytes;
+            },
+            shareIndexes ? plan.root.id : rel.id,
+          );
+        }
+        const group = workspace,
+          keyIdentity = group.identity;
+        group.members.push({ owner: rel.id, rel, minimum: keyMinimum });
+        const keyBudget = (runtime: QueryRuntime): MaybePromise<Grant> => {
+          const previous = group.grants.get(runtime);
+          if (previous) return previous;
+          const grant = runtime.admit(
+            `${keyIdentity.op}#${String(keyIdentity.id)}`,
+            keyMinimum(runtime.request.governor.capBytes, runtime),
+            true,
+            keyIdentity,
+          );
+          group.grants.set(runtime, grant);
+          return grant;
+        };
+        indexFetchOwners.add(rel.id);
+        const fullKeys = (runtime: QueryRuntime) => {
+          const width = runtime.view.index(rel.tableId, rel.indexId).def.columnIds.length;
+          return rel.op === "keyLookup" && rel.keys.every((tuple) => tuple.length === width);
+        };
+        const trackLocators = (runtime: QueryRuntime) =>
+          plan.root.op !== "modify" &&
+          rel.op === "keyLookup" &&
+          rel.keys.length > SMALL_INDEX_IN_KEYS &&
+          fullKeys(runtime);
         const minimum = (cap: number, runtime: QueryRuntime) =>
-          extra + batchTargetFor(cap, 4) + cursorMinimum(runtime, rel);
+          BATCH_ROWS * 32 +
+          32768 +
+          indexFetchTarget(cap) +
+          (trackLocators(runtime) ? MODIFY_TARGET_SET_BYTES : 0);
         readSources.set(rel.id, {
           id: rel.id,
           tableId: rel.tableId,
@@ -1232,10 +1397,10 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           stagingBytes: memoryScanBufferBytes(input),
           windowBytes: 0,
           rows: null,
+          batchRows: 1,
+          selectedRow: true,
         });
-        fixed(rel, minimum, rel.id, 1);
-        compoundColumns.set(rel.id, variableColumns(input));
-        compoundCopies.set(rel.id, 8);
+        fixed(rel, minimum, rel.id);
         const sort =
           rel.op === "keyLookup"
             ? { id: nextPhysicalId++, op: "sort" as const, profileAs: rel }
@@ -1243,11 +1408,12 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
         // One complete-key probe is already in row-id/locator order, including
         // non-unique matches. Multiple probes and composite-key prefixes still
         // need the bounded merge/dedup sort before a modification consumes them.
-        const needsSort = (runtime: QueryRuntime) =>
-          rel.op === "keyLookup" &&
-          (rel.keys.length !== 1 ||
-            rel.keys[0]?.length !==
-              runtime.view.index(rel.tableId, rel.indexId).def.columnIds.length);
+        const needsSort = (runtime: QueryRuntime) => {
+          if (rel.op !== "keyLookup") return false;
+          const width = runtime.view.index(rel.tableId, rel.indexId).def.columnIds.length;
+          if (rel.keys.length === 1 && rel.keys[0]?.length === width) return false;
+          return plan.root.op === "modify" || !fullKeys(runtime);
+        };
         const sortMinimum = sortMinimumBytes([{ kind: "float64" }]);
         if (sort) {
           fixed(sort, sortMinimum, rel.id);
@@ -1261,8 +1427,13 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                 rel,
                 counted(runtime, rel, downstream),
                 minimum(runtime.request.governor.capBytes, runtime),
+                keyIdentity,
+                keyMinimum(runtime.request.governor.capBytes, runtime),
+                () => keyBudget(runtime),
+                trackLocators(runtime),
                 needsSort(runtime) ? sort : null,
                 sortMinimum,
+                () => stops.some((stop) => stop()),
               );
       }
       case "recursive": {
@@ -1385,8 +1556,110 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           });
       }
       case "scan": {
+        if (!pageScan) {
+          const input = types(rel).slice(0, rel.columns.length),
+            filter = rel.filter;
+          // Only the terminal full-table export has no downstream consumer that may re-read.
+          // Other scans keep their selective/cache policy; TableScan also handles deletion,
+          // reader capability, memory refusal, pacing and cancellation fallbacks itself.
+          const terminal =
+            rel === terminalInput &&
+            filter === null &&
+            rel.runtimeFilters.length === 0 &&
+            !rel.emitLocator;
+          readSources.set(rel.id, {
+            id: rel.id,
+            tableId: rel.tableId,
+            columns: rel.columns,
+            types: input,
+            stagingBytes: memoryScanBufferBytes(input),
+            windowBytes: terminal ? 64 * 1024 * 1024 : 0,
+            rows: null,
+          });
+          const kernelBytes =
+            filter === null
+              ? 0
+              : measureCompilerBuffers(
+                  compilation,
+                  input,
+                  BATCH_ROWS,
+                  (context) => new FilterOperator(filter, context, DISCARD),
+                  (filter) => filter.abort(undefined),
+                );
+          fixed(rel, (cap) => kernelBytes + batchTargetFor(cap, 4) + BATCH_ROWS * 16);
+          return (runtime, downstream, stops, rowsNeeded) => {
+            if (stops.some((stop) => stop())) return downstream.finish();
+            const target = batchTargetFor(runtime.request.governor.capBytes, 4);
+            return instantiate(
+              runtime,
+              rel,
+              input,
+              kernelBytes + target + BATCH_ROWS * 16,
+              BATCH_ROWS,
+              (context, grant) => ({ context, grant }),
+              ({ context, grant }) =>
+                then(runtime.table(rel.tableId, grant), (table) => {
+                  const terminalFull =
+                    terminal &&
+                    rel.columns.length === table.columns.length &&
+                    rel.columns.every((id, k) => id === table.columns[k]?.id);
+                  const owner = terminalFull
+                    ? downstream instanceof ResultSink
+                      ? downstream
+                      : exportOwners.get(downstream)
+                    : undefined;
+                  const output = owner?.grant;
+                  const directories = directoryCacheFor(runtime.view.pages);
+                  const scan = new TableScan({
+                    table,
+                    pages: runtime.readPages(runtime.view.pages),
+                    reads: runtime.request.reads,
+                    ...(directories === undefined
+                      ? {}
+                      : { directories, directoryOnce: !runtime.sourceRetains(rel.id) }),
+                    budget: grant,
+                    columns: rel.columns,
+                    filter: rel.filter,
+                    emitLocator: rel.emitLocator,
+                    context,
+                    loans: { borrow: (bytes) => grant.borrow(bytes, runtime.signal) },
+                    // Larger batches remain restricted to explicit relinquishing export consumers.
+                    targetBytes: runtime.request.outputBuffers
+                      ? (owner?.terminalBatchTarget(2 * target) ?? target)
+                      : target,
+                    boundedMemory: true,
+                    readWindowBytes: terminalFull ? runtime.sourceWindow(rel.id) : 0,
+                    ...(output === undefined
+                      ? {}
+                      : {
+                          transferOutputs: "dictionary" as const,
+                          outputBudget: output,
+                          ...(runtime.request.outputBuffers
+                            ? { outputBuffers: runtime.request.outputBuffers }
+                            : {}),
+                          outputDictionary: (dictionary) =>
+                            owner?.admitDictionary(dictionary) ?? false,
+                          borrowOutputOnRefusal: true,
+                        }),
+                    ...(runtime.sourceBatchRows(rel.id) === undefined
+                      ? rowsNeeded === undefined
+                        ? {}
+                        : { rowsNeeded }
+                      : { rowsNeeded: () => Math.min(rowsNeeded?.() ?? BATCH_ROWS, 1) }),
+                  });
+                  const books = starBooks.get(runtime);
+                  const outputSink = books?.shape.columns.has(rel.id)
+                    ? starColumns((batch) => books.encode(rel.id, batch), downstream)
+                    : downstream;
+                  return fts.scan(runtime, rel, scan, counted(runtime, rel, outputSink), stops);
+                }),
+            );
+          };
+        }
         const input = types(rel).slice(0, rel.columns.length),
-          filter = rel.filter;
+          filter = rel.filter,
+          count = countedPages,
+          Scan = EncodedTableScan;
         // Only the terminal full-table export has no downstream consumer that may re-read.
         // Other scans keep their selective/cache policy; TableScan also handles deletion,
         // reader capability, memory refusal, pacing and cancellation fallbacks itself.
@@ -1414,10 +1687,14 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                 (context) => new FilterOperator(filter, context, DISCARD),
                 (filter) => filter.abort(undefined),
               );
-        fixed(rel, (cap) => kernelBytes + batchTargetFor(cap, 4) + BATCH_ROWS * 16);
+        fixed(
+          rel,
+          (_cap, runtime) =>
+            kernelBytes + sourceTarget(runtime, rel.tableId, input) + BATCH_ROWS * 16,
+        );
         const scanRecipe: Recipe = (runtime, downstream, stops, rowsNeeded) => {
           if (stops.some((stop) => stop())) return downstream.finish();
-          const target = batchTargetFor(runtime.request.governor.capBytes, 4);
+          const target = sourceTarget(runtime, rel.tableId, input);
           return instantiate(
             runtime,
             rel,
@@ -1438,7 +1715,23 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                   : undefined;
                 const output = owner?.grant;
                 const directories = directoryCacheFor(runtime.view.pages);
-                const scan = new TableScan({
+                const books = starBooks.get(runtime);
+                const outputSink = books?.shape.columns.has(rel.id)
+                  ? starColumns((batch) => books.encode(rel.id, batch), downstream)
+                  : downstream;
+                const countedSink = count(runtime, rel, outputSink);
+                const pageConsumer = !fts.enabled && !books ? countedSink.pageConsumer : undefined;
+                const oneRow = runtime.sourceBatchRows(rel.id) !== undefined;
+                const demand = oneRow
+                  ? () => Math.min(rowsNeeded?.() ?? BATCH_ROWS, 1)
+                  : rowsNeeded;
+                const scanDemand = pageConsumer
+                  ? () => {
+                      for (const stop of stops) if (stop()) return 0;
+                      return demand?.() ?? BATCH_ROWS;
+                    }
+                  : demand;
+                const scan = new Scan({
                   table,
                   pages: runtime.readPages(runtime.view.pages),
                   reads: runtime.request.reads,
@@ -1456,6 +1749,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                     ? (owner?.terminalBatchTarget(2 * target) ?? target)
                     : target,
                   boundedMemory: true,
+                  ...(pageConsumer === undefined ? {} : { pageConsumer }),
                   readWindowBytes: terminalFull ? runtime.sourceWindow(rel.id) : 0,
                   ...(output === undefined
                     ? {}
@@ -1469,17 +1763,9 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                           owner?.admitDictionary(dictionary) ?? false,
                         borrowOutputOnRefusal: true,
                       }),
-                  ...(runtime.sourceBatchRows(rel.id) === undefined
-                    ? rowsNeeded === undefined
-                      ? {}
-                      : { rowsNeeded }
-                    : { rowsNeeded: () => Math.min(rowsNeeded?.() ?? BATCH_ROWS, 1) }),
+                  ...(scanDemand === undefined ? {} : { rowsNeeded: scanDemand }),
                 });
-                const books = starBooks.get(runtime);
-                const outputSink = books?.shape.columns.has(rel.id)
-                  ? starColumns((batch) => books.encode(rel.id, batch), downstream)
-                  : downstream;
-                return fts.scan(runtime, rel, scan, counted(runtime, rel, outputSink), stops);
+                return fts.scan(runtime, rel, scan, countedSink, stops);
               }),
           );
         };
@@ -1513,7 +1799,10 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
       case "filter":
       case "project":
       case "limit": {
-        const originalChild = prepare(rel.input),
+        const encoded = pageScan && rel.op === "project",
+          count = encoded ? countedPages : counted,
+          Project = encoded ? PageProjectOperator : ProjectOperator,
+          originalChild = prepare(rel.input, encoded),
           input = types(rel.input);
         const targetColumn =
           inputOnly &&
@@ -1653,7 +1942,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                       },
                     },
                     types(rel),
-                    counted(runtime, rel, downstream),
+                    count(runtime, rel, downstream),
                   ),
                 (operator) => {
                   fts.borrow(runtime, rel.id, operator);
@@ -1708,7 +1997,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                     signal: runtime.signal,
                     stopped: () => stops.some((stop) => stop()),
                   },
-                  counted(runtime, rel, downstream),
+                  count(runtime, rel, downstream),
                 ),
               (operator) => {
                 fts.borrow(runtime, rel.id, operator);
@@ -1765,7 +2054,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
             (rel.op === "filter"
               ? new FilterOperator(actualExprs as ScalarExpr, context, sink)
               : rel.op === "project"
-                ? new ProjectOperator(actualExprs as readonly ScalarExpr[], context, sink, progress)
+                ? new Project(actualExprs as readonly ScalarExpr[], context, sink, progress)
                 : new LimitOperator(null, 0, context.arena, sink))
           );
         };
@@ -1802,7 +2091,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                 : exportOwners.get(downstream)
               : undefined;
           if (owner) {
-            const output = counted(runtime, rel, downstream);
+            const output = count(runtime, rel, downstream);
             exportOwners.set(output, owner);
             return child(runtime, output, stops, rowsNeeded);
           }
@@ -1818,9 +2107,9 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                     runtime.bounds(rel).limit,
                     runtime.bounds(rel).offset,
                     context.arena,
-                    counted(runtime, rel, downstream),
+                    count(runtime, rel, downstream),
                   )
-                : setup(context, counted(runtime, rel, downstream), runtime, grant, stops),
+                : setup(context, count(runtime, rel, downstream), runtime, grant, stops),
             (operator) => {
               runtime.onAbort((reason) => operator.abort(reason));
               const childStops =
@@ -1845,7 +2134,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
       }
       case "aggregate":
       case "distinct": {
-        const child = prepare(rel.input),
+        const child = prepare(rel.input, rel.op === "aggregate" && pageReduction(rel, fts.enabled)),
           input = types(rel.input);
         if (rel.op === "distinct" && input.length === 0) {
           // Empty tuples form one class only when at least one arrived. Scalar aggregation
@@ -3052,7 +3341,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
   // One document may feed several output columns in the same copied result row.
   const jsonProgressColumns = Math.max(1, plan.columns.length);
   // SQL may use the exact PK order only with a complete caller-admitted cursor.
-  // Explicit indexRange and legacy cursors retain their separate diagnostic opt-in.
+  // Explicit native index sources use their complete general query recipe below.
   const ordered = options.keyOrder !== false ? orderedSort(plan) : null;
   const cursorIdentity: OperatorIdentity = {
     id: nextPhysicalId++,
@@ -3094,6 +3383,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
       } else if ("input" in rel) visit(rel.input);
     };
     visit(plan.root);
+    indexActive.set(runtime, active);
     // Query-local scalar key bounds. They are populated by complete sizing passes,
     // before any execution grant exists; no native vectors/grants are retained here.
     const joinKeySources = new Map<number, Set<number>>();
@@ -3168,6 +3458,12 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
         return maximum;
       });
     }
+    for (const [id, group] of indexKeyPlans)
+      for (const member of group.members)
+        if (active.has(member.owner)) {
+          runtime.operatorStepOwner(id);
+          runtime.operatorStepOwner(member.owner);
+        }
     for (const [id, columns] of compoundColumns)
       if (active.has(id)) runtime.operatorParameterColumns(id, columns, compoundCopies.get(id));
     const singleValueSources = new Map<number, Set<number>>();
@@ -3295,6 +3591,41 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
       kind === "json" ? 48 : kind === "array" ? 64 : 0;
     let opaqueConsumerStep = 0;
     runtime.groupKeyProgress((id, loanSlot, slots, largest, minimum, ordinary) => {
+      if (indexFetchOwners.has(id))
+        return {
+          complete: Math.max(
+            0,
+            (bounds.get(id)?.progress ?? 0) - indexFetchTarget(runtime.request.governor.capBytes),
+          ),
+        };
+      const indexKeys = indexKeyPlans.get(id);
+      if (indexKeys?.members.some((member) => active.has(member.owner))) {
+        let bytes = 0;
+        for (const member of indexKeys.members) {
+          if (!active.has(member.owner)) continue;
+          for (const tuple of indexTuples(member.rel)) {
+            let width = 0;
+            for (const expr of tuple) {
+              const sizeOf = (key: ScalarExpr): number | null => {
+                const size = expressionInputBytes(key, member.rel, {
+                  parameter: (slot) => slots[slot] ?? largest,
+                  source: () => null,
+                });
+                if (key.op !== "cast") return size;
+                const input = sizeOf(key.input);
+                return size === null || input === null ? null : Math.max(size, input);
+              };
+              const size = sizeOf(expr);
+              if (size === null) return { complete: ordinary };
+              width += size + 32;
+            }
+            bytes = Math.max(bytes, width);
+          }
+        }
+        // Two range bounds, UTF-8 escaping and geometric growth overlap. The
+        // cursor keeps these buffers immutable while fetch owns another loan.
+        return { complete: Math.max(0, 16 * bytes - INDEX_KEY_FIXED_SLACK) };
+      }
       const sort = sortRows.get(id);
       if (sort && loanSlot === undefined && minimum > 0 && active.has(id)) {
         const widths = sort.exprs.map((expr) =>
@@ -4081,7 +4412,11 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
               },
               runtime.request.governor,
               runtime.signal,
-              batchTargetFor(runtime.request.governor.capBytes, 4),
+              // Index fetch owners admit exactly indexFetchTarget (see their minimum);
+              // every other source takes the bounded-demand target.
+              indexFetchOwners.has(source.id)
+                ? indexFetchTarget(runtime.request.governor.capBytes)
+                : sourceTarget(runtime, source.tableId, source.types),
               BATCH_ROWS,
               runtime.metadataCaches(
                 source.retain !== false &&
@@ -4346,85 +4681,121 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
     // Validate both bounds before zero admission, including OFFSET with LIMIT 0.
     const bounds = runtime.bounds(rel);
     if (bounds.limit === 0) return then(runtime.reserve([]), () => sink.finish());
-    const shape: IndexShape = {
-      tableId: scan.tableId,
-      columns: ordered.columns,
-      types: types(project),
-      source: scan,
-      fetch: project,
-      restore: rel,
-      descending: rel.keys[0]?.direction === "desc",
-    };
-    const cap = runtime.request.governor.capBytes;
-    const inputs = integerParameterBytes(plan, runtime.request.parameters);
-    // Keep the generic recipe without even opening an index reader when the fixed
-    // optional buffers plus owned inputs already do not fit.
-    if (inputs === null || runtime.minimumBytes(indexMinimums(shape, cap), inputs) > cap)
-      return genericProgram(runtime, sink);
-    const range = planIndexRange(runtime.view.index(scan.tableId, index.id), shape.descending);
-    const run = (read?: AdmittedIndexRead) => {
-      const entries = read ? admittedIndexMinimums(shape, cap, read) : indexMinimums(shape, cap);
-      return then(runtime.reserve(entries), () =>
-        then(
-          runIndexOrder(
-            runtime,
-            sink,
-            shape,
-            index.id,
-            bounds.limit,
-            bounds.offset,
-            undefined,
-            undefined,
-            read,
+    return then(runtime.retryResidentSources([{ tableId: scan.tableId }]), () => {
+      // A complete resident input of at most one chunk needs only the ordinary sort.
+      // Avoid admitting both an index cursor and a dormant restore sort for this case.
+      // The count chooses a recipe only: execution still visits every demanded row.
+      const residentRows = runtime.residentSourceRows(scan.tableId);
+      if (bounds.limit !== 1 && residentRows !== null && residentRows <= BATCH_ROWS)
+        return genericProgram(runtime, sink);
+      const shape: IndexShape = {
+        tableId: scan.tableId,
+        columns: ordered.columns,
+        types: types(project),
+        source: scan,
+        fetch: project,
+        restore: rel,
+        descending: rel.keys[0]?.direction === "desc",
+      };
+      const cap = runtime.request.governor.capBytes;
+      const targetBytes = indexReadTarget(shape.types, cap, bounds.limit);
+      const cursorRows = Math.min(BATCH_ROWS, bounds.limit ?? BATCH_ROWS);
+      const inputs = integerParameterBytes(plan, runtime.request.parameters);
+      // Keep the generic recipe without even opening an index reader when the fixed
+      // optional buffers plus owned inputs already do not fit.
+      if (
+        inputs === null ||
+        runtime.minimumBytes(indexMinimums(shape, cap, targetBytes, cursorRows), inputs) > cap
+      )
+        return genericProgram(runtime, sink);
+      const reader = runtime.view.index(scan.tableId, index.id),
+        direction = shape.descending ? "desc" : "asc";
+      const resident =
+        residentRows !== null && bounds.limit === 1
+          ? (reader.prepareResidentRange?.({ lower: null, upper: null }, direction) ?? null)
+          : null;
+      if (resident) runtime.dispose(() => resident.close());
+      const range = resident ?? planIndexRange(reader, shape.descending);
+      const run = (read?: AdmittedIndexRead) => {
+        const entries = read ? admittedIndexMinimums(shape, cap, read) : indexMinimums(shape, cap);
+        return then(runtime.reserve(entries), () =>
+          then(
+            runIndexOrder(
+              runtime,
+              sink,
+              shape,
+              index.id,
+              bounds.limit,
+              bounds.offset,
+              undefined,
+              undefined,
+              read,
+            ),
+            () => {
+              for (const projection of ordered.projects) {
+                if (projection.id === project.id) continue;
+                const profile = runtime.profile(projection),
+                  output = runtime.profile(project);
+                profile.rowsOut = output.rowsOut;
+                profile.batchesOut = output.batchesOut;
+              }
+            },
           ),
-          () => {
-            for (const projection of ordered.projects) {
-              if (projection.id === project.id) continue;
-              const profile = runtime.profile(projection),
-                output = runtime.profile(project);
-              profile.rowsOut = output.rowsOut;
-              profile.batchesOut = output.batchesOut;
-            }
-          },
-        ),
-      );
-    };
-    if (range === null) return options.keyOrder === true ? run() : genericProgram(runtime, sink);
-    if (runtime.minimumBytes(indexMinimums(shape, cap), inputs) + range.minimumBytes > cap)
-      return genericProgram(runtime, sink);
-    const size = function* (): SlicedJob<void> {
-      // A locator may name any group. Size only the output columns, but use the
-      // complete pinned source rather than assuming a physical prefix for PK order.
-      const payload = yield* readValue(
-        boundSource(
-          runtime.view,
-          {
-            id: project.id,
-            tableId: scan.tableId,
-            columns: shape.columns,
-            types: shape.types,
-            windowBytes: 0,
-            stagingBytes: memoryScanBufferBytes(shape.types),
-            rows: null,
-          },
-          runtime.request.governor,
-          runtime.signal,
-          batchTargetFor(cap, 4),
-          BATCH_ROWS,
-          runtime.metadataCaches(),
-        ),
-      );
-      const read: AdmittedIndexRead = { plan: range, cursor: cursorIdentity, payload };
-      runtime.sourceBounds(new Map([[project.id, payload]]));
-      runtime.readMinimum(payload.io, payload.progress);
-      if (runtime.minimumBytes(admittedIndexMinimums(shape, cap, read), inputs) > cap) {
-        runtime.sourceBounds(new Map());
-        runtime.readMinimum(0, 0);
-        return yield* readValue(genericProgram(runtime, sink));
-      }
-      return yield* readValue(run(read));
-    };
-    return runSliced(size(), new Slice(Infinity), () => undefined);
+        );
+      };
+      // The legacy diagnostic cursor does not enforce the admitted read target or
+      // locator capacity. Keep its full-batch minimum and generic alternative.
+      if (range === null)
+        return options.keyOrder === true &&
+          runtime.minimumBytes(indexMinimums(shape, cap), inputs) <= cap
+          ? run()
+          : genericProgram(runtime, sink);
+      if (
+        runtime.minimumBytes(indexMinimums(shape, cap, targetBytes, cursorRows), inputs) +
+          range.minimumBytes >
+        cap
+      )
+        return genericProgram(runtime, sink);
+      const size = function* (): SlicedJob<void> {
+        // A locator may name any group. Size only the output columns, but use the
+        // complete pinned source rather than assuming a physical prefix for PK order.
+        const payload = yield* readValue(
+          boundSource(
+            runtime.sourceView(),
+            {
+              id: project.id,
+              tableId: scan.tableId,
+              columns: shape.columns,
+              types: shape.types,
+              windowBytes: 0,
+              stagingBytes: memoryScanBufferBytes(shape.types),
+              rows: null,
+            },
+            runtime.request.governor,
+            runtime.signal,
+            targetBytes,
+            BATCH_ROWS,
+            runtime.metadataCaches(),
+          ),
+        );
+        const read: AdmittedIndexRead = {
+          plan: range,
+          cursor: cursorIdentity,
+          payload,
+          targetBytes,
+          rows: cursorRows,
+        };
+        runtime.sourceBounds(new Map([[project.id, payload]]));
+        runtime.readMinimum(payload.io, payload.progress);
+        if (runtime.minimumBytes(admittedIndexMinimums(shape, cap, read), inputs) > cap) {
+          runtime.sourceBounds(new Map());
+          runtime.readMinimum(0, 0);
+          return yield* readValue(genericProgram(runtime, sink));
+        }
+        return yield* readValue(run(read));
+      };
+      return runSliced(size(), new Slice(Infinity), () => undefined);
+    });
   };
   return fts.wrap(program, () => nextPhysicalId++);
 }

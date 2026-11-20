@@ -1,3 +1,5 @@
+import { cpus } from "node:os";
+
 export const PERFORMANCE_ENGINES = ["sqlite", "pglite"] as const;
 export type PerformanceEngine = (typeof PERFORMANCE_ENGINES)[number];
 
@@ -61,17 +63,44 @@ function record(value: unknown, label: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-/** Performance ratios are runtime-specific enough to need an explicit host profile. */
+/**
+ * The CPU part of a profile name, from the model string the host line records: vendor marks,
+ * clock speed and a trailing "Processor"/"CPU" are dropped, the rest lower-cased and hyphenated.
+ * "AMD EPYC 9V45 96-Core Processor" becomes "amd-epyc-9v45-96-core"; "Intel(R) Xeon(R)
+ * 6975P-C" becomes "intel-xeon-6975p-c". An unidentifiable CPU has no profile to compare with.
+ */
+export function cpuPerformanceModel(model: string | undefined): string {
+  const slug = (model ?? "")
+    .replace(/\((?:R|TM|tm|r)\)/g, "")
+    .replace(/@\s*[\d.]+\s*GHz/gi, "")
+    .replace(/\b(?:processor|cpu)\b/gi, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  if (slug === "" || slug === "unknown") {
+    throw new TypeError(`Cannot identify the CPU model from ${JSON.stringify(model ?? null)}`);
+  }
+  return slug;
+}
+
+/**
+ * Performance ratios are runtime-specific enough to need an explicit host profile, and CPU
+ * families shift them too: SQLite runs relatively faster on some hosted Intel runners than on
+ * the AMD ones the Linux thresholds were pinned on. So a profile is platform, architecture,
+ * Node major and CPU model; a host whose CPU has no profile is refused, never compared with
+ * another machine's thresholds.
+ */
 export function runtimePerformanceProfile(
   platform = process.platform,
   architecture = process.arch,
   nodeVersion = process.versions.node,
+  cpuModel: string | undefined = cpus()[0]?.model,
 ): string {
   const [major] = nodeVersion.split(".");
   if (major === undefined || !/^\d+$/.test(major)) {
     throw new TypeError(`Cannot identify the Node major version from ${nodeVersion}`);
   }
-  return `${platform}-${architecture}-node${major}`;
+  return `${platform}-${architecture}-node${major}-${cpuPerformanceModel(cpuModel)}`;
 }
 
 /** Parses the checked-in file without trusting a JSON type assertion. */
