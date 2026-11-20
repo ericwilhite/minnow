@@ -197,7 +197,10 @@ load its fixture does. With a `candidate` git ref (the workflow input, or `--can
 checkout>` locally) the same lane compares main's rebuild engine with that ref's instead of 0.20,
 at the columnar frames boundary, and reports each cell's paired per-round difference: a gain or
 regression needs its median difference above the IQR and at least seven of nine rounds the same
-way. That is a screen for a change in review, not an acceptance measurement.
+way. That is a screen for a change in review, not an acceptance measurement: each engine runs in
+one long-lived process, and an A/A run of two identical builds flagged 4 of 45 cells, so a single
+verdict is a lead for the paired probe, not a result. Its dependable output is that both builds give
+the same answers.
 
 Each browser runner owns its test directory, server, port, and build prerequisites. Shared browser
 defaults live in `playwright.shared.mjs`; runner-specific configuration stays in its named

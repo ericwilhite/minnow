@@ -286,7 +286,7 @@ function reportCandidate(results: readonly HeadToHeadResult[]): string {
     "",
     `main \`${first.revision.slice(0, 10)}\` · candidate \`${first.candidate.revision.slice(0, 10)}\` · Node ${first.node} · ${first.cpu ?? "unknown CPU"} · ${first.rounds} alternating rounds · 256 MiB on both`,
     "",
-    "Process CPU in ms. Δ = candidate − main per round; a gain or regression needs |median Δ| above its IQR and at least 7 of 9 rounds the same way (the paired-CPU rule), otherwise it is inconclusive. One shared runner, no A/A: a screen, not acceptance.",
+    "Process CPU in ms. Δ = candidate − main per round; a gain or regression needs |median Δ| above its IQR and at least 7 of 9 rounds the same way (the paired-CPU rule), otherwise it is inconclusive. One shared runner, one process per arm: an A/A run of identical builds (run 44670745106) flagged 4 of 45 cells, so read a single verdict as a lead to check with the paired probe, never as acceptance. Identical answers are the dependable part.",
     "",
     "| Cell | main | candidate | Δ median | IQR | candidate faster | verdict | answers |",
     "|---|---:|---:|---:|---:|---:|---|---|",
