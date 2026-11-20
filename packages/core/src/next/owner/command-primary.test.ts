@@ -898,9 +898,18 @@ it.each(seedsFor("next-native-primary-admission", [0xb5f0]))(
           const ready = new Promise<void>((r) => {
             entered = r;
           });
+          const queued = { entered: false };
           const original = governor.admitGroup.bind(governor);
           const admission = vi.spyOn(governor, "admitGroup").mockImplementation((options) => {
-            if (options.label.startsWith("grow write path")) entered();
+            if (
+              options.label.startsWith("grow write path") ||
+              options.grants.some(
+                (part) => part.label === "write growth write path" && part.minimumBytes > 0,
+              )
+            ) {
+              queued.entered = true;
+              entered();
+            }
             return original(options);
           });
           let closing: Promise<void> | null = null;
@@ -914,6 +923,12 @@ it.each(seedsFor("next-native-primary-admission", [0xb5f0]))(
               pending.then((error) => {
                 throw new Error("Expected native row growth to wait", { cause: error });
               }),
+              (async () => {
+                for (let turn = 0; turn < 32 && !queued.entered; turn++) await yieldTask();
+                expect(queued.entered, "native row growth reaches its admission boundary").toBe(
+                  true,
+                );
+              })(),
             ]);
             reach.reach("native growth queued");
             const cancellation = { done: false };
@@ -943,6 +958,7 @@ it.each(seedsFor("next-native-primary-admission", [0xb5f0]))(
             expect(governor.peakBytes).toBeLessThanOrEqual(governor.capBytes);
           } finally {
             admission.mockRestore();
+            closing ??= f.primary.close();
             await closing;
             holder.close();
             await f.close();

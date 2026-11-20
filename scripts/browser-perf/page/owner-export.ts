@@ -97,6 +97,8 @@ export function prepareOwnerExport(
   const writePath: WritePath = {
     databaseId: 1n, // Immutable read-only fixture; no restore/write path.
     durability: "strict",
+    // A read-only fixture has no write growth to count holdings against.
+    retainOwnerHoldings: () => () => undefined,
     appliedLsn: 0,
     durableLsn: 0,
     catalog: catalog.view,

@@ -14,6 +14,7 @@ import {
   locators,
   rules,
   rowsOf,
+  watchGrants,
 } from "../write/test-support.js";
 import { yieldTask } from "../task.js";
 import type { Grant } from "../memory/governor.js";
@@ -37,6 +38,17 @@ for (const seed of seedsFor("next-fts-admission-cancel", [0xb861, 0xb862]))
                 optionController = new AbortController(),
                 endController = new AbortController(),
                 controller = source === "options" ? optionController : endController;
+              const accounts: Grant[] = [],
+                nativeBuffers = new Map<Grant, Uint8Array>();
+              watchGrants(h.governor, (grant) => accounts.push(grant));
+              const releaseNativeBuffers = () => {
+                for (const [account, buffer] of nativeBuffers) {
+                  const bytes = buffer.byteLength;
+                  expect(buffer.at(-1)).toBe(73);
+                  nativeBuffers.delete(account);
+                  account.free(bytes);
+                }
+              };
               let competitor: Grant | undefined, pending: Promise<void> | undefined;
               let opened: Harness["path"] | undefined;
               const release = () => {
@@ -48,6 +60,7 @@ for (const seed of seedsFor("next-fts-admission-cancel", [0xb861, 0xb862]))
               };
               retire = () => {
                 controller.abort(new Error("Retired FTS admission"));
+                releaseNativeBuffers();
                 release();
                 void opened?.close().catch(() => undefined);
               };
@@ -74,6 +87,24 @@ for (const seed of seedsFor("next-fts-admission-cancel", [0xb861, 0xb862]))
                   else {
                     await s.table(1).insert(batch(texts(["beta"])), null);
                     s.noteFtsMutation(1, "upsert");
+                  }
+                  // Native phase forecasts can fund metadata without global admission.
+                  // Give that credit real buffers before requiring an external wait.
+                  for (const account of accounts) {
+                    if (
+                      ![
+                        "write path",
+                        "write path metadata",
+                        "write commit buffers",
+                        "write merge credit",
+                      ].includes(account.label)
+                    )
+                      continue;
+                    const bytes = account.held - account.allocated - account.loaned;
+                    if (bytes > 0) {
+                      expect(account.allocate(bytes)).toBe(true);
+                      nativeBuffers.set(account, new Uint8Array(bytes).fill(73));
+                    }
                   }
                   competitor = await h.governor.admit({
                     label: "FTS end cancellation competitor",
@@ -106,6 +137,7 @@ for (const seed of seedsFor("next-fts-admission-cancel", [0xb861, 0xb862]))
                   await yieldTask();
                   expect(state).toBe("pending");
                   reach.reach("actual admission wait");
+                  reach.reach("native forecasts own real buffers during wait");
                   if (mode === "wait") {
                     controller.abort(abort);
                     await yieldTask();
@@ -129,6 +161,7 @@ for (const seed of seedsFor("next-fts-admission-cancel", [0xb861, 0xb862]))
                   expect(reason).toBe(abort);
                   path.prepareFtsMutation = nativePrepare;
                   await Promise.allSettled([pending]);
+                  releaseNativeBuffers();
                   s.rollback();
                   // Failed admission must not leave an UNFUNDED minimum in the same transaction.
                   // Reject an unexpected fresh-credit attempt immediately, never by timeout.
@@ -176,10 +209,12 @@ for (const seed of seedsFor("next-fts-admission-cancel", [0xb861, 0xb862]))
                 } finally {
                   release();
                   await Promise.allSettled(pending ? [pending] : []);
+                  releaseNativeBuffers();
                   tx.rollback();
                 }
               } finally {
                 controller.abort();
+                releaseNativeBuffers();
                 release();
                 await Promise.allSettled(pending ? [pending] : []);
                 await h.close();
