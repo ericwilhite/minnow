@@ -2867,6 +2867,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#reclaimable();
     const tx = new TransactionImpl(this, this.appliedLsn);
     this.#holder = tx;
+    // Its first write funds the commit window, which it then keeps until it ends: the commit
+    // never waits while its rows are counted (credits.ts holdCommitWindow).
+    this.#credits.holdCommitWindow(true);
     return tx;
   }
 
@@ -2927,6 +2930,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     )
       this.#ftsUnclaimed = true;
     this.#holder = null;
+    this.#credits.holdCommitWindow(false);
     this.#reclaimable();
     this.#passSlot();
     // A frozen memtable may have waited for this writer's pending rows.
@@ -3947,9 +3951,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (!(cached instanceof Promise)) this.#rememberReader(ref, cached);
       return cached;
     }
-    // Its resident parts are charged to the metadata grant before they are built (runs.ts).
+    // Its resident parts are charged to the metadata grant before they are built (runs.ts), and
+    // so are its page reads: a native step's row account holds only that step's rows (writer
+    // floors), so a read charged there had no funding. A refused read grows metadata and retries.
     const opened = this.#metadataRetry(() =>
-      RunReader.open(this.#space, ref, this.#grant, this.#metadataBudget),
+      RunReader.open(this.#space, ref, this.#metadataBudget, this.#metadataBudget),
     );
     if (opened instanceof Promise) {
       this.#runReadersPending++;

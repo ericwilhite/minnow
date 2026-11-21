@@ -44,6 +44,14 @@ export class WriteCredits {
   #mergeActive: Grant | null = null;
   #mergeFloor = 0;
   #commitFunding = 0;
+  /**
+   * The open writing transaction's commit window (GOVERNOR-WAIT-POLICY, no hold-and-wait): set
+   * while a transaction holds the writer turn. Its first write funds the window beside its first
+   * step, while it holds nothing yet; every later step and reclaim keeps it, so the commit (and a
+   * sequence frame) never waits while the transaction's rows are counted. Cleared when the
+   * transaction ends.
+   */
+  #transactionCommit = false;
   #commitMetadataFunding = 0;
   #mergeMetadataFunding = 0;
   #metadataHeadroom = 0;
@@ -110,13 +118,38 @@ export class WriteCredits {
     return Math.max(this.#rowFloor, this.#workingMinimum().rows ?? 0);
   }
 
-  /** Commit credit a native step keeps: live buffers and loans, and the commit window only
-   * while a commit or log append runs or was funded. */
+  /** Commit credit a native step keeps: live buffers and loans, the commit window while a
+   * commit or log append runs or was funded, and the writing transaction's commit window. */
   get nativeCommitBytes(): number {
     return Math.max(
       this.commits.allocated + this.commits.loaned,
       this.#commitFunding,
       this.#workingMinimum().commits ?? 0,
+      this.transactionCommitBytes,
+    );
+  }
+
+  /** The writing transaction's commit window (`holdCommitWindow`), or 0 without one. */
+  get transactionCommitBytes(): number {
+    return this.#transactionCommit ? this.minimum.commits : 0;
+  }
+
+  /**
+   * Starts (`true`) or ends (`false`) a writing transaction's commit window. Starting funds
+   * nothing: the transaction's first write step grows to it. Ending returns it if idle.
+   */
+  holdCommitWindow(hold: boolean): void {
+    if (this.#transactionCommit === hold) return;
+    this.#transactionCommit = hold;
+    if (!hold && releaseIdle(this.commits, this.#commitFloor())) this.#changed?.();
+  }
+
+  /** Commit credit no reclaim may return: an active step's and the transaction's window. */
+  #commitFloor(): number {
+    return Math.max(
+      this.#workingMinimum().commits ?? 0,
+      this.#commitFunding,
+      this.transactionCommitBytes,
     );
   }
 
@@ -334,7 +367,7 @@ export class WriteCredits {
         this.metadata,
         Math.max(working.metadata ?? 0, this.#commitMetadataFunding, this.#mergeMetadataFunding),
       ) +
-      releaseIdle(this.commits, Math.max(working.commits ?? 0, this.#commitFunding)) +
+      releaseIdle(this.commits, this.#commitFloor()) +
       releaseIdle(this.merge, Math.max(this.#mergeFloor, working.merge ?? 0));
     if (released) this.#changed?.();
     return released;
@@ -403,7 +436,7 @@ export class WriteCredits {
     if (bytes > this.governor.capBytes)
       throw new MemoryAdmissionError("write metadata step", bytes, this.governor.capBytes);
     const wanted = this.metadata.allocated + bytes;
-    if (this.metadata.held >= wanted) {
+    if (this.metadata.held >= wanted && this.commits.held >= this.transactionCommitBytes) {
       this.#metadataHeadroom = bytes;
       if (before !== bytes) this.#changed?.();
       return undefined;
@@ -485,6 +518,7 @@ export class WriteCredits {
       if (
         grant.held >= wanted &&
         this.metadata.held >= metadata &&
+        this.commits.held >= this.transactionCommitBytes &&
         (!nativeMinimum || this.#nativeReady())
       ) {
         this.#rememberFundedMetadata(grant, wanted, metadata, funding);
@@ -495,7 +529,7 @@ export class WriteCredits {
       const floors = [
         Math.max(this.#rowFloor, working.rows ?? 0),
         Math.max(working.metadata ?? 0, this.#commitMetadataFunding, this.#mergeMetadataFunding),
-        Math.max(working.commits ?? 0, this.#commitFunding),
+        this.#commitFloor(),
         Math.max(this.#mergeFloor, working.merge ?? 0),
       ];
       const desired = accounts.map((account, i) =>
