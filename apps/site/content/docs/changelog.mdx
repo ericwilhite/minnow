@@ -10,6 +10,8 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The unexported 1.0 rebuild no longer waits for memory while a query holds memory for its preparation, such as a retained source of a small or recently written table. Such a query could wait forever behind another query that needed that memory. Preparation now takes its memory from one credit or not at all; when it would wait, it releases everything, waits for a larger credit, and prepares again. Results are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.
+
 The unexported 1.0 rebuild's inner joins skip gathering build-side columns that no consumer reads, when a projection or another inner join sits directly over the join and the join has no residual condition, including dictionary-encoded star joins. Results are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.
 
 The unexported 1.0 rebuild again sizes ordinary scans of small retained tables from their row count, as page-consuming scans already did, after a merge lost the change for ordinary scans. Results are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.

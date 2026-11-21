@@ -10418,6 +10418,18 @@ export const NATIVE_BODY_PRESSURE_REACH = [
   "zero ownership",
 ] as const;
 
+/** Query preparation under FIFO contention (next/testing/preparation-credit.test.ts). */
+export const PREPARATION_CREDIT_REACH = [
+  "restart",
+  "restart released a source recipe",
+  "credit grew",
+  "served from credit",
+  "concurrent restarts",
+  "cancel during credit wait",
+  "publish between attempts",
+  "join",
+] as const;
+
 export const NATIVE_BODY_LIFETIME_REACH = [
   "root close",
   "caller cancel",

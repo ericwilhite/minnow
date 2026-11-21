@@ -117,7 +117,7 @@ export class FtsPlan {
           stagingBytes: 0,
           rows,
         },
-        runtime.request.governor,
+        runtime.governor,
         runtime.signal,
         1,
         1,

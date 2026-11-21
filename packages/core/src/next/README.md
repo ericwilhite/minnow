@@ -1605,6 +1605,19 @@ and the owner import it directly.
   resident-page space, downstream buffers, private progress credit, and one result frame.
   FIFO admission waits while holding no partial reservation. A minimum above the whole cap
   raises `MemoryAdmissionError`. See [the bounded read-step contract](memory/README.md).
+- Query preparation never waits while it holds memory (`exec/preparation.ts`). Until the
+  minimum is installed, every admission (retained source recipes, source sizing scratch,
+  planning probes, parameter sizing) is one the governor serves at once, through the same call
+  as without preparation, or (only when the attempt holds nothing) an ordinary wait. Otherwise
+  the execution releases everything the attempt holds, waits holding nothing, and prepares again
+  from scratch on a fresh runtime. That wait is the admission that would have waited, with its
+  own label and named parts, plus a `query#N/preparation-credit` part; all of it becomes the
+  next attempt's credit, a single pool: every grant the attempt obtains returns the bytes it
+  releases there, so freed scratch serves the next phase. The request is the attempt's peak
+  simultaneous need, at least twice the previous request, and at most the usable capacity
+  (the cap less the reserve unless private progress, less lifetime
+  holdings), so a query restarts at most `ceil(log2(usable / first request)) + 1` times. A peak
+  need above the usable capacity is `MemoryAdmissionError` (53200).
 - A grant _holds_ bytes, and its operator _allocates_ buffers out of them, so a non-spillable
   operator works inside its admitted minimum.
 - Growth is charged before it happens, including the overlap while a buffer is copied.
