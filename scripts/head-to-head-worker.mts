@@ -92,6 +92,8 @@ type Consume = (
 interface Engine {
   /** next only: capture the loaded fixture as a native image (fresh fixtures only). */
   capture?(directory: string, identity: string, signal: AbortSignal): Promise<unknown>;
+  /** next on a restored image: durable-file writes during open (startup refuses any). */
+  readonly openWrites?: number;
   /** Runs one query to completion; `consume` sees each materialized row when given. */
   run(sql: string, boundary: string, signal: AbortSignal, consume?: Consume): Promise<number>;
   close(): Promise<void>;
@@ -144,7 +146,16 @@ async function nextEngine(data: HeadToHeadData, signal: AbortSignal): Promise<En
       data.imageIdentity ?? "",
       signal,
     );
+  // A restored image must open as it is: a build that converted or upgraded it would measure
+  // another image (and a claim's shared image assumes both builds read the same format).
+  const durableWrites =
+    data.image === undefined ? null : images.watchDurableWrites(core.harness.backend);
   await core.open();
+  const openWrites = durableWrites?.stop() ?? 0;
+  if (openWrites > 0)
+    throw new Error(
+      `Opening the restored image wrote its durable files ${String(openWrites)} times (a conversion or upgrade)`,
+    );
   if (data.image === undefined)
     try {
       const load = async (
@@ -229,6 +240,7 @@ async function nextEngine(data: HeadToHeadData, signal: AbortSignal): Promise<En
       throw error;
     }
   return {
+    ...(data.image === undefined ? {} : { openWrites }),
     async run(sql, boundary, querySignal, consume) {
       const lowered = core.lowerer.lower(sql, core.context());
       if (lowered.kind !== "query") throw new Error("expected a query");
@@ -523,6 +535,10 @@ export default async function create(context: CPUWorkerContext): Promise<CPUWork
         const { directory, identity } = value as { directory: string; identity: string };
         if (engine.capture === undefined) throw new Error("This engine cannot capture images");
         return engine.capture(directory, identity, context.signal);
+      }
+      if (name === "opened") {
+        // Reached only when startup succeeded: a restored image opened without durable writes.
+        return { image: data.image ?? null, durableWrites: engine.openWrites ?? null };
       }
       if (name === "column-kinds") {
         // The comparison kinds of a cell's columns, from the other engine's result types.
