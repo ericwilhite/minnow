@@ -6,7 +6,9 @@ import { OwnerServer } from "../owner/server.js";
 import { ChunkReader } from "../page/reader.js";
 import { StorageCore } from "./storage-core.js";
 
-export async function publicOwner(options: { planCacheBytes?: number; capBytes?: number } = {}) {
+export async function publicOwner(
+  options: { planCacheBytes?: number; capBytes?: number; transactionIdleTimeoutMs?: number } = {},
+) {
   const core = new StorageCore();
   if (options.capBytes !== undefined)
     Object.defineProperty(core.harness, "governor", { value: new Governor(options.capBytes) });
@@ -19,7 +21,14 @@ export async function publicOwner(options: { planCacheBytes?: number; capBytes?:
     spill: core.spill,
     reads: { open: (pages, chunk, options) => ChunkReader.open(pages, chunk, options) },
   });
-  const server = new OwnerServer(engine, { ownerId: "public-owner", epoch: 1, build: "test" });
+  const server = new OwnerServer(engine, {
+    ownerId: "public-owner",
+    epoch: 1,
+    build: "test",
+    ...(options.transactionIdleTimeoutMs === undefined
+      ? {}
+      : { transactionIdleTimeoutMs: options.transactionIdleTimeoutMs }),
+  });
   const channel = new MessageChannel();
   const client = new ProtocolClient();
   server.accept(channel.port2);

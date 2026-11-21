@@ -117,6 +117,26 @@ const SUITES: Suite[] = [
     name: "interaction-simulator-schema",
     file: "packages/core/src/testing/interaction-simulator-schema.test.ts",
   },
+  {
+    name: "interaction-simulator-next-base",
+    file: "packages/core/src/next/testing/interaction-simulator-next.test.ts",
+  },
+  {
+    name: "interaction-simulator-next-constraints",
+    file: "packages/core/src/next/testing/interaction-simulator-next.test.ts",
+  },
+  {
+    name: "interaction-simulator-next-rekeying",
+    file: "packages/core/src/next/testing/interaction-simulator-next.test.ts",
+  },
+  {
+    name: "interaction-simulator-next-schema",
+    file: "packages/core/src/next/testing/interaction-simulator-next.test.ts",
+  },
+  {
+    name: "interaction-simulator-next-full-text",
+    file: "packages/core/src/next/testing/interaction-simulator-next.test.ts",
+  },
   { name: "compaction-soak", file: "packages/core/src/engine/compaction-soak.test.ts" },
   {
     name: "auto-compaction-soak",
