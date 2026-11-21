@@ -180,6 +180,7 @@ import {
   admittedIndexMinimums,
   planIndexRange,
   runIndexOrder,
+  windowSegments,
   type IndexShape,
   type AdmittedIndexRead,
 } from "./key-order.js";
@@ -3933,7 +3934,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
             runtime.view,
             planner.shape.source,
             runtime.request.reads,
-            runtime.request.governor,
+            runtime.governor,
             read,
             runtime.signal,
             `query#${String(runtime.request.queryId)}/percentile-domain-planning`,
@@ -3986,7 +3987,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                 runtime.view,
                 planner.dictionary.source,
                 runtime.request.reads,
-                runtime.request.governor,
+                runtime.governor,
                 read,
                 runtime.signal,
                 `query#${String(runtime.request.queryId)}/aggregate-domain-planning`,
@@ -4057,7 +4058,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
               runtime.request.parameters,
               runtime.nativeParameters !== null,
               runtime.signal,
-              runtime.request.governor.capBytes,
+              runtime.governor.capBytes,
             ),
           );
           if (parameterFootprint === null) continue;
@@ -4078,7 +4079,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                   payloads: [],
                 },
                 runtime.request.reads,
-                runtime.request.governor,
+                runtime.governor,
                 read,
                 runtime.signal,
                 `query#${String(runtime.request.queryId)}/star-domain-planning`,
@@ -4179,7 +4180,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           },
         };
         return (async () => {
-          const idle = await acquirePhasePool(runtime.request.governor, runtime.signal);
+          const idle = await acquirePhasePool(runtime.governor, runtime.signal);
           let failed = false,
             failure: unknown;
           try {
@@ -4365,7 +4366,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                   : {}),
                 rows: demand.get(source.id) ?? null,
               },
-              runtime.request.governor,
+              runtime.governor,
               runtime.signal,
               // Index fetch owners admit exactly indexFetchTarget (see their minimum);
               // every other source takes the bounded-demand target.
@@ -4412,7 +4413,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                     windowBytes: 0,
                     rows: demand.get(source.id) ?? null,
                   },
-                  runtime.request.governor,
+                  runtime.governor,
                   runtime.signal,
                   1,
                   1,
@@ -4450,7 +4451,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                     windowBytes: 0,
                     rows: demand.get(source.id) ?? null,
                   },
-                  runtime.request.governor,
+                  runtime.governor,
                   runtime.signal,
                   batchTargetFor(runtime.sizingBytes, 4),
                   BATCH_ROWS,
@@ -4478,7 +4479,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                   windowBytes: 0,
                   rows: demand.get(source.id) ?? null,
                 },
-                runtime.request.governor,
+                runtime.governor,
                 runtime.signal,
                 1,
                 1,
@@ -4504,7 +4505,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                   windowBytes: 0,
                   rows: demand.get(source.id) ?? null,
                 },
-                runtime.request.governor,
+                runtime.governor,
                 runtime.signal,
                 1,
                 1,
@@ -4529,7 +4530,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
               boundSource(
                 runtime.sourceView(),
                 { ...source, windowBytes: 0, rows: demand.get(source.id) ?? null },
-                runtime.request.governor,
+                runtime.governor,
                 runtime.signal,
                 1,
                 1,
@@ -4712,9 +4713,34 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
       )
         return genericProgram(runtime, sink);
       const size = function* (): SlicedJob<void> {
-        // A locator may name any group. Size only the output columns, but use the
-        // complete pinned source rather than assuming a physical prefix for PK order.
-        const payload = yield* readValue(
+        // A locator may name any group. A window of at most one cursor batch is read first
+        // (its own released scratch grant, a fresh plan on this pinned view): only the
+        // segments it names are sized. A larger or unbounded window sizes the whole source.
+        // The window's own scratch must fit the cap: it may never refuse a query that whole-
+        // source sizing admits.
+        const sizingPlan =
+          resident === null &&
+          bounds.limit !== null &&
+          bounds.limit <= BATCH_ROWS &&
+          range.minimumBytes + bounds.limit * Float64Array.BYTES_PER_ELEMENT <= cap
+            ? planIndexRange(reader, shape.descending)
+            : null;
+        const window =
+          sizingPlan !== null && bounds.limit !== null
+            ? yield* readValue(
+                windowSegments(
+                  sizingPlan,
+                  bounds.offset,
+                  bounds.limit,
+                  runtime.governor,
+                  runtime.signal,
+                ),
+              )
+            : undefined;
+        // The window's segment list and the sizing that follows are both preparation admissions
+        // (exec/preparation.ts): one that would wait while the list is held releases the whole
+        // attempt and prepares again with a credit covering both, so sizing never waits holding.
+        const sizePayload = (segments?: Uint32Array) =>
           boundSource(
             runtime.sourceView(),
             {
@@ -4725,14 +4751,22 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
               windowBytes: 0,
               stagingBytes: memoryScanBufferBytes(shape.types),
               rows: null,
+              ...(segments === undefined ? {} : { segments }),
             },
-            runtime.request.governor,
+            runtime.governor,
             runtime.signal,
             targetBytes,
             BATCH_ROWS,
             runtime.metadataCaches(),
-          ),
-        );
+          );
+        let payload: ReadBound;
+        if (window !== undefined)
+          try {
+            payload = yield* readValue(sizePayload(window.segments));
+          } finally {
+            window.release();
+          }
+        else payload = yield* readValue(sizePayload());
         const read: AdmittedIndexRead = {
           plan: range,
           cursor: cursorIdentity,

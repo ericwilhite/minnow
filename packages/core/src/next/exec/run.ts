@@ -11,7 +11,8 @@ import { readTable } from "./read-table.js";
 import type { ByteBudget } from "../access/space.js";
 import type { Snapshot, TableSnapshot, TableReadRecipe } from "../access/snapshot.js";
 import type { Bound, PhysicalPlan, Rel } from "../ir/ir.js";
-import type { Grant } from "../memory/governor.js";
+import type { Grant, MemoryGovernor } from "../memory/governor.js";
+import { PreparationGovernor, PreparationWouldWait, preparationGovernor } from "./preparation.js";
 import {
   ExecutionError,
   ParameterBindError,
@@ -257,9 +258,9 @@ export class QueryRuntime {
   #growthRoom(): number {
     return Math.max(
       0,
-      this.request.governor.capBytes -
-        this.request.governor.reserveBytes -
-        this.request.governor.usedBytes -
+      this.governor.capBytes -
+        this.governor.reserveBytes -
+        this.governor.usedBytes -
         this.#growthSlack,
     );
   }
@@ -349,7 +350,7 @@ export class QueryRuntime {
     if (!retain || this.#closed || this.signal.aborted) return undefined;
     if (this.#queryRoots !== undefined) return this.#queryRoots;
     if (sources === undefined) return undefined;
-    const roots = QueryRoots.forReader(this.request.governor, sources, this.view.pages);
+    const roots = QueryRoots.forReader(this.governor, sources, this.view.pages);
     this.#queryRoots = roots;
     // Global cleanup runs last, after phase readers, in-flight jobs and caller pins drain.
     this.#dispose.unshift(() => {
@@ -440,9 +441,9 @@ export class QueryRuntime {
           throw error;
         }
       };
-      const grant = this.request.governor.tryAdmit(options);
+      const grant = this.governor.tryAdmit(options);
       return grant === null
-        ? this.request.governor.admit({ ...options, signal: this.signal }).then(bind)
+        ? this.governor.admit({ ...options, signal: this.signal }).then(bind)
         : bind(grant);
     };
     const next = (): MaybePromise<boolean> => {
@@ -720,7 +721,7 @@ export class QueryRuntime {
     if (this.nativeParameters || !needsParameterSizing(this.plan, this.request.parameters))
       return this.#sizeAndReserve(entries);
     const label = `query#${String(this.request.queryId)}/parameter-sizing`;
-    const admitted = admitWorkingSet(this.request.governor, {
+    const admitted = admitWorkingSet(this.governor, {
       label,
       includesProgress: true,
       signal: this.signal,
@@ -746,7 +747,7 @@ export class QueryRuntime {
           this.plan,
           this.request.parameters,
           this.signal,
-          this.request.governor.capBytes,
+          this.governor.capBytes,
           scratch,
         );
     } catch (error) {
@@ -905,7 +906,7 @@ export class QueryRuntime {
         : 0;
     this.#growthSlack = resultSaving;
     const started = performance.now();
-    const admitted = admitWorkingSet(this.request.governor, {
+    const admitted = admitWorkingSet(this.governor, {
       label: `${prefix}/fixed-buffers`,
       ...(idleCredit === undefined ? {} : { idleCredit }),
       grants: parts,
@@ -1000,7 +1001,12 @@ export class QueryRuntime {
           this.dispose(() => share.close());
         }
       };
-      return bound instanceof Promise ? bound.then(attach) : attach(bound);
+      // The reservation is installed: preparation ends, and its unused credit returns.
+      const installed = (slots: ParameterSlots) => {
+        attach(slots);
+        if (this.governor instanceof PreparationGovernor) this.governor.finish();
+      };
+      return bound instanceof Promise ? bound.then(installed) : installed(bound);
     };
     return admitted instanceof Promise
       ? admitted.then((grants) => {
@@ -1016,6 +1022,9 @@ export class QueryRuntime {
     readonly view: Snapshot,
     readonly signal: AbortSignal,
     readonly nativeParameters: NativeParameterBinding | null = null,
+    /** Where this runtime admits memory: the request's governor, or a QueryExecution's
+     * preparation facade over it (exec/preparation.ts). `request.governor` stays the caller's. */
+    readonly governor: MemoryGovernor = request.governor,
   ) {
     if (nativeParameters && !nativeParameters.matches(plan))
       throw new TypeError("Native parameter binding belongs to another plan");
@@ -1131,7 +1140,7 @@ export class QueryRuntime {
       }
       return reserved;
     }
-    const governor = this.request.governor;
+    const governor = this.governor;
     const options = {
       label: `query#${String(this.request.queryId)}/${label}`,
       minimumBytes,
@@ -1217,7 +1226,7 @@ export class QueryRuntime {
         throw new Error("Phase result has no native reservation");
       const lane = this.#phaseParts.get(target);
       if (!lane) throw new Error("Missing native phase result parts");
-      target.parkIdle(this.request.governor, idleCredit, lane);
+      target.parkIdle(this.governor, idleCredit, lane);
       this.params.slots = [];
       await this.#releaseResources();
       this.#readStep = null;
@@ -1404,10 +1413,7 @@ export class QueryRuntime {
         if (
           this.#growthSlack > 0 &&
           needed > this.#growthRoom() &&
-          needed <=
-            this.request.governor.capBytes -
-              this.request.governor.reserveBytes -
-              this.request.governor.usedBytes
+          needed <= this.governor.capBytes - this.governor.reserveBytes - this.governor.usedBytes
         )
           return Promise.resolve(false);
         return reclaim(bytes, signal);
@@ -1432,6 +1438,8 @@ function hasStatement(request: ExecuteRequest): boolean {
 // Synchronous cached executions never touch these maps or allocate fence state. Async
 // launch/program promises already exist; weak keys cannot retain retired executions.
 const launches = new WeakMap<QueryExecution, Promise<void>>();
+/** The abort reason that retires one preparation attempt's runtime (never the execution). */
+const RESTART = Symbol("query preparation restart");
 const producers = new WeakMap<QueryExecution, Promise<void>>();
 const retirements = new WeakMap<QueryExecution, Promise<void>>();
 
@@ -1448,6 +1456,9 @@ export class QueryExecution implements Execution {
   #sink: ResultSink | null = null;
   #result: Grant | null = null;
   #modifySpool: ModifySpool | null = null;
+  /** Preparation admissions never wait while holding (exec/preparation.ts). */
+  readonly #preparation: PreparationGovernor | null;
+  #atomic: { readonly result: DeferredGrant; readonly window: number } | null = null;
   #committed = false;
   #draining = false;
   #async = false;
@@ -1485,6 +1496,7 @@ export class QueryExecution implements Execution {
     this.#resolve = resolve as (summary: ExecutionSummary) => void;
     this.#reject = reject as (reason: unknown) => void;
     this.executed.catch(() => undefined);
+    this.#preparation = preparationGovernor(request.governor, `query#${String(request.queryId)}`);
     this.results = new ResultChannel(plan.columns, {
       windowBytes,
       onCancel: (reason) => this.cancel(reason),
@@ -1519,9 +1531,10 @@ export class QueryExecution implements Execution {
       this.#controller.signal.throwIfAborted();
       if (view.catalog.version !== plan.catalogVersion)
         throw new PlanStaleError(plan.catalogVersion, view.catalog.version);
-      this.#runtime = new QueryRuntime(plan, request, view, this.#controller.signal);
+      this.#runtime = this.#newRuntime();
       if (program.atomic === true) {
         const deferred = new DeferredGrant(`query#${String(request.queryId)}/result`);
+        this.#atomic = { result: deferred, window: windowBytes };
         this.#runtime.atomicResult(deferred, windowBytes);
         this.#start(deferred, program);
         return;
@@ -1605,7 +1618,6 @@ export class QueryExecution implements Execution {
     this.#result = grant;
     const runtime = this.#runtime;
     if (runtime === null) throw new TypeError("execution runtime missing");
-    runtime.resultGrant(grant);
     // An empty result window must not prevent admission of its producer. Allocated frame
     // bytes remain held until credit; unused holdings can be reclaimed at any time.
     grant.onReclaimRequest(() => {
@@ -1619,6 +1631,97 @@ export class QueryExecution implements Execution {
       runtime.view.observedLsn,
       { deferEnd: true, maxRows: this.request.resultFrameRows ?? null },
     );
+    this.#bind(runtime, grant);
+    try {
+      const work = this.#attempt(program);
+      if (work instanceof Promise) {
+        this.#async = true;
+        producers.set(this, work);
+        work
+          .then(
+            () => this.#finish(),
+            (error: unknown) => this.#sourceFailed(error),
+          )
+          .catch((error: unknown) => this.#fail(error));
+      } else this.#finish();
+    } catch (error) {
+      this.#sourceFailed(error);
+    }
+  }
+
+  #newRuntime(): QueryRuntime {
+    const view = this.request.statement?.view ?? this.request.snapshot;
+    if (view === null) throw new TypeError("execution requires a view");
+    return new QueryRuntime(
+      this.plan,
+      this.request,
+      view,
+      this.#controller.signal,
+      null,
+      this.#preparation ?? this.request.governor,
+    );
+  }
+
+  /** One preparation attempt; a would-wait restarts it from scratch (exec/preparation.ts). */
+  #attempt(program: Program): MaybePromise<void> {
+    const runtime = this.#runtime,
+      sink = this.#sink;
+    if (runtime === null || sink === null) throw new TypeError("execution runtime missing");
+    let work: MaybePromise<void>;
+    try {
+      work = program(runtime, sink);
+    } catch (error) {
+      // Any other failure stays synchronous, exactly as without the facade.
+      if (!this.#restartable(error)) throw error;
+      return this.#restart(error, program);
+    }
+    return work instanceof Promise
+      ? work.catch((error: unknown) => {
+          if (!this.#restartable(error)) throw error;
+          return this.#restart(error, program);
+        })
+      : work;
+  }
+
+  /** A would-wait before the reservation installed: the attempt can be prepared again. */
+  #restartable(error: unknown): error is PreparationWouldWait {
+    return (
+      error instanceof PreparationWouldWait &&
+      this.#preparation !== null &&
+      this.#preparation.preparing &&
+      this.#runtime !== null &&
+      this.#sink !== null
+    );
+  }
+
+  /**
+   * Releases everything the failed attempt holds (its recipes, scratch and credit), waits holding
+   * nothing for a larger credit, and prepares again on a fresh runtime. Any other failure, or a
+   * would-wait after the reservation was installed, is the execution's failure.
+   */
+  async #restart(error: PreparationWouldWait, program: Program): Promise<void> {
+    const preparation = this.#preparation,
+      runtime = this.#runtime,
+      sink = this.#sink;
+    if (preparation === null || runtime === null || sink === null) throw error;
+    if (sink.rowCount !== 0 || runtime.modification)
+      throw new Error("Query preparation restarted after it produced output");
+    runtime.abort(RESTART);
+    await runtime.close();
+    await sizingSettled(this.#controller.signal);
+    await preparation.regrow(error, this.#controller.signal);
+    const fresh = this.#newRuntime();
+    this.#runtime = fresh;
+    if (this.#atomic !== null) fresh.atomicResult(this.#atomic.result, this.#atomic.window);
+    const grant = this.#result;
+    if (grant === null) throw new TypeError("execution result grant missing");
+    this.#bind(fresh, grant);
+    return this.#attempt(program);
+  }
+
+  /** Connects a (fresh) runtime to this execution's result grant and sink. */
+  #bind(runtime: QueryRuntime, grant: Grant): void {
+    runtime.resultGrant(grant);
     runtime.resultAllocator((bytes) => {
       const sink = this.#sink;
       if (sink === null) throw new Error("Missing result sink");
@@ -1636,22 +1739,10 @@ export class QueryExecution implements Execution {
       runtime.modification = { spool: this.#modifySpool, writer };
       return this.#modifySpool;
     };
-    runtime.onAbort((reason) => this.#sink?.abort(reason));
-    try {
-      const work = program(runtime, this.#sink);
-      if (work instanceof Promise) {
-        this.#async = true;
-        producers.set(this, work);
-        work
-          .then(
-            () => this.#finish(),
-            (error: unknown) => this.#sourceFailed(error),
-          )
-          .catch((error: unknown) => this.#fail(error));
-      } else this.#finish();
-    } catch (error) {
-      this.#sourceFailed(error);
-    }
+    // A preparation restart retires only the attempt's runtime; the sink stays this execution's.
+    runtime.onAbort((reason) => {
+      if (reason !== RESTART) this.#sink?.abort(reason);
+    });
   }
 
   #sourceFailed(error: unknown): void {
@@ -1718,6 +1809,7 @@ export class QueryExecution implements Execution {
       this.#resolve(this.#summary);
       this.#drainReturning();
     };
+    this.#preparation?.close();
     try {
       const close = () => this.#runtime?.close();
       const cleanup =
@@ -1789,6 +1881,8 @@ export class QueryExecution implements Execution {
         ? new ExecutionError(raw.message, "MINNOW_WINDOW_ERROR", raw.code, { cause: raw })
         : raw;
     if (!this.#controller.signal.aborted) this.#controller.abort(error);
+    // No preparation credit outlives the execution.
+    this.#preparation?.close();
     this.#runtime?.abort(error);
     this.request.statement?.rollback();
     this.#sink?.abort(error);

@@ -96,6 +96,12 @@ export interface ReadSource {
   readonly rows: number | null;
   /** Optional exact int32 address certificate for a complete, unfiltered source. */
   readonly domainColumn?: number;
+  /**
+   * The only segments (indexes into the pinned table's segments, ascending and distinct) the
+   * source can read: a locator window's segments. Others are neither read nor sized. The bound is exact for
+   * those segments only, so the caller must read no other segment of the same pinned view.
+   */
+  readonly segments?: Uint32Array;
 }
 export interface ReadBound {
   readonly batchRows?: 1;
@@ -143,6 +149,21 @@ const NO_ALLOCATION: ByteBudget = { allocate: () => false, free: () => undefined
 const sizingJobs = new WeakMap<AbortSignal, Set<Promise<unknown>>>();
 
 /** Resource fence for the native execution's signal, separate from outcome completion. */
+/** Registers an asynchronous sizing job so `sizingSettled` waits for its readers to unwind. */
+export function trackSizing<T>(signal: AbortSignal, result: MaybePromise<T>): MaybePromise<T> {
+  if (result instanceof Promise) {
+    let jobs = sizingJobs.get(signal);
+    if (jobs === undefined) sizingJobs.set(signal, (jobs = new Set()));
+    jobs.add(result);
+    const complete = () => {
+      jobs.delete(result);
+      if (jobs.size === 0) sizingJobs.delete(signal);
+    };
+    void result.then(complete, complete);
+  }
+  return result;
+}
+
 export function sizingSettled(signal: AbortSignal): Promise<void> | undefined {
   if (!sizingJobs.has(signal)) return undefined;
   return (async () => {
@@ -160,7 +181,7 @@ export function sizingSettled(signal: AbortSignal): Promise<void> | undefined {
  * itself one fully admitted bounded step and closes all readers before it retries admission.
  * Its tables are used only for immutable segment descriptors, never for borrowed row values.
  */
-function scratchMinimum(
+export function scratchMinimum(
   governor: MemoryGovernor,
   label: string,
   minimumBytes: number,
@@ -190,25 +211,14 @@ export function boundSource(
   prefixRows = BATCH_ROWS,
   caches?: QueryRoots,
 ): MaybePromise<ReadBound> {
-  const result = run(size());
-  if (result instanceof Promise) {
-    let jobs = sizingJobs.get(signal);
-    if (jobs === undefined) sizingJobs.set(signal, (jobs = new Set()));
-    jobs.add(result);
-    const complete = () => {
-      jobs.delete(result);
-      if (jobs.size === 0) sizingJobs.delete(signal);
-    };
-    void result.then(complete, complete);
-  }
-  return result;
+  return trackSizing(signal, run(size()));
   function* size(): ReadJob<ReadBound> {
     const directoryCache = directoryCacheFor(view.pages);
     const table = yield* readValue(view.table(source.tableId, { budget: NO_ALLOCATION }));
     const certificate = new Int32DomainCertificate(
       source.domainColumn,
       table.liveRowCount,
-      source.rows === null,
+      source.rows === null && source.segments === undefined,
     );
     const fullColumns =
       source.columns.length === table.columns.length &&
@@ -237,9 +247,14 @@ export function boundSource(
     const single = source.singleValueBound === true;
     if (single && source.columns.length !== 1)
       throw new TypeError("Single-value sizing needs one column");
-    for (const segment of table.segments) {
+    let listed = 0;
+    for (const [index, segment] of table.segments.entries()) {
       signal.throwIfAborted();
       if (remaining === 0) break;
+      if (source.segments !== undefined) {
+        while (listed < source.segments.length && (source.segments[listed] ?? 0) < index) listed++;
+        if (source.segments[listed] !== index) continue;
+      }
       if (segment.rowCount === 0) continue;
       // LIMIT counts live rows. A sparse/deleted group may reach any stored position,
       // including its last page, before it produces the requested live prefix.

@@ -107,8 +107,12 @@ it.each(seedsFor("next-executor-pk-offset-locking", [0xe143, 0xe144]))(
               // Both capabilities open admitted cursors. A complete two-row
               // retained input with LIMIT != 1 instead uses the cheaper generic sort.
               const cursor = !locking && limit !== 0 && (stored || limit === 1);
+              // Lead design decision under the governor law (size before admission, release,
+              // then admit): a stored LIMIT 1 window is sized by its own planned cursor first.
+              // An unbounded window and a resident LIMIT 1 range are not sized.
+              const sized = cursor && stored && limit === 1;
               expect((spy?.mock.calls.length ?? 0) + (resident?.mock.calls.length ?? 0), sql).toBe(
-                cursor ? 1 : 0,
+                cursor ? (sized ? 2 : 1) : 0,
               );
               if (locking) {
                 reach.reach("locking fallback");

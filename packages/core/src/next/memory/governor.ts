@@ -5,6 +5,12 @@
  * 1. Held bytes include cache, leases, operator/input/result buffers and resize overlap.
  * 2. Complete executions atomically admit their whole minimum FIFO, holding nothing while
  *    waiting. `includesProgress` includes their private I/O and per-operator progress credit.
+ *    Admissions before that minimum (query preparation: retained source recipes, sizing
+ *    scratch, planning probes) come from one preparation credit (`carve`, `adopt`:
+ *    released bytes return to it), grown only by immediate admissions (`canAdmitNow`), or wait
+ *    only while the query holds nothing. Otherwise the query releases everything and waits,
+ *    holding nothing, for a credit covering its peak need, up to the usable capacity, then prepares
+ *    again (exec/preparation.ts).
  * 3. Only a complete minimum above the whole cap is a typed admission-size refusal. An
  *    incomplete legacy operator minimum leaves the shared reserve for its isolated step loans.
  * 4. Held and allocated differ: allocate/free suballocate an existing grant. Allocation and
@@ -236,8 +242,23 @@ interface Request {
   readonly parts: NativeGrantGroupOptions["grants"] | null;
 }
 
+/** A growth observer (Governor.observeGrowth) tried to change grant or governor state. */
+export class GrowthObserverReentryError extends Error {
+  readonly code = "MINNOW_GROWTH_OBSERVER_REENTRY";
+  constructor() {
+    super("A growth observer may only read: it called a grant or governor mutator");
+    this.name = "GrowthObserverReentryError";
+  }
+}
+
 class GrantImpl implements Grant {
   group: readonly GrantImpl[] | null = null;
+  /** A grant carved from held credit returns its bytes there while that credit is open. */
+  parent: GrantImpl | null = null;
+  /** Called after this grant's holdings grow (Governor.observeGrowth). */
+  grown: (() => void) | null = null;
+  /** Holdings grew during the current operation; the observer runs once it completes. */
+  pendingGrowth = false;
   held = 0;
   allocated = 0;
   loan = 0;
@@ -252,15 +273,25 @@ class GrantImpl implements Grant {
   ) {}
 
   allocate(bytes: number): boolean {
+    this.governor.assertMutable();
     if (this.closed || this.governor.isIdleCredit(this)) return false;
     const shortfall = this.allocated + bytes - this.held;
-    if (shortfall > 0 && !this.tryGrow(shortfall)) return false;
+    if (shortfall > 0 && !this.#grow(shortfall)) return false;
     this.allocated += bytes;
     this.governor.activity++;
+    this.settleGrowth();
     return true;
   }
 
+  /** Runs the growth observer once, after a complete operation grew this grant. */
+  settleGrowth(): void {
+    if (!this.pendingGrowth) return;
+    this.pendingGrowth = false;
+    this.governor.notifyGrowth(this);
+  }
+
   free(bytes: number): void {
+    this.governor.assertMutable();
     if (this.closed) return;
     if (bytes > this.allocated) throw new RangeError(`${this.label} freed more than it allocated`);
     this.allocated -= bytes;
@@ -268,15 +299,23 @@ class GrantImpl implements Grant {
   }
 
   tryGrow(bytes: number): boolean {
+    this.governor.assertMutable();
+    const grew = this.#grow(bytes);
+    this.settleGrowth();
+    return grew;
+  }
+  #grow(bytes: number): boolean {
     if (this.closed || !this.spillable || this.governor.isIdleCredit(this)) return false;
     return this.governor.grow(this, bytes);
   }
 
   makeRoom(bytes: number, signal?: AbortSignal): Promise<boolean> {
+    this.governor.assertMutable();
     return this.governor.makeRoom(this, bytes, signal);
   }
 
   reclaimRoom(bytes: number, signal?: AbortSignal): Promise<boolean> {
+    this.governor.assertMutable();
     return this.governor.reclaimRoom(this, bytes, signal);
   }
 
@@ -285,14 +324,28 @@ class GrantImpl implements Grant {
   }
 
   release(bytes: number): void {
+    this.governor.assertMutable();
     if (this.closed) return;
     const releasable = this.held - this.allocated - this.loan;
     if (bytes > releasable) throw new LoanBackedReleaseError(this.label, bytes, releasable);
     this.held -= bytes;
-    this.governor.give(bytes);
+    this.#giveBack(bytes);
+    this.parent?.settleGrowth();
+  }
+
+  /** Returned bytes go back to an open parent credit, else to the governor. */
+  #giveBack(bytes: number): void {
+    const parent = this.parent;
+    if (parent !== null && !parent.closed) {
+      parent.held += bytes;
+      if (bytes > 0) parent.pendingGrowth = true;
+      // Credit moved between grants: holder activity for the stall guard.
+      this.governor.activity++;
+    } else this.governor.give(bytes);
   }
 
   borrow(bytes: number, signal?: AbortSignal): Promise<Loan> {
+    this.governor.assertMutable();
     if (this.closed || this.governor.isIdleCredit(this))
       return Promise.reject(new GrantClosedError(this.label));
     if (this.loan > 0 || this.loanPending)
@@ -312,7 +365,9 @@ class GrantImpl implements Grant {
             repaid = true;
             this.loan = 0;
             this.governor.repaid(bytes);
-            this.release(bytes);
+            // Loan bytes came from the governor: they never join a parent credit.
+            this.held -= bytes;
+            this.governor.give(bytes);
           },
         };
       },
@@ -328,18 +383,23 @@ class GrantImpl implements Grant {
   }
 
   close(): void {
+    this.governor.assertMutable();
     if (this.closed) return;
     this.closed = true;
     // Profiles may retain closed grant handles across passes; they must not keep
     // the retired operator graph alive through its cooperative spill callback.
     this.reclaim = null;
     this.governor.forget(this);
-    const held = this.held;
+    const held = this.held,
+      loan = this.loan;
     this.held = 0;
     this.allocated = 0;
-    if (this.loan > 0) this.governor.repaid(this.loan);
+    if (loan > 0) this.governor.repaid(loan);
     this.loan = 0;
-    this.governor.give(held);
+    // Loan bytes return to the governor; the rest to an open parent credit.
+    if (loan > 0) this.governor.give(loan);
+    this.#giveBack(held - loan);
+    this.parent?.settleGrowth();
   }
 }
 
@@ -388,10 +448,15 @@ export class GovernorStallError extends Error {
     readonly afterMs: number,
     /** Where the waiter queued (stack at admission). */
     readonly waiterStack: string,
+    /** Which rule fired: no governor progress for `afterMs`, or queued past the hard deadline
+     * (`Governor.stallDeadlineWindows` windows) whatever unrelated activity continued. */
+    readonly rule: "no progress" | "deadline" = "no progress",
   ) {
     super(
-      `Governor stall: "${waiter.label}" waited ${String(afterMs)} ms for ${String(waiter.bytes)}B ` +
-        `(capacity ${String(capacity)}B, used ${String(usedBytes)}B) with no progress; holders: ` +
+      `Governor stall (${rule}): "${waiter.label}" waited ` +
+        `${String(rule === "deadline" ? afterMs * Governor.stallDeadlineWindows : afterMs)} ms ` +
+        `for ${String(waiter.bytes)}B (capacity ${String(capacity)}B, used ${String(usedBytes)}B) ` +
+        `${rule === "deadline" ? "queued past its deadline" : "with no progress"}; holders: ` +
         holders
           .map(
             (holder) =>
@@ -415,12 +480,16 @@ export class Governor implements MemoryGovernor {
    * longer than the window would also be reported.
    */
   static stallAfterMs: number | null = null;
+  /** Test builds: a waiter queued for this many windows is reported whatever other activity
+   * continues (review 10): unrelated grant activity cannot mask a stalled waiter indefinitely. */
+  static stallDeadlineWindows = 6;
   readonly #grantObservers = new Set<(event: GrantEvent) => void>();
 
   /** Reports every grant synchronously, with the queues as they stand at that moment, so a
    * suite checks the serving order itself rather than promise resolution, which lags the grant
    * (GOVERNOR-WAIT-POLICY). For tests and diagnostics; returns the unsubscription. */
   observeGrants(observer: (event: GrantEvent) => void): () => void {
+    this.assertMutable();
     this.#grantObservers.add(observer);
     return () => this.#grantObservers.delete(observer);
   }
@@ -455,9 +524,11 @@ export class Governor implements MemoryGovernor {
   readonly #permanent = new Set<() => number>();
 
   registerPermanent(bytes: () => number): () => void {
+    this.assertMutable();
     this.#permanent.add(bytes);
     this.#drain();
     return () => {
+      this.assertMutable();
       this.#permanent.delete(bytes);
       this.#drain();
     };
@@ -591,6 +662,7 @@ export class Governor implements MemoryGovernor {
     this.#take(bytes);
     grant.held += bytes;
     this.#observeGrant(grant.label, "grow", bytes);
+    grant.pendingGrowth = true;
     return true;
   }
 
@@ -840,6 +912,7 @@ export class Governor implements MemoryGovernor {
         this.#grants.add(grant);
       }
       grant.held += taken;
+      if (request.grant !== null) grant.pendingGrowth = true;
       {
         let remaining = wanted - taken;
         for (const pool of this.#idleCredit) {
@@ -876,6 +949,8 @@ export class Governor implements MemoryGovernor {
               : "admission",
         wanted,
       );
+      // Idle credit and any loan are installed: the holdings are complete.
+      grant.settleGrowth();
       request.resolve(grant);
     }
   }
@@ -934,6 +1009,7 @@ export class Governor implements MemoryGovernor {
     if (afterMs === null) return;
     const queuedAt = new Error().stack?.split("\n").slice(3, 16).join("\n") ?? "";
     const moved = () => this.#progress + this.activity;
+    const deadline = Date.now() + afterMs * Governor.stallDeadlineWindows;
     let seen = moved(),
       since = Date.now();
     const timer = setInterval(
@@ -942,12 +1018,13 @@ export class Governor implements MemoryGovernor {
           clearInterval(timer);
           return;
         }
+        const now = Date.now();
         if (moved() !== seen) {
           seen = moved();
-          since = Date.now();
-          return;
+          since = now;
         }
-        if (Date.now() - since < afterMs) return;
+        const rule = now - since >= afterMs ? "no progress" : now >= deadline ? "deadline" : null;
+        if (rule === null) return;
         clearInterval(timer);
         const holders = new Map<string, { held: number; allocated: number; spillable: boolean }>();
         for (const grant of this.#grants) {
@@ -975,6 +1052,7 @@ export class Governor implements MemoryGovernor {
               .map(([label, holder]) => ({ label, ...holder })),
             afterMs,
             queuedAt,
+            rule,
           ),
         );
       },
@@ -994,6 +1072,7 @@ export class Governor implements MemoryGovernor {
   }
 
   async admit(options: AdmitOptions): Promise<Grant> {
+    this.assertMutable();
     if (options.minimumBytes > this.usableCapacity(false))
       throw new MemoryAdmissionError(
         options.label,
@@ -1014,6 +1093,7 @@ export class Governor implements MemoryGovernor {
   }
 
   async admitGroup(options: NativeGrantGroupOptions): Promise<readonly Grant[]> {
+    this.assertMutable();
     const { label, signal, includesProgress } = options;
     // Copy before waiting: the caller cannot change the named minima after admission queues.
     const parts = options.grants.map(({ label, minimumBytes, spillable }) => ({
@@ -1083,7 +1163,105 @@ export class Governor implements MemoryGovernor {
     }
   }
 
+  /**
+   * Whether an admission of `bytes` would be served at once: nothing is queued and it fits now,
+   * after evicting caches (a private-progress group may use the reserve). Takes no credit; an
+   * `admitGroup` of that size called next, synchronously, is served without waiting.
+   */
+  canAdmitNow(bytes: number, includesProgress: boolean): boolean {
+    // Any queued request, holder growth included (GOVERNOR-WAIT-POLICY): never "at once" past it.
+    if (
+      this.#draining ||
+      this.#loans.length > 0 ||
+      this.#reads.length > 0 ||
+      this.#holders.length > 0 ||
+      this.#admissions.length > 0
+    )
+      return false;
+    return this.#room(bytes, includesProgress);
+  }
+
+  /**
+   * Carves a new ordinary grant of `bytes` from `source`'s idle credit, synchronously. Nothing is
+   * admitted: the bytes were already held by the same owner, so no queued admission is passed.
+   * The carved grant returns what it releases or closes to `source` while `source` is open (then
+   * to the governor). Null when `source` cannot spare the bytes.
+   */
+  carve(source: Grant, label: string, spillable: boolean, bytes: number): Grant | null {
+    this.assertMutable();
+    if (!Number.isSafeInteger(bytes) || bytes < 0)
+      throw new RangeError("Carved bytes must be a nonnegative safe integer");
+    if (
+      !(source instanceof GrantImpl) ||
+      source.governor !== this ||
+      source.closed ||
+      this.#idleCredit.has(source) ||
+      bytes > source.held - source.allocated - source.loaned
+    )
+      return null;
+    const grant = new GrantImpl(this, label, spillable);
+    grant.parent = source;
+    this.#grants.add(grant);
+    source.held -= bytes;
+    grant.held += bytes;
+    this.activity++;
+    return grant;
+  }
+
+  /**
+   * Calls `observer` after `grant`'s holdings grow (growth, a read's room, a credit transfer in),
+   * or stops with null. Preparation tracks its peak with it. False for a foreign grant.
+   */
+  observeGrowth(grant: Grant, observer: (() => void) | null): boolean {
+    this.assertMutable();
+    if (!(grant instanceof GrantImpl) || grant.governor !== this) return false;
+    grant.grown = observer;
+    return true;
+  }
+
+  #observing = false;
+  /** Runs `grant`'s growth observer, read-only: any mutator it calls throws. */
+  notifyGrowth(grant: Grant): void {
+    if (!(grant instanceof GrantImpl) || grant.grown === null) return;
+    this.#observing = true;
+    try {
+      grant.grown();
+    } finally {
+      this.#observing = false;
+    }
+  }
+  /** Grant and governor mutators refuse while a growth observer runs. */
+  assertMutable(): void {
+    if (this.#observing) throw new GrowthObserverReentryError();
+  }
+
+  /**
+   * From now on `child` returns the bytes it releases to `parent` while `parent` is open, exactly
+   * as if it had been carved from it. False (nothing changes) for a closed, foreign, idle or
+   * already parented grant.
+   */
+  adopt(parent: Grant, child: Grant): boolean {
+    this.assertMutable();
+    if (
+      !(parent instanceof GrantImpl) ||
+      !(child instanceof GrantImpl) ||
+      parent === child ||
+      parent.governor !== this ||
+      child.governor !== this ||
+      parent.closed ||
+      child.closed ||
+      child.parent !== null ||
+      this.#idleCredit.has(parent) ||
+      this.#idleCredit.has(child)
+    )
+      return false;
+    child.parent = parent;
+    this.activity++;
+    return true;
+  }
+
   transferCredit(source: Grant, target: Grant, bytes: number): boolean {
+    this.assertMutable();
     if (!Number.isSafeInteger(bytes) || bytes < 0)
       throw new RangeError("Credit transfer bytes must be a nonnegative safe integer");
     if (
@@ -1100,7 +1278,9 @@ export class Governor implements MemoryGovernor {
       source.held -= bytes;
       target.held += bytes;
       this.activity++;
+      if (bytes > 0) target.pendingGrowth = true;
     }
+    target.settleGrowth();
     if (
       bytes > 0 &&
       source !== target &&
@@ -1111,6 +1291,7 @@ export class Governor implements MemoryGovernor {
   }
 
   tryAdmit(options: Omit<AdmitOptions, "signal">): Grant | null {
+    this.assertMutable();
     if (options.minimumBytes > this.capBytes - this.reserveBytes)
       throw new MemoryAdmissionError(
         options.label,

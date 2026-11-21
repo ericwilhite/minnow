@@ -1,10 +1,12 @@
 /** Ordered index cursors and private locator fetches share the query's pinned view. */
 import type { IndexCursor, IndexReader, IndexRangePlan } from "../access/key-index.js";
-import type { ReadBound } from "../page/read-bounds.js";
+import { trackSizing, type ReadBound } from "../page/read-bounds.js";
+import { admitWorkingSet } from "../memory/working-set.js";
 import { directoryCacheFor } from "../page/directory-cache.js";
 import type { PhysicalPlan, Rel } from "../ir/ir.js";
 import { BATCH_ROWS, dataBytes, type FlatVector } from "../vector/vector.js";
-import { batchTargetFor, OBJECT_OVERHEAD_BYTES } from "../memory/governor.js";
+import { batchTargetFor, OBJECT_OVERHEAD_BYTES, type MemoryGovernor } from "../memory/governor.js";
+import { locatorSegment } from "../vector/locator.js";
 import { pauseIfDue } from "../task.js";
 import { layoutOf, samePhysicalType, type PhysicalType } from "../types.js";
 import { OutputArena } from "./kernels/vectors.js";
@@ -20,6 +22,138 @@ export function planIndexRange(reader: IndexReader, descending: boolean) {
   if (plan && (!Number.isSafeInteger(plan.minimumBytes) || plan.minimumBytes < 0))
     throw new RangeError("invalid index cursor minimum");
   return plan ?? null;
+}
+
+/** The grant label of the window sizing pass (its cursor is the query's sizing cursor). */
+export const WINDOW_SIZING_LABEL = "key-order/window-sizing";
+/** The grant label of the window's segment list, held until sizing finishes. */
+export const WINDOW_SEGMENTS_LABEL = "key-order/window-segments";
+
+/** A window's distinct segment indexes, ascending, and the charge that holds them. */
+export interface WindowSegments {
+  readonly segments: Uint32Array;
+  /** Frees the list's charge once sizing no longer reads it. Idempotent. */
+  release(): void;
+}
+
+/**
+ * The segments a bounded primary-key window names: OFFSET skipped in the index, then up to
+ * `rows` locators. One admission charges the cursor scratch with its locators, and the segment
+ * list (4 bytes a locator, its bound). The scratch is released before this returns; the list's
+ * charge stays with the list until the caller releases it after sizing, so only that list is
+ * held while sizing admits. `plan` is a fresh single-use plan on the query's pinned view:
+ * execution's cursor yields the same window there, so a read bound over exactly these segments
+ * covers every row the fetch reads.
+ */
+export function windowSegments(
+  plan: IndexRangePlan,
+  offset: number,
+  rows: number,
+  governor: MemoryGovernor,
+  signal: AbortSignal,
+): Promise<WindowSegments> {
+  // Registered like source sizing: teardown waits for this cursor and grant to unwind.
+  return trackSizing(
+    signal,
+    readWindow(plan, offset, rows, governor, signal),
+  ) as Promise<WindowSegments>;
+}
+
+async function readWindow(
+  plan: IndexRangePlan,
+  offset: number,
+  rows: number,
+  governor: MemoryGovernor,
+  signal: AbortSignal,
+): Promise<WindowSegments> {
+  if (!Number.isSafeInteger(rows) || rows < 1 || rows > BATCH_ROWS)
+    throw new RangeError("A sized window holds one cursor batch");
+  const locatorBytes = rows * Float64Array.BYTES_PER_ELEMENT,
+    segmentBytes = rows * Uint32Array.BYTES_PER_ELEMENT;
+  const [grant, held] = await admitWorkingSet(governor, {
+    label: "key-order/window",
+    includesProgress: true,
+    signal,
+    grants: [
+      {
+        label: WINDOW_SIZING_LABEL,
+        minimumBytes: plan.minimumBytes + locatorBytes,
+        spillable: false,
+      },
+      { label: WINDOW_SEGMENTS_LABEL, minimumBytes: segmentBytes, spillable: false },
+    ],
+  });
+  if (grant === undefined || held === undefined)
+    throw new Error("window sizing did not receive its minimum");
+  let kept = false;
+  try {
+    // Every buffer is charged before it is allocated; the cursor's scratch is in the plan minimum.
+    if (!grant.allocate(locatorBytes) || !held.allocate(segmentBytes))
+      throw new Error("window sizing did not receive its minimum");
+    const out = new Float64Array(rows);
+    const list = new Uint32Array(rows);
+    let filled = 0;
+    const cursor = plan.open({ budget: grant, signal });
+    // Cancellation closes at once (cancelling pending I/O); the outstanding call still settles
+    // before `out` and the scratch are released below.
+    let open = true;
+    const close = () => {
+      if (!open) return;
+      open = false;
+      cursor.close();
+    };
+    signal.addEventListener("abort", close, { once: true });
+    try {
+      let skip = offset;
+      while (skip > 0) {
+        const skipped = await cursor.skip(skip);
+        signal.throwIfAborted();
+        if (!Number.isSafeInteger(skipped) || skipped < 0 || skipped > skip)
+          throw new RangeError("invalid index cursor skip count");
+        if (skipped < skip) break;
+        skip -= skipped;
+      }
+      while (skip === 0 && filled < rows) {
+        const count = await cursor.next(out.subarray(filled, rows));
+        signal.throwIfAborted();
+        if (!Number.isInteger(count) || count < 0 || count > rows - filled)
+          throw new RangeError("invalid index cursor count");
+        if (count === 0) break;
+        for (let k = filled; k < filled + count; k++) list[k] = locatorSegment(out[k] ?? -1);
+        filled += count;
+      }
+    } finally {
+      signal.removeEventListener("abort", close);
+      close();
+      grant.free(locatorBytes);
+      grant.close();
+    }
+    // Distinct, ascending, in place inside the charged list.
+    const window = list.subarray(0, filled).sort();
+    let distinct = 0;
+    for (let k = 0; k < window.length; k++)
+      if (k === 0 || window[k] !== window[k - 1]) window[distinct++] = window[k] ?? 0;
+    let released = false;
+    const result: WindowSegments = {
+      segments: list.subarray(0, distinct),
+      release() {
+        if (released) return;
+        released = true;
+        held.free(segmentBytes);
+        held.close();
+      },
+    };
+    kept = true;
+    return result;
+  } finally {
+    // A failed read releases both charges; a returned list keeps its own until released.
+    if (grant.allocated > 0) grant.free(grant.allocated);
+    grant.close();
+    if (!kept) {
+      if (held.allocated > 0) held.free(held.allocated);
+      held.close();
+    }
+  }
 }
 
 export class IndexOrderSource implements BatchSource {
@@ -183,8 +317,8 @@ export async function runIndexOrder(
   admitted?: AdmittedIndexRead,
 ): Promise<void> {
   const entries = admitted
-    ? admittedIndexMinimums(shape, runtime.request.governor.capBytes, admitted)
-    : indexMinimums(shape, runtime.request.governor.capBytes);
+    ? admittedIndexMinimums(shape, runtime.governor.capBytes, admitted)
+    : indexMinimums(shape, runtime.governor.capBytes);
   const grants = [];
   for (const entry of entries)
     grants.push(
@@ -226,7 +360,7 @@ export async function runIndexOrder(
       ...(directories === undefined ? {} : { directories }),
       spill: runtime.request.spill,
       queryId: runtime.request.queryId,
-      targetBytes: admitted?.targetBytes ?? batchTargetFor(runtime.request.governor.capBytes, 4),
+      targetBytes: admitted?.targetBytes ?? batchTargetFor(runtime.governor.capBytes, 4),
       signal: runtime.signal,
       onPipeline: () => runtime.pipeline(),
       orderedShortcut: true,

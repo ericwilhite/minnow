@@ -1740,6 +1740,19 @@ export const JOIN_DEMAND_EXPRESSION_REACH = [
   "PG exact",
 ] as const;
 
+/** Primary-key LIMIT/OFFSET windows sized over only the groups they fetch. */
+export const KEY_ORDER_WINDOW_REACH = [
+  "work bound",
+  "one group",
+  "spans groups",
+  "offset past end",
+  "one-row limit",
+  "over one batch",
+  "descending",
+  "deep offset",
+  "PG exact",
+] as const;
+
 /** SQL windows run through durable storage and the actual executor, not a plan interpreter. */
 export const LOWER_M3_WINDOWS_REACH = [
   "literal window amounts",
@@ -10464,6 +10477,18 @@ export const NATIVE_BODY_PRESSURE_REACH = [
   "zero ownership",
 ] as const;
 
+/** Query preparation under FIFO contention (next/testing/preparation-credit.test.ts). */
+export const PREPARATION_CREDIT_REACH = [
+  "restart",
+  "restart released a source recipe",
+  "credit grew",
+  "served from credit",
+  "concurrent restarts",
+  "cancel during credit wait",
+  "publish between attempts",
+  "join",
+] as const;
+
 export const NATIVE_BODY_LIFETIME_REACH = [
   "root close",
   "caller cancel",
@@ -11897,6 +11922,9 @@ export const LIFETIME_HOLDINGS_REACH = [
   "table dropped under a snapshot",
   "waited for a snapshot, then settled",
   "current run readers open",
+  "change feed created",
+  "change feed listener removed",
+  "transaction begun during idle reclaim",
   "exact after publication",
 ] as const;
 

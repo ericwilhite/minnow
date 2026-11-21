@@ -1624,7 +1624,8 @@ and the owner import it directly.
   floors are revocable when idle, so they are not counted as permanent; what the write engine keeps
   until close, or for as long as the current state needs it, is (the page cache's fixed slabs,
   permanent storage, the current state's resident metadata and pin, its fixed controls and
-  resident commit writers). What a finite holder releases is not: state only older snapshots keep
+  resident commit writers, and the change feed once created). A live-query runtime registers its
+  base and feed listener until it closes. What a finite holder releases is not: state only older snapshots keep
   (a request it blocks waits for them), FTS mutation entries, pending index records. Unflushed
   memtable content (rows, index tombstones, deletions) is not permanent: reclaim on an idle writer
   flushes it, and publishes once when only a publication releases the rest. Every transition that can make the writer's
@@ -1632,15 +1633,32 @@ and the owner import it directly.
   queued admissions. `Governor.observeGrants` reports each grant synchronously with the queues at
   that moment, so suites check the serving order itself. The writer and a native root
   cannot wait on each other (one writer per governor; a native root queues its own step only after
-  the writer's step has settled). Readers are not holders: query preparation is to wait only while
-  holding nothing (a preparation credit, pending), since readers each retaining a source recipe
-  while waiting could otherwise wait on each other. Policy: `holdsCredit` and `registerPermanent` in
+  the writer's step has settled). Readers are not holders: query preparation waits only while holding
+  nothing (the preparation credit, below), since readers each retaining a source recipe while
+  waiting could otherwise wait on each other. Policy: `holdsCredit` and `registerPermanent` in
   `memory/governor.ts`; tests: `memory/holder-priority.test.ts`,
   `memory/wait-policy-regressions.test.ts`, `memory/wait-wake-regressions.test.ts`,
   `testing/native-command-fifo.test.ts`. In test runs,
   `MINNOW_GOVERNOR_STALL_MS` turns any wait without governor progress into a `GovernorStallError`
   naming every holder. Progress includes any allocation, free or credit move on any grant, so a
-  holder working inside memory it was already granted is never reported as a stall.
+  holder working inside memory it was already granted is not reported while it touches its
+  grants; one computing longer than the window without touching any grant still is (a CPU-only
+  false positive). Unrelated activity can hide a stalled waiter only until its hard deadline
+  (6 windows): past it the waiter is reported whatever else moves, and the error says which rule
+  fired.
+- Query preparation never waits while it holds memory (`exec/preparation.ts`). Until the
+  minimum is installed, every admission (retained source recipes, source sizing scratch,
+  planning probes, parameter sizing) is one the governor serves at once, through the same call
+  as without preparation, or (only when the attempt holds nothing) an ordinary wait. Otherwise
+  the execution releases everything the attempt holds, waits holding nothing, and prepares again
+  from scratch on a fresh runtime. That wait is the admission that would have waited, with its
+  own label and named parts, plus a `query#N/preparation-credit` part; all of it becomes the
+  next attempt's credit, a single pool: every grant the attempt obtains returns the bytes it
+  releases there, so freed scratch serves the next phase. The request is the attempt's peak
+  simultaneous need, at least twice the previous request, and at most the usable capacity
+  (the cap less the reserve unless private progress, less lifetime
+  holdings), so a query restarts at most `ceil(log2(usable / first request)) + 1` times. A peak
+  need above the usable capacity is `MemoryAdmissionError` (53200).
 - A grant _holds_ bytes, and its operator _allocates_ buffers out of them, so a non-spillable
   operator works inside its admitted minimum.
 - Growth is charged before it happens, including the overlap while a buffer is copied.
@@ -1846,14 +1864,31 @@ projections are supported; row-locking intent, filters, computed ordering, parti
 directions and readers without `planRange` retain the generic scan/sort recipe. This exclusion
 does not add row locks; the SQL guide documents the current locking semantics.
 
-The executor plans the cursor once and atomically reserves its minimum with payload reads,
-locator buffers, ordinal restoration, parameters and result delivery. It opens once with its
-dedicated grant; the cursor never self-admits. LIMIT and OFFSET are both validated before
-opening, including LIMIT zero. OFFSET uses the visibility-safe cursor `skip` operation;
+The executor atomically reserves the execution cursor's minimum with payload reads, locator
+buffers, ordinal restoration, parameters and result delivery. The execution cursor opens once
+with its dedicated grant; a cursor never self-admits. LIMIT and OFFSET are both validated
+before opening, including LIMIT zero. OFFSET uses the visibility-safe cursor `skip` operation;
 only surviving locators reach payload fetch. Close drains pending skip/next before releasing
-the cursor grant. Payload sizing uses conservative metadata for every reachable source,
-including publication-safe memory read hints. If the optional recipe's complete minimum
-cannot fit, execution retains the generic plan before opening any producer.
+the cursor grant. If the optional recipe's complete minimum cannot fit, execution retains the
+generic plan before opening any producer.
+
+Payload sizing reads only what the fetch can reach. When LIMIT is at most one cursor batch
+(2048 rows), sizing first reads the window: a second, single-use plan on the same pinned view,
+opened with its own scratch grant (`key-order/window-sizing`: the plan minimum plus 8 bytes per
+locator, charged before allocation), skips OFFSET and reads up to LIMIT locators. That cursor
+closes at once on cancellation; its scratch is released only after its pending index call
+settles, and always before execution is admitted. The same admission charges the window's
+distinct segment list (`key-order/window-segments`, 4 bytes a locator, sorted in place). Only
+the groups those locators name are then sized. The list, the window scratch and that sizing are
+preparation admissions (see Memory): if one would wait while the list is held, the query releases
+the whole attempt, including the list, and prepares again with a credit that covers them
+together, so it never waits holding the list. The execution cursor reads the same window from the
+same snapshot, so every group it fetches was sized. Without a preparation restart, such a query
+opens exactly two cursors (sizing, then execution), each closed and each reading at most
+LIMIT + OFFSET rows; each restart closes its attempt's sizing cursor and opens one more.
+Larger or unbounded windows, LIMIT 1 over a resident one-chunk table (its single-use resident
+range), and caps the cursor path does not fit open one cursor or none, and size every reachable
+source with conservative metadata, including publication-safe memory read hints.
 
 Payload fetches run in physical page order. Monotonic batches stream directly; otherwise a
 charged, spillable ordinal sort restores the surviving rows' key order. This does not sort
