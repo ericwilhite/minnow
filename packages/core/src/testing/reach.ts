@@ -1761,6 +1761,7 @@ export const KEY_LOOKUP_SIZING_REACH = [
   "range",
   "range over the bound",
   "parameter",
+  "ordered by the key",
   "work bound",
   "fallback",
   "PG exact",

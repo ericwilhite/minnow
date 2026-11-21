@@ -1208,6 +1208,11 @@ export class Governor implements MemoryGovernor {
     return grant;
   }
 
+  /** Whether `grant` is an open grant of this governor. Read-only: safe inside an observer. */
+  isOpen(grant: Grant): boolean {
+    return grant instanceof GrantImpl && grant.governor === this && !grant.closed;
+  }
+
   /**
    * Calls `observer` after `grant`'s holdings grow (growth, a read's room, a credit transfer in),
    * or stops with null. Preparation tracks its peak with it. False for a foreign grant.

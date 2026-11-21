@@ -135,7 +135,8 @@ for (const seed of seedsFor("next-key-lookup-sizing", [0x10c51, 0x10c52]))
         fc.integer({ min: 1, max: ROWS }),
         fc.integer({ min: 0, max: 300 }),
         fc.boolean(),
-        async (shape, at, width, parameter) => {
+        fc.boolean(),
+        async (shape, at, width, parameter, ordered) => {
           reach.beginHistory();
           let sql: string,
             params: number[] = [],
@@ -154,6 +155,11 @@ for (const seed of seedsFor("next-key-lookup-sizing", [0x10c51, 0x10c52]))
             const low = Math.max(1, Math.min(at, ROWS - span));
             sql = `SELECT id, v, s FROM t WHERE id BETWEEN ${String(low)} AND ${String(low + span)}`;
             ids = Array.from({ length: span + 1 }, (_, k) => low + k);
+          }
+          // ORDER BY the key: the sort sizes its key column's width too, over the same groups.
+          if (ordered) {
+            sql += " ORDER BY id";
+            reach.reach("ordered by the key");
           }
           const { roots, sizedWhatItRead, op } = await run(sql, params);
           expect(op, sql).toBe(shape.startsWith("range") ? "indexRange" : "keyLookup");
@@ -176,13 +182,14 @@ for (const seed of seedsFor("next-key-lookup-sizing", [0x10c51, 0x10c52]))
         seed,
         numRuns: 30,
         examples: [
-          ["point", 777, 0, false],
-          ["point", 3000, 0, true],
-          ["missing key", 5, 0, false],
-          ["duplicate IN probes", 100, 0, false],
-          ["range", 250, 40, false],
-          ["range", 1, 300, false],
-          ["range over the bound", 1, 0, false],
+          ["point", 777, 0, false, false],
+          ["point", 3000, 0, true, true],
+          ["missing key", 5, 0, false, false],
+          ["duplicate IN probes", 100, 0, false, true],
+          ["range", 250, 40, false, false],
+          ["range", 2000, 99, false, true],
+          ["range", 1, 300, false, false],
+          ["range over the bound", 1, 0, false, true],
         ],
       },
     );
