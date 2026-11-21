@@ -1823,14 +1823,31 @@ projections are supported; row-locking intent, filters, computed ordering, parti
 directions and readers without `planRange` retain the generic scan/sort recipe. This exclusion
 does not add row locks; the SQL guide documents the current locking semantics.
 
-The executor plans the cursor once and atomically reserves its minimum with payload reads,
-locator buffers, ordinal restoration, parameters and result delivery. It opens once with its
-dedicated grant; the cursor never self-admits. LIMIT and OFFSET are both validated before
-opening, including LIMIT zero. OFFSET uses the visibility-safe cursor `skip` operation;
+The executor atomically reserves the execution cursor's minimum with payload reads, locator
+buffers, ordinal restoration, parameters and result delivery. The execution cursor opens once
+with its dedicated grant; a cursor never self-admits. LIMIT and OFFSET are both validated
+before opening, including LIMIT zero. OFFSET uses the visibility-safe cursor `skip` operation;
 only surviving locators reach payload fetch. Close drains pending skip/next before releasing
-the cursor grant. Payload sizing uses conservative metadata for every reachable source,
-including publication-safe memory read hints. If the optional recipe's complete minimum
-cannot fit, execution retains the generic plan before opening any producer.
+the cursor grant. If the optional recipe's complete minimum cannot fit, execution retains the
+generic plan before opening any producer.
+
+Payload sizing reads only what the fetch can reach. When LIMIT is at most one cursor batch
+(2048 rows), sizing first reads the window: a second, single-use plan on the same pinned view,
+opened with its own scratch grant (`key-order/window-sizing`: the plan minimum plus 8 bytes per
+locator, charged before allocation), skips OFFSET and reads up to LIMIT locators. That cursor
+closes at once on cancellation; its scratch is released only after its pending index call
+settles, and always before execution is admitted. The same admission charges the window's
+distinct segment list (`key-order/window-segments`, 4 bytes a locator, sorted in place). Only
+the groups those locators name are then sized. The list, the window scratch and that sizing are
+preparation admissions (see Memory): if one would wait while the list is held, the query releases
+the whole attempt, including the list, and prepares again with a credit that covers them
+together, so it never waits holding the list. The execution cursor reads the same window from the
+same snapshot, so every group it fetches was sized. Without a preparation restart, such a query
+opens exactly two cursors (sizing, then execution), each closed and each reading at most
+LIMIT + OFFSET rows; each restart closes its attempt's sizing cursor and opens one more.
+Larger or unbounded windows, LIMIT 1 over a resident one-chunk table (its single-use resident
+range), and caps the cursor path does not fit open one cursor or none, and size every reachable
+source with conservative metadata, including publication-safe memory read hints.
 
 Payload fetches run in physical page order. Monotonic batches stream directly; otherwise a
 charged, spillable ordinal sort restores the surviving rows' key order. This does not sort

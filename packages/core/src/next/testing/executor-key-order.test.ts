@@ -13,6 +13,7 @@ import { OutputArena } from "../exec/kernels/vectors.js";
 import { packLocator } from "../vector/locator.js";
 import { currentNullBoundRefusal } from "./divergences.js";
 import { createExecutor } from "../exec/create.js";
+import { WINDOW_SIZING_LABEL } from "../exec/key-order.js";
 
 const names = ["id", ...Array.from({ length: 16 }, (_, i) => `p${String(i)}`)];
 const schema = `id INTEGER PRIMARY KEY,${names
@@ -76,7 +77,16 @@ it.each(seedsFor("next-executor-key-order", [0xe101, 0xe102]))(
       "lowered-sort",
       "null-refusal-registered",
     ]);
-    const stats = { opens: 0, closes: 0, rows: 0, capacity: 0, admitted: 0 };
+    const stats = {
+      opens: 0,
+      closes: 0,
+      rows: 0,
+      capacity: 0,
+      admitted: 0,
+      sizingOpens: 0,
+      executionOpens: 0,
+      cursorRows: [] as number[],
+    };
     let explicit = false;
     const executor = createExecutor();
     const diagnostic = createExecutor({ keyOrder: true });
@@ -130,14 +140,18 @@ it.each(seedsFor("next-executor-key-order", [0xe101, 0xe102]))(
               if (name === "index")
                 return (...args: Parameters<Snapshot["index"]>): IndexReader => {
                   const reader = target.index(...args);
-                  const observe = (cursor: IndexCursor): IndexCursor => {
+                  const observe = (cursor: IndexCursor, sizing = false): IndexCursor => {
                     stats.opens++;
+                    if (sizing) stats.sizingOpens++;
+                    else stats.executionOpens++;
+                    const slot = stats.cursorRows.push(0) - 1;
                     return {
                       skip: cursor.skip.bind(cursor),
                       next(out) {
                         stats.capacity = Math.max(stats.capacity, out.length);
                         const done = (n: number) => {
                           stats.rows += n;
+                          stats.cursorRows[slot] = (stats.cursorRows[slot] ?? 0) + n;
                           return n;
                         };
                         const result = cursor.next(out);
@@ -163,7 +177,10 @@ it.each(seedsFor("next-executor-key-order", [0xe101, 0xe102]))(
                             options.budget.held - options.budget.allocated,
                           ).toBeGreaterThanOrEqual(plan.minimumBytes);
                           stats.admitted++;
-                          return observe(plan.open(options));
+                          return observe(
+                            plan.open(options),
+                            options.budget.label === WINDOW_SIZING_LABEL,
+                          );
                         },
                       };
                     },
@@ -265,7 +282,16 @@ it.each(seedsFor("next-executor-key-order", [0xe101, 0xe102]))(
             const small = projection && !useIR;
             explicit = useIR;
             reach.beginHistory();
-            Object.assign(stats, { opens: 0, closes: 0, rows: 0, capacity: 0, admitted: 0 });
+            Object.assign(stats, {
+              opens: 0,
+              closes: 0,
+              rows: 0,
+              capacity: 0,
+              admitted: 0,
+              sizingOpens: 0,
+              executionOpens: 0,
+              cursorRows: [],
+            });
             const table = ["m", "s", "x", "e", "d"][state],
               limit = bounds[li],
               offset = bounds[oi];
@@ -332,13 +358,19 @@ it.each(seedsFor("next-executor-key-order", [0xe101, 0xe102]))(
                 expect(stats.opens).toBe(0);
                 reach.reach("zero");
               } else {
-                expect(stats.opens).toBe(1);
-                expect(stats.closes).toBe(1);
+                // Lead design decision under the governor law (size before admission, release,
+                // then admit): a lowered window of 1..2048 rows is sized first by its own cursor.
+                const sized = !explicit && typeof limit === "number" && limit >= 1 && limit <= 2048;
+                expect(stats.executionOpens).toBe(1);
+                expect(stats.sizingOpens).toBe(sized ? 1 : 0);
+                expect(stats.closes).toBe(stats.opens);
                 reach.reach("cursor");
                 reach.reach(explicit ? "explicit-IR" : "lowered-sort");
                 reach.reach("closed");
                 if (typeof limit === "number" && typeof offset === "number") {
-                  expect(stats.rows).toBeLessThanOrEqual(limit + offset);
+                  for (const rows of stats.cursorRows)
+                    expect(rows).toBeLessThanOrEqual(limit + offset);
+                  expect(stats.rows).toBeLessThanOrEqual(2 * (limit + offset));
                   expect(stats.capacity).toBeLessThanOrEqual(Math.max(limit + offset, 1));
                   if (limit + offset < fixtureRows.length && state !== 3) reach.reach("early-stop");
                 }
