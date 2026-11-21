@@ -128,11 +128,25 @@ export class PreparationGovernor implements MemoryGovernor {
     for (const grant of this.#taken) this.governor.observeGrowth(grant, null);
     this.#taken.clear();
   }
-  /** Live bytes held by this attempt's grants. */
+  /**
+   * Live bytes held by this attempt's grants. A closed grant holds nothing and never grows again:
+   * it leaves the set here, so each call costs the grants still open, not every grant the attempt
+   * ever took (sizing passes take and close thousands). Read-only, as growth observers require.
+   */
   #live(): number {
     let bytes = 0;
-    for (const grant of this.#taken) bytes += grant.held;
+    for (const grant of this.#taken) {
+      if (!this.governor.isOpen(grant)) {
+        this.#taken.delete(grant);
+        continue;
+      }
+      bytes += grant.held;
+    }
     return bytes;
+  }
+  /** Grants of this attempt still tracked (open, or closed since the last count). */
+  get trackedGrants(): number {
+    return this.#taken.size;
   }
   /**
    * Records a grant of this attempt. With a credit (after a restart), its released bytes go back
