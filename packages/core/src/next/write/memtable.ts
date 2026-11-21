@@ -222,9 +222,8 @@ export class Memtable {
    * readers size row by row. Rows that did not arrive through `append` (a recovered staged group)
    * leave the memtable without summaries (`valueSummary` answers null).
    */
-  #valueMax: Float64Array;
-  #valueSum: Float64Array;
-  readonly #summaryColumns: Int32Array;
+  /** Column → summary index, maxima and sums; allocated (and charged) with the first row. */
+  #summary: { columns: Int32Array; max: Float64Array; sum: Float64Array } | null = null;
   readonly #summaryChunks: number;
   readonly #summarySlots: number;
   #summaryBytes = 0;
@@ -259,15 +258,12 @@ export class Memtable {
       this.columns = [...columns];
     } else this.columns = columns;
     this.chunks = this.columns.map(() => []);
-    this.#summaryColumns = new Int32Array(this.columns.length).fill(-1);
     let varlen = 0;
-    this.columns.forEach((column, c) => {
-      if (layoutOf(column.type) === "varlen") this.#summaryColumns[c] = varlen++;
-    });
+    for (const column of this.columns) if (layoutOf(column.type) === "varlen") varlen++;
     this.#summaryChunks = Math.ceil(limit / MEMORY_CHUNK_ROWS);
     this.#summarySlots = varlen * this.#summaryChunks;
-    // Allocated (and charged) with the first row: an empty memtable charges nothing.
-    this.#valueMax = this.#valueSum = new Float64Array(0);
+    // Nothing is allocated for summaries until the first row: an empty memtable allocates and
+    // charges nothing for them.
     this.deltas = new Map(indexIds.map((id) => [id, new KeyDelta(this.#counter)]));
   }
 
@@ -279,34 +275,41 @@ export class Memtable {
    */
   valueSummary(column: number, chunk: number): { max: number; sum: number } | null {
     if (!this.#summarized || this.#appendedRows < this.rowCount) return null;
-    const at = this.#summaryColumns[column];
-    if (at === undefined || chunk < 0 || chunk >= this.#summaryChunks) return null;
+    if (column < 0 || column >= this.columns.length || chunk < 0 || chunk >= this.#summaryChunks)
+      return null;
+    if (this.#summarySlots === 0) return { max: 0, sum: 0 };
+    const summary = this.#summary;
+    if (summary === null) return null;
+    const at = summary.columns[column] ?? -1;
     if (at < 0) return { max: 0, sum: 0 };
     const slot = at * this.#summaryChunks + chunk;
-    return { max: this.#valueMax[slot] ?? 0, sum: this.#valueSum[slot] ?? 0 };
+    return { max: summary.max[slot] ?? 0, sum: summary.sum[slot] ?? 0 };
   }
 
   #summarize(c: number, chunkIndex: number, chunk: ColumnChunk, from: number, to: number): void {
-    const at = this.#summaryColumns[c] ?? -1;
-    if (at < 0) return;
+    const summary = this.#summary;
+    const at = summary?.columns[c] ?? -1;
+    if (summary === null || at < 0) return;
     const offsets = need(chunk.offsets);
     const slot = at * this.#summaryChunks + chunkIndex;
-    let max = this.#valueMax[slot] ?? 0,
-      sum = this.#valueSum[slot] ?? 0;
+    let max = summary.max[slot] ?? 0,
+      sum = summary.sum[slot] ?? 0;
     for (let k = from; k < to; k++) {
       const bytes = (offsets[k + 1] ?? 0) - (offsets[k] ?? 0);
       if (bytes > max) max = bytes;
       sum += bytes;
     }
-    this.#valueMax[slot] = max;
-    this.#valueSum[slot] = sum;
+    summary.max[slot] = max;
+    summary.sum[slot] = sum;
   }
 
   /** A dropped chunk's rows are gone: its summaries start again with its next append. */
   #resetSummaries(chunkIndex: number): void {
-    for (let at = 0; at * this.#summaryChunks < this.#valueMax.length; at++) {
-      this.#valueMax[at * this.#summaryChunks + chunkIndex] = 0;
-      this.#valueSum[at * this.#summaryChunks + chunkIndex] = 0;
+    const summary = this.#summary;
+    if (summary === null) return;
+    for (let at = 0; at * this.#summaryChunks < summary.max.length; at++) {
+      summary.max[at * this.#summaryChunks + chunkIndex] = 0;
+      summary.sum[at * this.#summaryChunks + chunkIndex] = 0;
     }
   }
 
@@ -423,12 +426,23 @@ export class Memtable {
   append(columns: readonly Vector[], rows: Uint16Array | null, from: number, count: number): void {
     // Rows placed without `append` (recovery sets `rowCount`) have no summaries.
     if (this.#appendedRows !== this.rowCount) this.#summarized = false;
-    if (this.#summarized && this.#summaryBytes === 0 && this.#summarySlots > 0) {
-      const bytes = 2 * this.#summarySlots * Float64Array.BYTES_PER_ELEMENT;
+    if (this.#summarized && this.#summary === null && this.#summarySlots > 0 && count > 0) {
+      // The column mapping and both buffers, charged before any of them exists.
+      const bytes =
+        this.columns.length * Int32Array.BYTES_PER_ELEMENT +
+        2 * this.#summarySlots * Float64Array.BYTES_PER_ELEMENT;
       charged(this.#counter, bytes);
       this.#summaryBytes = bytes;
-      this.#valueMax = new Float64Array(this.#summarySlots);
-      this.#valueSum = new Float64Array(this.#summarySlots);
+      const columns = new Int32Array(this.columns.length).fill(-1);
+      let varlen = 0;
+      this.columns.forEach((column, c) => {
+        if (layoutOf(column.type) === "varlen") columns[c] = varlen++;
+      });
+      this.#summary = {
+        columns,
+        max: new Float64Array(this.#summarySlots),
+        sum: new Float64Array(this.#summarySlots),
+      };
     }
     let done = 0;
     while (done < count) {
@@ -567,7 +581,7 @@ export class Memtable {
   /** Every chunk is gone (publication or teardown): so are its summaries and their charge. */
   #dropSummaries(): void {
     this.#summarized = false;
-    this.#valueMax = this.#valueSum = new Float64Array(0);
+    this.#summary = null;
     if (this.#summaryBytes > 0) {
       this.#counter.free(this.#summaryBytes);
       this.#summaryBytes = 0;

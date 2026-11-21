@@ -11988,6 +11988,7 @@ export const MEMORY_SIZING_SUMMARY_REACH = [
   "null values",
   "several varlen columns",
   "exact for one varlen column",
+  "maxima kept after later writes",
 ] as const;
 
 /** Trigger-body point lookups whose sizing work does not grow with the memtable. */

@@ -92,6 +92,30 @@ for (const seed of seedsFor("next-memory-sizing-summary", [52011, 52012]))
                 }),
               );
             if (s.nulls) reach.reach("null values");
+            // Historical summaries of the inserted rows, per memtable, stored column and chunk:
+            // later updates, deletes, a rollback and an added column may only raise them.
+            const history: Array<{
+              memtable: Memtable;
+              at: number;
+              chunk: number;
+              max: number;
+              sum: number;
+            }> = [];
+            {
+              const pinned = core.harness.path.pin();
+              try {
+                for (const segment of memorySegments(pinned, id)) {
+                  const memtable = (segment as unknown as { memtable: Memtable }).memtable;
+                  for (let chunk = 0; chunk * MEMORY_CHUNK_ROWS < segment.rowCount; chunk++)
+                    for (let at = 0; at < memtable.columns.length; at++) {
+                      const summary = memtable.valueSummary(at, chunk);
+                      if (summary !== null) history.push({ memtable, at, chunk, ...summary });
+                    }
+                }
+              } finally {
+                pinned.release();
+              }
+            }
             if (s.update) {
               // New versions: wider than any inserted value, appended to the memtable.
               await core.execute("UPDATE t SET a = $1 WHERE id % 7 = 3", [
@@ -127,6 +151,19 @@ for (const seed of seedsFor("next-memory-sizing-summary", [52011, 52012]))
                 `ALTER TABLE t ADD COLUMN c TEXT DEFAULT '${"d".repeat(s.maxWidth)}'`,
               );
               reach.reach("added column");
+            }
+            for (const recorded of history) {
+              // A released (published) memtable has no summaries left to compare.
+              const now = recorded.memtable.valueSummary(recorded.at, recorded.chunk);
+              if (now === null) continue;
+              const where = `column ${String(recorded.at)} chunk ${String(recorded.chunk)}`;
+              expect(now.max, `maximum never decreases (${where})`).toBeGreaterThanOrEqual(
+                recorded.max,
+              );
+              expect(now.sum, `sum never decreases (${where})`).toBeGreaterThanOrEqual(
+                recorded.sum,
+              );
+              if (s.update || s.remove || s.rollback) reach.reach("maxima kept after later writes");
             }
             snapshot = core.harness.path.pin();
             const table = core.harness.path.catalog.table(id);
