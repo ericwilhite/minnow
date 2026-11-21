@@ -119,6 +119,8 @@ function values(family: Family): fc.Arbitrary<TestValue[]> {
   const ints64 = fc.oneof(
     fc.bigInt({ min: -3n, max: 3n }),
     fc.bigInt({ min: 0n, max: 70_000n }),
+    // Spans past 16 bits but within 32: frame-of-reference pages four bytes wide (scan32).
+    fc.bigInt({ min: 0n, max: 4_000_000_000n }),
     fc.bigInt({ min: -(2n ** 63n), max: 2n ** 63n - 1n }),
     fc.constantFrom(2n ** 53n + 1n, -(2n ** 63n), 2n ** 63n - 1n),
   );
