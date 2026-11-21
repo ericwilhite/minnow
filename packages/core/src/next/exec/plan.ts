@@ -4,6 +4,8 @@ import { statementRuleReach } from "./statement-reach.js";
 import {
   cursorMinimum,
   runIndexAccess,
+  lookupSegments,
+  type IndexRel,
   indexTuples,
   indexMetadata,
   indexFetchTarget,
@@ -184,6 +186,7 @@ import {
   type IndexShape,
   type AdmittedIndexRead,
 } from "./key-order.js";
+import { holdsAcrossAdmission } from "./preparation.js";
 import {
   WindowOperator,
   windowMinimumBytes,
@@ -810,6 +813,11 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
   };
   const compoundCopies = new Map<number, number>();
   const indexFetchOwners = new Set<number>();
+  /** Point and range lookups whose fetch is sized over only the segments their keys name. */
+  const lookupSizing = new Map<
+    number,
+    { rel: IndexRel; keyMinimum: (runtime: QueryRuntime) => number }
+  >();
   interface IndexWorkspace {
     identity: OperatorIdentity;
     members: Array<{
@@ -1405,6 +1413,10 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           return grant;
         };
         indexFetchOwners.add(rel.id);
+        lookupSizing.set(rel.id, {
+          rel,
+          keyMinimum: (runtime) => keyMinimum(runtime.governor.capBytes, runtime),
+        });
         const fullKeys = (runtime: QueryRuntime) => {
           const width = runtime.view.index(rel.tableId, rel.indexId).def.columnIds.length;
           return rel.op === "keyLookup" && rel.keys.every((tuple) => tuple.length === width);
@@ -4354,7 +4366,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
         let ftsSourceBytes = fts.declared;
         bounds.clear();
         for (const source of sources) {
-          const bound = yield* readValue(
+          const sizeMain = (segments?: Uint32Array) =>
             boundSource(
               runtime.sourceView(),
               {
@@ -4365,6 +4377,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                   ? { retain: false }
                   : {}),
                 rows: demand.get(source.id) ?? null,
+                ...(segments === undefined ? {} : { segments }),
               },
               runtime.governor,
               runtime.signal,
@@ -4379,8 +4392,26 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                   !(runtime.request.outputBuffers && source.windowBytes > 0),
                 sources,
               ),
-            ),
-          );
+            );
+          // A lookup's keys name its segments. The list and the sizing that follows are
+          // preparation admissions: one that would wait while the list is held releases the whole
+          // attempt and prepares again with a credit covering both (exec/preparation.ts). Without
+          // the facade (a native body's prepaid shares) the source is sized whole.
+          let bound: ReadBound;
+          const lookup = lookupSizing.get(source.id);
+          const found =
+            lookup === undefined || !holdsAcrossAdmission(runtime.governor)
+              ? null
+              : yield* readValue(
+                  lookupSegments(runtime, plan, lookup.rel, lookup.keyMinimum(runtime)),
+                );
+          if (found !== null)
+            try {
+              bound = yield* readValue(sizeMain(found.segments));
+            } finally {
+              found.release();
+            }
+          else bound = yield* readValue(sizeMain());
           bounds.set(source.id, bound);
           if (bound.batchRows === 1) {
             if (boundedColumns === null) {
@@ -4717,8 +4748,9 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
         // (its own released scratch grant, a fresh plan on this pinned view): only the
         // segments it names are sized. A larger or unbounded window sizes the whole source.
         // The window's own scratch must fit the cap: it may never refuse a query that whole-
-        // source sizing admits.
+        // source sizing admits. Only the preparation facade may hold the list across sizing.
         const sizingPlan =
+          holdsAcrossAdmission(runtime.governor) &&
           resident === null &&
           bounds.limit !== null &&
           bounds.limit <= BATCH_ROWS &&
