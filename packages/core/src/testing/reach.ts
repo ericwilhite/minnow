@@ -12017,6 +12017,57 @@ export const LIFETIME_HOLDINGS_REACH = [
   "exact after publication",
 ] as const;
 
+/** Memtable sizing summaries against one-row hints (write/memtable.ts valueSummary). */
+export const MEMORY_SIZING_SUMMARY_REACH = [
+  "several chunks",
+  "updated rows",
+  "deleted rows",
+  "rolled back rows",
+  "published chunk",
+  "added column",
+  "null values",
+  "several varlen columns",
+  "exact for one varlen column",
+  "maxima kept after later writes",
+] as const;
+
+/** Trigger-body point lookups whose sizing work does not grow with the memtable. */
+export const MEMORY_SIZING_WORK_REACH = [
+  "100-row memtable",
+  "1,000-row memtable",
+  "20,000-row memtable",
+  "summaries read",
+] as const;
+
+/** Commit encoding linear in the undo log (write/stream-body.ts effects). */
+export const COMMIT_EFFECTS_LINEAR_REACH = [
+  "streamed commit",
+  "root then body inserts",
+  "root then body deletes",
+  "several thousand undo entries",
+] as const;
+
+/** Native writes under the writer floors, against PostgreSQL (writer floors steps 2-3), unit lane. */
+export const NATIVE_WRITE_FLOORS_REACH = [
+  "native insert",
+  "native update",
+  "native delete",
+  "wide rows",
+  "published before update and delete",
+  "PG exact rows",
+] as const;
+
+/** The same histories at 20,000 rows, conformance lane (MINNOW_NATIVE_WRITE_LARGE=1). */
+export const NATIVE_WRITE_FLOORS_LARGE_REACH = [
+  "large native insert",
+  "native insert",
+  "native update",
+  "native delete",
+  "wide rows",
+  "published before update and delete",
+  "PG exact rows",
+] as const;
+
 /** A native step's minimum at the capacity boundary (writer floors, review of #34). */
 export const NATIVE_MINIMUM_BOUNDARY_REACH = [
   "live row allocations",

@@ -9,6 +9,8 @@ import {
   type MemoryReadContext,
   type MemoryReadHint,
   type MemoryReadRequest,
+  type MemoryReadSummary,
+  type MemorySummaryRequest,
   type MemoryOutputNeed,
 } from "../access/snapshot.js";
 import type { SpaceReader } from "../access/space.js";
@@ -48,6 +50,9 @@ export interface MemoryReadSource {
   /** A recovered staged group's physical membership is known only after its root is read. */
   publishedMissing?(columnId: number): FlatVector;
   publishedRoot(): BlobRef;
+  /** The memtable's sizing summary of a stored column in a chunk (write/memtable.ts
+   * `valueSummary`), or null without one (including a column the memtable does not store). */
+  summary?(columnId: number, chunk: number): { max: number; sum: number } | null;
   /** Explicit source recipe, independently owned by the query, keeps this chunk resident. */
   retained?(chunk: number): boolean;
   check(): void;
@@ -105,6 +110,25 @@ export class MemoryReads {
   hint(request: MemoryReadRequest, context: MemoryReadContext): MaybePromise<MemoryReadHint> {
     this.#validate(request);
     return this.#during(context, (ctx, check) => this.#hint(request, ctx, check));
+  }
+  /** One-row sizing of a run of rows from the memtable's summaries (`MemorySegment.readSummary`). */
+  summary(
+    request: MemorySummaryRequest,
+    context: MemoryReadContext,
+  ): MaybePromise<MemoryReadSummary | null> {
+    this.source.check();
+    const available = this.source.rowCount - request.chunk * MEMORY_CHUNK_ROWS;
+    if (
+      !Number.isSafeInteger(request.chunk) ||
+      request.chunk < 0 ||
+      !(available > 0) ||
+      !Number.isInteger(request.rows) ||
+      request.rows < 1 ||
+      request.rows > available
+    )
+      throw new RangeError("Invalid memory summary rows");
+    if (this.source.summary === undefined) return null;
+    return this.#during(context, (ctx, check) => this.#summary(request, ctx, check));
   }
   chunk(
     columnId: number,
@@ -298,6 +322,101 @@ export class MemoryReads {
     if (vector === null) return false;
     for (let row = 0; row < rows; row++) each(row, memoryValueBytes(vector, r.startRow + row));
     return true;
+  }
+
+  /**
+   * What the one-row hints of a run of rows would report, from the summaries: a row's output is its
+   * value bytes plus fixed per-column terms (as in `#hint` with one row), so the largest is at most
+   * the sum of each column's largest value over the run's chunks, and the total is the summed values
+   * plus the fixed terms per row. Reader terms are those of a one-row hint (a retained chunk's
+   * smaller terms only when every chunk of the run is retained); a published run's format envelope
+   * comes from its page directories over the whole run, which covers every row's pages. Cost: the
+   * columns times the run's chunks (at most a memtable's 32), never its rows.
+   */
+  *#summary(
+    input: MemorySummaryRequest,
+    context: MemoryReadContext,
+    check: () => void,
+  ): Generator<Promise<unknown>, MemoryReadSummary | null, unknown> {
+    const firstChunk = input.chunk,
+      endChunk = firstChunk + Math.ceil(input.rows / MEMORY_CHUNK_ROWS);
+    let retained = true;
+    for (let chunk = firstChunk; chunk < endChunk; chunk++)
+      if (this.source.retained?.(chunk) !== true) retained = false;
+    // The same charge as one one-row hint.
+    const charge = (retained ? 4096 : WORK) + 8 + 256 + input.columns.length * 256;
+    if (!context.budget.allocate(charge)) throw new PageBudgetError(charge);
+    try {
+      const columns = [...input.columns];
+      const seen = new Set<number>();
+      let gzip = 0,
+        fixedBytes = 0,
+        largest = 0,
+        values = 0;
+      for (const id of columns) {
+        yield* pause(check);
+        const type = this.source.column(id)?.type;
+        if (seen.has(id) || type === undefined) throw new RangeError("Invalid memory read columns");
+        seen.add(id);
+        fixedBytes += memoryOutputBytes(memoryOutputLayout(type), 1, 0) - 4;
+        const missing = this.source.missing?.(id);
+        if (missing) {
+          const bytes = memoryValueBytes(missing, 0);
+          largest += bytes;
+          values += bytes * input.rows;
+          continue;
+        }
+        let published = false;
+        let max = 0;
+        for (let chunk = firstChunk; chunk < endChunk; chunk++) {
+          if (layoutOf(type) === "varlen") {
+            const summary = this.source.summary?.(id, chunk) ?? null;
+            if (summary === null) return null;
+            max = Math.max(max, summary.max);
+            values += summary.sum;
+          }
+          if (this.source.resident(id, chunk) === null) published = true;
+        }
+        largest += max;
+        if (!published) continue;
+        // Published: the format envelope of every page the run's rows occupy.
+        const first = firstChunk * MEMORY_CHUNK_ROWS;
+        const envelope = yield* this.#withReader(id, context, check, function* (reader) {
+          yield* pause(check);
+          if ("missing" in reader) return { gzip: 0, bytes: memoryValueBytes(reader.missing, 0) };
+          const [a, b] = reader.pagesInRange(first, first + input.rows);
+          const dictionary =
+            reader.directory.dictionary !== null &&
+            (reader.directory.dictionary.encoding & PageEncoding.gzip) !== 0
+              ? GZIP_MAX_PAGE_BYTES - MAX_BLOB_BYTES
+              : 0;
+          for (let k = a; k < b; k++)
+            if (((reader.directory.pages[k]?.encoding ?? 0) & PageEncoding.gzip) !== 0)
+              return { gzip: dictionary + GZIP_MAX_PAGE_BYTES - MAX_BLOB_BYTES, bytes: 0 };
+          return { gzip: dictionary, bytes: 0 };
+        });
+        gzip = Math.max(gzip, envelope.gzip);
+        // A group that lacks the column reads the catalog scalar for every row.
+        largest += envelope.bytes;
+        values += envelope.bytes * input.rows;
+      }
+      // One row: value bytes, then per column its fixed lanes, offsets and one validity word.
+      const perRow = fixedBytes + columns.length * 4;
+      const rowBytes = largest + perRow,
+        totalBytes = values + input.rows * perRow;
+      if (!Number.isSafeInteger(rowBytes) || !Number.isSafeInteger(totalBytes))
+        throw new RangeError("Memory read size exceeds safe accounting units");
+      return Object.freeze({
+        rowBytes,
+        totalBytes,
+        residentBytes: retained ? 0 : MEMORY_READ_RESIDENT_BYTES + gzip,
+        scratchBytes:
+          1024 + (retained ? 4096 : WORK + DECODER_SCRATCH) + 8 + 256 + columns.length * 256,
+        ioBytes: retained ? 0 : MAX_READ_BYTES,
+      });
+    } finally {
+      context.budget.free(charge);
+    }
   }
 
   *#hint(

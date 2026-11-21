@@ -136,6 +136,12 @@ class SelectedMemory implements MemorySegment {
   readHint(...args: Parameters<MemorySegment["readHint"]>) {
     return this.source.readHint(...args);
   }
+  readSummary(
+    request: Parameters<NonNullable<MemorySegment["readSummary"]>>[0],
+    context: Parameters<NonNullable<MemorySegment["readSummary"]>>[1],
+  ) {
+    return this.source.readSummary?.(request, context) ?? null;
+  }
   deletions() {
     return this.mask;
   }

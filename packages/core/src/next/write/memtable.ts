@@ -34,6 +34,7 @@ import type { SpacePin } from "../access/space.js";
 import type { GroupRef, GroupRoot, RunRef } from "../format/manifest.js";
 import type { Vector } from "../vector/vector.js";
 import { ColumnChunk, MEMORY_CHUNK_ROWS } from "./columns.js";
+import { layoutOf } from "../types.js";
 import { KeyDelta } from "./key-hash.js";
 import { charged, UNCHARGED, type Charge } from "./bytes.js";
 import { need } from "./bytes.js";
@@ -211,6 +212,24 @@ export class Memtable {
   storedRows = 0;
   readonly #counter: Counter;
   #ownedColumnBytes = 0;
+  /**
+   * Sizing summaries for one-row reads (page/read-bounds.ts): per varlen column and chunk, the
+   * largest and the summed value bytes (write/memory-output.ts memoryValueBytes) of every row ever
+   * appended to that chunk, at `[column × chunks + chunk]`. Appends only raise them. A rollback that
+   * keeps a chunk keeps them: its dropped rows were appended, so the summary still covers every row
+   * the chunk holds. Only a dropped chunk resets them: a rollback past it, or publication
+   * (`release`), which drops every chunk and frees the summaries with the rows, so re-pointed
+   * readers size row by row. Rows that did not arrive through `append` (a recovered staged group)
+   * leave the memtable without summaries (`valueSummary` answers null).
+   */
+  /** Column → summary index, maxima and sums; allocated (and charged) with the first row. */
+  #summary: { columns: Int32Array; max: Float64Array; sum: Float64Array } | null = null;
+  readonly #summaryChunks: number;
+  readonly #summarySlots: number;
+  #summaryBytes = 0;
+  /** Rows `0 … #appendedRows − 1` all arrived through `append` (or none did, when it is 0). */
+  #appendedRows = 0;
+  #summarized = true;
   /** Readers borrowing each chunk index (memory segments: one chunk at a time each). */
   readonly #borrows = new Map<number, number>();
   /** Chunks released while borrowed: charged until their last borrow ends. */
@@ -239,7 +258,59 @@ export class Memtable {
       this.columns = [...columns];
     } else this.columns = columns;
     this.chunks = this.columns.map(() => []);
+    let varlen = 0;
+    for (const column of this.columns) if (layoutOf(column.type) === "varlen") varlen++;
+    this.#summaryChunks = Math.ceil(limit / MEMORY_CHUNK_ROWS);
+    this.#summarySlots = varlen * this.#summaryChunks;
+    // Nothing is allocated for summaries until the first row: an empty memtable allocates and
+    // charges nothing for them.
     this.deltas = new Map(indexIds.map((id) => [id, new KeyDelta(this.#counter)]));
+  }
+
+  /**
+   * The sizing summary of stored column `column` (index into `columns`) in chunk `chunk`: an upper
+   * bound on the value bytes of any one row (`max`) and of all its rows together (`sum`), or null
+   * when this memtable has none (rows that did not arrive through `append`). Fixed-width columns
+   * have no value bytes.
+   */
+  valueSummary(column: number, chunk: number): { max: number; sum: number } | null {
+    if (!this.#summarized || this.#appendedRows < this.rowCount) return null;
+    if (column < 0 || column >= this.columns.length || chunk < 0 || chunk >= this.#summaryChunks)
+      return null;
+    if (this.#summarySlots === 0) return { max: 0, sum: 0 };
+    const summary = this.#summary;
+    if (summary === null) return null;
+    const at = summary.columns[column] ?? -1;
+    if (at < 0) return { max: 0, sum: 0 };
+    const slot = at * this.#summaryChunks + chunk;
+    return { max: summary.max[slot] ?? 0, sum: summary.sum[slot] ?? 0 };
+  }
+
+  #summarize(c: number, chunkIndex: number, chunk: ColumnChunk, from: number, to: number): void {
+    const summary = this.#summary;
+    const at = summary?.columns[c] ?? -1;
+    if (summary === null || at < 0) return;
+    const offsets = need(chunk.offsets);
+    const slot = at * this.#summaryChunks + chunkIndex;
+    let max = summary.max[slot] ?? 0,
+      sum = summary.sum[slot] ?? 0;
+    for (let k = from; k < to; k++) {
+      const bytes = (offsets[k + 1] ?? 0) - (offsets[k] ?? 0);
+      if (bytes > max) max = bytes;
+      sum += bytes;
+    }
+    summary.max[slot] = max;
+    summary.sum[slot] = sum;
+  }
+
+  /** A dropped chunk's rows are gone: its summaries start again with its next append. */
+  #resetSummaries(chunkIndex: number): void {
+    const summary = this.#summary;
+    if (summary === null) return;
+    for (let at = 0; at * this.#summaryChunks < summary.max.length; at++) {
+      summary.max[at * this.#summaryChunks + chunkIndex] = 0;
+      summary.sum[at * this.#summaryChunks + chunkIndex] = 0;
+    }
   }
 
   #releaseChunk(chunk: ColumnChunk): void {
@@ -353,6 +424,26 @@ export class Memtable {
    * physical rows `from …`. The caller has checked capacity. Positions `rowCount …` are theirs.
    */
   append(columns: readonly Vector[], rows: Uint16Array | null, from: number, count: number): void {
+    // Rows placed without `append` (recovery sets `rowCount`) have no summaries.
+    if (this.#appendedRows !== this.rowCount) this.#summarized = false;
+    if (this.#summarized && this.#summary === null && this.#summarySlots > 0 && count > 0) {
+      // The column mapping and both buffers, charged before any of them exists.
+      const bytes =
+        this.columns.length * Int32Array.BYTES_PER_ELEMENT +
+        2 * this.#summarySlots * Float64Array.BYTES_PER_ELEMENT;
+      charged(this.#counter, bytes);
+      this.#summaryBytes = bytes;
+      const columns = new Int32Array(this.columns.length).fill(-1);
+      let varlen = 0;
+      this.columns.forEach((column, c) => {
+        if (layoutOf(column.type) === "varlen") columns[c] = varlen++;
+      });
+      this.#summary = {
+        columns,
+        max: new Float64Array(this.#summarySlots),
+        sum: new Float64Array(this.#summarySlots),
+      };
+    }
     let done = 0;
     while (done < count) {
       const chunkIndex = Math.floor(this.rowCount / MEMORY_CHUNK_ROWS);
@@ -367,9 +458,12 @@ export class Memtable {
         }
         const vector = columns[c];
         if (vector === undefined) throw new RangeError("A batch lacks a column");
+        const before = chunk.length;
         chunk.append(vector, rows, from + done, from + done + take);
+        this.#summarize(c, chunkIndex, chunk, before, chunk.length);
       });
       this.rowCount += take;
+      this.#appendedRows = this.rowCount;
       done += take;
     }
   }
@@ -449,6 +543,7 @@ export class Memtable {
       const stored = this.chunks.map((list) => need(list[chunk]));
       if (this.#borrows.has(chunk)) this.#holdBorrowed(chunk, stored);
       else for (const column of stored) this.#releaseChunk(column);
+      this.#resetSummaries(chunk);
     }
     for (const list of this.chunks) {
       list.length = Math.min(list.length, keepChunks);
@@ -456,6 +551,7 @@ export class Memtable {
       if (last !== undefined) last.truncate(rowCount - (keepChunks - 1) * MEMORY_CHUNK_ROWS);
     }
     this.rowCount = rowCount;
+    if (this.#appendedRows > rowCount) this.#appendedRows = rowCount;
   }
 
   /** Deleted positions under `bound` within `[0, rows)`. */
@@ -479,6 +575,17 @@ export class Memtable {
       else for (const column of stored) this.#releaseChunk(column);
     }
     this.chunks = this.columns.map(() => []);
+    this.#dropSummaries();
+  }
+
+  /** Every chunk is gone (publication or teardown): so are its summaries and their charge. */
+  #dropSummaries(): void {
+    this.#summarized = false;
+    this.#summary = null;
+    if (this.#summaryBytes > 0) {
+      this.#counter.free(this.#summaryBytes);
+      this.#summaryBytes = 0;
+    }
   }
 
   /** Frees the key deltas once no reader older than the publication remains. */
@@ -502,6 +609,7 @@ export class Memtable {
       this.#counter.free(this.#ownedColumnBytes);
       this.#ownedColumnBytes = 0;
     }
+    this.#dropSummaries();
   }
 
   deltasDropped = false;

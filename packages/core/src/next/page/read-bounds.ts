@@ -53,6 +53,25 @@ interface Snapshot {
             readonly scratchBytes: number;
             readonly ioBytes: number;
           }>;
+          /** Structural subset of access/MemorySegment.readSummary (one-row sizing of a chunk). */
+          readSummary?: (
+            request: {
+              readonly columns: readonly number[];
+              readonly chunk: number;
+              readonly rows: number;
+            },
+            context: {
+              readonly budget: ByteBudget;
+              readonly pages: SpaceReader;
+              readonly signal: AbortSignal;
+            },
+          ) => MaybePromise<{
+            readonly rowBytes: number;
+            readonly totalBytes: number;
+            readonly residentBytes: number;
+            readonly scratchBytes: number;
+            readonly ioBytes: number;
+          } | null>;
         }
       | {
           readonly kind: "group";
@@ -280,7 +299,26 @@ export function boundSource(
               resident = 0,
               scratch = 0;
             try {
-              for (let first = 0; first < rows; first += BATCH_ROWS) {
+              // One-row sizing reads one summary of every sized row instead of one hint per
+              // row: the same terms, as upper bounds, at a cost independent of the rows.
+              const summary =
+                source.batchRows === 1 && segment.readSummary !== undefined
+                  ? yield* readValue(
+                      segment.readSummary(
+                        { columns: source.columns, chunk: 0, rows },
+                        { budget, pages: sizingPages, signal },
+                      ),
+                    )
+                  : null;
+              if (summary !== null) {
+                totalOutput += Math.min(summary.totalBytes, Math.max(0, target - totalOutput));
+                largestOutput = Math.max(largestOutput, summary.rowBytes);
+                resident = Math.max(resident, summary.residentBytes);
+                scratch = Math.max(scratch, summary.scratchBytes);
+                io = Math.max(io, summary.ioBytes);
+                valueBytes = Math.max(valueBytes, summary.rowBytes);
+              }
+              for (let first = 0; summary === null && first < rows; first += BATCH_ROWS) {
                 const end = Math.min(BATCH_ROWS, rows - first);
                 for (let start = 0; start < end;) {
                   const hint = yield* readValue(
