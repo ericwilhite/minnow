@@ -27,7 +27,7 @@ import {
   tableInput,
 } from "../write/test-support.js";
 import type { WritePathImpl } from "../write/engine.js";
-import { Governor } from "./governor.js";
+import { Governor } from "../memory/governor.js";
 
 const PENDING = Symbol("pending");
 const settleWithin = <T>(work: Promise<T>, ms: number) =>

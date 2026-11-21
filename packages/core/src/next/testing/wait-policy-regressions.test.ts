@@ -7,7 +7,7 @@ import {
   GrowthObserverReentryError,
   MemoryAdmissionError,
   type Grant,
-} from "./governor.js";
+} from "../memory/governor.js";
 import { WriteCredits } from "../write/credits.js";
 
 const tick = () =>

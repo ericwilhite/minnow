@@ -11,7 +11,7 @@ import {
   locators,
   tableInput,
 } from "../write/test-support.js";
-import { Governor } from "./governor.js";
+import { Governor } from "../memory/governor.js";
 
 const settleWithin = <T>(work: Promise<T>, ms: number) =>
   Promise.race([
