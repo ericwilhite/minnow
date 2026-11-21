@@ -304,6 +304,30 @@ export interface MemoryReadHint {
   readonly token: object;
 }
 
+/** One-row sizing of a run of rows (`MemorySegment.readSummary`). */
+export interface MemorySummaryRequest {
+  readonly columns: readonly number[];
+  /** The first chunk of the run. */
+  readonly chunk: number;
+  /** Rows the caller sizes, from the chunk's first row on; they may span later chunks. */
+  readonly rows: number;
+}
+
+/**
+ * Upper bounds on what one-row `readHint`s over a run of rows would report, without visiting a
+ * row. Read from the memtable's sizing summaries (write/memtable.ts `valueSummary`).
+ */
+export interface MemoryReadSummary {
+  /** At least the largest one-row `outputBytes` of the run. */
+  readonly rowBytes: number;
+  /** At least the sum of the one-row `outputBytes` of the sized rows. */
+  readonly totalBytes: number;
+  /** At least every reader term of a one-row hint of the run. */
+  readonly residentBytes: number;
+  readonly scratchBytes: number;
+  readonly ioBytes: number;
+}
+
 export interface MemoryChunkStep {
   readonly hint: MemoryReadHint;
   readonly context: MemoryReadContext;
@@ -346,6 +370,15 @@ export interface MemorySegment extends SegmentBase {
    * identical requests keep their prefix and may only shrink byte bounds. No sizing borrow.
    */
   readHint(request: MemoryReadRequest, context: MemoryReadContext): MaybePromise<MemoryReadHint>;
+  /**
+   * One-row sizing of a run of rows in one step: bounds at least as large as the one-row
+   * `readHint`s of its rows would give, or null when this segment cannot summarize (callers then
+   * size row by row). Optional: alternate readers size row by row.
+   */
+  readSummary?(
+    request: MemorySummaryRequest,
+    context: MemoryReadContext,
+  ): MaybePromise<MemoryReadSummary | null>;
   /**
    * Rows of chunk `chunk` (rows `chunk × MEMORY_CHUNK_ROWS …`, at most `rowCount`) of `columnId`,
    * in its exact physical type, from chunk-relative row `startRow` (default 0) on.

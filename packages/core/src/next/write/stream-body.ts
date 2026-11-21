@@ -79,7 +79,12 @@ type Effect =
     }
   | { kind: "catalog"; change: LoggedChange };
 
-/** No transaction-sized effect/column/deletion copy. Catalog boundaries preserve the old order. */
+/**
+ * No transaction-sized effect/column/deletion copy. Catalog boundaries preserve the old order.
+ * Linear in the undo log apart from one forward pass per distinct memtable or table: whether a
+ * memtable or table was already emitted in a segment is a set lookup, not a rescan of the entries
+ * before it (a trigger statement logs one entry per body row, so a rescan made commit quadratic).
+ */
 async function* effects(
   tx: TransactionImpl,
   staged: (tableId: number) => PublishedRows | null,
@@ -92,23 +97,18 @@ async function* effects(
       if ((end & 1023) === 0) await pause(check);
       end++;
     }
+    // Memtables whose rows this segment already emitted (their first entry emits them all).
+    const emitted = new Set<Memtable>();
     for (let i = start; i < end; i++) {
       if ((i & 1023) === 0) await pause(check);
       const entry = need(undo[i]);
       if (entry.kind !== "rows") continue;
-      let seen = false;
-      for (let k = start; k < i; k++) {
-        if ((k & 1023) === 0) await pause(check);
-        const previous = need(undo[k]);
-        if (previous.kind === "rows" && previous.memtable === entry.memtable) {
-          seen = true;
-          break;
-        }
-      }
-      if (seen) continue;
+      if (emitted.has(entry.memtable)) continue;
+      emitted.add(entry.memtable);
       const memtable = entry.memtable;
       if (memtable.staged !== null) {
         if (memtable.rowCount === 0) continue;
+        let seen = false;
         for (let k = 0; k < i; k++) {
           if ((k & 1023) === 0) await pause(check);
           const previous = need(undo[k]);
@@ -137,20 +137,14 @@ async function* effects(
         from += count;
       }
     }
+    // Tables whose deletes this segment already emitted (their first delete emits them all).
+    const deleted = new Set<number>();
     for (let i = start; i < end; i++) {
       if ((i & 1023) === 0) await pause(check);
       const entry = need(undo[i]);
       if (!isDelete(entry)) continue;
-      let seen = false;
-      for (let k = start; k < i; k++) {
-        if ((k & 1023) === 0) await pause(check);
-        const previous = need(undo[k]);
-        if (isDelete(previous) && previous.tableId === entry.tableId) {
-          seen = true;
-          break;
-        }
-      }
-      if (seen) continue;
+      if (deleted.has(entry.tableId)) continue;
+      deleted.add(entry.tableId);
       let count = 0;
       for (let k = start; k < end; k++) {
         if ((k & 1023) === 0) await pause(check);
