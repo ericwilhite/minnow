@@ -326,15 +326,13 @@ it("never waits for memory while holding the lookup's segment list (FIFO repro)"
     return { ...prepared, execute: (request) => prepared.execute({ ...request, governor }) };
   });
   const queued: { competitor: Promise<Grant> | null } = { competitor: null };
-  // The point lookup's list holds 2048 locators' bound: 4 bytes each.
-  const listBytes = 2048 * Uint32Array.BYTES_PER_ELEMENT;
   const tryAdmit = governor.tryAdmit.bind(governor);
   const spy = vi.spyOn(governor, "tryAdmit").mockImplementation((options) => {
     if (queued.competitor === null && options.label.startsWith("read-step/"))
       queued.competitor = governor.admit({
         label: "list-blocked competitor",
-        // Fits exactly once the list is released.
-        minimumBytes: governor.capBytes - governor.reserveBytes - (governor.usedBytes - listBytes),
+        // Fits only once the query holds nothing (its list and any source recipe).
+        minimumBytes: governor.capBytes - governor.reserveBytes,
         spillable: false,
       });
     return tryAdmit(options);

@@ -1414,7 +1414,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
         indexFetchOwners.add(rel.id);
         lookupSizing.set(rel.id, {
           rel,
-          keyMinimum: (runtime) => keyMinimum(runtime.request.governor.capBytes, runtime),
+          keyMinimum: (runtime) => keyMinimum(runtime.governor.capBytes, runtime),
         });
         const fullKeys = (runtime: QueryRuntime) => {
           const width = runtime.view.index(rel.tableId, rel.indexId).def.columnIds.length;
@@ -4376,7 +4376,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                   ? { retain: false }
                   : {}),
                 rows: demand.get(source.id) ?? null,
-                ...(segments === undefined ? {} : { segments, noWait: true as const }),
+                ...(segments === undefined ? {} : { segments }),
               },
               runtime.governor,
               runtime.signal,
@@ -4392,9 +4392,10 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                 sources,
               ),
             );
-          // A lookup's keys name its segments (read while holding nothing). While that list is
-          // held, sizing never waits: a refusal releases it and the whole source is sized.
-          let bound: ReadBound | null = null;
+          // A lookup's keys name its segments. The list and the sizing that follows are
+          // preparation admissions: one that would wait while the list is held releases the whole
+          // attempt and prepares again with a credit covering both (exec/preparation.ts).
+          let bound: ReadBound;
           const lookup = lookupSizing.get(source.id);
           const found =
             lookup === undefined
@@ -4405,12 +4406,10 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           if (found !== null)
             try {
               bound = yield* readValue(sizeMain(found.segments));
-            } catch (error) {
-              if (!(error instanceof SizingWouldWait)) throw error;
             } finally {
               found.release();
             }
-          bound ??= yield* readValue(sizeMain());
+          else bound = yield* readValue(sizeMain());
           bounds.set(source.id, bound);
           if (bound.batchRows === 1) {
             if (boundedColumns === null) {

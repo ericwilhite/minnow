@@ -1821,8 +1821,9 @@ The selected-row fetch is sized over only the groups the lookup's keys name. Bef
 sizing binds the parameters and encodes the same keys on its own scratch grant
 (`index-lookup/sizing`: twice the key minimum plus 8 bytes per locator), probes the same pinned
 view, and charges the distinct segment list (`index-lookup/segments`, 4 bytes per locator). The
-scratch is released before sizing continues. While the list is held, sizing only tries its
-admissions; if one would wait, the list is released and the whole source is sized normally. More
+scratch is released before sizing continues. The list and that sizing are preparation admissions
+(see Memory): one that would wait while the list is held releases the whole attempt, which
+prepares again with a credit covering both, so sizing never waits holding the list. More
 than 2048 locators, a scratch the cap cannot hold, or keys that fail to bind or encode all size
 the whole source: execution raises any key error in its usual order, and nothing is refused below
 the cap. A sized lookup opens a sizing cursor per probed key before its execution cursors; each

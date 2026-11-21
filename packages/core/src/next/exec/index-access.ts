@@ -118,7 +118,8 @@ async function readLookup(
   keyMinimum: number,
   bound: number,
 ): Promise<WindowSegments | null> {
-  const { governor } = runtime.request,
+  // A preparation admission (exec/preparation.ts): it never waits while the query holds memory.
+  const { governor } = runtime,
     signal = runtime.signal;
   // One spare slot shows that the bound was exceeded.
   const locatorBytes = (bound + 1) * Float64Array.BYTES_PER_ELEMENT,
