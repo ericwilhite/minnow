@@ -7,7 +7,11 @@ import {
   claimManifest,
   formatIdentity,
   holm,
+  imageAaCells,
   imageFacts,
+  imageMode,
+  writerFingerprint,
+  IMAGE_REPLICATES,
   manifestDigest,
   report,
   signTestP,
@@ -113,11 +117,13 @@ const manifest: ClaimManifest = {
   ],
 };
 const IMAGE = { digest: "c".repeat(64), bytes: 1000 };
+const FORMAT = { registry: "f".repeat(64), writer: "9".repeat(64) };
 const SHARED: ClaimImages = {
   mode: "shared",
-  formats: { control: "f".repeat(64), candidate: "f".repeat(64) },
+  formats: { control: FORMAT, candidate: FORMAT },
   control: IMAGE,
   candidate: IMAGE,
+  candidateOpened: true,
 };
 const shard = (
   dataset: "W1M" | "S1",
@@ -291,75 +297,214 @@ describe("next/ claim report", () => {
 // Two captures of the same rows differ in physical layout (the writer's flush and merge timing);
 // an A/A on one image cannot see that, so the arms must share an image or run an image A/A.
 describe("next/ claim fixture images", () => {
-  const separate = (replicate = true): ClaimImages => ({
+  const OTHER = { registry: FORMAT.registry, writer: "8".repeat(64) };
+  const separate = (replicates = IMAGE_REPLICATES): ClaimImages => ({
     mode: "separate",
-    formats: { control: "f".repeat(64), candidate: "e".repeat(64) },
+    formats: { control: FORMAT, candidate: OTHER },
     control: IMAGE,
     candidate: { digest: "d".repeat(64), bytes: 1001 },
-    ...(replicate ? { replicate: { digest: "a".repeat(64), bytes: 999 } } : {}),
+    replicates: Array.from({ length: replicates }, (_, i) => ({
+      digest: String(i).repeat(64),
+      bytes: 999 + i,
+    })),
   });
+  /** Each replicate's image A/A over the given cells. */
+  const onReplicates = (records: CellRecord[]): CellRecord[] =>
+    Array.from({ length: IMAGE_REPLICATES }, (_, i) =>
+      records.map((r) => ({ ...r, replicate: i + 1 })),
+    ).flat();
+  // What every complete() shard needs: its controls, plus W1M shard 0's target t (a gain).
+  const covered = (r: ClaimResult): CellRecord[] =>
+    onReplicates(
+      r.dataset === "S1"
+        ? [neutral("qa")]
+        : r.shard === "0/2"
+          ? [neutral("aa"), neutral("t")]
+          : [neutral("aa")],
+    );
   const withImages = (
-    images: ClaimImages | undefined,
-    imageAa: (dataset: "W1M" | "S1") => CellRecord[] | undefined,
+    images: ((r: ClaimResult) => unknown) | unknown,
+    imageAa: (r: ClaimResult) => CellRecord[] | undefined,
+    results = complete(),
   ) =>
-    complete().map((r) => {
-      const aa = imageAa(r.dataset);
+    results.map((r) => {
+      const aa = imageAa(r);
+      const chosen =
+        typeof images === "function" ? (images as (r: ClaimResult) => unknown)(r) : images;
       const rest = Object.fromEntries(Object.entries(r).filter(([key]) => key !== "images"));
       return {
         ...rest,
-        ...(images === undefined ? {} : { images }),
+        ...(chosen === undefined ? {} : { images: chosen }),
         ...(aa === undefined ? {} : { imageAa: aa }),
       } as ClaimResult;
     });
+  const none = () => undefined;
 
   it("gives verdicts when both arms restored one image, and says so", () => {
     const text = report(complete(), manifest);
     expect(text).toContain("**gain**");
     expect(text).toContain("one image restored in both arms");
+    expect(text).toContain("opened by the candidate without durable writes");
+  });
+
+  it("shares an image only when the registry and the writer both match", () => {
+    expect(imageMode("auto", { control: FORMAT, candidate: FORMAT })).toBe("shared");
+    expect(imageMode("separate", { control: FORMAT, candidate: FORMAT })).toBe("separate");
+    expect(imageMode("auto", { control: FORMAT, candidate: OTHER })).toBe("separate");
+    const registry = { ...FORMAT, registry: "e".repeat(64) };
+    expect(imageMode("auto", { control: FORMAT, candidate: registry })).toBe("separate");
+    const unknown = { registry: null, writer: null };
+    expect(imageMode("auto", { control: unknown, candidate: unknown })).toBe("separate");
   });
 
   it("refuses arms that restored different images without an image A/A", () => {
-    const shared = withImages(
-      { ...SHARED, candidate: { digest: "d".repeat(64), bytes: 1 } },
-      () => undefined,
-    );
+    const shared = withImages({ ...SHARED, candidate: { digest: "d".repeat(64), bytes: 1 } }, none);
     const text = report(shared, manifest);
     expect(text).toContain("INCOMPLETE");
     expect(text).toContain("shared mode restored two images");
     expect(text).not.toContain("**gain**");
-    const noReplicate = report(
-      withImages(separate(false), () => undefined),
-      manifest,
-    );
+    const noReplicate = report(withImages(separate(0), none), manifest);
     expect(noReplicate).toContain("without an image A/A");
     expect(noReplicate).not.toContain("**gain**");
+    const oneReplicate = report(withImages(separate(1), covered), manifest);
+    expect(oneReplicate).toContain("1 of 2 replicate captures");
+    expect(oneReplicate).not.toContain("**gain**");
   });
 
   it("refuses a run that reported no images", () => {
-    const text = report(
-      withImages(undefined, () => undefined),
-      manifest,
-    );
+    const text = report(withImages(undefined, none), manifest);
     expect(text).toContain("reported no images");
     expect(text).not.toContain("**gain**");
   });
 
-  it("needs the image A/A on every control cell, and voids the run when it flags", () => {
-    const controls = (d: "W1M" | "S1") => [neutral(d === "W1M" ? "aa" : "qa")];
-    const ok = report(withImages(separate(), controls), manifest);
-    expect(ok).toContain("**gain**");
-    expect(ok).toContain("image A/A");
-    const missing = report(
-      withImages(separate(), () => []),
+  // Each record below is wrong in one way; every one leaves the run without verdicts.
+  const inconsistent: Array<[string, unknown, string]> = [
+    [
+      "a missing format identity",
+      { ...SHARED, formats: { control: FORMAT, candidate: { ...FORMAT, writer: null } } },
+      "shared mode without the candidate writer identity",
+    ],
+    [
+      "missing format facts",
+      { ...SHARED, formats: { control: FORMAT } },
+      "reported no format facts for the candidate",
+    ],
+    [
+      "unequal identities in shared mode",
+      { ...SHARED, formats: { control: FORMAT, candidate: OTHER } },
+      "shared mode with different format facts",
+    ],
+    [
+      "a missing mode",
+      Object.fromEntries(Object.entries(SHARED).filter(([key]) => key !== "mode")),
+      "reported no image mode",
+    ],
+    [
+      "a missing size",
+      { ...SHARED, control: { digest: IMAGE.digest } },
+      "reported no control image size",
+    ],
+    [
+      "a zero size",
+      { ...SHARED, candidate: { ...IMAGE, bytes: 0 } },
+      "reported no candidate image size",
+    ],
+    [
+      "an unchecked open",
+      Object.fromEntries(Object.entries(SHARED).filter(([key]) => key !== "candidateOpened")),
+      "did not check that the candidate opened the shared image as is",
+    ],
+  ];
+  for (const [what, images, message] of inconsistent)
+    it(`refuses ${what}`, () => {
+      const text = report(withImages(images, none), manifest);
+      expect(text).toContain("INCOMPLETE");
+      expect(text).toContain(message);
+      expect(text).not.toContain("**gain**");
+    });
+
+  it("refuses shards that mix shared and separate images", () => {
+    const mixed = withImages(
+      (r: ClaimResult) => (r.dataset === "S1" ? separate() : SHARED),
+      (r) => (r.dataset === "S1" ? covered(r) : undefined),
+    );
+    const text = report(mixed, manifest);
+    expect(text).toContain("INCOMPLETE");
+    expect(text).toContain("shards disagree on the image mode or format facts");
+    expect(text).not.toContain("**gain**");
+  });
+
+  it("refuses an image mode the format facts do not allow", () => {
+    // Different writers, yet both arms restored the control's image.
+    const text = report(
+      withImages({ ...SHARED, formats: { control: FORMAT, candidate: OTHER } }, none),
       manifest,
     );
-    expect(missing).toContain("image A/A missing");
+    expect(text).toContain("shared mode with different format facts");
+    const needless = report(
+      withImages({ ...separate(), formats: { control: FORMAT, candidate: FORMAT } }, covered),
+      manifest,
+    );
+    expect(needless).toContain("used separate images, which its format facts do not allow");
+  });
+
+  it("covers the controls, the targets and every cell with a verdict", () => {
+    const regression: CellRecord = {
+      ...neutral("s2"),
+      candidateMedianMs: 150,
+      acceptance: {
+        medianDeltaMs: 50,
+        iqrDeltaMs: 5,
+        favoursCandidate: 0,
+        favoursControl: 15,
+        acceptedGain: false,
+        significantRegression: true,
+      },
+    };
+    expect(imageAaCells(["aa"], ["t"], [neutral("t"), neutral("s1")])).toEqual(["aa", "t"]);
+    expect(imageAaCells(["aa"], ["t"], [regression, gain("s1")])).toEqual(["aa", "s2", "s1"]);
+    expect(imageAaCells(["aa"], [], [{ cell: "s1", repeats: 1, error: "x" }])).toEqual(["aa"]);
+    const ok = report(withImages(separate(), covered), manifest);
+    expect(ok).toContain("**gain**");
+    expect(ok).toContain("| image A/A r1 |");
+    expect(ok).toContain("| image A/A r2 |");
+    // Each replicate must cover every cell: the target missing from replicate 2.
+    const short = report(
+      withImages(separate(), (r) =>
+        covered(r).filter((c) => !(c.cell === "t" && c.replicate === 2)),
+      ),
+      manifest,
+    );
+    expect(short).toContain("W1M/t image A/A (replicate 2) missing");
+    expect(short).not.toContain("**gain**");
+    // A screened cell that met the rule needs the image A/A too.
+    const flaggedScreen = complete().map((r) =>
+      r.shard === "0/2" ? { ...r, ab: [gain("t"), regression] } : r,
+    );
+    const uncovered = report(withImages(separate(), covered, flaggedScreen), manifest);
+    expect(uncovered).toContain("W1M/s2 image A/A (replicate 1) missing");
+    const coveredScreen = report(
+      withImages(
+        separate(),
+        (r) => [...covered(r), ...(r.shard === "0/2" ? onReplicates([neutral("s2")]) : [])],
+        flaggedScreen,
+      ),
+      manifest,
+    );
+    expect(coveredScreen).not.toContain("INCOMPLETE");
+  });
+
+  it("voids the run when any replicate's image A/A flags", () => {
     const flagged = report(
-      withImages(separate(), (d) => (d === "W1M" ? [gain("aa")] : controls(d))),
+      withImages(separate(), (r) =>
+        covered(r).map((c) =>
+          c.cell === "t" && c.replicate === 2 ? { ...gain("t"), replicate: 2 } : c,
+        ),
+      ),
       manifest,
     );
     expect(flagged).toContain("**VOID:**");
-    expect(flagged).toContain("| image A/A | 0/2 |");
+    expect(flagged).toContain("| image A/A r2 | 0/2 |");
     expect(flagged).not.toMatch(/\| target \|[^\n]*\*\*gain\*\*/u);
   });
 
@@ -414,6 +559,32 @@ describe("next/ claim fixture images", () => {
       const identity = await formatIdentity(repository);
       expect(identity).toMatch(/^[0-9a-f]{64}$/u);
       expect(await formatIdentity(repository)).toBe(identity);
+      // The writer fingerprint follows the entries' imports, so a change to any module they
+      // reach (an encoder, a codec) changes it; a module it cannot read leaves no fingerprint.
+      expect(await writerFingerprint(root)).toBeNull();
+      const writer = await writerFingerprint(repository);
+      expect(writer).toMatch(/^[0-9a-f]{64}$/u);
+      expect(await writerFingerprint(repository)).toBe(writer);
+      const dist = join(root, "w", "packages/core/dist/next");
+      await mkdir(join(dist, "write"), { recursive: true });
+      await mkdir(join(dist, "testing"), { recursive: true });
+      await mkdir(join(dist, "page"), { recursive: true });
+      await writeFile(join(dist, "write/test-support.js"), 'export * from "../page/encode.js";\n');
+      await writeFile(
+        join(dist, "testing/executor-input.js"),
+        'import { x } from "../page/encode.js";\nconst later = () => import("./late.js");\n',
+      );
+      await writeFile(join(dist, "testing/late.js"), "export const y = 1;\n");
+      await writeFile(join(dist, "page/encode.js"), "export const x = 1;\n");
+      const before = await writerFingerprint(join(root, "w"));
+      expect(before).toMatch(/^[0-9a-f]{64}$/u);
+      await writeFile(join(dist, "page/encode.js"), "export const x = 2;\n");
+      const encoder = await writerFingerprint(join(root, "w"));
+      expect(encoder).not.toBe(before);
+      await writeFile(join(dist, "testing/late.js"), "export const y = 2;\n");
+      expect(await writerFingerprint(join(root, "w"))).not.toBe(encoder);
+      await rm(join(dist, "page/encode.js"));
+      expect(await writerFingerprint(join(root, "w"))).toBeNull();
     } finally {
       await rm(root, { recursive: true, force: true });
     }
