@@ -76,20 +76,26 @@ export class WriteCredits {
         this.#mergeMetadataFunding - this.metadata.allocated,
       ) +
       Math.max(this.minimum.commits, this.commits.held) +
-      Math.max(
-        this.minimum.merge,
-        mergeMinimum,
-        this.#mergeFloor,
-        active + this.merge.allocated + this.merge.loaned,
-      )
+      // Ordinary steps keep the merge minimum (the default); a native step passes 0, since it
+      // never merges: a later merge admits its own credit when it runs.
+      Math.max(mergeMinimum, this.#mergeFloor, active + this.merge.allocated + this.merge.loaned)
     );
   }
 
+  /** A native step's own workspace is funded. It holds no merge minimum: native steps never
+   * merge, and a background merge admits its own credit when it runs. */
   #nativeReady(): boolean {
     return (
       this.rows.held >= Math.max(this.#rowMinimum, this.#rowFloor) &&
-      this.commits.held >= this.minimum.commits &&
-      this.merge.held >= Math.max(0, this.minimum.merge - (this.#mergeActive?.held ?? 0))
+      this.commits.held >= this.minimum.commits
+    );
+  }
+
+  /** Merge credit a native step must keep: an active merge's holdings and prepaid floor only. */
+  get activeMergeBytes(): number {
+    return Math.max(
+      this.#mergeFloor,
+      (this.#mergeActive?.held ?? 0) + this.merge.allocated + this.merge.loaned,
     );
   }
 
@@ -125,16 +131,14 @@ export class WriteCredits {
     return this.#mergeActive !== null;
   }
 
-  /** Return high-water estimates without using a live primary or merge's progress. */
+  /** Return high-water estimates without using a live primary or merge's progress. Native
+   * steps pass 0: they hold no merge minimum (an active merge keeps its own floor). */
   reclaimNativeStep(mergeMinimum = this.minimum.merge): void {
     this.reclaimRows();
     this.reclaimMetadata();
     releaseIdle(
       this.merge,
-      Math.max(
-        this.#mergeFloor,
-        Math.max(0, Math.max(this.minimum.merge, mergeMinimum) - (this.#mergeActive?.held ?? 0)),
-      ),
+      Math.max(this.#mergeFloor, Math.max(0, mergeMinimum - (this.#mergeActive?.held ?? 0))),
     );
   }
 
@@ -464,7 +468,6 @@ export class WriteCredits {
       if (nativeMinimum) {
         desired[0] = Math.max(desired[0] ?? 0, this.#rowMinimum);
         desired[2] = Math.max(desired[2] ?? 0, this.minimum.commits);
-        desired[3] = Math.max(desired[3] ?? 0, this.minimum.merge - (this.#mergeActive?.held ?? 0));
       }
       desired[target] = Math.max(desired[target] ?? 0, wanted);
       desired[1] = Math.max(desired[1] ?? 0, metadata);

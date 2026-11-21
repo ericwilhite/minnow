@@ -11928,6 +11928,16 @@ export const LIFETIME_HOLDINGS_REACH = [
   "exact after publication",
 ] as const;
 
+/** A native step's minimum at the capacity boundary (writer floors, review of #34). */
+export const NATIVE_MINIMUM_BOUNDARY_REACH = [
+  "live row allocations",
+  "live commit allocations",
+  "depleted forecasts",
+  "fits exactly",
+  "fits below the boundary",
+  "refused above the boundary",
+] as const;
+
 /** A native trigger statement on an FTS-indexed table ends without waiting. */
 export const NATIVE_COMMAND_FTS_END_REACH = [
   "keyed delete ended",
