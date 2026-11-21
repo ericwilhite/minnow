@@ -11977,6 +11977,27 @@ export const LIFETIME_HOLDINGS_REACH = [
   "exact after publication",
 ] as const;
 
+/** Memtable sizing summaries against one-row hints (write/memtable.ts valueSummary). */
+export const MEMORY_SIZING_SUMMARY_REACH = [
+  "several chunks",
+  "updated rows",
+  "deleted rows",
+  "rolled back rows",
+  "published chunk",
+  "added column",
+  "null values",
+  "several varlen columns",
+  "exact for one varlen column",
+] as const;
+
+/** Trigger-body point lookups whose sizing work does not grow with the memtable. */
+export const MEMORY_SIZING_WORK_REACH = [
+  "100-row memtable",
+  "1,000-row memtable",
+  "20,000-row memtable",
+  "summaries read",
+] as const;
+
 /** A native step's minimum at the capacity boundary (writer floors, review of #34). */
 export const NATIVE_MINIMUM_BOUNDARY_REACH = [
   "live row allocations",
