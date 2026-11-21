@@ -113,7 +113,12 @@ it.each(seedsFor("next-executor-key-order-demand", [0xb9f01, 0xb9f02]))(
               const result = await core.execute(sql, [1, offset]);
               if (!("batches" in result)) throw Error("query rows");
               expect(oracleRows(result)).toEqual((await pg.query(sql, [1, offset])).rows);
-              expect(ordinary.mock.calls.length + resident.mock.calls.length).toBe(1);
+              // Lead design decision under the governor law (size before admission, release,
+              // then admit): LIMIT 1 over a resident one-chunk table keeps its single-use
+              // resident range, unsized; otherwise its own planned cursor sizes the window first.
+              expect([ordinary.mock.calls.length, resident.mock.calls.length]).toEqual(
+                !stored && count <= 2048 ? [0, 1] : [2, 0],
+              );
               expect(audit.observedBytes).toBeGreaterThan(0);
               expect(audit.completed.every((step) => step.actual <= step.credit)).toBe(true);
               expect(competitor.grant).not.toBeNull();

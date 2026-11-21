@@ -54,6 +54,8 @@ it.each(seedsFor("next-executor-pk-offset", [0xe141, 0xe142]))(
       "resident generic",
       "PG exact",
       "released",
+      "sized window",
+      "unsized window",
     ]);
     let governor = new Governor(64 << 20);
     const prepare = core.executor.prepare.bind(core.executor);
@@ -68,6 +70,8 @@ it.each(seedsFor("next-executor-pk-offset", [0xe141, 0xe142]))(
       nexts: 0,
       skips: [] as number[],
       grants: [] as Grant[],
+      /** Per opened cursor, in open order (a sized window opens sizing, then execution). */
+      cursors: [] as Array<{ skips: number[]; rows: number; nexts: number; closes: number }>,
     };
     // eslint-disable-next-line @typescript-eslint/unbound-method -- Invoked with .call(this).
     const nativePlan = ViewIndex.prototype.planRange;
@@ -81,23 +85,29 @@ it.each(seedsFor("next-executor-pk-offset", [0xe141, 0xe142]))(
         open(options) {
           stats.opens++;
           stats.grants.push(options.budget);
+          const own = { skips: [] as number[], rows: 0, nexts: 0, closes: 0 };
+          stats.cursors.push(own);
           const cursor = plan.open(options);
           return {
             skip(count) {
               stats.skips.push(count);
+              own.skips.push(count);
               return cursor.skip(count);
             },
             next(out) {
               stats.nexts++;
+              own.nexts++;
               const work = cursor.next(out);
               const record = (count: number) => {
                 stats.rows += count;
+                own.rows += count;
                 return count;
               };
               return work instanceof Promise ? work.then(record) : record(work);
             },
             close() {
               stats.closes++;
+              own.closes++;
               cursor.close();
               expect(options.budget.held).toBeGreaterThanOrEqual(plan.minimumBytes);
             },
@@ -136,7 +146,15 @@ it.each(seedsFor("next-executor-pk-offset", [0xe141, 0xe142]))(
           async (kind, oi, li, omitLimit, descending, parameters) => {
             reach.beginHistory();
             governor = new Governor(64 << 20);
-            Object.assign(stats, { opens: 0, closes: 0, rows: 0, nexts: 0, skips: [], grants: [] });
+            Object.assign(stats, {
+              opens: 0,
+              closes: 0,
+              rows: 0,
+              nexts: 0,
+              skips: [],
+              grants: [],
+              cursors: [],
+            });
             const offset = offsets[oi],
               limit = limits[li];
             if (offset === undefined || limit === undefined) throw new Error("Bound dimension");
@@ -185,19 +203,26 @@ it.each(seedsFor("next-executor-pk-offset", [0xe141, 0xe142]))(
                 expect(stats.opens).toBe(0);
                 reach.reach("zero unopened");
               } else if (eligible) {
-                expect(stats.opens).toBe(1);
-                expect(stats.closes).toBe(1);
-                expect(stats.rows).toBe(actual.length);
-                expect(stats.skips).toEqual(offset === null || offset === 0 ? [] : [offset]);
-                if (typeof offset === "number" && offset > rows.length) {
-                  expect(stats.nexts).toBe(0);
-                  reach.reach("past end");
-                } else if (offset === rows.length) {
+                // Cursor contract (#27): a window of at most one cursor batch over a stored
+                // table is sized first, so it opens a sizing cursor, then the execution cursor,
+                // over the same window. Any other eligible query opens the execution cursor only.
+                // Every cursor is closed once and reads exactly the window.
+                const sized = !omitLimit && typeof limit === "number" && limit > 0 && limit <= 2048;
+                expect(stats.opens).toBe(sized ? 2 : 1);
+                expect(stats.closes).toBe(stats.opens);
+                for (const cursor of stats.cursors) {
+                  expect(cursor.closes).toBe(1);
+                  expect(cursor.rows).toBe(actual.length);
+                  expect(cursor.skips).toEqual(offset === null || offset === 0 ? [] : [offset]);
+                  if (typeof offset === "number" && offset > rows.length)
+                    expect(cursor.nexts).toBe(0);
                   // A full skip count carries no EOF flag. One empty next is
                   // permitted by IndexCursor; no locator may be materialized.
-                  expect(stats.nexts).toBeLessThanOrEqual(1);
-                  reach.reach("exact end");
+                  else if (offset === rows.length) expect(cursor.nexts).toBeLessThanOrEqual(1);
                 }
+                if (typeof offset === "number" && offset > rows.length) reach.reach("past end");
+                else if (offset === rows.length) reach.reach("exact end");
+                reach.reach(sized ? "sized window" : "unsized window");
                 if (stats.skips.length) reach.reach("skip once");
                 if (omitLimit) reach.reach("offset only");
                 if (offset === null) reach.reach("NULL offset");
