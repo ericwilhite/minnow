@@ -1854,8 +1854,9 @@ the groups those locators name are then sized. The list, the window scratch and 
 preparation admissions (see Memory): if one would wait while the list is held, the query releases
 the whole attempt, including the list, and prepares again with a credit that covers them
 together, so it never waits holding the list. The execution cursor reads the same window from the
-same snapshot, so every group it fetches was sized. Such a query therefore opens exactly two
-cursors (sizing, then execution), each closed and each reading at most LIMIT + OFFSET rows.
+same snapshot, so every group it fetches was sized. Without a preparation restart, such a query
+opens exactly two cursors (sizing, then execution), each closed and each reading at most
+LIMIT + OFFSET rows; each restart closes its attempt's sizing cursor and opens one more.
 Larger or unbounded windows, LIMIT 1 over a resident one-chunk table (its single-use resident
 range), and caps the cursor path does not fit open one cursor or none, and size every reachable
 source with conservative metadata, including publication-safe memory read hints.
