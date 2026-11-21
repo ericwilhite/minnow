@@ -1928,7 +1928,10 @@ into hidden columns and removed from visible results. No runtime code generation
 
 The owner composition uses it by default; protocol tests over `StandinWritePath` explicitly keep
 their synthetic executor. Native INSERT VALUES/SELECT, UPDATE, DELETE, ON CONFLICT and RETURNING
-execute with statement snapshot input spools. Joined/index inputs retain locator identity;
+execute with statement snapshot input spools. When the input runs in producer phases (text
+concatenation, spilling aggregates), the input spool holds no rows at a phase handoff (rows reach
+the modification root only after the last cut) and releases its buffers there, since they share
+the result reservation the handoff parks; each phase builds its own spool. Joined/index inputs retain locator identity;
 repeat tracking and returned rows use charged, spillable state. SQL writers without a unique-target
 proof require the admitted tracker before writer lookup, including raw executor requests. The
 direct-native legacy target Set cannot be selected by SQL. Complete-row validation includes
