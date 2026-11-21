@@ -77,6 +77,11 @@ statement checks the signal once before it starts running, so an already-aborted
 never mutates anything, and a mutation that has begun publishes completely or fails. Losing its worker reply can leave
 the outcome unknown; see [worker deadlines and cancellation](/docs/engine/workers).
 
+In the 1.0 rebuild, a write that needs memory held elsewhere waits for it instead of failing. A
+result your application keeps open while it awaits its own write can therefore make that write
+wait until the result is released; aborting the write's signal ends the wait with an
+`AbortError`, and nothing of the write is kept.
+
 ## The buffer pool
 
 Separately from execution, decoded blocks are cached so a warm scan does not re-read and

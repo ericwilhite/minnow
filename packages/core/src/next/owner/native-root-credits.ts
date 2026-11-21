@@ -40,6 +40,25 @@ function closeAll(grants: readonly Grant[] | null): void {
   for (const grant of grants ?? []) grant.close();
 }
 
+/**
+ * Opens a root's accounts as owner dispatch does (native-command.ts): a root's steps include
+ * private progress, so they may use the governor's reserve. Every caller that funds a root,
+ * test fixtures included, opens it here, so the mode cannot drift between them. `statement` is
+ * read through on every step (a fixture may move the root to a fresh statement).
+ */
+export function openRootCredits(
+  scope: Pick<NativeRootCreditScope, "governor" | "signal" | "statement">,
+): Promise<NativeRootCredits> {
+  return NativeRootCredits.open({
+    governor: scope.governor,
+    signal: scope.signal,
+    get statement() {
+      return scope.statement;
+    },
+    includesProgress: true,
+  });
+}
+
 export class NativeRootCredits {
   readonly #stop = new AbortController();
   readonly #base = { metadata: NATIVE_ROOT_CREDIT_BYTES, source: 0, rules: 0, parameters: 0 };

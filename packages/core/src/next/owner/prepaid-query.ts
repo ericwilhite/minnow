@@ -12,8 +12,15 @@ import type {
 import { GrantClosedError, MemoryAdmissionError } from "../memory/governor.js";
 import type { ByteCharge } from "../vector/varlen.js";
 export const PREPAID_QUERY_BYTES = 4096;
-const SHARE_BYTES = 512,
-  CACHE_BYTES = 256;
+const SHARE_BYTES = 512;
+/** Every cache a native query registers is declined, so one shared, inert registration serves
+ * them all: it retains nothing per query and cannot fail under memory pressure. */
+const DECLINED_CACHE: ReturnType<MemoryGovernor["registerCache"]> = Object.freeze({
+  charge: () => false,
+  release: () => undefined,
+  takeFrom: () => false,
+  unregister: () => undefined,
+});
 function size(n: number): number {
   if (!Number.isSafeInteger(n) || n < 0) throw new RangeError("Invalid prepaid query bytes");
   return n;
@@ -34,7 +41,6 @@ export interface PrepaidQueryScope {
 export class PrepaidQueryGovernor implements MemoryGovernor {
   #first: PrepaidShare | null = null;
   #held = 0;
-  #caches: Set<() => void>;
   #closed = false;
   #pending: Promise<readonly Grant[]> | null = null;
   #stop: AbortController;
@@ -46,7 +52,6 @@ export class PrepaidQueryGovernor implements MemoryGovernor {
       throw new RangeError("Native query metadata must be admitted");
     try {
       this.#stop = new AbortController();
-      this.#caches = new Set();
       this.#signal = AbortSignal.any([scope.signal, this.#stop.signal]);
     } catch (error) {
       scope.metadata.free(PREPAID_QUERY_BYTES);
@@ -196,27 +201,13 @@ export class PrepaidQueryGovernor implements MemoryGovernor {
     return source.transfer(target, bytes);
   }
   /** Query root facts may remain caller-owned; this native scope deliberately declines
-   * optional cache retention/transfers rather than creating another owner-wide cache. */
+   * optional cache retention/transfers rather than creating another owner-wide cache. Declining
+   * retains nothing, so registration charges nothing (a charge here could only fail as an
+   * untyped error mid-statement when the root's metadata is fully used). */
   registerCache(_cache: EvictableCache): ReturnType<MemoryGovernor["registerCache"]> {
     void _cache;
     this.#check();
-    if (!this.scope.metadata.allocate(CACHE_BYTES))
-      throw new RangeError("Native query cache metadata must be admitted");
-    let active = true;
-    const unregister = () => {
-      if (active) {
-        active = false;
-        this.#caches.delete(unregister);
-        this.scope.metadata.free(CACHE_BYTES);
-      }
-    };
-    this.#caches.add(unregister);
-    return {
-      charge: () => false,
-      release: () => undefined,
-      takeFrom: () => false,
-      unregister,
-    };
+    return DECLINED_CACHE;
   }
   grow(share: PrepaidShare, bytes: number): boolean {
     this.#check();
@@ -250,7 +241,6 @@ export class PrepaidQueryGovernor implements MemoryGovernor {
       this.#stop.abort(new GrantClosedError("native query workspace"));
       await this.#pending?.catch(() => undefined);
       while (this.#first) this.#first.close();
-      for (const unregister of this.#caches) unregister();
       this.scope.metadata.free(PREPAID_QUERY_BYTES);
       if (this.#held !== 0) throw new Error("Native query workspace retained credit");
     })());
