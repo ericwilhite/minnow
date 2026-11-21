@@ -23,6 +23,18 @@ export const NEXT_PARITY_GAPS: readonly ParityGap[] = [
       "a rekey whose native trigger bodies need an indexed-domain preflight (writes stop the plan)",
   },
   {
+    // 0.20 runs these. Cause: expressions with variable-size output (text and array
+    // concatenation, casts to text, JSON constructors and casts) compile only inside the
+    // pipeline's resumable projection/filter, and these sites evaluate outside it. Closing it:
+    // a row host (design note P1-phase-expression-design.md, mechanism A); each step removes
+    // its sites from the reason, and the last removes this entry.
+    id: "row-site-variable-expression",
+    message:
+      /^The executor does not support variable expression outside a resumable projection\/filter$/u,
+    reason:
+      "such an expression in INSERT ... VALUES, a CHECK constraint, a generated column, ON CONFLICT DO UPDATE SET/WHERE, or RETURNING",
+  },
+  {
     // 0.20 runs these. Cause: a producer-phase cut restarts the graph from the root, and the
     // UNION ALL concat recipe keeps no continuation, so it would replay arms already delivered.
     // Closing it: record completed arms across a cut (skip them on restart), allow UNION ALL in
