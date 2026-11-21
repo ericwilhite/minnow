@@ -58,14 +58,6 @@ export interface OpenFinding {
 
 export const NEXT_OPEN_FINDINGS: readonly OpenFinding[] = [
   {
-    id: "read-queues-behind-own-write",
-    failure: /^on the waiting connection while a transaction holds the turn: /u,
-    reason:
-      "a read on a session waits behind that session's own write queued for the writer turn " +
-      "(owner session FIFO); engine/transactions.mdx: reads never wait behind a callback",
-    owner: "P1 (read bypass, next PR)",
-  },
-  {
     id: "rekey-forwards",
     failure:
       /^rekey-forward: reading retired key \d+: |^duplicate insert (inside a transaction )?was accepted, but the model refuses it \(unique\)/u,
