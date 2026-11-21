@@ -12,6 +12,8 @@ compatibility policy and release process.
 
 The unexported 1.0 rebuild sizes a point or range lookup that also sorts by its key (such as `WHERE id BETWEEN 500 AND 599 ORDER BY id`) over only the groups its keys name, instead of reading every group of the table to size the sort key; a 100-key range over 300,000 rows went from about 300 ms to 25 ms. Results are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.
 
+The unexported 1.0 rebuild no longer fails `INSERT ... SELECT ... RETURNING`, `UPDATE ... RETURNING` or `DELETE ... RETURNING` whose input computes text with `||` with the internal error "Statement row rules already bound". Results are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.
+
 The unexported 1.0 rebuild no longer fails `INSERT ... SELECT`, `UPDATE` or `DELETE` whose input computes text with `||` (for example `INSERT INTO t SELECT g, 'x' || g::text FROM generate_series(1, 50) g`) with the internal error "Result budget retained buffers at handoff". Results are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.
 
 The unexported 1.0 rebuild sizes a point or small range lookup on an index over only the groups its keys name, instead of every group of the table, except inside trigger bodies, which still size every group. Results are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.

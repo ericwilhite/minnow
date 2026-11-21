@@ -1219,8 +1219,15 @@ export class QueryRuntime {
   async suspendProducer(sink: ProgramSink, idleCredit: Grant): Promise<void> {
     if (!this.#handoff || this.#scope !== null || this.#atomicResult === null)
       throw new Error("Producer graph must retire before phase admission");
-    // The modification spool's buffers share the result reservation parked below.
-    await this.modification?.spool.handoff();
+    // The modification spool's buffers share the result reservation parked below. RETURNING and
+    // ON CONFLICT also bind a writer, row rules and their own grant with the graph: none holds a
+    // row yet, so they close here and the next phase binds them again.
+    const modification = this.modification;
+    if (modification !== null) {
+      await modification.spool.handoff();
+      await modification.returned?.handoff();
+      await modification.close?.();
+    }
     await sink.suspendBudget();
     const target = this.#atomicResult.detach();
     try {
