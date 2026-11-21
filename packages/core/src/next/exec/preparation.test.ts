@@ -402,3 +402,29 @@ it("a credit admitted after cancellation is returned at once", async () => {
   expect(governor.usedBytes).toBe(0);
   facade.close();
 });
+
+it("keeps only open grants in an attempt's live total (sizing passes take and close thousands)", () => {
+  // Whole-source sizing takes and closes one small grant per group; each growth notification
+  // sums the attempt's live grants. Closed grants hold nothing, so they must leave that sum, or
+  // every notification costs every grant ever taken (quadratic in groups).
+  const governor = new Governor(16 << 20);
+  const facade = new PreparationGovernor(governor);
+  const recipe = facade.tryAdmit({ label: "recipe", minimumBytes: 4096, spillable: false });
+  if (recipe === null) throw new Error("recipe");
+  for (let i = 0; i < 1000; i++) {
+    const step = facade.tryAdmit({
+      label: "read-step/sizing",
+      minimumBytes: 4096,
+      spillable: true,
+    });
+    if (step === null) throw new Error("sizing step");
+    expect(step.allocate(8192)).toBe(true); // grows past its holdings: notifies
+    step.free(8192);
+    step.close();
+  }
+  expect(facade.trackedGrants).toBeLessThanOrEqual(2);
+  expect(facade.heldBytes).toBe(recipe.held);
+  facade.close();
+  recipe.close();
+  expect(governor.usedBytes).toBe(0);
+});
