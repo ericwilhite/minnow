@@ -165,7 +165,7 @@ it.each(seedsFor("next-compound-progress", [0xb720, 0xb721]))(
   120000,
 );
 
-it("audits the other set operations without adding an execution path", async () => {
+it("runs the other set operations like PostgreSQL", async () => {
   const core = await new StorageCore().open();
   try {
     const sql = "SELECT 1 AS n UNION ALL SELECT 1 AS n UNION ALL SELECT NULL::int AS n";
@@ -175,8 +175,9 @@ it("audits the other set operations without adding an execution path", async () 
     expect(canonical(oracleRows(result))).toEqual(canonical((await pg.query(sql)).rows));
     for (const operator of ["INTERSECT", "INTERSECT ALL", "UNION"]) {
       const query = `SELECT 1 AS n ${operator} SELECT 1 AS n`;
-      expect((await pg.query(query)).rows).toEqual([{ n: 1 }]);
-      await expect(core.execute(query)).rejects.toMatchObject({ sqlState: "0A000" });
+      const answer = await core.execute(query);
+      if (!("batches" in answer)) throw new Error(`Expected rows: ${query}`);
+      expect(oracleRows(answer), query).toEqual((await pg.query(query)).rows);
     }
   } finally {
     await core.close();

@@ -1532,7 +1532,11 @@ export function lowerSetOperation(
       big: col.big || (right.columns[position]?.big ?? false),
     }));
     const [kind, all] = op.split(" ") as ["union" | "intersect" | "except", string | undefined];
-    if (kind === "except" && types.some((type) => type.kind === "json" && !type.binary))
+    // Every set operation but UNION ALL compares rows, and json has no equality operator.
+    if (
+      !(kind === "union" && all === "all") &&
+      types.some((type) => type.kind === "json" && !type.binary)
+    )
       throw new PlanningError("could not identify an equality operator for type json", "42883");
     acc = {
       rel: {

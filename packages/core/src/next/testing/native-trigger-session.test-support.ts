@@ -36,14 +36,6 @@ export async function nativeTriggerSession(
   const execute = async (parameters: BoundParameters) => {
     const tables: Array<(typeof f.scope.tables)[number]> = [];
     try {
-      // Each fresh graph requires the complete caller reservation again. Queries between
-      // graphs may return idle credit; setupBytes alone excludes producer metadata.
-      await f.scope.funding.prepareMetadata(metadataFloor, f.scope.signal);
-      for (const p of programs)
-        tables.push({
-          table: p.table,
-          rules: bindTableRules(p.program, f.metadata, { capacity: 1, signal: f.scope.signal }),
-        });
       const opened = f.tx.statement({
         signal: f.scope.signal,
         rules: (id) => {
@@ -54,6 +46,17 @@ export async function nativeTriggerSession(
       });
       if (!(opened instanceof StatementImpl)) throw new TypeError("Native statement required");
       const statement = opened;
+      // The root's funding steps the statement this graph runs in. Each fresh graph requires the
+      // complete caller reservation again. Queries between graphs may return idle credit;
+      // setupBytes alone excludes producer metadata.
+      f.useStatement(statement);
+      await f.scope.funding.prepareMetadata(metadataFloor, f.scope.signal);
+      // Rules bind inside that reservation; the statement reads them only when it runs.
+      for (const p of programs)
+        tables.push({
+          table: p.table,
+          rules: bindTableRules(p.program, f.metadata, { capacity: 1, signal: f.scope.signal }),
+        });
       return await runTriggerStatement(
         {
           ...f.scope,
