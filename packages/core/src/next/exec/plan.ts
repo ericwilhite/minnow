@@ -91,6 +91,8 @@ import {
   expandingJsonExpression,
   nativeTextExpression,
 } from "../ir/json-expression.js";
+import { VALUES_ROW_SLACK, ValuesRowHost } from "./values-row-host.js";
+import { installJsonHost } from "./kernels/json.js";
 import type { ByteCharge } from "../vector/varlen.js";
 import { samePhysicalType, type PhysicalType } from "../types.js";
 import { BATCH_ROWS, type Batch, type Selection, type Vector } from "../vector/vector.js";
@@ -1587,6 +1589,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           );
       }
       case "values": {
+        if (rel.rows.some((row) => row.some(jsonExpression))) return prepareValuesRows(rel);
         const setup = (context: CompileContext) =>
           rel.rows.map((row) => row.map((expr) => compileExpr(expr, context)));
         const minimum = measureCompilerBuffers(compilation, [], 1, setup, () => undefined);
@@ -3235,6 +3238,82 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
         throw new UnsupportedPlanError(`the ${rel.op} operator`, { construct: rel.op });
     }
   };
+  /**
+   * VALUES rows whose cells compute variable-size values (concatenation, casts to text, JSON):
+   * each row compiles its cells on its own arena when it is reached and evaluates them on the
+   * row host (values-row-host.ts), with no producer phase. The arena closes when the row's
+   * borrow ends, so the admitted minimum is the largest row's kernels plus the small-row slack,
+   * not every row's at once.
+   */
+  function prepareValuesRows(rel: Extract<Rel, { op: "values" }>): Recipe {
+    const rowSetup = (row: readonly ScalarExpr[]) => (context: CompileContext) => {
+      installJsonHost(context.arena, new ValuesRowHost());
+      return row.map((expr) => compileExpr(expr, context));
+    };
+    let largest = 0;
+    for (const row of rel.rows)
+      largest = Math.max(
+        largest,
+        measureCompilerBuffers(compilation, [], 1, rowSetup(row), () => undefined),
+      );
+    const minimum = largest + VALUES_ROW_SLACK;
+    fixed(rel, Math.max(4096, minimum));
+    return (runtime, downstream, stops) =>
+      instantiate(
+        runtime,
+        rel,
+        [],
+        minimum,
+        1,
+        (context, grant) => ({ context, grant }),
+        ({ context, grant }) => {
+          const label = `values#${String(rel.id)}`;
+          const host = new ValuesRowHost();
+          host.bind({
+            grant,
+            governor: runtime.governor,
+            signal: runtime.signal,
+            label,
+            admitRow: (bytes) => runtime.admit(`${label}/row`, bytes, false, rel, true),
+          });
+          let at = 0;
+          let arena: OutputArena | null = null;
+          const endRow = () => {
+            // The previous row's borrow ends here (pipeline.ts BatchSource.next): its values
+            // and then its kernels give their bytes back.
+            host.endBorrow();
+            arena?.close();
+            arena = null;
+          };
+          runtime.dispose(() => {
+            host.close();
+            arena?.close();
+            arena = null;
+          });
+          const source: BatchSource = {
+            next() {
+              endRow();
+              if (at === rel.rows.length || stops.some((stop) => stop())) return null;
+              const row = rel.rows[at++] ?? [];
+              host.beginRow();
+              const rowArena = new OutputArena(grant, 1);
+              arena = rowArena;
+              installJsonHost(rowArena, host);
+              const cells = row.map((expr) => compileExpr(expr, { ...context, arena: rowArena }));
+              return host.row(cells, EMPTY, runtime.signal).then((columns) => ({
+                batch: { length: 1, columns, selection: null },
+              }));
+            },
+            abort() {
+              at = rel.rows.length;
+            },
+          };
+          runtime.onAbort((reason) => source.abort(reason));
+          runtime.pipeline();
+          return drive(source, counted(runtime, rel, downstream), runtime.signal);
+        },
+      );
+  }
   function prepareLate(rel: Extract<Rel, { op: "sort" }>, shape: LateSortShape): Recipe {
     lateSortIds.add(rel.id);
     const { project, scan, narrow, keys, locator } = shape;

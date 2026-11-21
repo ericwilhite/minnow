@@ -1124,11 +1124,16 @@ export class QueryRuntime {
     return grant;
   }
 
+  /**
+   * `holdsCredit`: holder growth for an operator that already holds admitted credit (the
+   * governor serves it before new admissions; see GOVERNOR-WAIT-POLICY).
+   */
   admit(
     label: string,
     minimumBytes: number,
     spillable: boolean,
     rel?: OperatorIdentity,
+    holdsCredit = false,
   ): MaybePromise<Grant> {
     this.signal.throwIfAborted();
     const reserved = this.#reserved.get(label);
@@ -1149,10 +1154,12 @@ export class QueryRuntime {
     const immediate = governor.tryAdmit(options);
     if (immediate !== null) return this.#adopt(immediate, rel);
     const start = performance.now();
-    return governor.admit({ ...options, signal: this.signal }).then((grant) => {
-      this.#wait += performance.now() - start;
-      return this.#adopt(grant, rel);
-    });
+    return governor
+      .admit({ ...options, signal: this.signal, ...(holdsCredit ? { holdsCredit } : {}) })
+      .then((grant) => {
+        this.#wait += performance.now() - start;
+        return this.#adopt(grant, rel);
+      });
   }
 
   /** The result grant is tracked but survives pipeline disposal until result delivery. */

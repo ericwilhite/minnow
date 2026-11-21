@@ -10745,6 +10745,21 @@ export const FOLLOW_NESTED_AFTER_REACH = [
 ] as const;
 
 /** Computed INSERT ... SELECT, UPDATE and DELETE against PostgreSQL (dml-computed-differential). */
+/** INSERT ... VALUES cells on the VALUES row host (next/testing/values-row-host.test.ts). */
+export const VALUES_ROW_HOST_REACH = [
+  "concatenation",
+  "cast to text",
+  "parameter",
+  "null propagated",
+  "jsonb literal",
+  "json constructor",
+  "one row",
+  "several rows",
+  "row past the slack",
+  "multi-MiB row",
+  "row grant admitted",
+] as const;
+
 export const DML_COMPUTED_REACH = [
   "series source",
   "table source",
