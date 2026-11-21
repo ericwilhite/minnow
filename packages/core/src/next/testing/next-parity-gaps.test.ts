@@ -16,6 +16,7 @@ const REFUSED: Readonly<Record<string, readonly string[]>> = {
     "INSERT INTO g (id, v) VALUES (1, 'q')",
   ],
   "union-all-phase-arm": ["SELECT 'a' || 'b' AS c UNION ALL SELECT 'c'"],
+  "json-parameter-document": ["INSERT INTO j SELECT 1, ($1::text)::jsonb"],
 };
 
 it("every listed gap names a refusal the engine raises", async () => {
@@ -25,11 +26,12 @@ it("every listed gap names a refusal the engine raises", async () => {
       "CREATE TABLE t(id INT PRIMARY KEY, v TEXT)",
       "CREATE TABLE c(id INT PRIMARY KEY, v TEXT CHECK (v || 'x' <> 'zx'))",
       "CREATE TABLE g(id INT PRIMARY KEY, v TEXT, w TEXT GENERATED ALWAYS AS (v || '!') STORED)",
+      "CREATE TABLE j(id INT PRIMARY KEY, d JSONB)",
     ])
       await core.execute(ddl);
     for (const [id, statements] of Object.entries(REFUSED))
       for (const sql of statements) {
-        const error: unknown = await core.execute(sql).then(
+        const error: unknown = await core.execute(sql, sql.includes("$1") ? ['{"a": 1}'] : []).then(
           () => undefined,
           (refusal: unknown) => refusal,
         );

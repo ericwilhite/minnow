@@ -35,6 +35,16 @@ export const NEXT_PARITY_GAPS: readonly ParityGap[] = [
       "such an expression in INSERT ... VALUES, a CHECK constraint, a generated column, ON CONFLICT DO UPDATE SET/WHERE, or RETURNING",
   },
   {
+    // 0.20 runs these. Cause: a pipeline JSON expression needs a bounded source envelope, and
+    // jsonInputsBounded (exec/json-plan.ts) accepts table columns, literals and their
+    // projections but not a parameter, although its bytes are known once bound. Closing it:
+    // accept bound parameters as a bounded source (their bound size is the envelope).
+    id: "json-parameter-document",
+    message: /^The executor does not support JSON document without a bounded source envelope$/u,
+    reason:
+      "a JSON value built from a parameter in a query, such as INSERT ... SELECT ($1::text)::jsonb",
+  },
+  {
     // 0.20 runs these. Cause: a producer-phase cut restarts the graph from the root, and the
     // UNION ALL concat recipe keeps no continuation, so it would replay arms already delivered.
     // Closing it: record completed arms across a cut (skip them on restart), allow UNION ALL in
