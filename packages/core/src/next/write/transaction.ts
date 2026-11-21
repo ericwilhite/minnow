@@ -30,12 +30,14 @@ import {
 } from "../access/catalog.js";
 import type { MaybePromise } from "../access/key-index.js";
 import {
+  BatchTooLargeError,
   CardinalityViolationError,
   CheckViolationError,
   ConflictKind,
   ForeignKeyViolationError,
   NotNullViolationError,
   ClosedSetViolationError,
+  MAX_WRITE_BATCH_ROWS,
   UniqueViolationError,
   type ConflictOutput,
   type Statement,
@@ -247,6 +249,12 @@ interface RowPlan {
   readonly rows: Uint16Array | null;
   readonly from: number;
   readonly count: number;
+}
+
+/** Row positions and selections are 16-bit: a longer batch would wrap them (row 65,536 read as
+ * row 0) and write the wrong rows. Refused before anything is written. */
+function checkBatchRows(batch: Batch): void {
+  if (batch.length > MAX_WRITE_BATCH_ROWS) throw new BatchTooLargeError(batch.length);
 }
 
 function activeRows(batch: Batch): Uint16Array {
@@ -1811,6 +1819,7 @@ export class TableWriterImpl implements TableWriter {
   }
 
   insert(batch: Batch, written: Selection | null): MaybePromise<number> {
+    checkBatchRows(batch);
     return this.statement.guard(() => {
       this.statement.checkLegacyWrite();
       this.statement.beginMutation();
@@ -1823,7 +1832,7 @@ export class TableWriterImpl implements TableWriter {
       // input retains the selected-row path used by deferred child checks.
       const contiguous =
         batch.selection === null &&
-        batch.length <= 0x10000 &&
+        batch.length <= MAX_WRITE_BATCH_ROWS &&
         this.def.foreignKeys.length === 0 &&
         batch.columns.every((vector) => vector.form === "flat" && vector.validity === null);
       const rows = contiguous ? null : activeRows(batch);
@@ -2419,6 +2428,7 @@ export class TableWriterImpl implements TableWriter {
   }
 
   update(batch: Batch, written: Selection | null): MaybePromise<number> {
+    checkBatchRows(batch);
     return this.statement.guard(() => {
       this.statement.checkLegacyWrite();
       this.statement.beginMutation();
@@ -2555,6 +2565,7 @@ export class TableWriterImpl implements TableWriter {
   }
 
   delete(batch: Batch, written: Selection | null): MaybePromise<number> {
+    checkBatchRows(batch);
     return this.statement.guard(() => {
       this.statement.checkLegacyWrite();
       this.statement.beginMutation();
@@ -2711,6 +2722,7 @@ export class TableWriterImpl implements TableWriter {
   }
 
   conflicts(batch: Batch, arbiters: readonly number[], out: ConflictOutput): MaybePromise<void> {
+    checkBatchRows(batch);
     return this.statement.guard(() => {
       this.statement.checkLegacyWrite();
       this.#checkShape(

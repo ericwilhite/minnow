@@ -236,6 +236,23 @@ abstract class ConstraintError extends Error {
   }
 }
 
+/** The most rows one write batch may carry: row positions and selections are 16-bit. */
+export const MAX_WRITE_BATCH_ROWS = 0x10000;
+
+/** 54000 (program limit exceeded). A write batch longer than `MAX_WRITE_BATCH_ROWS` is refused
+ * before anything is written; the statement stays open for smaller batches. */
+export class BatchTooLargeError extends Error {
+  readonly code = "MINNOW_BATCH_TOO_LARGE";
+  readonly sqlState = "54000";
+  constructor(
+    readonly rows: number,
+    readonly limit: number = MAX_WRITE_BATCH_ROWS,
+  ) {
+    super(`A write batch of ${String(rows)} rows exceeds the ${String(limit)}-row limit`);
+    this.name = "BatchTooLargeError";
+  }
+}
+
 /** 23505. `key` is the equality-key bytes (decodable for the message; never null-containing). */
 export class UniqueViolationError extends ConstraintError {
   readonly code = "MINNOW_UNIQUE_VIOLATION";
