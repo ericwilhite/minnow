@@ -418,17 +418,7 @@ export function selectPage(
   }
 }
 
-/** The single-range kernels below, as test observations name them. */
-export type RangeKernel = "scan8" | "scan16" | "scan32" | "scanI32" | "single-range";
-let kernelObserver: ((kernel: RangeKernel) => void) | null = null;
-/** Test-only: reports each single-range kernel a page selection runs (null in production). */
-export function observeRangeKernels(observer: ((kernel: RangeKernel) => void) | null): void {
-  kernelObserver = observer;
-}
-
-/** One loop for a value array against number ranges: the hot path of plain and FOR pages.
- * The single-range loops keep a branch per row: a branch-free form (write every row, count the
- * 0/1 match) measured slower end to end on the W1M scans (#28 claim 44773706711). */
+/** One loop for a value array against number ranges: the hot path of plain and FOR pages. */
 function rangeKernel(
   context: SelectContext,
   rows: Rows | null,
@@ -450,25 +440,14 @@ function rangeKernel(
     // over a union of typed arrays runs several times slower).
     const low = ranges.lows[0] ?? 0;
     const high = ranges.highs[0] ?? 0;
-    if (values instanceof Uint8Array) {
-      if (kernelObserver !== null) kernelObserver("scan8");
-      return scan8(values, from, to, low, high, out, at, first);
-    }
-    if (values instanceof Uint16Array) {
-      if (kernelObserver !== null) kernelObserver("scan16");
-      return scan16(values, from, to, low, high, out, at, first);
-    }
-    if (values instanceof Uint32Array) {
-      if (kernelObserver !== null) kernelObserver("scan32");
-      return scan32(values, from, to, low, high, out, at, first);
-    }
-    if (kernelObserver !== null) kernelObserver("scanI32");
+    if (values instanceof Uint8Array) return scan8(values, from, to, low, high, out, at, first);
+    if (values instanceof Uint16Array) return scan16(values, from, to, low, high, out, at, first);
+    if (values instanceof Uint32Array) return scan32(values, from, to, low, high, out, at, first);
     return scanI32(values, from, to, low, high, out, at, first);
   }
   if (ranges.count === 1) {
     const low = ranges.lows[0] ?? 0;
     const high = ranges.highs[0] ?? 0;
-    if (kernelObserver !== null) kernelObserver("single-range");
     for (let k = from; k < to; k++) {
       const row = rows === null ? k : (rows[k] ?? 0) - first;
       if (validity !== null && (((validity[row >>> 5] ?? 0) >>> (row & 31)) & 1) === 0) continue;
