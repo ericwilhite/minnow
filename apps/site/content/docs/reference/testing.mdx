@@ -1460,11 +1460,11 @@ their verdicts may carry the image bias described in step 1, and they are not ci
 re-validated on this protocol. A rerun of a pre-fix claim on two engines whose trees differed only
 in a test file flagged two W1M cells as regressions, slower in both orders.
 
-| Claim                                   | Pre-fix run | Re-validated                                            |
-| --------------------------------------- | ----------- | ------------------------------------------------------- |
-| J2, `join_fact_fact_int` (PR #23)       | 44732967139 | 44865926352: gain holds, 192.4 to 164.5 ms, 15/15       |
-| J3, `join_star_3dims` (PR #24)          | 44748874332 | not yet (separate images: it changes the input builder) |
-| DISTINCT, `agg_count_distinct` (PR #19) | 44678818852 | 44867223666: gain holds, 699.6 to 506.3 ms, 15/15       |
+| Claim                                   | Pre-fix run | Re-validated                                                        |
+| --------------------------------------- | ----------- | ------------------------------------------------------------------- |
+| J2, `join_fact_fact_int` (PR #23)       | 44732967139 | 44865926352: gain holds, 192.4 to 164.5 ms, 15/15                   |
+| J3, `join_star_3dims` (PR #24)          | 44748874332 | 44874096053 (separate images): gain holds, 466.0 to 432.4 ms, 15/15 |
+| DISTINCT, `agg_count_distinct` (PR #19) | 44678818852 | 44867223666: gain holds, 699.6 to 506.3 ms, 15/15                   |
 
 A cell can be far more sensitive to the runner's CPU model than to the change under test: the
 control's `win_median_pct` took about 2.4 s per query on an AMD EPYC 7763 and about 0.4 s on an
