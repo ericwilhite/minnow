@@ -2,7 +2,12 @@
  * Each subscription owns one dirty bit and at most one unacknowledged result. A sweep pins
  * its complete cohort synchronously, executes at most eight at once and delivers together.
  */
-import type { ChangeFeed, CommittedChange, RekeyEffect } from "../access/changes.js";
+import {
+  CHANGE_LISTENER_BYTES,
+  type ChangeFeed,
+  type CommittedChange,
+  type RekeyEffect,
+} from "../access/changes.js";
 import { MemoryAdmissionError, stringBytes, type MemoryGovernor } from "../memory/governor.js";
 import type { EngineSession, OwnerEngine, PlannedStatement } from "../owner/engine.js";
 import type { FramePayload } from "../owner/frame.js";
@@ -112,6 +117,8 @@ export class LiveRuntime {
   #id = 0;
   #version = 0;
   readonly #limit: number;
+  /** Unregisters this runtime's lifetime holding (GOVERNOR-WAIT-POLICY). */
+  #unregisterLifetime: (() => void) | null = null;
   constructor(
     readonly engine: OwnerEngine,
     readonly governor: MemoryGovernor,
@@ -148,6 +155,11 @@ export class LiveRuntime {
       this.#charge(512);
       this.#seen = feed.probe();
       this.#stop = feed.observe((event) => this.#invalidate(event));
+      // Lifetime holdings until close (database replacement or engine close): its 512 B base and
+      // its feed listener cell. A request only their release could serve is refused at once.
+      this.#unregisterLifetime =
+        governor.registerPermanent?.(() => (this.#closed ? 0 : 512 + CHANGE_LISTENER_BYTES)) ??
+        null;
     } catch (error) {
       if (this.#used > 0) this.#free(this.#used);
       this.#cache.unregister?.();
@@ -660,6 +672,8 @@ export class LiveRuntime {
     if (this.#timer !== null) clearTimeout(this.#timer);
     clearInterval(this.#poll);
     this.#stop();
+    this.#unregisterLifetime?.();
+    this.#unregisterLifetime = null;
     for (const entry of this.#entries) this.#closeEntry(entry);
     this.#free(512);
     // Running cleanup still owns cache charges; unregister only removes eviction callbacks.

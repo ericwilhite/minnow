@@ -1,8 +1,9 @@
 /** Review 7 of #11 (GOVERNOR-WAIT-POLICY): deterministic regressions for the governor's wait
  * policy. The generated schedules are in holder-priority.test.ts. */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   Governor,
+  GovernorStallError,
   GrowthObserverReentryError,
   MemoryAdmissionError,
   type Grant,
@@ -258,4 +259,73 @@ describe("preparation credit interactions", () => {
     parent.close();
     expect(governor.usedBytes).toBe(0);
   });
+});
+
+// Review 10 P3: unrelated grant activity cannot mask a stalled waiter indefinitely. Two holders'
+// growth waits on credit the other holds while an unrelated grant allocates and frees one byte a
+// second (progress for the no-progress rule): the hard deadline reports the waiter, naming the rule.
+it("reports a waiter past its hard deadline despite unrelated activity", async () => {
+  vi.useFakeTimers();
+  const previous = Governor.stallAfterMs;
+  Governor.stallAfterMs = 10_000;
+  const governor = new Governor(32 << 20);
+  const room = governor.capBytes - governor.reserveBytes;
+  const a = await governor.admit({
+    label: "A",
+    minimumBytes: Math.floor(room / 2),
+    spillable: false,
+  });
+  const b = await governor.admit({
+    label: "B",
+    minimumBytes: room - Math.floor(room / 2) - 1024,
+    spillable: false,
+  });
+  const unrelated = await governor.admit({
+    label: "unrelated",
+    minimumBytes: 1024,
+    spillable: false,
+  });
+  expect(a.allocate(a.held)).toBe(true);
+  expect(b.allocate(b.held)).toBe(true);
+  const outcomes: unknown[] = ["pending", "pending"];
+  const waits = outcomes.map((_, i) =>
+    governor
+      .admitGroup({
+        label: `growth ${String(i)}`,
+        holdsCredit: true,
+        grants: [{ label: "growth", minimumBytes: 2048, spillable: false }],
+      })
+      .then(
+        (grants) => {
+          for (const grant of grants) grant.close();
+          outcomes[i] = "served";
+        },
+        (error: unknown) => {
+          outcomes[i] = error;
+        },
+      ),
+  );
+  try {
+    // Activity every second for 70 s: the no-progress rule never fires; the deadline (60 s) does.
+    for (let second = 0; second < 70; second++) {
+      expect(unrelated.allocate(1)).toBe(true);
+      unrelated.free(1);
+      await vi.advanceTimersByTimeAsync(1_000);
+      if (second < 55) expect(outcomes[0], `reported at ${String(second)} s`).toBe("pending");
+    }
+    expect(outcomes[0]).toBeInstanceOf(GovernorStallError);
+    expect((outcomes[0] as GovernorStallError).rule).toBe("deadline");
+    expect((outcomes[0] as GovernorStallError).message).toContain("Governor stall (deadline)");
+  } finally {
+    a.free(a.allocated);
+    b.free(b.allocated);
+    a.close();
+    b.close();
+    await vi.advanceTimersByTimeAsync(100_000);
+    await Promise.all(waits);
+    unrelated.close();
+    Governor.stallAfterMs = previous;
+    vi.useRealTimers();
+  }
+  expect(governor.usedBytes).toBe(0);
 });

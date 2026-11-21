@@ -340,3 +340,62 @@ it.each([0, 1, 2, 4, 8])("closes after an idle spill already running (%i turns)"
   await h.close();
   expect(governor.usedBytes).toBe(0);
 });
+
+// Review 10: the idle spill republishes the state after freezing; a begin() racing it must see a
+// funded state (the previous one until the new pin's charge succeeds), never a ParseBudgetError.
+it.each([0, 1, 2, 4])(
+  "begins a transaction while an idle spill publishes (%i turns)",
+  async (turns) => {
+    const h = new Harness();
+    Object.defineProperty(h, "governor", { value: new Governor(32 << 20) });
+    const path = await h.open();
+    const governor = h.governor;
+    const outcome = (label: string, bytes: number, signal?: AbortSignal) =>
+      governor
+        .admit({ label, minimumBytes: bytes, spillable: false, ...(signal ? { signal } : {}) })
+        .then(
+          (grant) => {
+            grant.close();
+            return "served";
+          },
+          (error: unknown) =>
+            (error as { sqlState?: string; name?: string }).sqlState ?? (error as Error).name,
+        );
+    try {
+      let t = 0;
+      await autocommit(path, async (s) => {
+        t =
+          (
+            await s.changeCatalog({
+              kind: "createTable",
+              table: tableInput("d", [column("id", INT, false)], { primaryKey: null }),
+            })
+          ).id ?? 0;
+      });
+      await autocommit(path, (s) => s.table(t).insert(batch(ints([0, 1, 2])), null));
+      await path.quiesce();
+      await settleWithin(outcome("publish inserts", governor.usableCapacity()), 4_000);
+      await path.quiesce();
+      await autocommit(path, (s) => s.table(t).delete(batch(locators([0, 1], t)), null));
+      await path.quiesce();
+      const stop = new AbortController();
+      const racing = outcome("racing request", governor.usableCapacity(), stop.signal);
+      for (let turn = 0; turn < turns; turn++) await Promise.resolve();
+      let failure: unknown = null;
+      try {
+        const tx = await path.begin();
+        tx.rollback();
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure, "begin() pinned an unfunded state").toBeNull();
+      const settled = await settleWithin(racing, 4_000);
+      stop.abort();
+      await racing;
+      expect(["served", "53200"]).toContain(settled);
+    } finally {
+      await h.close();
+    }
+    expect(governor.usedBytes).toBe(0);
+  },
+);

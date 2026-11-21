@@ -11909,6 +11909,9 @@ export const LIFETIME_HOLDINGS_REACH = [
   "table dropped under a snapshot",
   "waited for a snapshot, then settled",
   "current run readers open",
+  "change feed created",
+  "change feed listener removed",
+  "transaction begun during idle reclaim",
   "exact after publication",
 ] as const;
 

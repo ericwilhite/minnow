@@ -98,7 +98,11 @@ for (const seed of seedsFor("next-governor-lifetime-holdings", [50901, 50902]))
           ),
           fc.constantFrom(16, 1 << 16),
           fc.boolean(),
-          async (tables, memtableRows, holdSnapshot) => {
+          // Review 10: the change feed (created lazily; a listener subscribed and later removed).
+          fc.constantFrom("none", "created", "listened"),
+          // Review 10: a transaction begun while the idle reclaim's spill publishes.
+          fc.boolean(),
+          async (tables, memtableRows, holdSnapshot, feed, beginDuringReclaim) => {
             reach.beginHistory();
             const h = new Harness("strict", "sim", memtableRows);
             Object.defineProperty(h, "governor", { value: new Governor(32 << 20) });
@@ -106,7 +110,13 @@ for (const seed of seedsFor("next-governor-lifetime-holdings", [50901, 50902]))
             const governor = h.governor;
             let snapshot: ReturnType<WritePathImpl["pin"]> | null = null;
             const indexedLive: number[] = [];
+            let unlisten: (() => void) | null = null;
             try {
+              if (feed !== "none") {
+                void path.changes;
+                reach.reach("change feed created");
+                if (feed === "listened") unlisten = path.changes.observe(() => undefined);
+              }
               for (const [k, spec] of tables.entries()) {
                 let t = 0;
                 await autocommit(path, async (s) => {
@@ -213,15 +223,27 @@ for (const seed of seedsFor("next-governor-lifetime-holdings", [50901, 50902]))
                 if (early === PENDING) reach.reach("waited for a snapshot, then settled");
                 await path.quiesce();
               }
-              const first = await settleWithin(
-                outcome(governor, "idle usable cap", governor.usableCapacity()),
-                deadline,
-              );
+              const pending = outcome(governor, "idle usable cap", governor.usableCapacity());
+              if (beginDuringReclaim) {
+                // The request's reclaim starts the idle spill; a transaction begins meanwhile and
+                // must see a funded state (never a ParseBudgetError).
+                await Promise.resolve();
+                const tx = await path.begin();
+                tx.rollback();
+                reach.reach("transaction begun during idle reclaim");
+              }
+              const first = await settleWithin(pending, deadline);
               expect(
                 first,
                 "waited on idle state no flush, publication or reclaim was freeing",
               ).not.toBe(PENDING);
               expect(first).not.toBe("53200 below the usable cap");
+              if (unlisten !== null) {
+                // The listener's cell is its subscriber's: gone with it, the base stays registered.
+                unlisten();
+                unlisten = null;
+                reach.reach("change feed listener removed");
+              }
               await path.quiesce();
               // Read every surviving indexed table through its primary key: the current state's
               // run readers open and stay resident after the snapshot closes, and the
@@ -259,6 +281,7 @@ for (const seed of seedsFor("next-governor-lifetime-holdings", [50901, 50902]))
               expect(slack, "registered lifetime holdings the writer does not hold").toBe(0);
               reach.reach("exact after publication");
             } finally {
+              unlisten?.();
               snapshot?.release();
               await h.close();
             }
@@ -283,6 +306,8 @@ for (const seed of seedsFor("next-governor-lifetime-holdings", [50901, 50902]))
               ],
               1 << 16,
               false,
+              "none",
+              false,
             ],
             // Review 9: retired run readers kept only by a snapshot.
             [
@@ -298,6 +323,8 @@ for (const seed of seedsFor("next-governor-lifetime-holdings", [50901, 50902]))
               ],
               16,
               true,
+              "none",
+              false,
             ],
             // Unindexed published deletions only (no memtable content).
             [
@@ -313,6 +340,25 @@ for (const seed of seedsFor("next-governor-lifetime-holdings", [50901, 50902]))
               ],
               1 << 16,
               false,
+              "none",
+              false,
+            ],
+            // Review 10: a racing begin() and a change feed with a listener, over published rows.
+            [
+              [
+                {
+                  indexed: false,
+                  secondary: false,
+                  rows: 3,
+                  deletes: "some",
+                  spillFirst: true,
+                  drop: false,
+                },
+              ],
+              1 << 16,
+              false,
+              "listened",
+              true,
             ],
           ],
         },

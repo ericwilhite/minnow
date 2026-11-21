@@ -1624,7 +1624,8 @@ and the owner import it directly.
   floors are revocable when idle, so they are not counted as permanent; what the write engine keeps
   until close, or for as long as the current state needs it, is (the page cache's fixed slabs,
   permanent storage, the current state's resident metadata and pin, its fixed controls and
-  resident commit writers). What a finite holder releases is not: state only older snapshots keep
+  resident commit writers, and the change feed once created). A live-query runtime registers its
+  base and feed listener until it closes. What a finite holder releases is not: state only older snapshots keep
   (a request it blocks waits for them), FTS mutation entries, pending index records. Unflushed
   memtable content (rows, index tombstones, deletions) is not permanent: reclaim on an idle writer
   flushes it, and publishes once when only a publication releases the rest. Every transition that can make the writer's
@@ -1640,7 +1641,11 @@ and the owner import it directly.
   `testing/native-command-fifo.test.ts`. In test runs,
   `MINNOW_GOVERNOR_STALL_MS` turns any wait without governor progress into a `GovernorStallError`
   naming every holder. Progress includes any allocation, free or credit move on any grant, so a
-  holder working inside memory it was already granted is never reported as a stall.
+  holder working inside memory it was already granted is not reported while it touches its
+  grants; one computing longer than the window without touching any grant still is (a CPU-only
+  false positive). Unrelated activity can hide a stalled waiter only until its hard deadline
+  (6 windows): past it the waiter is reported whatever else moves, and the error says which rule
+  fired.
 - Query preparation never waits while it holds memory (`exec/preparation.ts`). Until the
   minimum is installed, every admission (retained source recipes, source sizing scratch,
   planning probes, parameter sizing) is one the governor serves at once, through the same call

@@ -448,10 +448,15 @@ export class GovernorStallError extends Error {
     readonly afterMs: number,
     /** Where the waiter queued (stack at admission). */
     readonly waiterStack: string,
+    /** Which rule fired: no governor progress for `afterMs`, or queued past the hard deadline
+     * (`Governor.stallDeadlineWindows` windows) whatever unrelated activity continued. */
+    readonly rule: "no progress" | "deadline" = "no progress",
   ) {
     super(
-      `Governor stall: "${waiter.label}" waited ${String(afterMs)} ms for ${String(waiter.bytes)}B ` +
-        `(capacity ${String(capacity)}B, used ${String(usedBytes)}B) with no progress; holders: ` +
+      `Governor stall (${rule}): "${waiter.label}" waited ` +
+        `${String(rule === "deadline" ? afterMs * Governor.stallDeadlineWindows : afterMs)} ms ` +
+        `for ${String(waiter.bytes)}B (capacity ${String(capacity)}B, used ${String(usedBytes)}B) ` +
+        `${rule === "deadline" ? "queued past its deadline" : "with no progress"}; holders: ` +
         holders
           .map(
             (holder) =>
@@ -475,6 +480,9 @@ export class Governor implements MemoryGovernor {
    * longer than the window would also be reported.
    */
   static stallAfterMs: number | null = null;
+  /** Test builds: a waiter queued for this many windows is reported whatever other activity
+   * continues (review 10): unrelated grant activity cannot mask a stalled waiter indefinitely. */
+  static stallDeadlineWindows = 6;
   readonly #grantObservers = new Set<(event: GrantEvent) => void>();
 
   /** Reports every grant synchronously, with the queues as they stand at that moment, so a
@@ -1001,6 +1009,7 @@ export class Governor implements MemoryGovernor {
     if (afterMs === null) return;
     const queuedAt = new Error().stack?.split("\n").slice(3, 16).join("\n") ?? "";
     const moved = () => this.#progress + this.activity;
+    const deadline = Date.now() + afterMs * Governor.stallDeadlineWindows;
     let seen = moved(),
       since = Date.now();
     const timer = setInterval(
@@ -1009,12 +1018,13 @@ export class Governor implements MemoryGovernor {
           clearInterval(timer);
           return;
         }
+        const now = Date.now();
         if (moved() !== seen) {
           seen = moved();
-          since = Date.now();
-          return;
+          since = now;
         }
-        if (Date.now() - since < afterMs) return;
+        const rule = now - since >= afterMs ? "no progress" : now >= deadline ? "deadline" : null;
+        if (rule === null) return;
         clearInterval(timer);
         const holders = new Map<string, { held: number; allocated: number; spillable: boolean }>();
         for (const grant of this.#grants) {
@@ -1042,6 +1052,7 @@ export class Governor implements MemoryGovernor {
               .map(([label, holder]) => ({ label, ...holder })),
             afterMs,
             queuedAt,
+            rule,
           ),
         );
       },

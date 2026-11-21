@@ -5,7 +5,7 @@ import {
   capturedWriterReferences,
   type CapturedWriterExtents,
 } from "../storage/writer-extents.js";
-import { ChangeFeed } from "../access/changes.js";
+import { CHANGE_FEED_BYTES, ChangeFeed } from "../access/changes.js";
 import { freshDatabaseIdentity } from "../format/database-identity.js";
 import type { RetirementInventory } from "../storage/retirement-contract.js";
 import { FTS_MUTATION_BASE_BYTES, FtsMutations, type FtsMutationCommit } from "./fts-mutations.js";
@@ -1835,15 +1835,20 @@ export class WritePathImpl implements WritePath, EngineHooks {
   #currentPin: SpacePin | null = null;
 
   #publishState(): void {
+    const tables = new Map<number, TableView>();
+    for (const [id, state] of this.#tables) tables.set(id, state.view);
+    const next: WriteState = { root: this.#root, tables };
+    // Funded before it is exposed (review 10): the pin's charge may be refused (the caller's
+    // metadata retry then grows and publishes again); until it succeeds the previous state, already
+    // pinned, stays current, so a concurrent begin() or snapshot never pins an unfunded state.
+    const pin = this.#pinState(next, "current state");
     if (this.#root.fts.staged === null) {
       this.#ftsPending = null;
       this.#ftsUnclaimed = false;
     }
-    const tables = new Map<number, TableView>();
-    for (const [id, state] of this.#tables) tables.set(id, state.view);
-    this.#state = { root: this.#root, tables };
+    this.#state = next;
     const previous = this.#currentPin;
-    this.#currentPin = this.#pinState(this.#state, "current state");
+    this.#currentPin = pin;
     previous?.release();
   }
 
@@ -2289,6 +2294,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
       FIXED_CACHE_BYTES +
       this.#space.stats.permanentBytes +
       metadata +
+      // The change feed, created on first use, lives until close: its base and the rekey history
+      // it keeps for live queries. Listener cells are their subscribers' (finite) holdings.
+      (this.#changes === null ? 0 : CHANGE_FEED_BYTES + this.#changes.historyBytes) +
       (this.#currentPin === null ? 0 : (this.#statePins.get(this.#state)?.pin.bytes ?? 0)) +
       OBJECT_OVERHEAD_BYTES +
       NATIVE_WRITE_STEP_BYTES +
@@ -4092,10 +4100,15 @@ export class WritePathImpl implements WritePath, EngineHooks {
           this.#holder === null &&
           this.#unpublishedIdleState()
         ) {
-          this.#spillPublishedAt = this.#appender.lastLsn;
-          await this.#metadataAsync(() =>
-            this.#publishUnchanged("idle spill", () => !this.closed && this.#holder === null),
-          );
+          const at = this.#appender.lastLsn;
+          // Marked only once published: a skipped publication (a transaction took the slot)
+          // leaves the state eligible for the next idle reclaim.
+          if (
+            await this.#metadataAsync(() =>
+              this.#publishUnchanged("idle spill", () => !this.closed && this.#holder === null),
+            )
+          )
+            this.#spillPublishedAt = at;
         }
       })
       .catch((error: unknown) => {
