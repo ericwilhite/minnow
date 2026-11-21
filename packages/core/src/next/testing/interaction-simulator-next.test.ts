@@ -8,6 +8,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import {
   generateInteractionPlan,
   runInteractionPlan,
+  type InteractionPlan,
   type InteractionPlanOptions,
 } from "../../testing/interaction-simulator.js";
 import { seedsFor } from "../../testing/seeds.js";
@@ -84,4 +85,49 @@ describe.each(SETS)("interaction simulator over next/: %s", (name, options, seed
     },
     120_000,
   );
+});
+
+/**
+ * Both foreign-key sides, pinned (the generated plans rarely delete a RESTRICT-referenced parent):
+ * an insert naming no parent is refused as the referencing side, and a delete of a referenced
+ * parent as the referenced side. Each must be judged by its own side (PostgreSQL's 23503 "is not
+ * present in table" vs "is still referenced from table"; next/'s typed `problem`).
+ */
+it("judges each foreign-key side by its own refusal (pinned plan)", async () => {
+  const parent = { name: "p", columns: [{ name: "c0", type: "integer" as const, nullable: true }] };
+  const child = {
+    name: "c",
+    columns: [
+      {
+        name: "f",
+        type: "integer" as const,
+        nullable: true,
+        references: { table: "p", onDelete: "restrict" as const },
+      },
+    ],
+  };
+  const plan: InteractionPlan = {
+    version: 1,
+    seed: 0,
+    connections: 1,
+    interactions: [
+      { kind: "createTable", connection: 0, table: parent, expectExisting: false },
+      { kind: "createTable", connection: 0, table: child, expectExisting: false },
+      { kind: "insert", connection: 0, table: "p", rows: [{ id: 1, c0: 1 }], viaParameters: false },
+      { kind: "insert", connection: 0, table: "c", rows: [{ id: 1, f: 1 }], viaParameters: false },
+      // The referencing side: no parent row 9.
+      { kind: "insert", connection: 0, table: "c", rows: [{ id: 2, f: 9 }], viaParameters: true },
+      // The referenced side: child 1 still references parent 1 under RESTRICT.
+      {
+        kind: "delete",
+        connection: 0,
+        table: "p",
+        predicate: { kind: "compare", column: "id", op: "=", value: 1 },
+      },
+    ],
+  };
+  const driver = await createNextDriver();
+  const result = await runInteractionPlan(plan, driver);
+  expect(result.interactions).toBe(plan.interactions.length);
+  expect(result.reached).toContain("write-refused");
 });
