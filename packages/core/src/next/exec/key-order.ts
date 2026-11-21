@@ -317,8 +317,8 @@ export async function runIndexOrder(
   admitted?: AdmittedIndexRead,
 ): Promise<void> {
   const entries = admitted
-    ? admittedIndexMinimums(shape, runtime.request.governor.capBytes, admitted)
-    : indexMinimums(shape, runtime.request.governor.capBytes);
+    ? admittedIndexMinimums(shape, runtime.governor.capBytes, admitted)
+    : indexMinimums(shape, runtime.governor.capBytes);
   const grants = [];
   for (const entry of entries)
     grants.push(
@@ -360,7 +360,7 @@ export async function runIndexOrder(
       ...(directories === undefined ? {} : { directories }),
       spill: runtime.request.spill,
       queryId: runtime.request.queryId,
-      targetBytes: admitted?.targetBytes ?? batchTargetFor(runtime.request.governor.capBytes, 4),
+      targetBytes: admitted?.targetBytes ?? batchTargetFor(runtime.governor.capBytes, 4),
       signal: runtime.signal,
       onPipeline: () => runtime.pipeline(),
       orderedShortcut: true,

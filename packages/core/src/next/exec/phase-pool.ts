@@ -1,11 +1,14 @@
 /** One shared idle account per governor, never a per-waiter reservation. */
 import type { Grant, MemoryGovernor } from "../memory/governor.js";
+import { baseGovernor } from "./preparation.js";
 const pools = new WeakMap<MemoryGovernor, { refs: number; ready: Promise<Grant> }>();
 export async function acquirePhasePool(
   owner: MemoryGovernor,
   signal: AbortSignal,
 ): Promise<{ pool: Grant; release: () => void }> {
   signal.throwIfAborted();
+  // One pool per real governor, also when a query admits through its preparation facade.
+  owner = baseGovernor(owner);
   let entry = pools.get(owner);
   if (!entry) {
     entry = {
