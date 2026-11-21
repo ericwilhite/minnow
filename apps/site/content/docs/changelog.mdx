@@ -77,6 +77,11 @@ Unqualified native roots retain typed 0A000
 refusals. Public 0.x behavior, package entry points and stored formats are unchanged; no
 migration is required.
 
+The unexported 1.0 write path refuses a write batch longer than 65,536 rows with a typed error
+(SQLSTATE 54000) before writing anything. It used to misread row positions past 65,536 and fail
+with a false duplicate-key or "row affected twice" error. SQL statements and bulk inserts already
+split their input into smaller batches and are unaffected.
+
 The unexported 1.0 rebuild reserves wide sort merge workspace independently of source batch size, including encoded keys and the `WITH TIES` boundary row when a competing query forces a smaller source recipe.
 
 The private 1.0 writer preserves exact BIGINT values when updating or deleting persisted

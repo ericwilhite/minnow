@@ -169,7 +169,8 @@ export interface DictionaryVector {
 export type Vector = FlatVector | ConstantVector | DictionaryVector;
 
 export interface Batch {
-  /** Physical rows 0 … length; ≤ BATCH_ROWS. */
+  /** Physical rows 0 … length; ≤ BATCH_ROWS by convention, never above 65,536 (row positions
+   * and selections are 16-bit; the write path refuses longer batches, BatchTooLargeError). */
   readonly length: number;
   readonly columns: readonly Vector[];
   /** Active rows, or null when all `length` rows are active. */
