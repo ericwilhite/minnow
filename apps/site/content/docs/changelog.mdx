@@ -73,8 +73,9 @@ a full-text index or pending full-text state exists. A trigger body's query size
 from what its root can afford beside the writer. These changes keep the qualified SQL histories
 within 32 MiB. A native step no longer holds the writer's background-merge minimum (a native
 step never merges; a merge admits its own credit when it runs), so at 32 MiB the generated
-preparation bodies that used to be refused with 53200 now run; only a body whose own preparation
-exceeds the cap is refused.
+preparation bodies that used to be refused with 53200 now run. A body is still refused with 53200
+when its preparation together with the writer's mandatory workspace (its row and commit minimums,
+any running merge, its metadata headroom and the page cache's fixed slabs) exceeds the cap.
 Unqualified native roots retain typed 0A000
 refusals. Public 0.x behavior, package entry points and stored formats are unchanged; no
 migration is required.
