@@ -182,6 +182,33 @@ it("never asks for more than the usable capacity: lifetime holdings cap the doub
   expect(governor.usedBytes).toBe(0);
 });
 
+it("counts growth after admission in the peak need (review repro)", async () => {
+  // Retain 1 MiB, admit 1 MiB of spillable scratch, grow it to 7 MiB, close it, then block on a
+  // 1 MiB admission: the attempt's peak was 8 MiB, so that is the next request.
+  const MiB = 1 << 20;
+  const governor = new Governor(16 * MiB);
+  const facade = new PreparationGovernor(governor);
+  const recipe = await facade.admit({ label: "recipe", minimumBytes: MiB, spillable: false });
+  const scratch = await facade.admit({ label: "scratch", minimumBytes: MiB, spillable: true });
+  expect(scratch.allocate(7 * MiB)).toBe(true);
+  expect(facade.heldBytes).toBe(8 * MiB);
+  scratch.free(7 * MiB);
+  scratch.close();
+  const competitor = governor.admit({
+    label: "competitor",
+    minimumBytes: governor.capBytes - governor.reserveBytes,
+    spillable: false,
+  });
+  const blocked = facade.admit({ label: "next", minimumBytes: MiB, spillable: false });
+  await expect(blocked).rejects.toBeInstanceOf(PreparationWouldWait);
+  const wait = await blocked.catch((error: unknown) => error);
+  expect(wait).toMatchObject({ held: MiB, requested: MiB, needed: 8 * MiB });
+  recipe.close();
+  (await competitor).close();
+  facade.close();
+  expect(governor.usedBytes).toBe(0);
+});
+
 it("waits for each credit holding nothing", async () => {
   const governor = new Governor(64 << 20);
   contended(governor);

@@ -380,12 +380,18 @@ for (const seed of seedsFor("next-preparation-credit", [0x9c4e, 0x9c4f]))
             // Probe "restart": two concurrent queries restart, rows published between attempts.
             probing.on = true;
             // Two ordered scans retain source recipes, so both restart; the join holds nothing
-            // when it waits (it waits as usual), and runs across the same publication.
+            // when it waits (it waits as usual), and runs across the same publication. Each scan's
+            // window covers its table's last rows, and the publication between attempts appends
+            // rows inside that window: an attempt that read the published snapshot instead of its
+            // own would return them.
+            const tail = (t: number, keep: number) => (rows[t]?.length ?? 0) - keep;
             const restartProbes = [
-              plan({ table: 0, shape: 0, a: 4, b: 5 }),
-              plan({ table: 1, shape: 0, a: 7, b: 2200 }),
+              plan({ table: 0, shape: 0, a: 9, b: tail(0, 3) }),
+              plan({ table: 1, shape: 0, a: 7, b: tail(1, 2) }),
               plan({ table: 0, shape: 3, a: 11, b: 0 }),
             ];
+            expect(restartProbes[0]?.expected).toHaveLength(3);
+            expect(restartProbes[1]?.expected).toHaveLength(2);
             const probeRuns = restartProbes.map(({ sql, join }) => {
               if (join) reach.reach("join");
               return core.execute(sql);

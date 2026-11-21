@@ -222,6 +222,8 @@ class GrantImpl implements Grant {
   group: readonly GrantImpl[] | null = null;
   /** A grant carved from held credit returns its bytes there while that credit is open. */
   parent: GrantImpl | null = null;
+  /** Called after this grant's holdings grow (Governor.observeGrowth). */
+  grown: (() => void) | null = null;
   held = 0;
   allocated = 0;
   loan = 0;
@@ -432,6 +434,7 @@ export class Governor implements MemoryGovernor {
     if (!this.#room(bytes, false)) return false;
     this.#take(bytes);
     grant.held += bytes;
+    grant.grown?.();
     return true;
   }
 
@@ -659,6 +662,7 @@ export class Governor implements MemoryGovernor {
         this.#grants.add(grant);
       }
       grant.held += taken;
+      if (request.grant !== null) grant.grown?.();
       {
         let remaining = wanted - taken;
         for (const pool of this.#idleCredit) {
@@ -873,6 +877,16 @@ export class Governor implements MemoryGovernor {
   }
 
   /**
+   * Calls `observer` after `grant`'s holdings grow (growth, a read's room, a credit transfer in),
+   * or stops with null. Preparation tracks its peak with it. False for a foreign grant.
+   */
+  observeGrowth(grant: Grant, observer: (() => void) | null): boolean {
+    if (!(grant instanceof GrantImpl) || grant.governor !== this) return false;
+    grant.grown = observer;
+    return true;
+  }
+
+  /**
    * From now on `child` returns the bytes it releases to `parent` while `parent` is open, exactly
    * as if it had been carved from it. False (nothing changes) for a closed, foreign, idle or
    * already parented grant.
@@ -911,6 +925,7 @@ export class Governor implements MemoryGovernor {
     if (source !== target) {
       source.held -= bytes;
       target.held += bytes;
+      target.grown?.();
     }
     if (
       bytes > 0 &&

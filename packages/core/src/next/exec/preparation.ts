@@ -125,6 +125,11 @@ export class PreparationGovernor implements MemoryGovernor {
     const credit = this.#credit;
     return credit === null ? 0 : credit.held - credit.allocated - credit.loaned;
   }
+  /** Ends this attempt's tracking of its grants (they keep their bytes; no observer remains). */
+  #forget(): void {
+    for (const grant of this.#taken) this.governor.observeGrowth(grant, null);
+    this.#taken.clear();
+  }
   /** Live bytes held by this attempt's grants. */
   #live(): number {
     let bytes = 0;
@@ -139,6 +144,10 @@ export class PreparationGovernor implements MemoryGovernor {
     if (!this.#preparing) return grant;
     if (this.#credit !== null && grant !== this.#credit) this.governor.adopt(this.#credit, grant);
     this.#taken.add(grant);
+    // A grant can grow after admission (allocation past its holdings); the peak sees that too.
+    this.governor.observeGrowth(grant, () => {
+      if (this.#preparing) this.#peak = Math.max(this.#peak, this.#live());
+    });
     this.#peak = Math.max(this.#peak, this.#live());
     return grant;
   }
@@ -294,7 +303,7 @@ export class PreparationGovernor implements MemoryGovernor {
     if (!this.#preparing) throw new TypeError("Preparation already reserved");
     this.#credit?.close();
     this.#credit = null;
-    this.#taken.clear();
+    this.#forget();
     this.#peak = 0;
     const progress = wait.includesProgress || this.#progress;
     const usable = this.usableCapacity(progress);
@@ -332,7 +341,7 @@ export class PreparationGovernor implements MemoryGovernor {
   /** The reservation is installed: release the unused credit and pass admissions through. */
   finish(): void {
     this.#preparing = false;
-    this.#taken.clear();
+    this.#forget();
     this.#credit?.close();
     this.#credit = null;
   }
