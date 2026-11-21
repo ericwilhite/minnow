@@ -714,6 +714,8 @@ class ComposedSession implements EngineSession {
   readonly sequences = new Sequences();
   readonly #engine: ComposedEngine;
   #state: TransactionState = "idle";
+  /** Epoch of the session's transactions: each BEGIN opens the next one. */
+  #transaction = 0;
   #modes: AppliedTransactionModes = { ...DEFAULT_TRANSACTION_MODES };
   #snapshotTaken = false;
   #hasWrites = false;
@@ -899,11 +901,27 @@ class ComposedSession implements EngineSession {
   }
 
   /** Inside an open transaction a failure aborts it (PostgreSQL 25P02 afterwards). */
-  #abortOnFailure<T>(promise: Promise<T>): Promise<T> {
+  /**
+   * Fails the transaction a statement belonged to when the statement fails. `owner` is that
+   * transaction (its epoch), captured when the statement starts: "opens" for transaction control
+   * that may open the one it fails, null for a statement outside any transaction, which never
+   * fails one, even if a later transaction is open on the session when it settles (a read that
+   * bypassed the session's queue: owner/server.ts).
+   */
+  #abortOnFailure<T>(
+    promise: Promise<T>,
+    owner: number | "opens" | null = this.#owner(),
+  ): Promise<T> {
     return promise.catch((error: unknown) => {
-      if (this.#state === "open") this.#state = "failed";
+      if (this.#state === "open" && (owner === "opens" || owner === this.#transaction))
+        this.#state = "failed";
       throw error;
     });
+  }
+
+  /** The open transaction's epoch, or null outside one. */
+  #owner(): number | null {
+    return this.#state === "open" ? this.#transaction : null;
   }
 
   // ---- EngineSession ----
@@ -973,10 +991,17 @@ class ComposedSession implements EngineSession {
   }
 
   run(statement: PlannedStatement, params: readonly WireValue[], context: RunContext): Run {
+    // Captured before the statement runs: the transaction it belongs to, if any.
+    const owner =
+      this.#state === "open"
+        ? this.#transaction
+        : statement.lowered.kind === "transactionControl"
+          ? "opens"
+          : null;
     const run = this.#run(statement, params, context);
     // PostgreSQL: any error inside an open transaction aborts it (25P02 until it ends), whatever
     // raised it: a refusal, a missing savepoint, the statement itself.
-    const done = this.#abortOnFailure(run.done);
+    const done = this.#abortOnFailure(run.done, owner);
     done.catch(() => undefined);
     return {
       results: run.results,
@@ -1562,6 +1587,7 @@ class ComposedSession implements EngineSession {
     this.#snapshotTaken = false;
     this.#hasWrites = false;
     this.#startedAtMs = this.#engine.now();
+    this.#transaction++;
     this.#state = "open";
   }
 

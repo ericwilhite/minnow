@@ -1761,6 +1761,7 @@ export const KEY_LOOKUP_SIZING_REACH = [
   "range",
   "range over the bound",
   "parameter",
+  "ordered by the key",
   "work bound",
   "fallback",
   "PG exact",
@@ -10762,6 +10763,37 @@ export const DML_COMPUTED_REACH = [
   "update concatenation",
   "delete concatenation predicate",
   "large insert",
+  "insert returning",
+  "update returning",
+  "delete returning",
+] as const;
+
+/** Set operations against PostgreSQL (set-operation-differential). */
+export const SET_OPERATION_REACH = [
+  "union all",
+  "union",
+  "intersect",
+  "intersect all",
+  "except",
+  "except all",
+  "mixed chain",
+  "two arms",
+  "three or more arms",
+  "coerced arm",
+  "empty arm",
+  "duplicates kept",
+  "bag",
+  "ordered",
+  "aggregated",
+  "grouped",
+  "joined",
+  "insert",
+  "rollup",
+  "cube",
+  "grouping sets",
+  "refused like PostgreSQL",
+  "phase arm refused under UNION ALL",
+  "phase arm in a hash-count set operation",
 ] as const;
 
 export const FOLLOW_NESTED_PRESSURE_REACH = [

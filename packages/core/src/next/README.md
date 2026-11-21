@@ -1862,9 +1862,12 @@ The selected-row fetch is sized over only the groups the lookup's keys name. Bef
 sizing binds the parameters and encodes the same keys on its own scratch grant
 (`index-lookup/sizing`: twice the key minimum plus 8 bytes per locator), probes the same pinned
 view, and charges the distinct segment list (`index-lookup/segments`, 4 bytes per locator). The
-scratch is released before sizing continues. The list and that sizing are preparation admissions
-(see Memory): one that would wait while the list is held releases the whole attempt, which
-prepares again with a credit covering both, so sizing never waits holding the list. More
+scratch is released before sizing continues. The list stays held through every sizing of that
+source in the pass (its read bound, and the per-column widths of sort and join keys, bounded
+columns, JSON keys and result columns), so none of them sizes the whole table. The list and those
+sizings are preparation admissions (see Memory): one that would wait while the list is held
+releases the whole attempt, which prepares again with a credit covering both, so sizing never
+waits holding the list. More
 than 2048 locators, a scratch the cap cannot hold, or keys that fail to bind or encode all size
 the whole source: execution raises any key error in its usual order, and nothing is refused below
 the cap. A sized lookup opens a sizing cursor per probed key before its execution cursors (per
@@ -1931,7 +1934,9 @@ their synthetic executor. Native INSERT VALUES/SELECT, UPDATE, DELETE, ON CONFLI
 execute with statement snapshot input spools. When the input runs in producer phases (text
 concatenation, spilling aggregates), the input spool holds no rows at a phase handoff (rows reach
 the modification root only after the last cut) and releases its buffers there, since they share
-the result reservation the handoff parks; each phase builds its own spool. Joined/index inputs retain locator identity;
+the result reservation the handoff parks; each phase builds its own spool. RETURNING and ON
+CONFLICT also bind a writer, row rules and their own grant with each phase's graph: these close
+at the handoff, holding no row yet, and the next phase binds them again. Joined/index inputs retain locator identity;
 repeat tracking and returned rows use charged, spillable state. SQL writers without a unique-target
 proof require the admitted tracker before writer lookup, including raw executor requests. The
 direct-native legacy target Set cannot be selected by SQL. Complete-row validation includes
@@ -2504,8 +2509,9 @@ shipped-engine or stored-format change.
   `aggregationProgress: false` retains the unexported parent benchmark control. The Node
   benchmark also accepts `--control-executor` for a pinned main executor over the same
   stored fixture; shared owner contract/error modules must preserve class identity.
-  Ordinary hash aggregation still refuses GROUPING SETS and string/array/JSON aggregates
-  (`UnsupportedPlanError`, construct `aggregate`, before allocation). Numeric ordered-set-only
+  Ordinary hash aggregation still refuses string/array/JSON aggregates (`UnsupportedPlanError`,
+  construct `aggregate`, before allocation). Several grouping sets (ROLLUP, CUBE, GROUPING SETS)
+  lower to a UNION ALL of ordinary grouped aggregates, one per set, and run as such. Numeric ordered-set-only
   lists retain `agg/ordered-set.ts` as their bounded external fallback. Numeric percentile
   lists may instead use `agg/percentile.ts`: exact dictionary-domain planning bounds at most
   1024 byte-key groups and 2^21 source rows on the same pinned snapshot. The complete typed
@@ -3438,7 +3444,16 @@ not require a home cache directory.
   supports multiple FULL joins, FULL joins under windows, and NATURAL FULL JOIN; the shipped
   executor retains its separate sole-FULL-join rewrite and NATURAL FULL refusal.
 - Set operations resolve each pair's column types as PostgreSQL does: an unknown-typed constant
-  (NULL, a string literal) takes the other arm's type, and two unknowns are text.
+  (NULL, a string literal) takes the other arm's type, and two unknowns are text. UNION ALL runs
+  each arm in order into one consumer, holding no rows of its own; a stop (LIMIT) between arms
+  ends it early, and each arm sees the consumer's remaining demand. An expression evaluated in
+  producer phases (text concatenation, JSON expansion, a JSON aggregate) inside a UNION ALL arm
+  is refused (0A000): earlier arms' rows would already be downstream when a later arm cut a
+  phase. ROLLUP, CUBE and GROUPING SETS with several sets lower to a UNION ALL of grouped
+  aggregates over the same input, so such an expression in their input is refused too. EXCEPT, INTERSECT and distinct UNION share one hash-count operator (exec/except.ts) that
+  counts every distinct row's copies on each side and emits PostgreSQL's count for the kind;
+  their arms are phase parents, so such expressions run there. They compare rows, so json arms
+  are refused with PostgreSQL's 42883 and blank-padded CHAR arms with 0A000.
 - A FULL JOIN with no hash-joinable condition lowers, though PostgreSQL refuses it (0A000): an
   intended extension (R24.2), checked against PostgreSQL's LEFT JOIN UNION ALL anti-join rewrite.
 - Integer and timestamp GENERATE_SERIES in FROM streams fixed prepaid batches with NULL/zero-step rules,
@@ -5414,9 +5429,9 @@ ordering around that family; native suffixes are not PostgreSQL OID spellings.
 
 Typed 0A000 refusals remain for RETURNING/conflict/MERGE roots, volatile/FTS/init-plan inputs,
 auto-increment or indexed domains missing native preflight, parameterized or growing/
-structural CHECK/generated workspace. A trigger body subquery with more than one grouping set
-(ROLLUP, CUBE, or GROUPING SETS with several members) keeps the executor's existing set-operation
-refusal; a single grouping set runs as an ordinary grouped subquery. Raw executor calls do not
+structural CHECK/generated workspace. A trigger body subquery with grouping sets runs as
+PostgreSQL's does: one set as an ordinary grouped subquery, several (ROLLUP, CUBE, GROUPING
+SETS) as a UNION ALL of grouped aggregates. Raw executor calls do not
 install this owner controller.
 
 ### Native compiled-input phase memory

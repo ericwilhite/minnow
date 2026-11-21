@@ -34,7 +34,11 @@ import {
   type NativeRootPreparation,
   type NativeCommandRootScope,
 } from "./command-root.js";
-import { NativeRootCredits, NATIVE_ROOT_CREDIT_BYTES } from "./native-root-credits.js";
+import {
+  NativeRootCredits,
+  NATIVE_ROOT_CREDIT_BYTES,
+  openRootCredits,
+} from "./native-root-credits.js";
 import { NATIVE_INPUT_CAPTURE_BYTES } from "./native-input.js";
 import { PREPAID_QUERY_BYTES } from "./prepaid-query.js";
 import {
@@ -235,7 +239,7 @@ export async function executeNativeCommand(
     failure: { reason: unknown } | null = null;
   const cleanup: unknown[] = [];
   try {
-    credits = await NativeRootCredits.open({ governor, statement, signal, includesProgress: true });
+    credits = await openRootCredits({ governor, statement, signal });
     const paid = credits;
     // Metered preparation with a growing reservation. The meter charges each base share (linear
     // in stored text, native-preparation-bound.ts) and every copy the parser, optimizer and

@@ -456,6 +456,11 @@ export interface SimulatedFaults {
 
 export interface SimulationDriver {
   open(connection: number): Promise<SimulatedConnection>;
+  /**
+   * The reviewed parity gap an error is (a refusal the engine declares, with its SQLSTATE), or
+   * null. A read refused by a listed gap is skipped and counted; anything else still fails.
+   */
+  listedGap?(error: unknown): string | null;
   readonly faults?: SimulatedFaults;
   /** Whether errors the driver reports carry `name`; a driver over a text channel may not. */
   close?(): Promise<void>;
@@ -504,9 +509,20 @@ export const INTERACTION_REACH_STATES = [
   "alter-populated",
   /** An index-shaped lookup, planned through a secondary index, that returned rows. */
   "index-lookup-rows",
+  /** A read on a connection answered while that connection's own write still waited for the turn. */
+  "read-bypassed-queued-write",
 ] as const;
 
 export type InteractionReachState = (typeof INTERACTION_REACH_STATES)[number];
+
+/** Interactions that only read: the model is unchanged whatever the engine answers. */
+const READ_ONLY_KINDS: ReadonlySet<Interaction["kind"]> = new Set([
+  "select",
+  "partition",
+  "unionAll",
+  "lookup",
+  "match",
+]);
 
 export interface InteractionRunResult {
   readonly seed: number;
@@ -537,6 +553,10 @@ export interface InteractionRunResult {
   readonly indexPathQueries: number;
   /** Single-row commits that write bursts attempted. */
   readonly burstCommits: number;
+  /** Reads skipped because the engine refused them as a listed parity gap, by gap. */
+  readonly gapsSkipped?: Readonly<Record<string, number>>;
+  /** A write refused by a listed parity gap: the plan stopped at that step, unjudged after it. */
+  readonly stoppedByGap?: { readonly gap: string; readonly index: number };
   /** The reach states this run entered, in declaration order. */
   readonly reached: readonly InteractionReachState[];
   /** The most visible segments any table held at the end of a burst. */
@@ -3189,6 +3209,7 @@ class PlanRunner {
   #burstCommits = 0;
   #peakBurstSegments = 0;
   readonly #reached = new Set<InteractionReachState>();
+  readonly #gapsSkipped = new Map<string, number>();
 
   constructor(plan: InteractionPlan, driver: SimulationDriver, traceLength: number) {
     this.#plan = plan;
@@ -3202,6 +3223,7 @@ class PlanRunner {
     }
     let judged = 0;
     let stoppedBy: string | undefined;
+    let stoppedByGap: { gap: string; index: number } | undefined;
     for (const [index, interaction] of this.#plan.interactions.entries()) {
       this.#index = index;
       try {
@@ -3209,6 +3231,23 @@ class PlanRunner {
       } catch (error) {
         if (error instanceof AcceptedStoreUnresponsive) {
           stoppedBy = describeError(error.storageError);
+          break;
+        }
+        // A read changes nothing in the model, so one refused by a listed parity gap is skipped.
+        const gap = READ_ONLY_KINDS.has(interaction.kind)
+          ? (this.#driver.listedGap?.(error) ?? null)
+          : null;
+        if (gap !== null) {
+          this.#gapsSkipped.set(gap, (this.#gapsSkipped.get(gap) ?? 0) + 1);
+          continue;
+        }
+        // A write refused by a listed gap leaves the model ahead of the engine: never continue
+        // past it. The plan stops here, and the result names the gap and the step.
+        const stoppingGap = READ_ONLY_KINDS.has(interaction.kind)
+          ? null
+          : (this.#driver.listedGap?.(error) ?? null);
+        if (stoppingGap !== null) {
+          stoppedByGap = { gap: stoppingGap, index };
           break;
         }
         if (error instanceof InteractionFailure) throw error;
@@ -3235,6 +3274,8 @@ class PlanRunner {
       indexPathQueries: this.#indexPathQueries,
       burstCommits: this.#burstCommits,
       reached: INTERACTION_REACH_STATES.filter((state) => this.#reached.has(state)),
+      gapsSkipped: Object.fromEntries(this.#gapsSkipped),
+      ...(stoppedByGap === undefined ? {} : { stoppedByGap }),
       peakBurstSegments: this.#peakBurstSegments,
       transientsAccepted: stoppedBy === undefined ? 0 : 1,
       stoppedBy,
@@ -3677,9 +3718,11 @@ class PlanRunner {
       if (
         !errorChainSome(
           outcome.error,
-          (name, message) =>
-            name === "UniqueConstraintError" &&
-            message?.startsWith(`Duplicate value for ${interaction.table}.`) === true,
+          (name, message, sqlState) =>
+            (name === "UniqueConstraintError" &&
+              message?.startsWith(`Duplicate value for ${interaction.table}.`) === true) ||
+            // PostgreSQL's unique_violation for an index build over a duplicate.
+            sqlState === "23505",
         )
       ) {
         this.#fail(
@@ -3734,9 +3777,11 @@ class PlanRunner {
       if (
         !errorChainSome(
           outcome.error,
-          (name, message) =>
-            name === "TypeError" &&
-            message?.startsWith(`Cannot drop ${interaction.table}: foreign key `) === true,
+          (name, message, sqlState) =>
+            (name === "TypeError" &&
+              message?.startsWith(`Cannot drop ${interaction.table}: foreign key `) === true) ||
+            // PostgreSQL's dependent_objects_still_exist.
+            sqlState === "2BP01",
         )
       ) {
         this.#fail(
@@ -3831,6 +3876,10 @@ class PlanRunner {
     }
     const sql = renderKeyed(interaction.table, columns, interaction.mutation);
     const queued = this.#attempt(interaction.waiter, sql);
+    const waiting = { settled: false };
+    void queued.then(() => {
+      waiting.settled = true;
+    });
     // The waiter's write must still be pending while the transaction holds the turn: give it
     // real time to land wrongly before checking, then read through the waiter (reads never
     // wait) to prove the transaction's rows are invisible there.
@@ -3849,6 +3898,7 @@ class PlanRunner {
       committed.sorted(interaction.table),
       "on the waiting connection while a transaction holds the turn",
     );
+    if (!waiting.settled) this.#reach("read-bypassed-queued-write");
     const end = poisoned ? "ROLLBACK" : interaction.outcome === "commit" ? "COMMIT" : "ROLLBACK";
     try {
       await this.#execute(interaction.connection, end);
@@ -4332,11 +4382,17 @@ class PlanRunner {
         this.#fail(`schema-change: ALTER TABLE ${change.kind} of a column in use was accepted`);
       }
       const column = change.kind === "addColumn" ? change.column.name : change.column;
-      const expected = (name: string | undefined, message: string | undefined): boolean =>
-        name === "TypeError" &&
-        (change.kind === "dropColumn"
-          ? message?.endsWith(` still uses this column: ${interaction.table}.${column}`) === true
-          : message?.startsWith(`Cannot rename ${interaction.table}.${column}: `) === true);
+      const expected = (
+        name: string | undefined,
+        message: string | undefined,
+        sqlState: string | undefined,
+      ): boolean =>
+        (name === "TypeError" &&
+          (change.kind === "dropColumn"
+            ? message?.endsWith(` still uses this column: ${interaction.table}.${column}`) === true
+            : message?.startsWith(`Cannot rename ${interaction.table}.${column}: `) === true)) ||
+        // PostgreSQL's dependent_objects_still_exist, for a column another object uses.
+        (change.kind === "dropColumn" && sqlState === "2BP01");
       if (!errorChainSome(outcome.error, expected)) {
         this.#fail(
           `a refused ALTER TABLE ${change.kind} failed with the wrong error: ${describeError(outcome.error)}`,
@@ -4707,29 +4763,43 @@ export function describeError(error: unknown): string {
 function isTableAlreadyExists(error: unknown, table: string): boolean {
   return errorChainSome(
     error,
-    (name, message) =>
+    (name, message, sqlState) =>
       (name === "Error" && message === `Table name already exists: ${table}`) ||
-      (name === "TypeError" && message === `Table already exists: ${table}`),
+      (name === "TypeError" && message === `Table already exists: ${table}`) ||
+      // PostgreSQL's duplicate_table, as the rebuild engine reports it.
+      (sqlState === "42P07" && message === `relation "${table}" already exists`),
   );
 }
 
 function isUnknownTable(error: unknown, table: string): boolean {
   return errorChainSome(
     error,
-    (name, message) => name === "UnknownTableError" && message === `Unknown table: ${table}`,
+    (name, message, sqlState) =>
+      (name === "UnknownTableError" && message === `Unknown table: ${table}`) ||
+      // PostgreSQL's undefined_table.
+      (sqlState === "42P01" &&
+        (message === `relation "${table}" does not exist` ||
+          message === `table "${table}" does not exist`)),
   );
 }
 
 function isUniqueViolation(error: unknown): boolean {
-  return errorChainSome(error, (name) => name === "UniqueConstraintError");
+  // PostgreSQL's unique_violation (23505), as the rebuild engine reports it.
+  return errorChainSome(
+    error,
+    (name, _message, sqlState) => name === "UniqueConstraintError" || sqlState === "23505",
+  );
 }
 
 /** A write naming a parent row that does not exist: `FOREIGN KEY <name> has no <parent> row ...`. */
 function isMissingParent(error: unknown): boolean {
   return errorChainSome(
     error,
-    (name, message) =>
-      name === "TypeError" && /^FOREIGN KEY \S+ has no \S+ row with /u.test(message ?? ""),
+    (name, message, sqlState, problem) =>
+      (name === "TypeError" && /^FOREIGN KEY \S+ has no \S+ row with /u.test(message ?? "")) ||
+      // PostgreSQL's foreign_key_violation on the referencing side ("is not present in table"):
+      // the rebuild engine types that side as problem "missingParent".
+      (sqlState === "23503" && problem === "missingParent"),
   );
 }
 
@@ -4737,9 +4807,14 @@ function isMissingParent(error: unknown): boolean {
 function isRestricted(error: unknown): boolean {
   return errorChainSome(
     error,
-    (name, message) =>
-      name === "TypeError" &&
-      /^FOREIGN KEY \S+ still has \d+ \S+ row\(s\) referencing /u.test(message ?? ""),
+    (name, message, sqlState, problem) =>
+      (name === "TypeError" &&
+        /^FOREIGN KEY \S+ still has \d+ \S+ row\(s\) referencing /u.test(message ?? "")) ||
+      // PostgreSQL's foreign_key_violation on the referenced side ("is still referenced from
+      // table"), typed "referenced" by the rebuild engine, or restrict_violation (23001) for an
+      // explicit RESTRICT.
+      (sqlState === "23503" && problem === "referenced") ||
+      sqlState === "23001",
   );
 }
 
@@ -4834,14 +4909,24 @@ class RefusedTransaction extends Error {
 
 function errorChainSome(
   error: unknown,
-  predicate: (name: string | undefined, message: string | undefined) => boolean,
+  predicate: (
+    name: string | undefined,
+    message: string | undefined,
+    sqlState: string | undefined,
+    problem: string | undefined,
+  ) => boolean,
 ): boolean {
   return findErrorInChain(error, predicate) !== undefined;
 }
 
 function findErrorInChain(
   error: unknown,
-  predicate: (name: string | undefined, message: string | undefined) => boolean,
+  predicate: (
+    name: string | undefined,
+    message: string | undefined,
+    sqlState: string | undefined,
+    problem: string | undefined,
+  ) => boolean,
 ): Record<string, unknown> | undefined {
   const seen = new Set<unknown>();
   let current = error;
@@ -4849,7 +4934,10 @@ function findErrorInChain(
     seen.add(current);
     const name = typeof current.name === "string" ? current.name : undefined;
     const message = typeof current.message === "string" ? current.message : undefined;
-    if (predicate(name, message)) return current;
+    const sqlState = typeof current.sqlState === "string" ? current.sqlState : undefined;
+    // The rebuild engine's typed foreign-key side ("missingParent" | "referenced").
+    const problem = typeof current.problem === "string" ? current.problem : undefined;
+    if (predicate(name, message, sqlState, problem)) return current;
     current = current.cause;
   }
   return undefined;

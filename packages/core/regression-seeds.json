@@ -26,7 +26,8 @@
     "B8 seeds 8804/8805 preserve missing explicit-commit invalidation; 8810/8811 preserve a dropped middle notification followed by an unrelated commit; 8840/8841 preserve explicit adapter Date comparison by instant. Reductions are the native live commit/runtime/row-value oracles.",
     "B8 rekey-history seeds 8806/8807 preserve the catalog identity boundary: an old table rekey pending during DROP/CREATE of its SQL name must reset without stale notices.",
     "B8 cleanup-fence seeds 8812/8813 force asynchronous result cleanup after producer completion; owner close must wait before releasing its lifetime.",
-    "B8 rejected-delivery seeds8826/8827 preserve a decoder rejection before snapshot installation: resource credit may return, but the last accepted result/rekey watermark must not advance."
+    "B8 rejected-delivery seeds8826/8827 preserve a decoder rejection before snapshot installation: resource credit may return, but the last accepted result/rekey watermark must not advance.",
+    "Interaction simulator over next/ seeds 5-12 of base, constraints, schema changes and full text once failed on read-queues-behind-own-write: a read on a session queued behind that session's own write waiting for the writer turn."
   ],
   "suites": {
     "next-execution-retirement": [8850, 8851],
@@ -91,6 +92,11 @@
     "next-live-store-reset": [8904, 8905],
     "next-live-store-metadata": [8906, 8907],
     "next-live-store-data": [8908, 8909],
-    "next-live-store-canonical": [8910, 8911]
+    "next-live-store-canonical": [8910, 8911],
+    "interaction-simulator-next-base": [5, 6, 7, 8, 9, 10, 11, 12],
+    "interaction-simulator-next-constraints": [5, 6, 7, 8, 9, 10, 11, 12],
+    "interaction-simulator-next-schema": [5, 6, 7, 8, 9, 10, 11, 12],
+    "interaction-simulator-next-full-text": [5, 6, 7, 8, 9, 10, 11, 12],
+    "interaction-simulator-next-rekeying": []
   }
 }

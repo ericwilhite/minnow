@@ -980,6 +980,24 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
     return found;
   };
   findJson(plan.root);
+  // Rels inside a UNION ALL arm: a phase producer there is refused (see the UNION ALL recipe).
+  const unionArms = new Set<number>();
+  const markUnionArms = (rel: Rel, inArm: boolean): void => {
+    if (inArm) unionArms.add(rel.id);
+    const arm = inArm || (rel.op === "setOp" && rel.kind === "union" && rel.all);
+    if ("input" in rel) markUnionArms(rel.input, arm);
+    if ("left" in rel && "right" in rel) {
+      markUnionArms(rel.left, arm);
+      markUnionArms(rel.right, arm);
+    }
+    if ("inputs" in rel) for (const input of rel.inputs) markUnionArms(input, arm);
+  };
+  markUnionArms(plan.root, false);
+  const unionArmPhase = (): UnsupportedPlanError =>
+    new UnsupportedPlanError(
+      "an expression evaluated in producer phases (text concatenation, JSON expansion or a JSON aggregate) inside a UNION ALL arm (ROLLUP, CUBE and GROUPING SETS run as UNION ALL arms)",
+      { construct: "setOp" },
+    );
   // Ordinary plans without possible JSON/hybrid cuts need no retention metadata.
   const {
     supported: phaseParents,
@@ -1830,6 +1848,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
             const deliveryCopies = nativeTextOutput
               ? checkpointDeliveryCopies(plan.root, rel)
               : undefined;
+            if (unionArms.has(rel.id)) throw unionArmPhase();
             if (!phaseParents.has(rel.id))
               throw new UnsupportedPlanError(
                 "expanding JSON under a join/window retaining parent (checkpoint seam pending)",
@@ -2126,6 +2145,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           jsonAggregateRecipes.set(rel.id, { minimum, loans, rel: aggregate, input });
           registerPhaseProducer(rel.id);
           fixed(rel, minimum, rel.id, loans);
+          if (unionArms.has(rel.id)) throw unionArmPhase();
           if (!phaseParents.has(rel.id))
             throw new UnsupportedPlanError("JSON aggregate phase parent", {
               construct: "aggregate",
@@ -3115,15 +3135,48 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
         };
       }
       case "setOp": {
-        if (rel.kind !== "except" || rel.inputs.length !== 2)
-          throw new UnsupportedPlanError("set operation other than binary EXCEPT", {
+        // Lowering builds two-input set operations; fewer inputs is a malformed plan.
+        if (rel.inputs.length < 2)
+          throw new UnsupportedPlanError("a set operation over fewer than two inputs", {
+            construct: "setOp",
+          });
+        if (rel.kind === "union" && rel.all) {
+          // UNION ALL: every arm in order into one consumer; an arm's end is not the union's.
+          // Lowering conforms each arm to the union's column types. Arms are not phase parents
+          // (json-plan.ts phaseRetainingParents): an earlier arm's rows would already be
+          // downstream when a later arm cut a phase, so such plans stay refused there.
+          const arms = rel.inputs.map((input) => prepare(input));
+          return async (runtime, downstream, stops, rowsNeeded) => {
+            const out = counted(runtime, rel, downstream);
+            const arm: Operator = {
+              get reclassifiesTransfers() {
+                return out.reclassifiesTransfers === true;
+              },
+              push: (batch, transfer) => out.push(batch, transfer),
+              ready: () => out.ready(),
+              finish: () => undefined,
+              abort: (reason) => {
+                out.abort(reason);
+              },
+            };
+            for (const recipe of arms) {
+              if (stops.some((stop) => stop()) || runtime.handingOff) break;
+              await recipe(runtime, arm, stops, rowsNeeded);
+            }
+            if (runtime.handingOff) return;
+            await out.finish();
+          };
+        }
+        // EXCEPT, INTERSECT and distinct UNION: one hash-count operator (exec/except.ts).
+        if (rel.inputs.length !== 2)
+          throw new UnsupportedPlanError("a set operation over other than two inputs", {
             construct: "setOp",
           });
         const [leftInput, rightInput] = rel.inputs;
         if (leftInput === undefined || rightInput === undefined)
-          throw new TypeError("Missing EXCEPT arm");
+          throw new TypeError("Missing set operation arm");
         const input = types(rel);
-        exceptKeyLayout(input);
+        exceptKeyLayout(input, rel.kind.toUpperCase());
         compoundColumns.set(rel.id, variableColumns(input));
         const left = prepare(leftInput),
           right = prepare(rightInput);
@@ -3147,6 +3200,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                   signal: runtime.signal,
                 },
                 counted(runtime, rel, downstream),
+                rel.kind,
               ),
             (operator) => {
               runtime.onAbort((reason) => operator.abort(reason));
@@ -4365,216 +4419,236 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           progress = 0;
         let ftsSourceBytes = fts.declared;
         bounds.clear();
-        for (const source of sources) {
-          const sizeMain = (segments?: Uint32Array) =>
-            boundSource(
-              runtime.sourceView(),
-              {
-                ...source,
-                windowBytes: windows ? source.windowBytes : 0,
-                ...(singleRows && boundedScans.has(source.id) ? { batchRows: 1 as const } : {}),
-                ...(runtime.request.outputBuffers && source.windowBytes > 0
-                  ? { retain: false }
-                  : {}),
-                rows: demand.get(source.id) ?? null,
-                ...(segments === undefined ? {} : { segments }),
-              },
-              runtime.governor,
-              runtime.signal,
-              // Index fetch owners admit exactly indexFetchTarget (see their minimum);
-              // every other source takes the bounded-demand target.
-              indexFetchOwners.has(source.id)
-                ? indexFetchTarget(runtime.sizingBytes)
-                : sourceTarget(runtime, source.tableId, source.types),
-              BATCH_ROWS,
-              runtime.metadataCaches(
-                source.retain !== false &&
-                  !(runtime.request.outputBuffers && source.windowBytes > 0),
-                sources,
-              ),
-            );
-          // A lookup's keys name its segments. The list and the sizing that follows are
-          // preparation admissions: one that would wait while the list is held releases the whole
-          // attempt and prepares again with a credit covering both (exec/preparation.ts). Without
-          // the facade (a native body's prepaid shares) the source is sized whole.
-          let bound: ReadBound;
-          const lookup = lookupSizing.get(source.id);
-          const found =
-            lookup === undefined || !holdsAcrossAdmission(runtime.governor)
-              ? null
-              : yield* readValue(
-                  lookupSegments(runtime, plan, lookup.rel, lookup.keyMinimum(runtime)),
-                );
-          if (found !== null)
-            try {
-              bound = yield* readValue(sizeMain(found.segments));
-            } finally {
-              found.release();
-            }
-          else bound = yield* readValue(sizeMain());
-          bounds.set(source.id, bound);
-          if (bound.batchRows === 1) {
-            if (boundedColumns === null) {
-              boundedColumns = new Map();
-              for (const planner of aggregatePlanners.values())
-                if (active.has(planner.rel.id))
-                  aggregateProgressLayout(planner.rel, (id, column) => {
-                    const columns = boundedColumns?.get(id) ?? new Set<number>();
-                    columns.add(column);
-                    boundedColumns?.set(id, columns);
-                    return null;
-                  });
-            }
-            const values = new Map<number, number>();
-            for (const column of boundedColumns.get(source.id) ?? []) {
-              const name = source.columns[column],
-                type = source.types[column];
-              if (name === undefined || type === undefined)
-                throw new Error("Missing aggregate source column");
-              const cell = yield* readValue(
-                boundSource(
-                  runtime.sourceView(),
-                  {
-                    ...source,
-                    columns: [name],
-                    types: [type],
-                    singleValueBound: true,
-                    batchRows: 1,
-                    stagingBytes: 0,
-                    windowBytes: 0,
-                    rows: demand.get(source.id) ?? null,
-                  },
-                  runtime.governor,
-                  runtime.signal,
-                  1,
-                  1,
-                  runtime.metadataCaches(source.retain !== false, sources),
-                ),
-              );
-              values.set(column, sourceValueBytes(cell));
-            }
-            boundedSourceRows.set(source.id, values);
-          }
-          if (fts.enabled)
-            ftsSourceBytes = Math.max(
-              ftsSourceBytes,
-              yield* fts.sourceBytes(runtime, source, demand.get(source.id) ?? null),
-            );
-
-          const keyColumns = joinKeySources.get(source.id);
-          if (keyColumns)
-            for (const index of keyColumns) {
-              const column = source.columns[index],
-                type = source.types[index];
-              if (column === undefined || type === undefined)
-                throw new Error("Missing join key source column");
-              const row = yield* readValue(
-                boundSource(
-                  runtime.sourceView(),
-                  {
-                    ...source,
-                    ...(singleValueSources.get(source.id)?.has(index)
-                      ? { singleValueBound: true, batchRows: 1 as const }
-                      : {}),
-                    columns: [column],
-                    types: [type],
-                    stagingBytes: 0,
-                    windowBytes: 0,
-                    rows: demand.get(source.id) ?? null,
-                  },
-                  runtime.governor,
-                  runtime.signal,
-                  batchTargetFor(runtime.sizingBytes, 4),
-                  BATCH_ROWS,
-                  runtime.metadataCaches(source.retain !== false, sources),
-                ),
-              );
-              const widths = joinKeyColumnBytes.get(source.id) ?? new Map<number, number>();
-              widths.set(index, row.valueBytes ?? row.progress / 4);
-              joinKeyColumnBytes.set(source.id, widths);
-            }
-          for (const column of jsonGroupSources.get(source.id) ?? []) {
-            const name = source.columns[column],
-              type = source.types[column];
-            if (name === undefined || type === undefined)
-              throw new Error("Missing semantic key column");
-            const row = yield* readValue(
-              boundSource(
-                runtime.sourceView(),
-                {
-                  ...source,
-                  columns: [name],
-                  singleValueBound: true,
-                  types: [type],
-                  stagingBytes: 0,
-                  windowBytes: 0,
-                  rows: demand.get(source.id) ?? null,
-                },
-                runtime.governor,
-                runtime.signal,
-                1,
-                1,
-              ),
-            );
-            const columns = jsonGroupColumnBytes.get(source.id) ?? new Map<number, number>();
-            columns.set(column, row.valueBytes ?? row.progress / 4);
-            jsonGroupColumnBytes.set(source.id, columns);
-          }
-          for (const column of resultSizing ? (resultSources.get(source.id) ?? []) : []) {
-            const name = source.columns[column],
-              type = source.types[column];
-            if (name === undefined || type === undefined) throw new Error("Missing result column");
-            const row = yield* readValue(
-              boundSource(
-                runtime.sourceView(),
-                {
-                  ...source,
-                  batchRows: 1,
-                  columns: [name],
-                  types: [type],
-                  stagingBytes: 0,
-                  windowBytes: 0,
-                  rows: demand.get(source.id) ?? null,
-                },
-                runtime.governor,
-                runtime.signal,
-                1,
-                1,
-                runtime.metadataCaches(source.retain !== false, sources),
-              ),
-            );
-            const columns = resultColumnBytes.get(source.id) ?? new Map<number, number>();
-            columns.set(column, Math.max(row.valueBytes ?? 0, row.progress / 4));
-            resultColumnBytes.set(source.id, columns);
-          }
-          io = Math.max(io, bound.io);
-          progress = Math.max(progress, bound.progress);
-        }
-        if (resultCopies > 1 && resultLayout?.sourceBacked && !hasInputSizedJson) {
-          let resultProgress = 0;
+        // Each lookup's segment list stays held (charged, a preparation admission) through every
+        // sizing of its source in this pass, so none of them sizes the whole table.
+        const held: Array<{ release(): void }> = [];
+        const named = new Map<number, Uint32Array>();
+        const segmentsOf = (id: number): { segments?: Uint32Array } => {
+          const segments = named.get(id);
+          return segments === undefined ? {} : { segments };
+        };
+        try {
           for (const source of sources) {
-            // The normal read bound includes a batch-sized output floor. Copy admission
-            // needs a one-row envelope: otherwise 262 tiny aliases multiply that floor
-            // into a fictitious >1-GiB minimum. This metadata-only, publication-stable
-            // sizing pass releases every grant before complete execution admission.
-            const row = yield* readValue(
+            const sizeMain = (segments?: Uint32Array) =>
               boundSource(
                 runtime.sourceView(),
-                { ...source, windowBytes: 0, rows: demand.get(source.id) ?? null },
+                {
+                  ...source,
+                  windowBytes: windows ? source.windowBytes : 0,
+                  ...(singleRows && boundedScans.has(source.id) ? { batchRows: 1 as const } : {}),
+                  ...(runtime.request.outputBuffers && source.windowBytes > 0
+                    ? { retain: false }
+                    : {}),
+                  rows: demand.get(source.id) ?? null,
+                  ...(segments === undefined ? {} : { segments }),
+                },
                 runtime.governor,
                 runtime.signal,
-                1,
-                1,
+                // Index fetch owners admit exactly indexFetchTarget (see their minimum);
+                // every other source takes the bounded-demand target.
+                indexFetchOwners.has(source.id)
+                  ? indexFetchTarget(runtime.sizingBytes)
+                  : sourceTarget(runtime, source.tableId, source.types),
+                BATCH_ROWS,
                 runtime.metadataCaches(
                   source.retain !== false &&
                     !(runtime.request.outputBuffers && source.windowBytes > 0),
                   sources,
                 ),
-              ),
-            );
-            resultProgress = Math.max(resultProgress, row.progress);
+              );
+            // A lookup's keys name its segments. The list and the sizing that follows are
+            // preparation admissions: one that would wait while the list is held releases the whole
+            // attempt and prepares again with a credit covering both (exec/preparation.ts). Without
+            // the facade (a native body's prepaid shares) the source is sized whole.
+            const lookup = lookupSizing.get(source.id);
+            const found =
+              lookup === undefined || !holdsAcrossAdmission(runtime.governor)
+                ? null
+                : yield* readValue(
+                    lookupSegments(runtime, plan, lookup.rel, lookup.keyMinimum(runtime)),
+                  );
+            if (found !== null) {
+              held.push(found);
+              named.set(source.id, found.segments);
+            }
+            const segments = found === null ? {} : { segments: found.segments };
+            const bound: ReadBound = yield* readValue(sizeMain(found?.segments));
+            bounds.set(source.id, bound);
+            if (bound.batchRows === 1) {
+              if (boundedColumns === null) {
+                boundedColumns = new Map();
+                for (const planner of aggregatePlanners.values())
+                  if (active.has(planner.rel.id))
+                    aggregateProgressLayout(planner.rel, (id, column) => {
+                      const columns = boundedColumns?.get(id) ?? new Set<number>();
+                      columns.add(column);
+                      boundedColumns?.set(id, columns);
+                      return null;
+                    });
+              }
+              const values = new Map<number, number>();
+              for (const column of boundedColumns.get(source.id) ?? []) {
+                const name = source.columns[column],
+                  type = source.types[column];
+                if (name === undefined || type === undefined)
+                  throw new Error("Missing aggregate source column");
+                const cell = yield* readValue(
+                  boundSource(
+                    runtime.sourceView(),
+                    {
+                      ...source,
+                      columns: [name],
+                      types: [type],
+                      singleValueBound: true,
+                      batchRows: 1,
+                      stagingBytes: 0,
+                      windowBytes: 0,
+                      rows: demand.get(source.id) ?? null,
+                      ...segments,
+                    },
+                    runtime.governor,
+                    runtime.signal,
+                    1,
+                    1,
+                    runtime.metadataCaches(source.retain !== false, sources),
+                  ),
+                );
+                values.set(column, sourceValueBytes(cell));
+              }
+              boundedSourceRows.set(source.id, values);
+            }
+            if (fts.enabled)
+              ftsSourceBytes = Math.max(
+                ftsSourceBytes,
+                yield* fts.sourceBytes(runtime, source, demand.get(source.id) ?? null),
+              );
+
+            const keyColumns = joinKeySources.get(source.id);
+            if (keyColumns)
+              for (const index of keyColumns) {
+                const column = source.columns[index],
+                  type = source.types[index];
+                if (column === undefined || type === undefined)
+                  throw new Error("Missing join key source column");
+                const row = yield* readValue(
+                  boundSource(
+                    runtime.sourceView(),
+                    {
+                      ...source,
+                      ...(singleValueSources.get(source.id)?.has(index)
+                        ? { singleValueBound: true, batchRows: 1 as const }
+                        : {}),
+                      columns: [column],
+                      types: [type],
+                      stagingBytes: 0,
+                      windowBytes: 0,
+                      rows: demand.get(source.id) ?? null,
+                      ...segments,
+                    },
+                    runtime.governor,
+                    runtime.signal,
+                    batchTargetFor(runtime.sizingBytes, 4),
+                    BATCH_ROWS,
+                    runtime.metadataCaches(source.retain !== false, sources),
+                  ),
+                );
+                const widths = joinKeyColumnBytes.get(source.id) ?? new Map<number, number>();
+                widths.set(index, row.valueBytes ?? row.progress / 4);
+                joinKeyColumnBytes.set(source.id, widths);
+              }
+            for (const column of jsonGroupSources.get(source.id) ?? []) {
+              const name = source.columns[column],
+                type = source.types[column];
+              if (name === undefined || type === undefined)
+                throw new Error("Missing semantic key column");
+              const row = yield* readValue(
+                boundSource(
+                  runtime.sourceView(),
+                  {
+                    ...source,
+                    columns: [name],
+                    singleValueBound: true,
+                    types: [type],
+                    stagingBytes: 0,
+                    windowBytes: 0,
+                    rows: demand.get(source.id) ?? null,
+                    ...segments,
+                  },
+                  runtime.governor,
+                  runtime.signal,
+                  1,
+                  1,
+                ),
+              );
+              const columns = jsonGroupColumnBytes.get(source.id) ?? new Map<number, number>();
+              columns.set(column, row.valueBytes ?? row.progress / 4);
+              jsonGroupColumnBytes.set(source.id, columns);
+            }
+            for (const column of resultSizing ? (resultSources.get(source.id) ?? []) : []) {
+              const name = source.columns[column],
+                type = source.types[column];
+              if (name === undefined || type === undefined)
+                throw new Error("Missing result column");
+              const row = yield* readValue(
+                boundSource(
+                  runtime.sourceView(),
+                  {
+                    ...source,
+                    batchRows: 1,
+                    columns: [name],
+                    types: [type],
+                    stagingBytes: 0,
+                    windowBytes: 0,
+                    rows: demand.get(source.id) ?? null,
+                    ...segments,
+                  },
+                  runtime.governor,
+                  runtime.signal,
+                  1,
+                  1,
+                  runtime.metadataCaches(source.retain !== false, sources),
+                ),
+              );
+              const columns = resultColumnBytes.get(source.id) ?? new Map<number, number>();
+              columns.set(column, Math.max(row.valueBytes ?? 0, row.progress / 4));
+              resultColumnBytes.set(source.id, columns);
+            }
+            io = Math.max(io, bound.io);
+            progress = Math.max(progress, bound.progress);
           }
-          runtime.resultCopySourceProgress(resultProgress);
+          if (resultCopies > 1 && resultLayout?.sourceBacked && !hasInputSizedJson) {
+            let resultProgress = 0;
+            for (const source of sources) {
+              // The normal read bound includes a batch-sized output floor. Copy admission
+              // needs a one-row envelope: otherwise 262 tiny aliases multiply that floor
+              // into a fictitious >1-GiB minimum. This metadata-only, publication-stable
+              // sizing pass releases every grant before complete execution admission.
+              const row = yield* readValue(
+                boundSource(
+                  runtime.sourceView(),
+                  {
+                    ...source,
+                    windowBytes: 0,
+                    rows: demand.get(source.id) ?? null,
+                    ...segmentsOf(source.id),
+                  },
+                  runtime.governor,
+                  runtime.signal,
+                  1,
+                  1,
+                  runtime.metadataCaches(
+                    source.retain !== false &&
+                      !(runtime.request.outputBuffers && source.windowBytes > 0),
+                    sources,
+                  ),
+                ),
+              );
+              resultProgress = Math.max(resultProgress, row.progress);
+            }
+            runtime.resultCopySourceProgress(resultProgress);
+          }
+        } finally {
+          for (const list of held) list.release();
         }
         fts.size(runtime, ftsSourceBytes);
         const jsonWidth = Math.max(jsonConstants, progress) + 1;

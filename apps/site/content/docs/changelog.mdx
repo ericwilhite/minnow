@@ -10,6 +10,18 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The unexported 1.0 rebuild no longer fails a write whose trigger bodies run lookups with the internal error "Native query cache metadata must be admitted" when other work holds almost all memory; the write completes. Results are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.
+
+The testing entry point's interaction-plan simulator reports one more reach state, `read-bypassed-queued-write`: a read on a connection answered while that connection's own write still waited for the writer turn. Code that switches exhaustively over `InteractionReachState` sees the new member; nothing else changes, and no stored-format change or migration is required.
+
+The unexported 1.0 rebuild runs `UNION ALL`, which it refused before: each arm in order, with PostgreSQL's column type resolution, and a `LIMIT` above it stops at the arm that satisfies it. Queries with several grouping sets (`ROLLUP`, `CUBE`, `GROUPING SETS`), which lower to a `UNION ALL` of grouped aggregates, run as well. `UNION`, `INTERSECT`, `INTERSECT ALL` and `EXCEPT ALL` run too, on the hash-count operator `EXCEPT` already used. A text concatenation or other phase-evaluated expression inside a `UNION ALL` arm, or in the input of `ROLLUP`, `CUBE` or `GROUPING SETS`, is still refused with `0A000`. Results are unchanged where it ran; released 0.x behavior is unchanged; no stored-format change or migration is required.
+
+The testing entry point (`@minnowdb/core/testing`) adds optional members to the interaction-plan simulator: a `SimulationDriver` may implement `listedGap(error)` to name a reviewed parity gap, and `InteractionRunResult` may report `gapsSkipped` (reads skipped as a listed gap) and `stoppedByGap` (a write refused as one, where the plan stopped). Existing drivers and results are unchanged; nothing breaks; no stored-format change or migration is required.
+
+The unexported 1.0 rebuild sizes a point or range lookup that also sorts by its key (such as `WHERE id BETWEEN 500 AND 599 ORDER BY id`) over only the groups its keys name, instead of reading every group of the table to size the sort key; a 100-key range over 300,000 rows went from about 300 ms to 25 ms. Results are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.
+
+The unexported 1.0 rebuild no longer fails `INSERT ... SELECT ... RETURNING`, `UPDATE ... RETURNING` or `DELETE ... RETURNING` whose input computes text with `||` with the internal error "Statement row rules already bound". Results are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.
+
 The unexported 1.0 rebuild no longer fails `INSERT ... SELECT`, `UPDATE` or `DELETE` whose input computes text with `||` (for example `INSERT INTO t SELECT g, 'x' || g::text FROM generate_series(1, 50) g`) with the internal error "Result budget retained buffers at handoff". Results are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.
 
 The unexported 1.0 rebuild sizes a point or small range lookup on an index over only the groups its keys name, instead of every group of the table, except inside trigger bodies, which still size every group. Results are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.

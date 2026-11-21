@@ -1,4 +1,8 @@
-/** Hash-count EXCEPT, with radix spill and a bounded one-key collision fallback. */
+/**
+ * Hash-count set operations (EXCEPT, INTERSECT and distinct UNION, each with or without ALL where
+ * PostgreSQL has it), with radix spill and a bounded one-key collision fallback. Every distinct
+ * row counts its copies on each side; the kind decides how many it emits.
+ */
 import type { Grant } from "../memory/governor.js";
 import type { SpillService } from "../spill/contract.js";
 import type { PhysicalType } from "../types.js";
@@ -64,11 +68,14 @@ export interface ExceptContext {
   /** Collision stress seam; production uses all hash bits. */
   readonly hashMask?: number;
 }
-export function exceptKeyLayout(types: readonly PhysicalType[]): KeyLayout {
+/** Which set operation the hash-count operator computes. */
+export type SetOperationKind = "except" | "intersect" | "union";
+
+export function exceptKeyLayout(types: readonly PhysicalType[], label = "EXCEPT"): KeyLayout {
   if (types.length === 0 || types.length > 31)
-    throw new UnsupportedPlanError("EXCEPT needs 1 to 31 key columns", { construct: "setOp" });
+    throw new UnsupportedPlanError(`${label} needs 1 to 31 key columns`, { construct: "setOp" });
   if (types.some((type) => type.kind === "text" && type.fixed === true))
-    throw new UnsupportedPlanError("EXCEPT blank-padded CHAR equality", { construct: "setOp" });
+    throw new UnsupportedPlanError(`${label} blank-padded CHAR equality`, { construct: "setOp" });
   try {
     return new KeyLayout(
       types,
@@ -76,7 +83,7 @@ export function exceptKeyLayout(types: readonly PhysicalType[]): KeyLayout {
     );
   } catch (error) {
     if (error instanceof UnsupportedPlanError)
-      throw new UnsupportedPlanError("EXCEPT key type", { construct: "setOp" });
+      throw new UnsupportedPlanError(`${label} key type`, { construct: "setOp" });
     throw error;
   }
 }
@@ -92,6 +99,27 @@ function countAt(vector: Vector | undefined, row: number): bigint {
   const [flat, slot] = slotOf(vector, row);
   if (flat.data.layout !== "int64") throw new Error("Invalid EXCEPT count");
   return int64At(flat.data.values, slot);
+}
+
+/**
+ * Copies of one distinct row, from its counts on each side (PostgreSQL): EXCEPT ALL keeps
+ * left - right, INTERSECT ALL min(left, right); without ALL each keeps one row that qualifies;
+ * distinct UNION keeps one of every row on either side.
+ */
+export function copiesOf(
+  kind: SetOperationKind,
+  all: boolean,
+  left: bigint,
+  right: bigint,
+): bigint {
+  switch (kind) {
+    case "except":
+      return all ? left - right : left > 0n && right === 0n ? 1n : 0n;
+    case "intersect":
+      return all ? (left < right ? left : right) : left > 0n && right > 0n ? 1n : 0n;
+    case "union":
+      return left > 0n || right > 0n ? 1n : 0n;
+  }
 }
 
 /** Only immutable row/count records survive an execution phase boundary. */
@@ -142,6 +170,7 @@ export class ExceptOperator {
     readonly all: boolean,
     readonly context: ExceptContext,
     readonly downstream: Operator,
+    readonly kind: SetOperationKind = "except",
   ) {
     const layout = exceptKeyLayout(types);
     this.#keep = reserve(types);
@@ -634,11 +663,7 @@ export class ExceptOperator {
   }
   async #emit(): Promise<void> {
     for (const entry of this.#entries()) {
-      let copies = this.all
-        ? entry.left - entry.right
-        : entry.left > 0n && entry.right === 0n
-          ? 1n
-          : 0n;
+      let copies = copiesOf(this.kind, this.all, entry.left, entry.right);
       if (copies <= 0n) continue;
       await this.#value(entry, async (columns, row) => {
         while (copies > 0n) {

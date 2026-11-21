@@ -304,8 +304,11 @@ export interface TableInput {
 /** A DDL request the catalog refuses (name clash, unknown id, unsupported change). */
 export class CatalogChangeError extends Error {
   readonly code = "MINNOW_CATALOG_CHANGE";
-  constructor(message: string) {
+  /** PostgreSQL's SQLSTATE, where the change has one (2BP01: dependent objects still exist). */
+  readonly sqlState?: string;
+  constructor(message: string, sqlState?: string) {
     super(message);
     this.name = "CatalogChangeError";
+    if (sqlState !== undefined) this.sqlState = sqlState;
   }
 }
