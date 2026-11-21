@@ -890,6 +890,18 @@ statement in flight — the tab then reports the loss to its client at once, so 
 fails as an unknown outcome instead of waiting out the client's silence deadline. The same seed
 produces the same plan in both.
 
+The same plans also run against the 1.0 rebuild engine (`next/testing/interaction-simulator-next.test.ts`,
+Node only for now): each connection is its own client session of one public owner, `?`
+placeholders become `$1`, `$2`, and there are no storage faults, crashes or maintenance steps yet.
+Expected refusals are judged by PostgreSQL's SQLSTATE there (`23505`, `23503`, `42P07`, `42P01`,
+`2BP01`). Two reviewed lists in `next/testing/next-parity-gaps.ts`, shared with the feature-matrix
+parity audit, keep the run honest: a read the engine refuses with `0A000` as a listed parity gap
+is skipped and counted, and a write refused that way stops its plan at that step rather than
+continuing on a model the engine no longer matches. A plan whose first failure is a listed open
+finding (a reduced divergence with an owner) is counted against it, every listed finding must
+still block some plan, and every other plan must run to the end. A fixed finding leaves the list
+and its seeds join the regression seeds.
+
 The browser driver recovers a crash by reloading the document. A new worker in the same document
 is enough on Chromium and Firefox, but WebKit can keep a transaction the dead worker still had
 queued — behind another of its own, or behind another tab's write that waited on it — registered,

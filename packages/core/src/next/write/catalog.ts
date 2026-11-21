@@ -326,6 +326,7 @@ export class Catalog implements CatalogView {
             if (fk.parentTableId === table.id && other.id !== table.id && fk.enforced)
               throw new CatalogChangeError(
                 `Table ${table.name} is referenced by a foreign key of ${other.name}`,
+                "2BP01",
               );
         return [{ op: "dropTable", tableId: table.id }];
       }
