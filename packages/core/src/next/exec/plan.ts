@@ -3933,7 +3933,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
             runtime.view,
             planner.shape.source,
             runtime.request.reads,
-            runtime.request.governor,
+            runtime.governor,
             read,
             runtime.signal,
             `query#${String(runtime.request.queryId)}/percentile-domain-planning`,
@@ -3986,7 +3986,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                 runtime.view,
                 planner.dictionary.source,
                 runtime.request.reads,
-                runtime.request.governor,
+                runtime.governor,
                 read,
                 runtime.signal,
                 `query#${String(runtime.request.queryId)}/aggregate-domain-planning`,
@@ -4057,7 +4057,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
               runtime.request.parameters,
               runtime.nativeParameters !== null,
               runtime.signal,
-              runtime.request.governor.capBytes,
+              runtime.governor.capBytes,
             ),
           );
           if (parameterFootprint === null) continue;
@@ -4078,7 +4078,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                   payloads: [],
                 },
                 runtime.request.reads,
-                runtime.request.governor,
+                runtime.governor,
                 read,
                 runtime.signal,
                 `query#${String(runtime.request.queryId)}/star-domain-planning`,
@@ -4179,7 +4179,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           },
         };
         return (async () => {
-          const idle = await acquirePhasePool(runtime.request.governor, runtime.signal);
+          const idle = await acquirePhasePool(runtime.governor, runtime.signal);
           let failed = false,
             failure: unknown;
           try {
@@ -4365,7 +4365,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                   : {}),
                 rows: demand.get(source.id) ?? null,
               },
-              runtime.request.governor,
+              runtime.governor,
               runtime.signal,
               // Index fetch owners admit exactly indexFetchTarget (see their minimum);
               // every other source takes the bounded-demand target.
@@ -4412,7 +4412,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                     windowBytes: 0,
                     rows: demand.get(source.id) ?? null,
                   },
-                  runtime.request.governor,
+                  runtime.governor,
                   runtime.signal,
                   1,
                   1,
@@ -4450,7 +4450,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                     windowBytes: 0,
                     rows: demand.get(source.id) ?? null,
                   },
-                  runtime.request.governor,
+                  runtime.governor,
                   runtime.signal,
                   batchTargetFor(runtime.sizingBytes, 4),
                   BATCH_ROWS,
@@ -4478,7 +4478,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                   windowBytes: 0,
                   rows: demand.get(source.id) ?? null,
                 },
-                runtime.request.governor,
+                runtime.governor,
                 runtime.signal,
                 1,
                 1,
@@ -4504,7 +4504,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                   windowBytes: 0,
                   rows: demand.get(source.id) ?? null,
                 },
-                runtime.request.governor,
+                runtime.governor,
                 runtime.signal,
                 1,
                 1,
@@ -4529,7 +4529,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
               boundSource(
                 runtime.sourceView(),
                 { ...source, windowBytes: 0, rows: demand.get(source.id) ?? null },
-                runtime.request.governor,
+                runtime.governor,
                 runtime.signal,
                 1,
                 1,
@@ -4726,7 +4726,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
               stagingBytes: memoryScanBufferBytes(shape.types),
               rows: null,
             },
-            runtime.request.governor,
+            runtime.governor,
             runtime.signal,
             targetBytes,
             BATCH_ROWS,

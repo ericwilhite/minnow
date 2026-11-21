@@ -1632,15 +1632,28 @@ and the owner import it directly.
   queued admissions. `Governor.observeGrants` reports each grant synchronously with the queues at
   that moment, so suites check the serving order itself. The writer and a native root
   cannot wait on each other (one writer per governor; a native root queues its own step only after
-  the writer's step has settled). Readers are not holders: query preparation is to wait only while
-  holding nothing (a preparation credit, pending), since readers each retaining a source recipe
-  while waiting could otherwise wait on each other. Policy: `holdsCredit` and `registerPermanent` in
+  the writer's step has settled). Readers are not holders: query preparation waits only while holding
+  nothing (the preparation credit, below), since readers each retaining a source recipe while
+  waiting could otherwise wait on each other. Policy: `holdsCredit` and `registerPermanent` in
   `memory/governor.ts`; tests: `memory/holder-priority.test.ts`,
   `memory/wait-policy-regressions.test.ts`, `memory/wait-wake-regressions.test.ts`,
   `testing/native-command-fifo.test.ts`. In test runs,
   `MINNOW_GOVERNOR_STALL_MS` turns any wait without governor progress into a `GovernorStallError`
   naming every holder. Progress includes any allocation, free or credit move on any grant, so a
   holder working inside memory it was already granted is never reported as a stall.
+- Query preparation never waits while it holds memory (`exec/preparation.ts`). Until the
+  minimum is installed, every admission (retained source recipes, source sizing scratch,
+  planning probes, parameter sizing) is one the governor serves at once, through the same call
+  as without preparation, or (only when the attempt holds nothing) an ordinary wait. Otherwise
+  the execution releases everything the attempt holds, waits holding nothing, and prepares again
+  from scratch on a fresh runtime. That wait is the admission that would have waited, with its
+  own label and named parts, plus a `query#N/preparation-credit` part; all of it becomes the
+  next attempt's credit, a single pool: every grant the attempt obtains returns the bytes it
+  releases there, so freed scratch serves the next phase. The request is the attempt's peak
+  simultaneous need, at least twice the previous request, and at most the usable capacity
+  (the cap less the reserve unless private progress, less lifetime
+  holdings), so a query restarts at most `ceil(log2(usable / first request)) + 1` times. A peak
+  need above the usable capacity is `MemoryAdmissionError` (53200).
 - A grant _holds_ bytes, and its operator _allocates_ buffers out of them, so a non-spillable
   operator works inside its admitted minimum.
 - Growth is charged before it happens, including the overlap while a buffer is copied.

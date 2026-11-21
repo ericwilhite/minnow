@@ -1,7 +1,12 @@
 /** Review 7 of #11 (GOVERNOR-WAIT-POLICY): deterministic regressions for the governor's wait
  * policy. The generated schedules are in holder-priority.test.ts. */
-import { expect, it } from "vitest";
-import { Governor, MemoryAdmissionError, type Grant } from "./governor.js";
+import { describe, expect, it } from "vitest";
+import {
+  Governor,
+  GrowthObserverReentryError,
+  MemoryAdmissionError,
+  type Grant,
+} from "./governor.js";
 import { WriteCredits } from "../write/credits.js";
 
 const tick = () =>
@@ -175,4 +180,82 @@ it("serves an admission within the usable cap once the holder chain ahead of it 
   unregister();
   persistent.close();
   expect(governor.usedBytes).toBe(0);
+});
+
+// Merge of #31 (preparation credit) with holder priority, lifetime registration and the stall
+// guard (GOVERNOR-WAIT-POLICY).
+describe("preparation credit interactions", () => {
+  it("never reports an admission as possible at once past queued holder growth", async () => {
+    const governor = new Governor(8 << 20);
+    const ordinary = governor.capBytes - governor.reserveBytes;
+    const owner = await governor.admit({
+      label: "owner",
+      minimumBytes: ordinary - (1 << 20),
+      spillable: false,
+    });
+    const holder = governor.admit({
+      label: "holder growth",
+      minimumBytes: 2 << 20,
+      spillable: false,
+      holdsCredit: true,
+    });
+    // 1 MiB is free, but a holder is queued: a preparation step must not be told "at once".
+    expect(governor.canAdmitNow(64 << 10, false)).toBe(false);
+    owner.close();
+    (await holder).close();
+    expect(governor.canAdmitNow(64 << 10, false)).toBe(true);
+    expect(governor.usedBytes).toBe(0);
+  });
+
+  it("refuses #11's mutators inside a growth observer", async () => {
+    const governor = new Governor(8 << 20);
+    const grant = await governor.admit({ label: "observed", minimumBytes: 0, spillable: true });
+    const seen: unknown[] = [];
+    governor.observeGrowth(grant, () => {
+      for (const mutate of [
+        () => governor.registerPermanent(() => 0),
+        () => governor.observeGrants(() => undefined),
+      ])
+        try {
+          mutate();
+          seen.push("allowed");
+        } catch (error) {
+          seen.push(error);
+        }
+    });
+    expect(grant.tryGrow(4096)).toBe(true);
+    expect(seen).toHaveLength(2);
+    for (const error of seen) expect(error).toBeInstanceOf(GrowthObserverReentryError);
+    governor.observeGrowth(grant, null);
+    grant.close();
+    expect(governor.permanentBytes).toBe(0);
+    expect(governor.usedBytes).toBe(0);
+  });
+
+  it("counts carving, adoption and credit returned to a parent as holder activity", async () => {
+    const governor = new Governor(8 << 20);
+    const parent = await governor.admit({
+      label: "credit",
+      minimumBytes: 1 << 20,
+      spillable: false,
+    });
+    const step = (work: () => void) => {
+      const before = governor.activity;
+      work();
+      return governor.activity - before;
+    };
+    let carved: ReturnType<Governor["carve"]> = null;
+    expect(
+      step(() => {
+        carved = governor.carve(parent, "carved", false, 4096);
+      }),
+    ).toBeGreaterThan(0);
+    const child = await governor.admit({ label: "child", minimumBytes: 4096, spillable: false });
+    expect(step(() => expect(governor.adopt(parent, child)).toBe(true))).toBeGreaterThan(0);
+    expect(step(() => child.release(4096))).toBeGreaterThan(0);
+    expect(step(() => carved?.close())).toBeGreaterThan(0);
+    child.close();
+    parent.close();
+    expect(governor.usedBytes).toBe(0);
+  });
 });
