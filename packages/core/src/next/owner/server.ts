@@ -162,6 +162,11 @@ interface SessionSlot {
   pending: number;
   /** Terminal callback request, reclaimed only after every queued task finished. */
   retireSequence: number | null;
+  /**
+   * Running or queued tasks that are not autocommit DML. While it is zero and the session holds
+   * no transaction, a read-only statement need not wait behind the queue (see #bypasses).
+   */
+  blocking: number;
 }
 
 const hexToBytes = (hex: string): Uint8Array => {
@@ -750,6 +755,7 @@ class Connection {
         queue: [],
         busy: false,
         pending: 0,
+        blocking: 0,
         retireSequence: null,
         timer: new IdleTransactionTimer(timeoutMs, () => {
           created.engine?.expire();
@@ -903,17 +909,103 @@ class Connection {
       void this.#serveOne(request, null);
       return;
     }
+    const kind = this.#classify(slot, request);
+    if (kind === "read" && this.#bypasses(slot)) {
+      this.#serveBeside(slot, request);
+      return;
+    }
+    const blocks = kind !== "dml";
+    if (blocks) slot.blocking++;
+    const unblock = (): void => {
+      if (blocks) slot.blocking--;
+    };
     const queued = { cancelled: false, close: false };
     this.#queued.set(request.seq, queued);
     this.#enqueue(slot, () => {
       this.#queued.delete(request.seq);
       // Cancelled while it waited behind its session: never admitted, never run.
       if (queued.cancelled) {
+        unblock();
         this.#answerCancelledBeforeStart(request, slot, queued.close);
         return;
       }
-      return this.#serveOne(request, slot);
+      let result: void | Promise<void>;
+      try {
+        result = this.#serveOne(request, slot);
+      } catch (error) {
+        unblock();
+        throw error;
+      }
+      if (isPromise(result)) return result.finally(unblock);
+      unblock();
+      return result;
     });
+  }
+
+  /**
+   * What a statement request is for the read bypass, decided from its plan (never its text):
+   * "dml" for an autocommit modification, "read" for a read-only query (`query()`, no row locks,
+   * no volatile function: no sequence, lock or session effect), "other" for everything else,
+   * including a statement that does not plan yet (it may depend on DDL queued ahead of it).
+   */
+  #classify(slot: SessionSlot, request: Request): "dml" | "read" | "other" {
+    if (request.t !== "statement" || request.scopedTransaction === true || request.retry)
+      return "other";
+    let planned: PlannedStatement;
+    try {
+      planned = this.#planStatement(this.#engineSession(slot), request.text, request.prepared);
+    } catch {
+      return "other";
+    }
+    if (planned.controlsTransaction) return "other";
+    if (planned.kind === "modify") return "dml";
+    const lowered = planned.lowered;
+    return planned.kind === "query" &&
+      request.queryOnly === true &&
+      lowered.kind === "query" &&
+      lowered.plan.hasRowLocking !== true &&
+      !lowered.plan.volatile
+      ? "read"
+      : "other";
+  }
+
+  /**
+   * engine/transactions.mdx: reads through query() do not take turns and never wait behind a
+   * callback. A session's read therefore need not queue behind that session's own autocommit
+   * writes while they wait for the writer turn, provided the session holds no transaction (whose
+   * staged rows the read must see in order) and nothing else is ahead of it (DDL, transaction
+   * control, session state, an unplannable statement). It runs on the same session, so it keeps
+   * that session's state, and reads the latest committed snapshot: every write the session has
+   * had acknowledged, none it is still waiting on.
+   */
+  #bypasses(slot: SessionSlot): boolean {
+    return (
+      slot.busy &&
+      slot.blocking === 0 &&
+      slot.retireSequence === null &&
+      (slot.engine?.transaction ?? "idle") === "idle" &&
+      this.#state === "open" &&
+      !this.#drainingForRestore
+    );
+  }
+
+  /** Serves a bypassing read beside its session's queue; drain and close still wait for it. */
+  #serveBeside(slot: SessionSlot, request: Request): void {
+    slot.pending++;
+    slot.timer.start();
+    const done = (): void => {
+      this.#afterTask(slot);
+      if (this.#state === "closed" && !slot.busy) this.#closeSession(slot);
+      this.#checkDrained();
+    };
+    let result: void | Promise<void>;
+    try {
+      result = this.#serveOne(request, slot);
+    } catch {
+      result = undefined;
+    }
+    if (isPromise(result)) result.then(done, done);
+    else done();
   }
 
   #answerCancelledBeforeStart(request: Request, slot: SessionSlot, close: boolean): void {

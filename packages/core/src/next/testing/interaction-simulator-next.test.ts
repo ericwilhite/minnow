@@ -10,10 +10,34 @@ import {
   runInteractionPlan,
   type InteractionPlan,
   type InteractionPlanOptions,
+  type InteractionReachState,
 } from "../../testing/interaction-simulator.js";
+import { createReach } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
 import { NEXT_OPEN_FINDINGS, NEXT_PARITY_GAPS, openFinding } from "./next-parity-gaps.js";
 import { createNextDriver } from "./simulator-driver.js";
+
+const COMMON: readonly InteractionReachState[] = [
+  "update-matched",
+  "delete-matched",
+  "write-refused",
+  "limit-truncated",
+  "rollback-discarded",
+  "concurrent-read",
+  "reopen-with-rows",
+  "read-bypassed-queued-write",
+];
+/**
+ * The states each family's seeds must reach. Rekeying plans declare none while the open
+ * rekey-forwards finding blocks them; faults, crashes and index-path explains do not run here.
+ */
+const DECLARED: Readonly<Record<string, readonly InteractionReachState[]>> = {
+  base: COMMON,
+  constraints: [...COMMON, "unique-refused"],
+  rekeying: [],
+  "schema changes": [...COMMON, "alter-populated"],
+  "full text": COMMON,
+};
 
 const SETS: ReadonlyArray<[string, InteractionPlanOptions, readonly number[]]> = [
   [
@@ -58,6 +82,10 @@ afterAll(() => {
 });
 
 describe.each(SETS)("interaction simulator over next/: %s", (name, options, seeds) => {
+  const reach = createReach(`interaction simulator over next/: ${name}`, DECLARED[name] ?? []);
+  afterAll(() => {
+    if (process.env.MINNOW_SEED === undefined) reach.assertReached();
+  });
   it.each(seeds)(
     "seed %i",
     async (seed) => {
@@ -67,6 +95,8 @@ describe.each(SETS)("interaction simulator over next/: %s", (name, options, seed
       const driver = await createNextDriver({ transactionIdleTimeoutMs: 2000 });
       try {
         const result = await runInteractionPlan(plan, driver);
+        reach.recordHistory(result.reached);
+        families.add(name);
         for (const gap of Object.keys(result.gapsSkipped ?? {})) expect(gaps.has(gap)).toBe(true);
         if (result.stoppedByGap !== undefined) expect(gaps.has(result.stoppedByGap.gap)).toBe(true);
         else {
@@ -74,7 +104,6 @@ describe.each(SETS)("interaction simulator over next/: %s", (name, options, seed
           const skipped = Object.values(result.gapsSkipped ?? {}).reduce((n, k) => n + k, 0);
           expect(result.interactions + skipped).toBe(plan.interactions.length);
         }
-        families.add(name);
       } catch (error) {
         // Blocked by an open finding: counted, not passed. Anything else fails here.
         families.add(name);

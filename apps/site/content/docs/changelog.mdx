@@ -10,6 +10,8 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The testing entry point's interaction-plan simulator reports one more reach state, `read-bypassed-queued-write`: a read on a connection answered while that connection's own write still waited for the writer turn. Code that switches exhaustively over `InteractionReachState` sees the new member; nothing else changes, and no stored-format change or migration is required.
+
 The testing entry point (`@minnowdb/core/testing`) adds optional members to the interaction-plan simulator: a `SimulationDriver` may implement `listedGap(error)` to name a reviewed parity gap, and `InteractionRunResult` may report `gapsSkipped` (reads skipped as a listed gap) and `stoppedByGap` (a write refused as one, where the plan stopped). Existing drivers and results are unchanged; nothing breaks; no stored-format change or migration is required.
 
 The unexported 1.0 rebuild sizes a point or range lookup that also sorts by its key (such as `WHERE id BETWEEN 500 AND 599 ORDER BY id`) over only the groups its keys name, instead of reading every group of the table to size the sort key; a 100-key range over 300,000 rows went from about 300 ms to 25 ms. Results are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.
