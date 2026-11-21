@@ -32,8 +32,7 @@ END
 Bodies contain ordered INSERT, UPDATE, or DELETE statements. INSERT bodies use VALUES into
 keyless tables; UPDATE and DELETE bodies target keyed tables. User parameters, ON CONFLICT,
 and RETURNING in a body are refused. Views cannot own triggers or be body targets. A subquery
-in a body may use one grouping set; ROLLUP, CUBE, or GROUPING SETS with several sets are not
-supported yet, and the statement that would fire such a body fails with `0A000`.
+in a body may use ROLLUP, CUBE, or GROUPING SETS.
 
 Later statements in a body see earlier writes and their completed trigger effects. A body
 statement finishes its own AFTER work before the next body statement starts, except inside a

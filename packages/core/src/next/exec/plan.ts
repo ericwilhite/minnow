@@ -980,11 +980,11 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
     return found;
   };
   findJson(plan.root);
-  // Rels inside a UNION arm: a phase producer there is refused (see the UNION ALL recipe).
+  // Rels inside a UNION ALL arm: a phase producer there is refused (see the UNION ALL recipe).
   const unionArms = new Set<number>();
   const markUnionArms = (rel: Rel, inArm: boolean): void => {
     if (inArm) unionArms.add(rel.id);
-    const arm = inArm || (rel.op === "setOp" && rel.kind === "union");
+    const arm = inArm || (rel.op === "setOp" && rel.kind === "union" && rel.all);
     if ("input" in rel) markUnionArms(rel.input, arm);
     if ("left" in rel && "right" in rel) {
       markUnionArms(rel.left, arm);
@@ -995,7 +995,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
   markUnionArms(plan.root, false);
   const unionArmPhase = (): UnsupportedPlanError =>
     new UnsupportedPlanError(
-      "an expression evaluated in producer phases (text concatenation, JSON expansion or a JSON aggregate) inside a UNION arm",
+      "an expression evaluated in producer phases (text concatenation, JSON expansion or a JSON aggregate) inside a UNION ALL arm (ROLLUP, CUBE and GROUPING SETS run as UNION ALL arms)",
       { construct: "setOp" },
     );
   // Ordinary plans without possible JSON/hybrid cuts need no retention metadata.
@@ -3162,15 +3162,16 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
             await out.finish();
           };
         }
-        if (rel.kind !== "except" || rel.inputs.length !== 2)
-          throw new UnsupportedPlanError("set operation other than UNION ALL or binary EXCEPT", {
+        // EXCEPT, INTERSECT and distinct UNION: one hash-count operator (exec/except.ts).
+        if (rel.inputs.length !== 2)
+          throw new UnsupportedPlanError("a set operation over other than two inputs", {
             construct: "setOp",
           });
         const [leftInput, rightInput] = rel.inputs;
         if (leftInput === undefined || rightInput === undefined)
-          throw new TypeError("Missing EXCEPT arm");
+          throw new TypeError("Missing set operation arm");
         const input = types(rel);
-        exceptKeyLayout(input);
+        exceptKeyLayout(input, rel.kind.toUpperCase());
         compoundColumns.set(rel.id, variableColumns(input));
         const left = prepare(leftInput),
           right = prepare(rightInput);
@@ -3194,6 +3195,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                   signal: runtime.signal,
                 },
                 counted(runtime, rel, downstream),
+                rel.kind,
               ),
             (operator) => {
               runtime.onAbort((reason) => operator.abort(reason));

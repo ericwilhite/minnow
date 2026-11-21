@@ -38,6 +38,8 @@ const arm = fc.oneof(
   }),
   fc.record({ kind: fc.constant("literal" as const), k: fc.integer({ min: -2, max: 4 }) }),
   fc.record({ kind: fc.constant("nulls" as const) }),
+  // Text concatenation evaluates in producer phases.
+  fc.record({ kind: fc.constant("concat" as const) }),
   fc.record({ kind: fc.constant("big" as const) }),
 );
 type Arm = typeof arm extends fc.Arbitrary<infer T> ? T : never;
@@ -51,10 +53,21 @@ const armSql = (a: Arm): string => {
       return `SELECT ${String(a.k)} AS k, 'lit' AS v`;
     case "nulls":
       return "SELECT NULL AS k, NULL AS v";
+    case "concat":
+      return "SELECT k AS k, v || '!' AS v FROM a";
     case "big":
       return "SELECT big AS k, 'big' AS v FROM c";
   }
 };
+const OPERATORS = [
+  "UNION ALL",
+  "UNION",
+  "INTERSECT",
+  "INTERSECT ALL",
+  "EXCEPT",
+  "EXCEPT ALL",
+] as const;
+const operator = fc.constantFrom(...OPERATORS);
 const wrap = fc.constantFrom(
   "bag",
   "ordered",
@@ -68,7 +81,7 @@ const wrap = fc.constantFrom(
 ) satisfies fc.Arbitrary<State>;
 
 for (const seed of seedsFor("next-set-operations", [0x5e71, 0x5e72]))
-  it(`UNION ALL matches PostgreSQL (seed ${String(seed)})`, async () => {
+  it(`set operations match PostgreSQL (seed ${String(seed)})`, async () => {
     const reach = createReach("set operations", SET_OPERATION_REACH);
     const core = await new StorageCore(32).open(),
       pg = new PGlite();
@@ -92,12 +105,19 @@ for (const seed of seedsFor("next-set-operations", [0x5e71, 0x5e72]))
       await fc.assert(
         fc.asyncProperty(
           fc.array(arm, { minLength: 2, maxLength: 4 }),
+          fc.array(operator, { minLength: 3, maxLength: 3 }),
           wrap,
           fc.integer({ min: 0, max: 6 }),
           fc.integer({ min: 0, max: 3 }),
-          async (arms, how, limit, offset) => {
+          async (arms, ops, how, limit, offset) => {
             reach.beginHistory();
-            const union = arms.map(armSql).join(" UNION ALL ");
+            // PostgreSQL binds INTERSECT tighter than UNION and EXCEPT; mixed chains check it.
+            const used = ops.slice(0, arms.length - 1);
+            const union = arms
+              .map((a, i) => (i === 0 ? armSql(a) : `${used[i - 1] ?? "UNION ALL"} ${armSql(a)}`))
+              .join(" ");
+            for (const op of used) reach.reach(op.toLowerCase() as State);
+            if (new Set(used).size > 1) reach.reach("mixed chain");
             reach.reach(arms.length > 2 ? "three or more arms" : "two arms");
             if (arms.some((a) => a.kind === "literal" || a.kind === "nulls" || a.kind === "big"))
               reach.reach("coerced arm");
@@ -110,7 +130,8 @@ for (const seed of seedsFor("next-set-operations", [0x5e71, 0x5e72]))
                 : how === "bag"
                   ? union
                   : how === "ordered"
-                    ? `${union} ORDER BY 1 NULLS LAST, 2 NULLS LAST LIMIT ${String(limit)} OFFSET ${String(offset)}`
+                    ? // Names, not ordinals: the front end refuses ordinals over a regrouped mixed chain.
+                      `${union} ORDER BY k NULLS LAST, v NULLS LAST LIMIT ${String(limit)} OFFSET ${String(offset)}`
                     : how === "aggregated"
                       ? `SELECT count(*) AS n, count(k) AS kn, sum(k) AS s, min(v) AS lo FROM (${union}) u(k, v)`
                       : how === "grouped"
@@ -140,7 +161,25 @@ for (const seed of seedsFor("next-set-operations", [0x5e71, 0x5e72]))
               reach.reach("refused like PostgreSQL");
               return;
             }
-            const result = await core.execute(sql);
+            let result: Awaited<ReturnType<typeof core.execute>>;
+            try {
+              result = await core.execute(sql);
+            } catch (error) {
+              // The one documented refusal PostgreSQL does not share: an expression evaluated in
+              // producer phases inside a UNION ALL arm (README "Set operations"). ROLLUP, CUBE and
+              // GROUPING SETS run as UNION ALL arms over the whole chain.
+              const unionAllPhase =
+                (used.includes("UNION ALL") ||
+                  how === "rollup" ||
+                  how === "cube" ||
+                  how === "grouping sets") &&
+                arms.some((a) => a.kind === "concat") &&
+                (error as { sqlState?: string }).sqlState === "0A000" &&
+                /inside a UNION ALL arm/u.test((error as Error).message);
+              if (!unionAllPhase) throw error;
+              reach.reach("phase arm refused under UNION ALL");
+              return;
+            }
             if (how === "insert") {
               if ("rowCount" in result) expect(result.rowCount, sql).toBe(expected.affectedRows);
               const check = "SELECT k, v FROM dst ORDER BY k NULLS LAST, v NULLS LAST";
@@ -151,6 +190,8 @@ for (const seed of seedsFor("next-set-operations", [0x5e71, 0x5e72]))
               );
               return;
             }
+            if (arms.some((x) => x.kind === "concat"))
+              reach.reach("phase arm in a hash-count set operation");
             if (!("batches" in result)) throw new Error(`no rows: ${sql}`);
             const actual = rowsOf(oracleRows(result));
             const wanted = rowsOf(expected.rows);
@@ -171,12 +212,14 @@ for (const seed of seedsFor("next-set-operations", [0x5e71, 0x5e72]))
                 { kind: "a", filter: "" },
                 { kind: "a", filter: "" },
               ],
+              ["UNION ALL", "UNION", "UNION"],
               "bag",
               0,
               0,
             ],
             [
               [{ kind: "a", filter: " WHERE k > 99" }, { kind: "b", filter: "" }, { kind: "big" }],
+              ["UNION ALL", "UNION ALL", "UNION"],
               "ordered",
               4,
               1,
@@ -187,7 +230,40 @@ for (const seed of seedsFor("next-set-operations", [0x5e71, 0x5e72]))
                 { kind: "literal", k: 2 },
                 { kind: "b", filter: " WHERE id > 3" },
               ],
+              ["UNION ALL", "UNION ALL", "UNION"],
               "aggregated",
+              0,
+              0,
+            ],
+            [
+              [
+                { kind: "a", filter: "" },
+                { kind: "b", filter: "" },
+                { kind: "a", filter: "" },
+              ],
+              ["UNION", "INTERSECT", "EXCEPT"],
+              "bag",
+              0,
+              0,
+            ],
+            [
+              [
+                { kind: "a", filter: "" },
+                { kind: "a", filter: " WHERE k > 2" },
+              ],
+              ["INTERSECT ALL", "EXCEPT ALL", "UNION"],
+              "ordered",
+              6,
+              0,
+            ],
+            [
+              [
+                { kind: "a", filter: "" },
+                { kind: "a", filter: " WHERE id % 2 = 0" },
+                { kind: "b", filter: "" },
+              ],
+              ["EXCEPT ALL", "INTERSECT", "UNION"],
+              "bag",
               0,
               0,
             ],

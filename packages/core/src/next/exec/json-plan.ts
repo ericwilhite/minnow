@@ -180,7 +180,14 @@ export function phaseRetainingParents(root: Rel): {
     }
     if ("inputs" in rel)
       for (const input of rel.inputs)
-        visit(input, allowed && rel.kind === "except", [...ancestors, rel.id], joinIds, windowIds);
+        // Hash-count set operations checkpoint like EXCEPT; UNION ALL arms stream through.
+        visit(
+          input,
+          allowed && !(rel.kind === "union" && rel.all),
+          [...ancestors, rel.id],
+          joinIds,
+          windowIds,
+        );
   };
   visit(root, true, [], [], []);
   return { supported, excepts, joins, windows };

@@ -10770,6 +10770,13 @@ export const DML_COMPUTED_REACH = [
 
 /** Set operations against PostgreSQL (set-operation-differential). */
 export const SET_OPERATION_REACH = [
+  "union all",
+  "union",
+  "intersect",
+  "intersect all",
+  "except",
+  "except all",
+  "mixed chain",
   "two arms",
   "three or more arms",
   "coerced arm",
@@ -10785,6 +10792,8 @@ export const SET_OPERATION_REACH = [
   "cube",
   "grouping sets",
   "refused like PostgreSQL",
+  "phase arm refused under UNION ALL",
+  "phase arm in a hash-count set operation",
 ] as const;
 
 export const FOLLOW_NESTED_PRESSURE_REACH = [
