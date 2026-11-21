@@ -1931,7 +1931,9 @@ their synthetic executor. Native INSERT VALUES/SELECT, UPDATE, DELETE, ON CONFLI
 execute with statement snapshot input spools. When the input runs in producer phases (text
 concatenation, spilling aggregates), the input spool holds no rows at a phase handoff (rows reach
 the modification root only after the last cut) and releases its buffers there, since they share
-the result reservation the handoff parks; each phase builds its own spool. Joined/index inputs retain locator identity;
+the result reservation the handoff parks; each phase builds its own spool. RETURNING and ON
+CONFLICT also bind a writer, row rules and their own grant with each phase's graph: these close
+at the handoff, holding no row yet, and the next phase binds them again. Joined/index inputs retain locator identity;
 repeat tracking and returned rows use charged, spillable state. SQL writers without a unique-target
 proof require the admitted tracker before writer lookup, including raw executor requests. The
 direct-native legacy target Set cannot be selected by SQL. Complete-row validation includes

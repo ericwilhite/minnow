@@ -10762,6 +10762,9 @@ export const DML_COMPUTED_REACH = [
   "update concatenation",
   "delete concatenation predicate",
   "large insert",
+  "insert returning",
+  "update returning",
+  "delete returning",
 ] as const;
 
 export const FOLLOW_NESTED_PRESSURE_REACH = [

@@ -110,16 +110,19 @@ const step = fc.oneof(
     text: fc.nat(texts.length - 1),
     int: fc.nat(ints.length - 1),
     filter: fc.nat(filters.length - 1),
+    returning: fc.boolean(),
   }),
   fc.record({
     kind: fc.constant("update" as const),
     suffix: fc.constantFrom("u", "", "-x"),
     delta: fc.integer({ min: -3, max: 3 }),
     where: fc.constantFrom("id % 2 = 0", "(v || 'q') <> 'evenq'", "n > 5", "true"),
+    returning: fc.boolean(),
   }),
   fc.record({
     kind: fc.constant("delete" as const),
     where: fc.constantFrom("v || '!' = 'even!'", "n % 5 = 0", "v IS NULL", "(v || '-') = 'p3-'"),
+    returning: fc.boolean(),
   }),
 );
 
@@ -134,11 +137,17 @@ async function history(
   const core = await new StorageCore(32).open(),
     pg = new PGlite();
   await pg.waitReady;
+  const bag = (rows: readonly unknown[]) =>
+    [...rows].sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
   const both = async (sql: string): Promise<void> => {
     const expected = await pg.query(sql);
     const actual = await core.execute(sql);
     if ("rowCount" in actual && expected.affectedRows !== undefined)
       expect(actual.rowCount, sql).toBe(expected.affectedRows);
+    // RETURNING: the same rows as PostgreSQL, in any order (no ORDER BY applies to them).
+    if ("returning" in actual)
+      expect(bag(oracleRows(actual.returning)), sql).toEqual(bag(expected.rows));
+    else expect(expected.fields.length, sql).toBe(0);
     const now = await core.execute("SELECT id, v, n FROM dst ORDER BY id");
     if (!("batches" in now)) throw new Error("dst rows");
     expect(oracleRows(now), sql).toEqual(
@@ -159,6 +168,8 @@ async function history(
     }
     const from = sources(series, limit);
     for (const [index, item] of steps.entries()) {
+      const returning = item.returning ? " RETURNING id, v, n" : "";
+      if (item.returning) reach.reach(`${item.kind} returning`);
       if (item.kind === "insert") {
         const source = from[item.source],
           text = texts[item.text],
@@ -169,18 +180,18 @@ async function history(
         // Keys stay unique across a history: each insert owns its own block of ids.
         const base = 10000 * (index + 1);
         await both(
-          `INSERT INTO dst(id, v, n) SELECT ${String(base)} + ${source.k}, ${text.sql(source)}, ${int.sql(source)} FROM ${source.from}${where === null ? "" : ` WHERE ${where}`}`,
+          `INSERT INTO dst(id, v, n) SELECT ${String(base)} + ${source.k}, ${text.sql(source)}, ${int.sql(source)} FROM ${source.from}${where === null ? "" : ` WHERE ${where}`}${returning}`,
         );
         for (const name of [source.name, ...text.reach, ...int.reach, ...filter.reach])
           reach.reach(name);
         if (source.name === "series source" && series >= 4096) reach.reach("large insert");
       } else if (item.kind === "update") {
         await both(
-          `UPDATE dst SET v = v || '${item.suffix}', n = n + ${String(item.delta)} WHERE ${item.where}`,
+          `UPDATE dst SET v = v || '${item.suffix}', n = n + ${String(item.delta)} WHERE ${item.where}${returning}`,
         );
         reach.reach("update concatenation");
       } else {
-        await both(`DELETE FROM dst WHERE ${item.where}`);
+        await both(`DELETE FROM dst WHERE ${item.where}${returning}`);
         if (item.where.includes("||")) reach.reach("delete concatenation predicate");
       }
     }
@@ -215,16 +226,23 @@ for (const seed of seedsFor("next-dml-computed", [0xd5e1, 0xd5e2]))
               text,
               int: text % ints.length,
               filter: text % filters.length,
+              returning: text % 2 === 1,
             })),
             50,
             7,
           ],
-          [[{ kind: "insert", source: 0, text: 0, int: 0, filter: 0 }], 5000, 0],
+          [[{ kind: "insert", source: 0, text: 0, int: 0, filter: 0, returning: false }], 5000, 0],
           [
             [
-              { kind: "insert", source: 1, text: 1, int: 4, filter: 2 },
-              { kind: "update", suffix: "u", delta: 1, where: "(v || 'q') <> 'evenq'" },
-              { kind: "delete", where: "v || '!' = 'even!'" },
+              { kind: "insert", source: 1, text: 1, int: 4, filter: 2, returning: true },
+              {
+                kind: "update",
+                suffix: "u",
+                delta: 1,
+                where: "(v || 'q') <> 'evenq'",
+                returning: true,
+              },
+              { kind: "delete", where: "v || '!' = 'even!'", returning: true },
             ],
             5,
             3,
