@@ -82,12 +82,48 @@ export class WriteCredits {
     );
   }
 
-  /** A native step's own workspace is funded. It holds no merge minimum: native steps never
-   * merge, and a background merge admits its own credit when it runs. */
+  /**
+   * What a native step protects (writer floors, steps 1-3): exactly the step it runs. Live
+   * allocations and loans; the funded row step (`protectRows`); the metadata step and its
+   * headroom; a commit window only while a commit or log append is running or already funded;
+   * an active merge's own floor. No row, commit or merge minimum: a native step never commits
+   * or merges inside itself, and a commit, a sequence frame or a merge funds its own window
+   * when it starts (`prepareCommit`, `acquireMerge`, as holder growth).
+   */
+  nativeProtectedBytes(metadataHeadroom = this.#metadataHeadroom): number {
+    return (
+      Math.max(this.rows.allocated + this.rows.loaned, this.nativeRowFloorBytes) +
+      this.metadata.allocated +
+      Math.max(
+        this.metadata.loaned,
+        metadataHeadroom,
+        this.#commitMetadataFunding - this.metadata.allocated,
+        this.#mergeMetadataFunding - this.metadata.allocated,
+      ) +
+      this.nativeCommitBytes +
+      this.activeMergeBytes
+    );
+  }
+
+  /** The funded row step a native step keeps (and recovery's scan, while recovering). */
+  get nativeRowFloorBytes(): number {
+    return Math.max(this.#rowFloor, this.#workingMinimum().rows ?? 0);
+  }
+
+  /** Commit credit a native step keeps: live buffers and loans, and the commit window only
+   * while a commit or log append runs or was funded. */
+  get nativeCommitBytes(): number {
+    return Math.max(
+      this.commits.allocated + this.commits.loaned,
+      this.#commitFunding,
+      this.#workingMinimum().commits ?? 0,
+    );
+  }
+
+  /** A native step's own workspace is funded (no row, commit or merge minimum). */
   #nativeReady(): boolean {
     return (
-      this.rows.held >= Math.max(this.#rowMinimum, this.#rowFloor) &&
-      this.commits.held >= this.minimum.commits
+      this.rows.held >= this.nativeRowFloorBytes && this.commits.held >= this.nativeCommitBytes
     );
   }
 
@@ -131,15 +167,15 @@ export class WriteCredits {
     return this.#mergeActive !== null;
   }
 
-  /** Return high-water estimates without using a live primary or merge's progress. Native
-   * steps pass 0: they hold no merge minimum (an active merge keeps its own floor). */
-  reclaimNativeStep(mergeMinimum = this.minimum.merge): void {
-    this.reclaimRows();
+  /** Return high-water estimates between native steps without using a live primary or a
+   * merge's progress: down to what a native step protects (`nativeProtectedBytes`). */
+  reclaimNativeStep(): void {
+    const released =
+      releaseIdle(this.rows, this.nativeRowFloorBytes) +
+      releaseIdle(this.commits, this.nativeCommitBytes) +
+      releaseIdle(this.merge, this.#mergeFloor);
     this.reclaimMetadata();
-    releaseIdle(
-      this.merge,
-      Math.max(this.#mergeFloor, Math.max(0, mergeMinimum - (this.#mergeActive?.held ?? 0))),
-    );
+    if (released) this.#changed?.();
   }
 
   #workingMinimum: () => Partial<WriteMinimum> = () => ({});
@@ -465,10 +501,6 @@ export class WriteCredits {
       const desired = accounts.map((account, i) =>
         Math.max(account.allocated + account.loaned, floors[i] ?? 0),
       );
-      if (nativeMinimum) {
-        desired[0] = Math.max(desired[0] ?? 0, this.#rowMinimum);
-        desired[2] = Math.max(desired[2] ?? 0, this.minimum.commits);
-      }
       desired[target] = Math.max(desired[target] ?? 0, wanted);
       desired[1] = Math.max(desired[1] ?? 0, metadata);
       // First preserve warm WAL/merge windows when immediate credit can fund

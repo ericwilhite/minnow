@@ -2156,7 +2156,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const native = this.#nativeSteps.funding || this.#holder?.nativeCommands;
     // Native producer/rule steps do not run a future background merge. Its real
     // acquireMerge prepares the exact step again; active merge credit stays protected.
-    if (native) this.#credits.reclaimNativeStep(0);
+    if (native) this.#credits.reclaimNativeStep();
     const headroom = this.#metadataHeadroom(catalog);
     const metadata = native
       ? this.#credits.prepareNativeMinimum(headroom, signal, includesProgress)
@@ -2164,10 +2164,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
     if (metadata instanceof Promise)
       return this.#trackMinimum(
         metadata.then(() => {
-          if (native) this.#credits.reclaimNativeStep(0);
+          if (native) this.#credits.reclaimNativeStep();
         }),
       );
-    if (native) this.#credits.reclaimNativeStep(0);
+    if (native) this.#credits.reclaimNativeStep();
     // A future background merge admits its own complete step after cold readers open.
     return undefined;
   }
@@ -2319,7 +2319,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
    * Cached pages/foreign read leases remain temporary governor pressure, not this floor. */
   #protectedNativeBytes(headroom?: number): number {
     return (
-      this.#credits.protectedBytes(0, headroom) +
+      this.#credits.nativeProtectedBytes(headroom) +
       FIXED_CACHE_BYTES +
       this.#space.stats.permanentBytes
     );
@@ -2406,13 +2406,15 @@ export class WritePathImpl implements WritePath, EngineHooks {
       signal.throwIfAborted();
       const headroom = this.#metadataHeadroom(catalog),
         needed =
-          this.#credits.protectedBytes(0, headroom) +
+          this.#credits.nativeProtectedBytes(headroom) +
           FIXED_CACHE_BYTES +
           this.#space.stats.permanentBytes,
+        // What relief cannot lower: the funded row step, the commit window in use, an active
+        // merge, the metadata headroom and the cache's fixed slabs (writer floors steps 1-3).
         mandatory =
           FIXED_CACHE_BYTES +
-          this.#credits.rowMinimum +
-          Math.max(this.#credits.minimum.commits, this.#credits.commits.held) +
+          this.#credits.nativeRowFloorBytes +
+          this.#credits.nativeCommitBytes +
           this.#credits.activeMergeBytes +
           headroom;
       if (
@@ -2425,7 +2427,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         // This route proved the entire root +native compound step fits the same
         // selected capacity. Replenishing its own metadata is part of that step.
         await this.#prepareMinimum(catalog, signal, capacity === this.#credits.governor.capBytes);
-        this.#credits.reclaimNativeStep(0);
+        this.#credits.reclaimNativeStep();
         // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- Native commit/maintenance can acquire a loan across the metadata await.
         if (!this.#credits.metadataReady || this.#credits.hasLoans) continue;
         if (this.#minimumState !== this.#state || this.#minimumCatalog !== owner.catalog) continue;
@@ -2440,7 +2442,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#checkNativeStep(owner);
       signal.throwIfAborted();
       this.#arenaPool.clear();
-      this.#credits.reclaimNativeStep(0);
+      this.#credits.reclaimNativeStep();
       if (state !== this.#state || this.#grant.allocated < rows) continue;
 
       const observedState = this.#state,
