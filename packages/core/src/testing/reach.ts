@@ -1707,6 +1707,16 @@ export const LOWER_M3_JOINS_REACH = [
   "build column in expression",
   "aggregate over join",
   "probe-only projection",
+  "nested join demand",
+  "aggregate over nested joins",
+] as const;
+
+/** Column-store appends of NULL constant columns (all-NULL or a join's unread column). */
+export const COLUMN_STORE_REACH = [
+  "null constant",
+  "varlen null constant",
+  "null constant spans a whole word",
+  "selected null constant",
 ] as const;
 
 /** Join output demand over every expression shape and placement (join-demand-expressions). */
@@ -11874,6 +11884,20 @@ export const GOVERNOR_HOLDER_PRIORITY_REACH = [
   "new admission of almost all room",
   "holder queued inside a reclaim callout",
   "holder granted while a new admission waits",
+] as const;
+
+/** The write engine's lifetime holdings and idle spill (GOVERNOR-WAIT-POLICY, reviews 8–9). */
+export const LIFETIME_HOLDINGS_REACH = [
+  "secondary index",
+  "deletion of memtable rows",
+  "deletion of published rows",
+  "unindexed published deletions",
+  "deletion-only memtable",
+  "table dropped",
+  "table dropped under a snapshot",
+  "waited for a snapshot, then settled",
+  "current run readers open",
+  "exact after publication",
 ] as const;
 
 /** A native trigger statement on an FTS-indexed table ends without waiting. */

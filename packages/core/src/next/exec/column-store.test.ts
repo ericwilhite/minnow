@@ -3,7 +3,7 @@
  * appends that stop at a row boundary when refused, and charges that match what it holds.
  */
 import { afterAll, describe, expect, it } from "vitest";
-import { createReach } from "../../testing/reach.js";
+import { COLUMN_STORE_REACH, createReach } from "../../testing/reach.js";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import type { PhysicalType } from "../types.js";
 import type { Vector } from "../vector/vector.js";
@@ -22,6 +22,9 @@ import {
 import { ColumnStore, TIER_INT128, TIER_INT64, TIER_SAFE, nullConstant } from "./column-store.js";
 
 const SEEDS = seedsFor("next-column-store", [0x570e, 99]);
+// A NULL constant column (all NULL, or a join's unread column) is written as one bitmap range.
+const storeReach = createReach("next-column-store", COLUMN_STORE_REACH);
+afterAll(() => storeReach.assertReached());
 
 class Ledger {
   held = 0;
@@ -49,6 +52,7 @@ function storeValues(store: ColumnStore, column: number): Value[] {
 describe("column store", () => {
   for (const seed of SEEDS)
     it(`keeps values exact across forms and tiers (seed ${String(seed)})`, () => {
+      storeReach.beginHistory();
       const random = mulberry32(seed);
       const types: PhysicalType[] = [INT, BIG, DBL, TEXT, BOOL, NUM, ANYNUM];
       const ledger = new Ledger();
@@ -82,10 +86,20 @@ describe("column store", () => {
           int64: wide || random() < 0.5 ? ("int64" as const) : ("safe" as const),
           dictionary: random() < 0.4,
         };
-        const vectors: Vector[] = types.map((type, c) => vectorOf(type, columns[c] ?? [], options));
+        const vectors: Vector[] = types.map((type, c) => {
+          if (random() >= 0.15) return vectorOf(type, columns[c] ?? [], options);
+          columns[c] = Array.from({ length: n }, () => null);
+          storeReach.reach("null constant");
+          if (type.kind === "text") storeReach.reach("varlen null constant");
+          return nullConstant(type, n);
+        });
         // A selection over every other row.
         const ids = Uint16Array.from({ length: Math.ceil(n / 2) }, (_, i) => i * 2);
         const take = random() < 0.5;
+        if (!take && n >= 64 && vectors.some((v) => v.form === "constant"))
+          storeReach.reach("null constant spans a whole word");
+        if (take && vectors.some((v) => v.form === "constant"))
+          storeReach.reach("selected null constant");
         const appended = take
           ? store.append(vectors, ids, 0, ids.length)
           : store.append(vectors, null, 0, n);

@@ -256,6 +256,7 @@ class GrantImpl implements Grant {
     const shortfall = this.allocated + bytes - this.held;
     if (shortfall > 0 && !this.tryGrow(shortfall)) return false;
     this.allocated += bytes;
+    this.governor.activity++;
     return true;
   }
 
@@ -263,6 +264,7 @@ class GrantImpl implements Grant {
     if (this.closed) return;
     if (bytes > this.allocated) throw new RangeError(`${this.label} freed more than it allocated`);
     this.allocated -= bytes;
+    this.governor.activity++;
   }
 
   tryGrow(bytes: number): boolean {
@@ -367,9 +369,9 @@ export interface StallHolder {
 
 /**
  * Thrown (test builds only, `Governor.stallAfterMs`) at a waiter that saw no governor progress
- * for that long: no credit taken or returned and no request queued, served or withdrawn. Every
- * waiter is then waiting on something no holder will release; this names the waiter and every
- * holder instead of hanging.
+ * for that long: no credit taken or returned, no request queued, served or withdrawn, and no
+ * grant anywhere allocated, freed or moved. Every waiter is then waiting on something no holder
+ * will release; this names the waiter and every holder instead of hanging.
  */
 export class GovernorStallError extends Error {
   readonly code = "MINNOW_GOVERNOR_STALL";
@@ -407,9 +409,10 @@ export class Governor implements MemoryGovernor {
    * Test builds only; null in production. When set, a queued request that sees no governor
    * progress for this many milliseconds is rejected with a `GovernorStallError` naming every
    * holder, so a wait nothing will ever release fails fast instead of hanging. Progress is any
-   * credit taken or returned and any request queued, served or withdrawn. It is a no-progress
-   * window, not a proof: a holder computing without touching the governor for longer than the
-   * window would also be reported.
+   * credit taken or returned, any request queued, served or withdrawn, and any allocation, free
+   * or credit move on any grant: a holder working inside memory it was granted is progress.
+   * It is a no-progress window, not a proof: a holder computing without touching any grant for
+   * longer than the window would also be reported.
    */
   static stallAfterMs: number | null = null;
   readonly #grantObservers = new Set<(event: GrantEvent) => void>();
@@ -442,8 +445,13 @@ export class Governor implements MemoryGovernor {
   readonly reserveBytes: number;
   usedBytes = 0;
   peakBytes = 0;
-  /** Counts governor progress for `stallAfterMs`. */
+  /** Counts governor progress for `stallAfterMs`: credit taken or returned, requests queued,
+   * served or withdrawn. */
   #progress = 0;
+  /** Counts holders' activity on held grants for `stallAfterMs`: allocations, frees and credit
+   * moved between grants or into a cache. A holder working inside memory it was granted is
+   * progress: a waiter has stalled only if no grant anywhere changed during the window. */
+  activity = 0;
   readonly #permanent = new Set<() => number>();
 
   registerPermanent(bytes: () => number): () => void {
@@ -925,7 +933,8 @@ export class Governor implements MemoryGovernor {
     const afterMs = Governor.stallAfterMs;
     if (afterMs === null) return;
     const queuedAt = new Error().stack?.split("\n").slice(3, 16).join("\n") ?? "";
-    let seen = this.#progress,
+    const moved = () => this.#progress + this.activity;
+    let seen = moved(),
       since = Date.now();
     const timer = setInterval(
       () => {
@@ -933,8 +942,8 @@ export class Governor implements MemoryGovernor {
           clearInterval(timer);
           return;
         }
-        if (this.#progress !== seen) {
-          seen = this.#progress;
+        if (moved() !== seen) {
+          seen = moved();
           since = Date.now();
           return;
         }
@@ -1090,6 +1099,7 @@ export class Governor implements MemoryGovernor {
     if (source !== target) {
       source.held -= bytes;
       target.held += bytes;
+      this.activity++;
     }
     if (
       bytes > 0 &&
@@ -1153,6 +1163,7 @@ export class Governor implements MemoryGovernor {
         // ordinary capacity changes owner; it cannot serve a queued admission in between.
         source.allocated -= bytes;
         source.held -= bytes;
+        this.activity++;
         return true;
       },
       charge: (bytes: number): boolean => {
