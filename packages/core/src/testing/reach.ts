@@ -11876,6 +11876,20 @@ export const GOVERNOR_HOLDER_PRIORITY_REACH = [
   "holder granted while a new admission waits",
 ] as const;
 
+/** The write engine's lifetime holdings and idle spill (GOVERNOR-WAIT-POLICY, reviews 8–9). */
+export const LIFETIME_HOLDINGS_REACH = [
+  "secondary index",
+  "deletion of memtable rows",
+  "deletion of published rows",
+  "unindexed published deletions",
+  "deletion-only memtable",
+  "table dropped",
+  "table dropped under a snapshot",
+  "waited for a snapshot, then settled",
+  "current run readers open",
+  "exact after publication",
+] as const;
+
 /** A native trigger statement on an FTS-indexed table ends without waiting. */
 export const NATIVE_COMMAND_FTS_END_REACH = [
   "keyed delete ended",

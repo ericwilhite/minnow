@@ -1622,9 +1622,12 @@ and the owner import it directly.
   than an endless wait, and queued requests are re-checked when a registration changes. An admission
   within that usable cap is served once the finite holder chains ahead of it finish. The writer's
   floors are revocable when idle, so they are not counted as permanent; what the write engine keeps
-  until close is (the page cache's fixed slabs, permanent storage, resident metadata, the current
-  state's pin, its fixed controls and resident commit writers). Unflushed memtable rows are not
-  permanent: reclaim on an idle writer flushes them. Every transition that can make the writer's
+  until close, or for as long as the current state needs it, is (the page cache's fixed slabs,
+  permanent storage, the current state's resident metadata and pin, its fixed controls and
+  resident commit writers). What a finite holder releases is not: state only older snapshots keep
+  (a request it blocks waits for them), FTS mutation entries, pending index records. Unflushed
+  memtable content (rows, index tombstones, deletions) is not permanent: reclaim on an idle writer
+  flushes it, and publishes once when only a publication releases the rest. Every transition that can make the writer's
   forecasts retirable (a statement or transaction ending, a flush, merge or commit finishing) wakes
   queued admissions. `Governor.observeGrants` reports each grant synchronously with the queues at
   that moment, so suites check the serving order itself. The writer and a native root
@@ -1636,7 +1639,8 @@ and the owner import it directly.
   `memory/wait-policy-regressions.test.ts`, `memory/wait-wake-regressions.test.ts`,
   `testing/native-command-fifo.test.ts`. In test runs,
   `MINNOW_GOVERNOR_STALL_MS` turns any wait without governor progress into a `GovernorStallError`
-  naming every holder.
+  naming every holder. Progress includes any allocation, free or credit move on any grant, so a
+  holder working inside memory it was already granted is never reported as a stall.
 - A grant _holds_ bytes, and its operator _allocates_ buffers out of them, so a non-spillable
   operator works inside its admitted minimum.
 - Growth is charged before it happens, including the overlap while a buffer is copied.
