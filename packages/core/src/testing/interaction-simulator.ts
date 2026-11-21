@@ -509,6 +509,8 @@ export const INTERACTION_REACH_STATES = [
   "alter-populated",
   /** An index-shaped lookup, planned through a secondary index, that returned rows. */
   "index-lookup-rows",
+  /** A read on a connection answered while that connection's own write still waited for the turn. */
+  "read-bypassed-queued-write",
 ] as const;
 
 export type InteractionReachState = (typeof INTERACTION_REACH_STATES)[number];
@@ -3874,6 +3876,10 @@ class PlanRunner {
     }
     const sql = renderKeyed(interaction.table, columns, interaction.mutation);
     const queued = this.#attempt(interaction.waiter, sql);
+    const waiting = { settled: false };
+    void queued.then(() => {
+      waiting.settled = true;
+    });
     // The waiter's write must still be pending while the transaction holds the turn: give it
     // real time to land wrongly before checking, then read through the waiter (reads never
     // wait) to prove the transaction's rows are invisible there.
@@ -3892,6 +3898,7 @@ class PlanRunner {
       committed.sorted(interaction.table),
       "on the waiting connection while a transaction holds the turn",
     );
+    if (!waiting.settled) this.#reach("read-bypassed-queued-write");
     const end = poisoned ? "ROLLBACK" : interaction.outcome === "commit" ? "COMMIT" : "ROLLBACK";
     try {
       await this.#execute(interaction.connection, end);
