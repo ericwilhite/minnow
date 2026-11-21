@@ -158,6 +158,19 @@ export const W_QUERIES = [
     ordered: true,
     sql: "SELECT id, d00, f09 FROM events_wide ORDER BY id LIMIT 100 OFFSET ${R90}",
   },
+  // Primary-key lookups: a point read and a 100-key range, sized over the groups their keys name.
+  {
+    id: "lookup_point_pk",
+    fam: "scan",
+    check: "count",
+    sql: "SELECT * FROM events_wide WHERE id = ${R50}",
+  },
+  {
+    id: "lookup_range_pk",
+    fam: "scan",
+    ordered: true,
+    sql: "SELECT id, d00, f09 FROM events_wide WHERE id BETWEEN ${R50} AND ${R50+99} ORDER BY id",
+  },
   {
     id: "sort_topn",
     fam: "sort",
@@ -291,6 +304,8 @@ export const S_TABLES = [
 export function sqlFor(q, engine, rows) {
   const s = (engine === "sqlite" && q.lite) || (engine === "duck" && q.duck) || q.sql;
   return s
+    .replaceAll("${R50}", String(Math.floor(rows * 0.5)))
+    .replaceAll("${R50+99}", String(Math.floor(rows * 0.5) + 99))
     .replaceAll("${R90}", String(Math.floor(rows * 0.9)))
     .replaceAll("${R99}", String(Math.floor(rows * 0.99)));
 }

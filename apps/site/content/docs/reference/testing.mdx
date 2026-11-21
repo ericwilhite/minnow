@@ -1440,7 +1440,7 @@ result from a different manifest counts as missing.
    2% of the control's per-query median; a regression is the reverse. Every other cell is screened
    for regressions, and a flag also needs a Holm-adjusted two-sided sign test p of at most 0.05
    across every screened cell the manifest declares, including any that did not report. Nine pairs
-   cannot pass that correction across 45 cells, so the default is 15. Anything else is "no
+   cannot pass that correction across 47 cells, so the default is 15. Anything else is "no
    accepted difference", which is not proof of equality.
 5. The table gives verdicts only when every declared shard and cell reported every pair. A missing
    shard or dataset, a failed cell or a short cell marks the run **INCOMPLETE**, with no verdicts.
@@ -1475,8 +1475,8 @@ Cost, measured on hosted runners (AMD EPYC 9V74, validation run 44678818852): ea
 about 3 minutes installing and building both builds, and each W1M build takes about 100 s to
 load and capture its image (a 1.1 GB image). One fresh-process sample takes about 4.5 to 5.6 s,
 most of it restoring and verifying. Every shard also runs the two A/A cells, so a cell costs
-about 2.5 minutes at 15 pairs. Gate B has 29 W1M and 16 S1 cells; over six jobs per dataset a
-full run is estimated at about 3.5 runner-hours (about 2.4 for W1M and 1.1 for S1, taking S1
+about 2.5 minutes at 15 pairs. Gate B has 31 W1M and 16 S1 cells; over six jobs per dataset a
+full run is estimated at about 3.7 runner-hours (about 2.6 for W1M and 1.1 for S1, taking S1
 samples to cost no more than W1M's), and about 30 minutes of wall time when twelve runners are
 free. Reloading fixtures in every process instead
 would cost about 10 runner-hours of setup alone. Separate images add two more control captures per
