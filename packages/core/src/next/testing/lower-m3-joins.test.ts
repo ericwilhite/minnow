@@ -168,6 +168,30 @@ for (const seed of seedsFor("next-lower-m3-joins", [0x3a71, 0x3a72]))
           "OR EXISTS",
           `SELECT p.id FROM ${p} p WHERE p.v<0 OR EXISTS (SELECT 1 FROM ${b} b WHERE b.v>0) ORDER BY p.id`,
         ],
+        // Output column demand: build columns read only inside an expression, an aggregate over
+        // the join, and a probe-only projection over duplicate keys (no build column read).
+        [
+          "build column in expression",
+          `SELECT p.id AS pid, b.id AS bid, b.v + 1 AS bv FROM ${p} p JOIN ${b} b ON p.k = b.k ORDER BY pid, bid`,
+        ],
+        [
+          "aggregate over join",
+          `SELECT COUNT(*) AS n, SUM(b.v) AS s FROM ${p} p JOIN ${b} b ON p.k = b.k`,
+        ],
+        // Demand through nested joins: b.v is read only as the outer join's key, d.v only
+        // inside an expression, and b's other columns by no one.
+        [
+          "nested join demand",
+          `SELECT p.id AS pid, d.v + 1 AS dv FROM ${p} p JOIN ${b} b ON p.k = b.k JOIN ${d} d ON d.k = b.v ORDER BY pid, dv NULLS FIRST`,
+        ],
+        [
+          "aggregate over nested joins",
+          `SELECT d.label AS dl, COUNT(*) AS n, SUM(p.v) AS s FROM ${p} p JOIN ${b} b ON p.k = b.k JOIN ${d} d ON d.label = b.label GROUP BY d.label ORDER BY dl NULLS FIRST`,
+        ],
+        [
+          "probe-only projection",
+          `SELECT p.id AS pid, p.v AS pv FROM ${p} p JOIN ${b} b ON p.k = b.k ORDER BY pid, pv NULLS FIRST`,
+        ],
         [
           "star",
           `SELECT p.id AS pid, b.id AS bid, d.id AS did FROM ${p} p JOIN ${b} b ON p.k=b.k JOIN ${d} d ON d.k=b.k WHERE p.v<d.v ORDER BY pid,bid,did`,

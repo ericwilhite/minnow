@@ -11,6 +11,34 @@ Nothing here ships yet:
 
 Public-contract decisions are in [`DECISIONS.md`](./DECISIONS.md).
 
+The optional resident three-dimension star lookup path preserves the native join
+transition order. It requires three single-key inner joins to enforced dimension
+primary keys, direct text group keys, COUNT(*) and one direct float8 SUM. Local
+dictionaries use the existing charged query-wide IDs. It traverses fact keys once,
+stages each C-surviving payload once with charged A/B query-ID sidecars, and links
+bounded row-ID buckets after A is known. Source barriers remain C, facts, A, B;
+each B prefix reaches the existing aggregate before its next source read. This
+preserves demanded source and transition errors, as well as native SUM bits. Pending
+jobs retain their owner grant through cancellation settlement. Exact domain proofs
+bound all arrays; sparse domains and
+unsupported shapes retain native joins. Ordinary-owner normalized literals and explicit
+plain TEXT bindings can use this exact three-lookup route: at most four slots, each NULL or at most
+1024 UTF-16 units without NUL. The shared binder sizes them before optional domain
+proofs; invalid or unsupported bindings retain the original bind/error demand. The
+complete strategy decision includes every parameter and progress slot. The complete original admission still
+applies, including cancellable waits and spill fallback. No smaller cap is claimed.
+
+### Count-only text membership
+
+Scalar byte `COUNT(DISTINCT)` can represent one byte prefix of at most 16 bytes followed by
+canonical decimal suffixes using exact paged bitmaps. The first demanded non-NULL
+value selects the representation. Each observed 4096-value page costs 512 bytes;
+the optional policy permits at most 128 KiB of bits. Leading zeros, other prefixes
+and larger suffixes retain ordinary byte membership. Local dictionary codes are
+resolved through their own entries. Checkpoints write every original key exactly,
+so replay preserves membership before continuing the input. Growth certificates
+include page metadata and the actual half-full byte-table growth boundary.
+
 ## Module map
 
 | Module        | Owner track                      | What it is                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
@@ -1577,6 +1605,19 @@ and the owner import it directly.
   resident-page space, downstream buffers, private progress credit, and one result frame.
   FIFO admission waits while holding no partial reservation. A minimum above the whole cap
   raises `MemoryAdmissionError`. See [the bounded read-step contract](memory/README.md).
+- Query preparation never waits while it holds memory (`exec/preparation.ts`). Until the
+  minimum is installed, every admission (retained source recipes, source sizing scratch,
+  planning probes, parameter sizing) is one the governor serves at once, through the same call
+  as without preparation, or (only when the attempt holds nothing) an ordinary wait. Otherwise
+  the execution releases everything the attempt holds, waits holding nothing, and prepares again
+  from scratch on a fresh runtime. That wait is the admission that would have waited, with its
+  own label and named parts, plus a `query#N/preparation-credit` part; all of it becomes the
+  next attempt's credit, a single pool: every grant the attempt obtains returns the bytes it
+  releases there, so freed scratch serves the next phase. The request is the attempt's peak
+  simultaneous need, at least twice the previous request, and at most the usable capacity
+  (the cap less the reserve unless private progress, less lifetime
+  holdings), so a query restarts at most `ceil(log2(usable / first request)) + 1` times. A peak
+  need above the usable capacity is `MemoryAdmissionError` (53200).
 - A grant _holds_ bytes, and its operator _allocates_ buffers out of them, so a non-spillable
   operator works inside its admitted minimum.
 - Growth is charged before it happens, including the overlap while a buffer is copied.
@@ -1808,10 +1849,10 @@ locator, charged before allocation), skips OFFSET and reads up to LIMIT locators
 closes at once on cancellation; its scratch is released only after its pending index call
 settles, and always before execution is admitted. The same admission charges the window's
 distinct segment list (`key-order/window-segments`, 4 bytes a locator, sorted in place). Only
-the groups those locators name are then sized, and while the list is held that sizing never waits
-for memory: each admission is tried at once (`ReadSource.noWait`). If one would wait (a queued
-admission is ahead), the list is released and the whole source is sized normally, holding
-nothing while it waits, so a queued admission blocked by the list cannot deadlock with it. The execution cursor reads the same window from the
+the groups those locators name are then sized. The list, the window scratch and that sizing are
+preparation admissions (see Memory): if one would wait while the list is held, the query releases
+the whole attempt, including the list, and prepares again with a credit that covers them
+together, so it never waits holding the list. The execution cursor reads the same window from the
 same snapshot, so every group it fetches was sized. Such a query therefore opens exactly two
 cursors (sizing, then execution), each closed and each reading at most LIMIT + OFFSET rows.
 Larger or unbounded windows, LIMIT 1 over a resident one-chunk table (its single-use resident
@@ -2170,6 +2211,10 @@ shipped-engine or stored-format change.
   tuple for several keys: direct-mapped (the value ids bit-packed into a slot of a table of at
   most 2^16) while the columns' value counts fit, hashed column by column past that. SQL GROUP BY equality: NULLs together, −0 = 0, NaN = NaN, NUMERIC by
   value.
+- A non-NULL flat text key column is interned in one loop per batch with the source's
+  DataView made once; keys of 16 to 64 bytes hash through it with the same XXH32, and byte
+  equality still resolves collisions. Storage grows on each new key exactly as the per-row
+  route grows it, so batch peaks are unchanged; the batch's complete growth is admitted first.
 - One int2/int4/date key whose range spans no more slots than the hash table would hold (twice
   its slots, at most 2^22 values) is direct-mapped instead: slot `key − base`, no hashing or
   probing, half the bytes. A key past the span widens it; a range too wide goes back to hashing;
@@ -2224,8 +2269,11 @@ shipped-engine or stored-format change.
   complete resident join/codebook/state/output grants, admitted together before input opens.
   A bounded proof scans plain keys when dictionary metadata cannot certify them. Proof
   grants close before whole admission. Unknown domains, excessive bounds, unproved uniqueness,
-  parameters, volatile/computed producers or insufficient whole-cap room retain the generic
-  route. All selected joins stay resident, preserving native per-group float transition order.
+  unsupported parameters, volatile/computed producers or insufficient whole-cap room retain the
+  generic route. At most four plain TEXT slots (NULL or <=1024 UTF-16 units, no NUL)
+  may enter the exact three-lookup family after shared binding validation and exact parameter-byte sizing. Other bound dictionary recipes retain their old fallback. The
+  per-execution check precedes proof reads and includes all parameter/progress bytes;
+  a cached plan does not reuse a previous binding certificate. All selected joins stay resident, preserving native per-group float transition order.
   Error-free dimension comparisons, AND/OR/NOT and NULL tests run on original vectors.
   Dimension TEXT attributes may be grouping keys. LEFT joins remain generic: null padding
   needs additional domain and uniqueness certification.
@@ -2450,9 +2498,17 @@ shipped-engine or stored-format change.
   composite key with text or bytes length-prefixes them instead of escaping them (equality
   needs no order). A batch's encoded keys get one buffer of their exact size, charged before it
   is allocated, and each value is copied into it once, in budgeted pieces (no regrowth copies).
+- Byte keys of at most 64 bytes hash and compare without a nested generator. They
+  spend the same inspected bytes and yield before publishing hashes or acting on a match.
+  Longer keys retain resumable streaming, including the second hash and collision cursor.
 - The build store and table are allocated from the join's spillable grant. A dense integer key
   is direct-addressed; others use open addressing with the key's words inline. Matched outputs
   reuse probe key vectors for build key columns that are identical in representation.
+- Output demand: an inner join without a residual or filter gathers only the build columns its
+  consumer reads, and emits the rest as typed NULL constants nothing reads. The consumer is a
+  projection directly above it, or a parent inner join, which passes on its own demand plus the
+  columns its keys read. Star-encoded joins use the same demand (the rewrite changes column
+  types, not positions). The column store writes a NULL constant as one validity range.
 - When refused memory the join partitions 16 ways (grace/hybrid), reads back the partitions
   that fit, spills the rest of the probe, and joins each spilled pair one level down with
   independent hash bits. A partition that does not split, or an oversized mark join, runs in
@@ -5098,6 +5154,13 @@ Native command statements retain their memory policy across end and commit. Endi
 the command scope must not reintroduce a future background-merge estimate into the
 commit step while another admitted execution retains its workspace. The next live
 statement selects its own policy; actual merge acquisition still funds its full step.
+
+Short raw join-key batches borrow one DataView over their existing source bytes
+for16–64-byte XXH32 word reads. This is the existing checksum with the same seed
+and byte range; long and encoded keys keep their original paths. The view stays
+local to extraction, and every key spends the same work before progress/yields.
+The incremental ordinary-build component is recorded separately from the short
+dispatch baseline in `scripts/bench-evidence/b9-j2-key-view-84d-2026-11-19.json`.
 
 Extent-delta capture remains internal preparation: allocate its immutable descriptor view
 before marking an external sink as entered. Internal `MetadataPressure` unwinds the

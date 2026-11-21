@@ -324,7 +324,7 @@ class IndexFetch implements Operator {
         reads: this.runtime.request.reads,
         budget: this.grant,
         context: this.context,
-        targetBytes: indexFetchTarget(this.runtime.request.governor.capBytes),
+        targetBytes: indexFetchTarget(this.runtime.governor.capBytes),
         boundedMemory: true,
         rowsNeeded: () => 1,
         loans: { borrow: (bytes) => this.grant.borrow(bytes, this.runtime.signal) },
