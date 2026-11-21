@@ -1826,8 +1826,9 @@ scratch is released before sizing continues. The list and that sizing are prepar
 prepares again with a credit covering both, so sizing never waits holding the list. More
 than 2048 locators, a scratch the cap cannot hold, or keys that fail to bind or encode all size
 the whole source: execution raises any key error in its usual order, and nothing is refused below
-the cap. A sized lookup opens a sizing cursor per probed key before its execution cursors; each
-closes at once on cancellation and settles before its memory is released.
+the cap. A sized lookup opens a sizing cursor per probed key before its execution cursors (per
+preparation attempt: a restart closes them and probes again); each closes at once on
+cancellation and settles before its memory is released.
 Ordinary SQL selects the admitted index recipe for a direct, complete
 primary-key ORDER BY with LIMIT or OFFSET, including OFFSET without LIMIT. The pinned
 catalog must certify the same unique key columns, byte collation and direction. Direct
