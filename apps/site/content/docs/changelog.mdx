@@ -10,6 +10,8 @@ compatibility policy and release process.
 
 ## Unreleased
 
+`ORDER BY` with a column number (`ORDER BY 1`) now works after a set operation whose first member is itself a set operation, such as `SELECT k FROM a INTERSECT SELECT k FROM b UNION SELECT k FROM c ORDER BY 1` or `(SELECT … UNION SELECT …) EXCEPT SELECT … ORDER BY 1`. Both the released engine and the unexported 1.0 rebuild refused it with "ORDER BY ordinals cannot be used with SELECT \*". The number now names a column of the whole result, which takes its columns from the first query, as in PostgreSQL. Other results are unchanged; no stored-format change or migration is required.
+
 The testing entry point's interaction-plan simulator reports one more reach state, `read-bypassed-queued-write`: a read on a connection answered while that connection's own write still waited for the writer turn. Code that switches exhaustively over `InteractionReachState` sees the new member; nothing else changes, and no stored-format change or migration is required.
 
 The unexported 1.0 rebuild runs `UNION ALL`, which it refused before: each arm in order, with PostgreSQL's column type resolution, and a `LIMIT` above it stops at the arm that satisfies it. Queries with several grouping sets (`ROLLUP`, `CUBE`, `GROUPING SETS`), which lower to a `UNION ALL` of grouped aggregates, run as well. `UNION`, `INTERSECT`, `INTERSECT ALL` and `EXCEPT ALL` run too, on the hash-count operator `EXCEPT` already used. A text concatenation or other phase-evaluated expression inside a `UNION ALL` arm, or in the input of `ROLLUP`, `CUBE` or `GROUPING SETS`, is still refused with `0A000`. Results are unchanged where it ran; released 0.x behavior is unchanged; no stored-format change or migration is required.
