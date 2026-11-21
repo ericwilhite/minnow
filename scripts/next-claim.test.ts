@@ -1,9 +1,13 @@
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   balancedOrders,
   bracketRepeats,
   claimManifest,
+  formatIdentity,
   holm,
+  imageFacts,
   manifestDigest,
   report,
   signTestP,
@@ -11,6 +15,7 @@ import {
   validateManifest,
   MIN_EFFECT,
   type CellRecord,
+  type ClaimImages,
   type ClaimManifest,
   type ClaimResult,
 } from "./next-claim.mts";
@@ -99,12 +104,20 @@ const gain = (cell: string): CellRecord => ({
 const manifest: ClaimManifest = {
   control: A,
   candidate: B,
+  images: "auto",
   pairs: 15,
   targets: ["t"],
   datasets: [
     { dataset: "W1M", shards: 2, controls: ["aa"], cells: ["t", "s1", "s2"] },
     { dataset: "S1", shards: 1, controls: ["qa"], cells: ["q1"] },
   ],
+};
+const IMAGE = { digest: "c".repeat(64), bytes: 1000 };
+const SHARED: ClaimImages = {
+  mode: "shared",
+  formats: { control: "f".repeat(64), candidate: "f".repeat(64) },
+  control: IMAGE,
+  candidate: IMAGE,
 };
 const shard = (
   dataset: "W1M" | "S1",
@@ -124,6 +137,7 @@ const shard = (
   targets: ["t"],
   repeats: {},
   aa,
+  images: SHARED,
   ab,
   void: false,
   manifest: manifestDigest(manifest),
@@ -271,5 +285,137 @@ describe("next/ claim report", () => {
         if (first !== undefined) first.shards = 0;
       }),
     ).rejects.toThrow(/shards/u);
+  });
+});
+
+// Two captures of the same rows differ in physical layout (the writer's flush and merge timing);
+// an A/A on one image cannot see that, so the arms must share an image or run an image A/A.
+describe("next/ claim fixture images", () => {
+  const separate = (replicate = true): ClaimImages => ({
+    mode: "separate",
+    formats: { control: "f".repeat(64), candidate: "e".repeat(64) },
+    control: IMAGE,
+    candidate: { digest: "d".repeat(64), bytes: 1001 },
+    ...(replicate ? { replicate: { digest: "a".repeat(64), bytes: 999 } } : {}),
+  });
+  const withImages = (
+    images: ClaimImages | undefined,
+    imageAa: (dataset: "W1M" | "S1") => CellRecord[] | undefined,
+  ) =>
+    complete().map((r) => {
+      const aa = imageAa(r.dataset);
+      const rest = Object.fromEntries(Object.entries(r).filter(([key]) => key !== "images"));
+      return {
+        ...rest,
+        ...(images === undefined ? {} : { images }),
+        ...(aa === undefined ? {} : { imageAa: aa }),
+      } as ClaimResult;
+    });
+
+  it("gives verdicts when both arms restored one image, and says so", () => {
+    const text = report(complete(), manifest);
+    expect(text).toContain("**gain**");
+    expect(text).toContain("one image restored in both arms");
+  });
+
+  it("refuses arms that restored different images without an image A/A", () => {
+    const shared = withImages(
+      { ...SHARED, candidate: { digest: "d".repeat(64), bytes: 1 } },
+      () => undefined,
+    );
+    const text = report(shared, manifest);
+    expect(text).toContain("INCOMPLETE");
+    expect(text).toContain("shared mode restored two images");
+    expect(text).not.toContain("**gain**");
+    const noReplicate = report(
+      withImages(separate(false), () => undefined),
+      manifest,
+    );
+    expect(noReplicate).toContain("without an image A/A");
+    expect(noReplicate).not.toContain("**gain**");
+  });
+
+  it("refuses a run that reported no images", () => {
+    const text = report(
+      withImages(undefined, () => undefined),
+      manifest,
+    );
+    expect(text).toContain("reported no images");
+    expect(text).not.toContain("**gain**");
+  });
+
+  it("needs the image A/A on every control cell, and voids the run when it flags", () => {
+    const controls = (d: "W1M" | "S1") => [neutral(d === "W1M" ? "aa" : "qa")];
+    const ok = report(withImages(separate(), controls), manifest);
+    expect(ok).toContain("**gain**");
+    expect(ok).toContain("image A/A");
+    const missing = report(
+      withImages(separate(), () => []),
+      manifest,
+    );
+    expect(missing).toContain("image A/A missing");
+    const flagged = report(
+      withImages(separate(), (d) => (d === "W1M" ? [gain("aa")] : controls(d))),
+      manifest,
+    );
+    expect(flagged).toContain("**VOID:**");
+    expect(flagged).toContain("| image A/A | 0/2 |");
+    expect(flagged).not.toMatch(/\| target \|[^\n]*\*\*gain\*\*/u);
+  });
+
+  it("refuses shared images when the manifest asked for separate ones", () => {
+    const text = report(complete(), { ...manifest, images: "separate" });
+    expect(text).toContain("did not use separate images");
+  });
+
+  it("validates the images field of a manifest", async () => {
+    const base = {
+      control: A,
+      candidate: B,
+      datasets: ["W1M"],
+      shards: 1,
+      pairs: 15,
+      targets: [],
+      only: [],
+    };
+    expect((await claimManifest(base)).images).toBe("auto");
+    expect((await claimManifest({ ...base, images: "separate" })).images).toBe("separate");
+    await expect(claimManifest({ ...base, images: "same" })).rejects.toThrow(/images/u);
+    const raw = JSON.parse(JSON.stringify(await claimManifest(base))) as Record<string, unknown>;
+    await expect(validateManifest({ ...raw, images: "both" })).rejects.toThrow(/images/u);
+    const without = { ...raw };
+    delete without.images;
+    await expect(validateManifest(without)).rejects.toThrow(/fields/u);
+  });
+
+  it("digests an image by its files, whatever their order, and identifies stored formats", async () => {
+    const root = await mkdtemp(join(process.env.TMPDIR ?? "/tmp", "claim-image-"));
+    try {
+      const files = [
+        { name: "data.bin", size: 10, sha256: "1".repeat(64), capacity: 4096 },
+        { name: "log.bin", size: 2, sha256: "2".repeat(64), capacity: 4096 },
+      ];
+      await mkdir(join(root, "a"));
+      await mkdir(join(root, "b"));
+      await writeFile(join(root, "a", "manifest.json"), JSON.stringify({ files }));
+      await writeFile(
+        join(root, "b", "manifest.json"),
+        JSON.stringify({ files: [...files].reverse() }),
+      );
+      const a = await imageFacts(join(root, "a"));
+      expect(a).toEqual(await imageFacts(join(root, "b")));
+      expect(a.bytes).toBe(12);
+      files[0] = { ...files[0], sha256: "3".repeat(64) } as (typeof files)[number];
+      await writeFile(join(root, "b", "manifest.json"), JSON.stringify({ files }));
+      expect((await imageFacts(join(root, "b"))).digest).not.toBe(a.digest);
+      // A checkout without a built durable-format module has no identity: separate images.
+      expect(await formatIdentity(root)).toBeNull();
+      const repository = join(import.meta.dirname, "..");
+      const identity = await formatIdentity(repository);
+      expect(identity).toMatch(/^[0-9a-f]{64}$/u);
+      expect(await formatIdentity(repository)).toBe(identity);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

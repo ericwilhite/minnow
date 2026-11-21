@@ -1390,16 +1390,25 @@ SHAs, the datasets, shards, cells, mandatory A/A controls, targets and pairs. Ev
 validates the manifest again and reads it, and every result carries the manifest's SHA-256: a
 result from a different manifest counts as missing.
 
-1. Each build (control and candidate) loads its own fixture once with its own writer and captures it
-   as a native storage image. The control build times each cell once to size its bracket: a fixed
-   number of complete queries, `ceil(1000 ms / one query)` between 1 and 10, the same for both builds.
+1. The control build loads the fixture once with its own writer and captures it as a native
+   storage image; it also times each cell once to size its bracket: a fixed number of complete
+   queries, `ceil(1000 ms / one query)` between 1 and 10, the same for both builds. Two captures of
+   the same rows are not identical: the writer's flush and merge timing changes their physical
+   layout (two captures of one engine measured 1,191,723,008 and 1,195,139,072 bytes), and that
+   alone moved some cells by up to a third. So when both builds declare the same stored format
+   (the same `next/durable-format.ts` registry, read from each build), **both arms restore the
+   control's image**. When the formats differ, or the manifest declares `images: separate` (a claim
+   about stored layout itself), each build restores its own capture, and the control build also
+   captures a second, independent image for the image A/A below.
 2. Every sample is a fresh process: it restores its build's image, opens, verifies the full answer,
    times one bracket of process CPU (all threads, natural garbage collection) and verifies again.
    Pairs run in a balanced AB/BA order shuffled from a recorded seed. Both builds must give the same
    answers, compared as above, or the cell has no verdict.
 3. A/A first: fixed control cells (W1M `scan_proj3_agg` and `agg_3dims_20aggs`, S1 `S_q3` and
-   `S_q8`) run the control build against an independent control process in every shard. If any of
-   them meets the target rule or fails, the whole run is void: no shard's verdict stands.
+   `S_q8`) run the control build against an independent control process in every shard. With
+   separate images they also run as an image A/A: the control build on its own image against the
+   control build on its second capture. If any A/A or image A/A meets the target rule or fails, the
+   whole run is void: no shard's verdict stands.
 4. Target cells are declared before the run. A gain needs the median paired saving to exceed its
    IQR, at least seven of nine pairs (scaled to the pair count) favouring the candidate and at least
    2% of the control's per-query median; a regression is the reverse. Every other cell is screened
@@ -1409,7 +1418,15 @@ result from a different manifest counts as missing.
    accepted difference", which is not proof of equality.
 5. The table gives verdicts only when every declared shard and cell reported every pair. A missing
    shard or dataset, a failed cell or a short cell marks the run **INCOMPLETE**, with no verdicts.
-   Every sample records the runner's CPU model.
+   Every sample records the runner's CPU model. Every shard records each arm's image (a SHA-256
+   over its files and their total size) and both builds' format identities; a shard whose arms
+   restored different images without a complete image A/A, or that reports no images, also marks
+   the run INCOMPLETE.
+
+A cell can be far more sensitive to the runner's CPU model than to the change under test: the
+control's `win_median_pct` took about 2.4 s per query on an AMD EPYC 7763 and about 0.4 s on an
+AMD EPYC 9V74. That is why every comparison is paired within one runner (both arms in the same
+job): compare a claim's control and candidate, never numbers from two runs on different models.
 
 Cost, measured on hosted runners (AMD EPYC 9V74, validation run 44678818852): each job spends
 about 3 minutes installing and building both builds, and each W1M build takes about 100 s to

@@ -30,6 +30,11 @@ on:
       shards:
         description: "Jobs per dataset"
         default: "6"
+      images:
+        description: "Fixture images: auto (one shared image when both builds have the same stored format) or separate (each arm its own, plus an image A/A)"
+        default: "auto"
+        type: choice
+        options: [auto, separate]
 
 permissions:
   contents: read
@@ -85,6 +90,7 @@ jobs:
           PAIRS: ${{ inputs.pairs }}
           TARGETS: ${{ inputs.targets }}
           ONLY: ${{ inputs.only }}
+          IMAGES: ${{ inputs.images }}
         run: |
           set -euo pipefail
           case "$DATASETS" in
@@ -95,7 +101,7 @@ jobs:
           # claimManifest validates pairs, shards and every cell name before declaring the run.
           node scripts/next-claim.mts manifest --control "$CONTROL" --candidate "$CANDIDATE" \
             --datasets "$DATASETS" --shards "$SHARDS" --pairs "$PAIRS" \
-            --targets "$TARGETS" --only "$ONLY" --output manifest.json > matrix.json
+            --targets "$TARGETS" --only "$ONLY" --images "$IMAGES" --output manifest.json > matrix.json
           echo "datasets=$(node -p 'JSON.stringify(require("./matrix.json").datasets)')" >> "$GITHUB_OUTPUT"
           echo "shards=$(node -p 'JSON.stringify(require("./matrix.json").shards)')" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v7

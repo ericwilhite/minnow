@@ -144,6 +144,10 @@ export interface ClaimResult {
   readonly targets: string[];
   readonly repeats: Record<string, number>;
   readonly aa: CellRecord[];
+  /** Separate images only: control on its image vs control on a second, independent capture. */
+  readonly imageAa?: CellRecord[];
+  /** Which fixture image each arm restored (digest of its files), and why. */
+  readonly images?: ClaimImages;
   readonly ab: CellRecord[];
   readonly void: boolean;
   /** manifestDigest of the manifest this shard ran under: binds the artefact to its run. */
@@ -151,9 +155,30 @@ export interface ClaimResult {
 }
 
 /** The run declared at dispatch: what a complete run must report. */
+/** A captured fixture image: SHA-256 over its files' names, sizes and hashes, and total bytes. */
+export interface ImageFacts {
+  readonly digest: string;
+  readonly bytes: number;
+}
+export interface ClaimImages {
+  /** shared: both arms restored the control's image; separate: each arm its own capture. */
+  readonly mode: "shared" | "separate";
+  /** Stored-format identity of each build (formatIdentity), or null when it has none. */
+  readonly formats: { readonly control: string | null; readonly candidate: string | null };
+  readonly control: ImageFacts;
+  readonly candidate: ImageFacts;
+  /** Separate mode: the control build's second, independent capture (the image A/A). */
+  readonly replicate?: ImageFacts;
+}
+
 export interface ClaimManifest {
   readonly control: string;
   readonly candidate: string;
+  /**
+   * auto: both arms restore one image when the builds' stored formats are identical (else
+   * separate); separate: each arm its own image, with an image A/A (a claim about stored layout).
+   */
+  readonly images: "auto" | "separate";
   readonly pairs: number;
   readonly targets: readonly string[];
   readonly datasets: ReadonlyArray<{
@@ -176,6 +201,7 @@ function canonicalManifest(m: ClaimManifest): ClaimManifest {
   return {
     control: m.control,
     candidate: m.candidate,
+    images: m.images,
     pairs: m.pairs,
     targets: [...m.targets],
     datasets: m.datasets.map((d) => ({
@@ -192,6 +218,46 @@ export function manifestDigest(m: ClaimManifest): string {
   return createHash("sha256")
     .update(JSON.stringify(canonicalManifest(m)))
     .digest("hex");
+}
+
+/**
+ * A build's stored-format identity: SHA-256 over every non-function export of its compiled
+ * `next/durable-format.js` (reader and writer versions, the durable, private and conditional
+ * format registries), or null when the build has none. Two builds with the same identity read and
+ * write the same stored format, so one fixture image serves both.
+ */
+export async function formatIdentity(root: string): Promise<string | null> {
+  let module: Record<string, unknown>;
+  try {
+    module = (await import(
+      pathToFileURL(join(root, "packages/core/dist/next/durable-format.js")).href
+    )) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  const declared = Object.keys(module)
+    .filter((name) => typeof module[name] !== "function")
+    .sort()
+    .map((name) => [name, module[name]]);
+  if (declared.length === 0) return null;
+  const text = JSON.stringify(declared, (_key, value: unknown) =>
+    typeof value === "bigint" ? `${value.toString()}n` : value,
+  );
+  return createHash("sha256").update(text).digest("hex");
+}
+
+/** A captured image's digest (its manifest's files: name, size, SHA-256) and total bytes. */
+export async function imageFacts(directory: string): Promise<ImageFacts> {
+  const image = JSON.parse(await readFile(join(directory, "manifest.json"), "utf8")) as {
+    files: Array<{ name: string; size: number; sha256: string }>;
+  };
+  const files = [...image.files]
+    .map((file) => ({ name: file.name, size: file.size, sha256: file.sha256 }))
+    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  return {
+    digest: createHash("sha256").update(JSON.stringify(files)).digest("hex"),
+    bytes: files.reduce((sum, file) => sum + file.size, 0),
+  };
 }
 
 /**
@@ -214,7 +280,7 @@ export async function validateManifest(raw: unknown): Promise<ClaimManifest> {
     return list;
   };
   const m = record(raw, "the manifest");
-  const keys = ["candidate", "control", "datasets", "pairs", "targets"];
+  const keys = ["candidate", "control", "datasets", "images", "pairs", "targets"];
   if (JSON.stringify(Object.keys(m).sort()) !== JSON.stringify(keys))
     fail(`fields must be exactly ${keys.join(", ")}`);
   const control = m.control,
@@ -226,6 +292,8 @@ export async function validateManifest(raw: unknown): Promise<ClaimManifest> {
     fail("control and candidate must be two different full commit SHAs");
   if (typeof pairs !== "number" || !Number.isSafeInteger(pairs) || pairs < 9 || pairs > 101)
     fail("pairs must be an integer from 9 to 101");
+  const images = m.images;
+  if (images !== "auto" && images !== "separate") return fail("images must be auto or separate");
   const targets = names(m.targets, "targets");
   if (!Array.isArray(m.datasets) || m.datasets.length === 0) return fail("no datasets");
   const datasets: Array<ClaimManifest["datasets"][number]> = [];
@@ -251,6 +319,7 @@ export async function validateManifest(raw: unknown): Promise<ClaimManifest> {
   return canonicalManifest({
     control: control as string,
     candidate: candidate as string,
+    images,
     pairs: pairs as number,
     targets,
     datasets,
@@ -266,7 +335,11 @@ export async function claimManifest(options: {
   pairs: number;
   targets: readonly string[];
   only: readonly string[];
+  images?: string;
 }): Promise<ClaimManifest> {
+  const images = options.images ?? "auto";
+  if (images !== "auto" && images !== "separate")
+    throw new Error("images must be auto or separate");
   if (!SHA.test(options.control) || !SHA.test(options.candidate))
     throw new Error("control and candidate must be full commit SHAs");
   if (options.control === options.candidate)
@@ -296,6 +369,7 @@ export async function claimManifest(options: {
   return validateManifest({
     control: options.control,
     candidate: options.candidate,
+    images,
     pairs: options.pairs,
     targets: [...options.targets],
     datasets,
@@ -339,6 +413,7 @@ async function run(): Promise<void> {
       only: { type: "string", default: "" },
       rows: { type: "string", default: "1000000" },
       scale: { type: "string", default: "333" },
+      images: { type: "string", default: "auto" },
     },
   });
   const dataset = values.dataset as Dataset;
@@ -373,6 +448,7 @@ async function run(): Promise<void> {
           pairs: Number(values.pairs),
           targets: values.targets.split(",").filter(Boolean),
           only: values.only.split(",").filter(Boolean),
+          images: values.images,
         })
       : await validateManifest(JSON.parse(await readFile(resolve(values.manifest), "utf8")));
   if (manifest.control !== revisions.control || manifest.candidate !== revisions.candidate)
@@ -402,13 +478,34 @@ async function run(): Promise<void> {
   const log = (event: object) => console.error(JSON.stringify(event));
   const base = { dataset, rows, scale, capBytes: 256 * 1024 * 1024, deadlineMs: 600_000 };
 
-  // 1. One fixture per arm, captured; the control arm also sizes the brackets.
-  const images: Record<Role, string> = {
+  // 1. Fixture images. Builds with the same stored format restore ONE image (the control's):
+  // two captures of the same rows differ in physical layout (the writer's flush and merge
+  // timing), which would bias every cell, and an A/A on one image cannot see it. A build that
+  // changes the stored format (or a manifest that asks for separate images) restores its own
+  // capture, and the control's second, independent capture runs an image A/A beside it.
+  const formats = {
+    control: await formatIdentity(roots.control),
+    candidate: await formatIdentity(roots.candidate),
+  };
+  const mode: ClaimImages["mode"] =
+    manifest.images === "auto" && formats.control !== null && formats.control === formats.candidate
+      ? "shared"
+      : "separate";
+  log({ phase: "images", mode, formats });
+  type ImageRole = "control" | "candidate" | "replicate";
+  const images: Record<ImageRole, string> = {
     control: join(output, "images", "control"),
     candidate: join(output, "images", "candidate"),
+    replicate: join(output, "images", "replicate"),
   };
+  // The build that captures each image, and the identity it is captured (and restored) under.
+  const captures: ImageRole[] =
+    mode === "shared" ? ["control"] : ["control", "candidate", "replicate"];
+  const builtBy = (image: ImageRole): Role => (image === "candidate" ? "candidate" : "control");
+  const identityOf = (image: ImageRole) => `${image}:${revisions[builtBy(image)]}`;
   let times: Record<string, number> = {};
-  for (const arm of ["control", "candidate"] as const) {
+  for (const image of captures) {
+    const arm = builtBy(image);
     const began = performance.now();
     const data: HeadToHeadData = { ...base, engine: "next", root: roots[arm], workloads: needed };
     const handle = await startCPUWorker(
@@ -419,18 +516,30 @@ async function run(): Promise<void> {
       await handle.ask({
         op: "command",
         name: "capture-image",
-        data: { directory: images[arm], identity: `${arm}:${revisions[arm]}` },
+        data: { directory: images[image], identity: identityOf(image) },
       });
-      if (arm === "control")
+      if (image === "control")
         times = await handle.ask<Record<string, number>>({ op: "command", name: "time-cells" });
     } finally {
       await handle.close();
     }
-    log({ phase: "image", arm, seconds: (performance.now() - began) / 1000 });
+    log({ phase: "image", image, arm, seconds: (performance.now() - began) / 1000 });
   }
+  const restored: Record<Role, ImageRole> = {
+    control: "control",
+    candidate: mode === "shared" ? "control" : "candidate",
+  };
+  const imageRecord: ClaimImages = {
+    mode,
+    formats,
+    control: await imageFacts(images[restored.control]),
+    candidate: await imageFacts(images[restored.candidate]),
+    ...(mode === "separate" ? { replicate: await imageFacts(images.replicate) } : {}),
+  };
+  log({ phase: "image-facts", ...imageRecord });
   const repeats = Object.fromEntries(needed.map((id) => [id, bracketRepeats(times[id] ?? 0)]));
   log({ phase: "brackets", repeats, seed });
-  const spec = (arm: Role): CPUArm => ({
+  const specOn = (arm: Role, image: ImageRole): CPUArm => ({
     module: worker,
     cwd: repository,
     revision: revisions[arm],
@@ -439,12 +548,13 @@ async function run(): Promise<void> {
       engine: "next",
       root: roots[arm],
       workloads: needed,
-      image: images[arm],
-      imageIdentity: `${arm}:${revisions[arm]}`,
+      image: images[image],
+      imageIdentity: identityOf(image),
       repeats,
     } satisfies HeadToHeadData,
     execArgv,
   });
+  const spec = (arm: Role): CPUArm => specOn(arm, restored[arm]);
   if (values["verify-only"]) {
     // Answers only: one fresh process per arm and cell, compared in full, no timing.
     const lines = [
@@ -553,7 +663,14 @@ async function run(): Promise<void> {
   const aa: CellRecord[] = [];
   for (const cell of controls)
     aa.push(await measure(cell, spec("control"), "identical-build-control"));
-  const flagged = aa.some((r) => r.error !== undefined || targetVerdict(r) !== "none");
+  // Separate images only: the control build on its own capture vs its second capture.
+  const imageAa: CellRecord[] = [];
+  if (mode === "separate")
+    for (const cell of controls)
+      imageAa.push(await measure(cell, specOn("control", "replicate"), "identical-build-control"));
+  const flagged = [...aa, ...imageAa].some(
+    (r) => r.error !== undefined || targetVerdict(r) !== "none",
+  );
   // 3. A/B on this shard's cells, measured even when void so the evidence is kept.
   const ab: CellRecord[] = [];
   for (const cell of cells) ab.push(await measure(cell, spec("candidate"), "true-parent"));
@@ -570,6 +687,8 @@ async function run(): Promise<void> {
     targets,
     repeats,
     aa,
+    ...(mode === "separate" ? { imageAa } : {}),
+    images: imageRecord,
     ab,
     void: flagged,
     manifest: manifestDigest(manifest),
@@ -636,11 +755,40 @@ export function claimProblems(results: readonly ClaimResult[], manifest: ClaimMa
       };
       check(result.aa, entry.controls, "A/A");
       check(result.ab, shardCells(entry.cells, index, entry.shards), "A/B");
+      // Both arms must have restored one image, or the image A/A must have run beside them.
+      const images = result.images;
+      if (images === undefined) problems.push(`${entry.dataset} shard ${shard} reported no images`);
+      else {
+        const same = images.control.digest === images.candidate.digest;
+        if (images.mode === "shared" && !same)
+          problems.push(`${entry.dataset} shard ${shard} shared mode restored two images`);
+        if (manifest.images === "separate" && images.mode !== "separate")
+          problems.push(`${entry.dataset} shard ${shard} did not use separate images`);
+        if (!same && (images.mode !== "separate" || images.replicate === undefined))
+          problems.push(
+            `${entry.dataset} shard ${shard} arms restored different images without an image A/A`,
+          );
+        if (images.mode === "separate") check(result.imageAa ?? [], entry.controls, "image A/A");
+        else if ((result.imageAa ?? []).length > 0)
+          problems.push(`${entry.dataset} shard ${shard} ran an image A/A on a shared image`);
+      }
     }
   for (const result of results)
     if (!declared.has(`${result.dataset} ${result.shard}`))
       problems.push(`${result.dataset} shard ${result.shard} was not declared`);
   return problems;
+}
+
+/** How each shard's arms got their fixture image, distinct descriptions joined. */
+function imageSummary(results: readonly ClaimResult[]): string {
+  const describe = (r: ClaimResult): string => {
+    const images = r.images;
+    if (images === undefined) return "unreported";
+    if (images.mode === "shared")
+      return `one image restored in both arms (${images.control.digest.slice(0, 12)}, ${String(images.control.bytes)} B)`;
+    return `separate images (control ${images.control.digest.slice(0, 12)}, candidate ${images.candidate.digest.slice(0, 12)}, replicate ${images.replicate?.digest.slice(0, 12) ?? "missing"}) with an image A/A`;
+  };
+  return [...new Set(results.map(describe))].join("; ") || "none reported";
 }
 
 /** One table across shards: verdicts only for a complete run, never for a void one. */
@@ -649,7 +797,11 @@ export function report(results: readonly ClaimResult[], manifest: ClaimManifest)
   const complete = problems.length === 0;
   // One A/A control meeting the target rule (or failing) in any shard voids every verdict.
   const voided = results.filter(
-    (r) => r.void || r.aa.some((a) => a.error !== undefined || targetVerdict(a) !== "none"),
+    (r) =>
+      r.void ||
+      [...r.aa, ...(r.imageAa ?? [])].some(
+        (a) => a.error !== undefined || targetVerdict(a) !== "none",
+      ),
   );
   // Holm runs over the declared screened family, not only the cells that reported.
   const screened = manifest.datasets.flatMap((entry) =>
@@ -672,8 +824,10 @@ export function report(results: readonly ClaimResult[], manifest: ClaimManifest)
     `control \`${manifest.control.slice(0, 10)}\` · candidate \`${manifest.candidate.slice(0, 10)}\` · Node ${first?.node ?? "—"} · ${String(manifest.pairs)} fresh-process pairs per cell · seed ${first === undefined ? "—" : String(first.seed)} · targets ${manifest.targets.join(", ") || "none"}`,
     "",
     voided.length > 0
-      ? `**VOID:** an A/A control met the target rule or failed in shard(s) ${voided.map((r) => `${r.dataset} ${r.shard}`).join(", ")}; no verdict from this run may be cited.`
+      ? `**VOID:** an A/A or image A/A control met the target rule or failed in shard(s) ${voided.map((r) => `${r.dataset} ${r.shard}`).join(", ")}; no verdict from this run may be cited.`
       : "A/A controls neutral in every reported shard.",
+    "",
+    `Fixture images: ${imageSummary(results)}.`,
     ...(complete
       ? []
       : [
@@ -689,6 +843,7 @@ export function report(results: readonly ClaimResult[], manifest: ClaimManifest)
   for (const result of results) {
     const rows: Array<[string, CellRecord]> = [
       ...result.aa.map((r): [string, CellRecord] => ["A/A", r]),
+      ...(result.imageAa ?? []).map((r): [string, CellRecord] => ["image A/A", r]),
       ...result.ab.map((r): [string, CellRecord] => [
         manifest.targets.includes(r.cell) ? "target" : "screen",
         r,
@@ -701,7 +856,7 @@ export function report(results: readonly ClaimResult[], manifest: ClaimManifest)
       const verdict =
         r.error !== undefined
           ? `error: ${r.error.replaceAll("|", "\\|").slice(0, 80)}`
-          : role === "A/A"
+          : role === "A/A" || role === "image A/A"
             ? tv === "none"
               ? "neutral"
               : `**${tv}** (voids the run)`
@@ -741,6 +896,7 @@ else if (mode === "manifest") {
       pairs: { type: "string", default: "15" },
       targets: { type: "string", default: "" },
       only: { type: "string", default: "" },
+      images: { type: "string", default: "auto" },
       output: { type: "string", default: "manifest.json" },
     },
   });
@@ -752,6 +908,7 @@ else if (mode === "manifest") {
     pairs: Number(values.pairs),
     targets: values.targets.split(",").filter(Boolean),
     only: values.only.split(",").filter(Boolean),
+    images: values.images,
   });
   await writeFile(resolve(values.output), JSON.stringify(manifest, null, 2));
   process.stdout.write(
