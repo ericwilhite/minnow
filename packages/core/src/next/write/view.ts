@@ -41,6 +41,8 @@ import {
   type MemoryReadRequest,
   type MemoryReadContext,
   type MemoryReadHint,
+  type MemoryReadSummary,
+  type MemorySummaryRequest,
   type MemoryChunkStep,
   type PageSummary,
   type PortableChunk,
@@ -387,6 +389,10 @@ class MemorySegmentImpl implements MemorySegment {
       column: (id) => this.view.column(id),
       check: () => this.view.snapshot.checkRead(),
       publishedRoot: () => need(this.memtable.published).group.root,
+      summary: (id, chunk) => {
+        const stored = this.#storedIndex(id);
+        return stored < 0 ? null : this.memtable.valueSummary(stored, chunk);
+      },
       // Staged replay must remain lazy at open. The group's validated ID list, not
       // the current catalog used to construct its wrapper, owns physical membership.
       publishedMissing: (id) => missingScalar(need(this.view.column(id))),
@@ -415,6 +421,13 @@ class MemorySegmentImpl implements MemorySegment {
 
   readHint(request: MemoryReadRequest, context: MemoryReadContext): MaybePromise<MemoryReadHint> {
     return this.#bounded().hint(request, context);
+  }
+
+  readSummary(
+    request: MemorySummaryRequest,
+    context: MemoryReadContext,
+  ): MaybePromise<MemoryReadSummary | null> {
+    return this.#bounded().summary(request, context);
   }
 
   constructor(
