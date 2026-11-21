@@ -241,6 +241,8 @@ export class WriteCredits {
     }
     const grants = await governor.admitGroup({
       label: "write owner minimum",
+      // The owner keeps its permanent holdings (scratch control) through this wait: holder growth.
+      ...(holdings !== undefined && holdings() > 0 ? { holdsCredit: true } : {}),
       grants: [
         { label: "write path", minimumBytes: minimum.rows, spillable: true },
         { label: "write path metadata", minimumBytes: minimum.metadata, spillable: true },
@@ -559,6 +561,9 @@ export class WriteCredits {
       const credits = await this.governor.admitGroup({
         label: `complete grow ${grant.label}`,
         ...(includesProgress ? { includesProgress: true } : {}),
+        // The writer holds its floors (and, inside a native step, the root its retained base)
+        // through this wait and cannot release them: holder growth (GOVERNOR-WAIT-POLICY).
+        holdsCredit: true,
         grants: accounts.map((account, i) => ({
           label: `write growth ${account.label}`,
           minimumBytes: Math.max(0, (desired[i] ?? 0) - account.held),
@@ -664,7 +669,11 @@ export class WriteCredits {
     } finally {
       this.#mergeFloor = 0;
       // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- #takeMerge installs the active grant across its await.
-      if (this.#mergeActive === null) this.#mergeMetadataFunding = 0;
+      if (this.#mergeActive === null) {
+        this.#mergeMetadataFunding = 0;
+        // A cancelled or failed preparation ends the merge step: its forecast may be retired.
+        this.#changed?.();
+      }
     }
   }
 

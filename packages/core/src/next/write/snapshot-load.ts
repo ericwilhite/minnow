@@ -260,6 +260,8 @@ export async function loadSnapshot(
       );
     const [grant] = await governor.admitGroup({
       label: "portable snapshot load",
+      // Retained input (counted in `retained`) stays held through this wait.
+      ...(retained > 0 ? { holdsCredit: true } : {}),
       includesProgress: true,
       grants: [{ label: "snapshot complete step", minimumBytes: minimum, spillable: false }],
       ...(options.signal === undefined ? {} : { signal: options.signal }),

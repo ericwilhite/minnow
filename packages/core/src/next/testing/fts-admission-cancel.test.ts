@@ -1,4 +1,6 @@
-/** Statement signal cancels newly required FTS metadata admission, not only row/input waits. */
+/** Statement signal cancels newly required FTS metadata admission, not only row/input waits. The
+ * table has a full-text index: without one no FTS publication can follow a keyed write, so the
+ * statement end reserves no FTS step and there is nothing to cancel (#11, 9fe1d8fd). */
 import fc from "fast-check";
 import { expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
@@ -18,6 +20,7 @@ import {
 } from "../write/test-support.js";
 import { yieldTask } from "../task.js";
 import type { Grant } from "../memory/governor.js";
+import { ftsDef } from "../access/fts-def.js";
 for (const seed of seedsFor("next-fts-admission-cancel", [0xb861, 0xb862]))
   it(`cancels FTS admission while competing credit remains held ${String(seed)}`, async (context) => {
     const reach = createReach("FTS admission cancel", FTS_ADMISSION_CANCEL_REACH);
@@ -73,8 +76,16 @@ for (const seed of seedsFor("next-fts-admission-cancel", [0xb861, 0xb862]))
                     table: tableInput("t", [column("body", TEXT)], { primaryKey: null }),
                   }),
                 );
+                const table = path.catalog.tableByName("t"),
+                  body = table?.columns.find((c) => c.name === "body");
+                if (!table || !body) throw new Error("Missing FTS column");
+                const { id: _id, ...fts } = ftsDef(1, table.id, body.id);
+                void _id;
+                await autocommit(path, (s) => s.changeCatalog({ kind: "createFts", fts }));
                 const values = Array.from({ length: n }, (_, i) => `alpha ${String(i)}`);
                 await autocommit(path, (s) => s.table(1).insert(batch(texts(values)), null));
+                // The FTS state the committed rows produced: the cancelled statement adds nothing.
+                const ftsBefore = structuredClone(path.state().root.fts);
                 const tx = await path.begin(),
                   s = tx.statement({ rules, signal: optionController.signal });
                 try {
@@ -199,7 +210,7 @@ for (const seed of seedsFor("next-fts-admission-cancel", [0xb861, 0xb862]))
                   } finally {
                     pin.release();
                   }
-                  expect(path.state().root.fts).toEqual({ checkpoint: null, staged: null });
+                  expect(path.state().root.fts).toEqual(ftsBefore);
                   reach.reach("no FTS preparation");
                   await autocommit(path, (st) => st.table(1).insert(batch(texts(["gamma"])), null));
                   expect(path.failure).toBeNull();

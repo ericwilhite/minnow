@@ -108,6 +108,8 @@ export interface EngineHooks {
     options?: NativeWriteStepOptions,
   ): Promise<NativeWriteStepBoundary>;
   checkNativeStepReady?(statement: StatementImpl): void;
+  /** A statement closed (ended or rolled back): its forecasts may now be reclaimable. */
+  statementEnded?(): void;
   closeNativeStep?(statement: StatementImpl): Promise<void>;
   readonly shared: Shared;
   /** The one key batch writers encode into (one writer at a time; consumed before reuse). */
@@ -326,6 +328,7 @@ export class TransactionImpl implements WriteTransaction {
     if (this.#open === statement) {
       this.#lastNativeCommands = statement.nativeCommandMode;
       this.#open = null;
+      this.hooks.statementEnded?.();
     }
   }
 
@@ -1172,6 +1175,20 @@ export class StatementImpl implements Statement {
     return work();
   }
 
+  /** Undo already scanned for FTS-keyed entries, and whether one was found: a native root asks
+   * at every step, so each entry is read once. A savepoint rollback can only shorten the undo. */
+  #ftsScanned = 0;
+  #ftsKeyed = false;
+  /** Whether this statement's accepted writes so far need a statement-end FTS step (keyed
+   * deletes and keyed row writes). A native root funds that step in its own last native step,
+   * so the statement end never waits while the root holds credit. */
+  needsFtsPreparation(): MaybePromise<boolean> {
+    if (this.#ftsKeyed) return true;
+    return this.#needsFtsPreparation(
+      Math.max(this.#start, Math.min(this.#ftsScanned, this.tx.undo.length)),
+    );
+  }
+
   /** Statement ranges are disjoint: revisiting all older undo makes N statements quadratic.
    * Large current statements still share the worker clock and recheck cancellation on resume. */
   #needsFtsPreparation(from: number): MaybePromise<boolean> {
@@ -1184,8 +1201,11 @@ export class StatementImpl implements Statement {
         (e.kind === "memDelete" ||
           e.kind === "groupDelete" ||
           (e.kind === "rows" && e.ftsKeyed === true))
-      )
+      ) {
+        this.#ftsKeyed = true;
         return true;
+      }
+      this.#ftsScanned = i + 1;
       if ((i & 1023) === 1023 && taskClock.due())
         return yieldTask().then(() => this.#needsFtsPreparation(i + 1));
     }
@@ -1202,7 +1222,7 @@ export class StatementImpl implements Statement {
       this.guard(() => {
         this.tx.hooks.checkNativeStepReady?.(this);
         this.#releaseViews();
-        return settle(this.#needsFtsPreparation(this.#start), (keyed) =>
+        return settle(this.needsFtsPreparation(), (keyed) =>
           settle(keyed ? this.tx.hooks.prepareFtsMutation?.(this.#signal) : undefined, () => {
             this.#signal?.throwIfAborted();
             this.#state = "ended";

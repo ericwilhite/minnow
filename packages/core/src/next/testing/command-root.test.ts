@@ -1,5 +1,5 @@
 /** Real root assembly owns all hooks but delegates end/commit exactly once; PG supplies
- * row/trace/error authority. Owner SQL dispatch remains guarded. */
+ * row/trace/error authority. This component fixture installs no owner SQL dispatcher. */
 import { PGlite } from "@electric-sql/pglite";
 import fc from "fast-check";
 import { expect, it } from "vitest";

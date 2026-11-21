@@ -307,8 +307,14 @@ summaries plus contiguous fragment offsets, and reclamation retires every old in
 The native reader/writer/manifest/commit-body development selectors are 8/8/11/8; older unpublished selectors
 refuse. The released 1.0 format has no supported predecessor yet. Trigger family20 now carries dialect-versioned bodies and stable OLD/NEW/target dependencies
 (body30/binding31/column32). Definitions and CREATE/DROP lowering persist through WAL and
-checkpoint; trigger scheduling/body execution is the next integration unit. Writes whose event
-can reach a stored trigger refuse before mutation until that runtime is installed. Rule admission
+checkpoint. A write whose event can reach a stored trigger, or a referential action the ordinary
+path does not run, goes through the native command runtime (see "Ordinary native SQL row
+triggers"): FOR EACH ROW BEFORE/AFTER bodies in PostgreSQL trigger-name and FK order, one further
+cascade level (54001 beyond it), and whole-statement rollback. FOR EACH STATEMENT and transaction
+control in bodies are syntax refusals. RETURNING/conflict/MERGE roots, volatile/FTS/init-plan
+inputs, auto-increment or indexed domains without native preflight, parameterized or growing
+CHECK/generated workspace, and multi-set grouping in body subqueries refuse with typed 0A000;
+a preparation whose metered memory need exceeds the cap refuses with 53200. Rule admission
 walks stable trigger target IDs and referential edges with event, assigned columns and remaining
 body budget; informational update-follow edges and generated keys are included. Unrelated writes
 keep their existing execution path. FTS declarations persist without making an index ready. Snapshot catalog frame
@@ -1605,6 +1611,41 @@ and the owner import it directly.
   resident-page space, downstream buffers, private progress credit, and one result frame.
   FIFO admission waits while holding no partial reservation. A minimum above the whole cap
   raises `MemoryAdmissionError`. See [the bounded read-step contract](memory/README.md).
+- Holder priority. New admissions (owners holding nothing) are served FIFO. Growth from an owner
+  that holds credit it cannot release (`holdsCredit`: all writer growth, a native root's retained
+  base, and the other holder sites the policy audit lists) is served before every queued new
+  admission as soon as it fits, FIFO among holders, so a holder never waits behind a request only
+  its own release could serve. Callouts (reclaim, eviction) that enqueue during a drain are
+  re-checked before any grant. Holder priority changes order, never limits. Lifetime holdings (the
+  native owner's scratch control) are registered as permanent: an admission needing more than the
+  cap (or `cap - reserve`) less those holdings can never be served, so it gets 53200 at once rather
+  than an endless wait, and queued requests are re-checked when a registration changes. An admission
+  within that usable cap is served once the finite holder chains ahead of it finish. The writer's
+  floors are revocable when idle, so they are not counted as permanent; what the write engine keeps
+  until close, or for as long as the current state needs it, is (the page cache's fixed slabs,
+  permanent storage, the current state's resident metadata and pin, its fixed controls and
+  resident commit writers, and the change feed once created). A live-query runtime registers its
+  base and feed listener until it closes. What a finite holder releases is not: state only older snapshots keep
+  (a request it blocks waits for them), FTS mutation entries, pending index records. Unflushed
+  memtable content (rows, index tombstones, deletions) is not permanent: reclaim on an idle writer
+  flushes it, and publishes once when only a publication releases the rest. Every transition that can make the writer's
+  forecasts retirable (a statement or transaction ending, a flush, merge or commit finishing) wakes
+  queued admissions. `Governor.observeGrants` reports each grant synchronously with the queues at
+  that moment, so suites check the serving order itself. The writer and a native root
+  cannot wait on each other (one writer per governor; a native root queues its own step only after
+  the writer's step has settled). Readers are not holders: query preparation waits only while holding
+  nothing (the preparation credit, below), since readers each retaining a source recipe while
+  waiting could otherwise wait on each other. Policy: `holdsCredit` and `registerPermanent` in
+  `memory/governor.ts`; tests: `memory/holder-priority.test.ts`,
+  `memory/wait-policy-regressions.test.ts`, `memory/wait-wake-regressions.test.ts`,
+  `testing/native-command-fifo.test.ts`. In test runs,
+  `MINNOW_GOVERNOR_STALL_MS` turns any wait without governor progress into a `GovernorStallError`
+  naming every holder. Progress includes any allocation, free or credit move on any grant, so a
+  holder working inside memory it was already granted is not reported while it touches its
+  grants; one computing longer than the window without touching any grant still is (a CPU-only
+  false positive). Unrelated activity can hide a stalled waiter only until its hard deadline
+  (6 windows): past it the waiter is reported whatever else moves, and the error says which rule
+  fired.
 - Query preparation never waits while it holds memory (`exec/preparation.ts`). Until the
   minimum is installed, every admission (retained source recipes, source sizing scratch,
   planning probes, parameter sizing) is one the governor serves at once, through the same call
@@ -4228,7 +4269,8 @@ copies a bounded scalar window and drops native read buffers/progress loans befo
 continuations, so a callback can append or run a nested producer without hold-and-wait.
 Close fences pending appends, reads and continuations before closing files or freeing scratch;
 cleanup attempts both epochs and surfaces close failures. This is a verified runtime component;
-SQL firing still needs the joint controller, compiled body-source host and native Statement.end hooks.
+SQL firing composes it with the joint controller, compiled body-source host and native
+Statement.end hooks (see "Ordinary native SQL row triggers").
 
 TriggerBindingProgram compiles stable (OLD/NEW, column ID) dependencies once. Repeated textual
 parameters alias one owned typed scalar; no Date/Number/JS-row or public raw-parameter rebinding
@@ -4248,7 +4290,7 @@ prepay only the reachable live frames. The queue
 encodes `budget + 1` as a nonnegative scalar; scratch packets retain all three states. Image-helper
 count stays one, and copied parameters retire after input spooling, before nested writes. This
 keeps the maximum binding minimum independent of depth. The generated component suite checks
-the depth boundary against the shipped engine; native SQL firing remains disabled.
+the depth boundary against the shipped engine; ordinary-owner qualification is described below.
 
 TriggerBodyRunner controls one prepared body command through an injected TriggerBodyHost.
 The host receives the complete modification plan and frozen body metadata, including explicit
@@ -4267,7 +4309,7 @@ command's nested AFTER frame, then verifies references; the root owns completion
 The generated protocol suite uses real native writers, shared bound row rules and PGlite for
 commit/rollback, generated output, CHECK and generated NOT NULL failures. Its source host is a
 small native-vector fixture, not the compiled provider. B5b's admitted source/registry and B6's
-named-trigger controller remain a separate integration; native SQL firing is still disabled.
+named-trigger controller are integrated by the qualified ordinary owner described below.
 
 ### Named trigger controller component
 
@@ -4290,8 +4332,8 @@ callbacks and all queues before its caller releases the native root or its grant
 The permanent PGlite differential exercises this component with injected scalar source,
 row-image and RI adapters, real prefix-pin lifetimes, nested frames and observed queue
 spills while competing grants hold spare credit. It does not exercise B5b's complete
-compiled source/registry/write driver. SQL firing stays disabled until that joint integration
-passes its end-to-end pressure, rollback, FK-action, cancellation and fault campaign.
+compiled source/registry/write driver. The ordinary-owner qualification below covers their
+joint end-to-end pressure, rollback, FK-action and cancellation paths.
 
 Prepared programs cover every matching trigger on nonnegative-budget routes. The controller
 checks actual catalog routes and refuses a missing program rather than skipping the trigger.
@@ -4443,7 +4485,7 @@ Native statement rule admission follows the shipped trigger budget: root1 and bo
 fire, and their body at -1 may write but cannot fire another matching user trigger.
 Referential actions preserve that signed budget. The static walk includes rules for both
 body levels and distinguishes the same table reached with different budgets; SQL trigger
-firing remains guarded until the joint runtime is installed.
+firing uses the qualified ordinary-owner runtime described below.
 
 ### Root registry scratch primitives (staging)
 
@@ -4484,8 +4526,8 @@ workspace. Encode scratch is prepaid before capture. Release clears vector array
 refunding them; close cancels progress waits and fences payload I/O and active leases.
 
 These image components use the frozen consumer ABI and pass through the real typed trigger
-binding copier in component tests. They still do not install a native statement provider or
-turn on SQL firing. The caller supplies admitted scope/progress and immutable table metadata;
+binding copier in component tests. They do not install a native statement provider
+themselves; the ordinary owner does (see "Ordinary native SQL row triggers"). The caller supplies admitted scope/progress and immutable table metadata;
 statement/command ownership, row rules, accepted-write hooks and deferred RI execution are
 separate integration responsibilities.
 
@@ -4494,7 +4536,7 @@ records, without reading scalar payloads or creating an image lease. The root ca
 writer growth from these exact sizes before borrowing OLD/NEW values. NULL and fixed-width
 cells need no variable payload credit. Metadata cancellation and close fence pending backing
 reads before returning the registry's fixed charge. Real native primary tests use this path;
-it does not supply the compiled body host or enable SQL firing.
+it does not supply the compiled body host itself.
 
 `owner/registry-commands.ts` records command/frame ownership, accepted native row IDs and
 immutable RI descriptors in the shared directory. Its fixed frame slots retain separate
@@ -4521,7 +4563,7 @@ An already checked command token never covers a later action's accepted rows; ob
 versions do not produce reference failures. A private fixed account also returns provisional
 key buffers when construction fails. Generated tests compare real native key checks against
 PGlite and shipped success/failure, including published sources and successive accepted writes.
-This checker is a provider component; it does not execute RI actions or install SQL firing.
+This checker is a provider component; it does not execute RI actions itself.
 
 `write/credits.ts` also provides a prepared-row reservation for the forthcoming native
 primary adapter. The root funds writer growth first, then protects that already admitted
@@ -4548,8 +4590,8 @@ Accepted native-primary UPDATE/DELETE calls preserve the same FTS mutation notif
 funded row undo and atomic WAL history as legacy writers. Ordinary INSERT keeps insert deltas;
 rollback and savepoints retire this history with the rows.
 Its initial preflight refuses auto-increment and wide/variable indexed domains before writes.
-No SQL path installs it yet. A compiled body-input host now consumes this continuation;
-production admission and SQL dispatch remain separate integration work.
+The ordinary owner's native SQL dispatch installs it, and the compiled body-input host
+consumes this continuation (see "Ordinary native SQL row triggers").
 
 `owner/command-execution.ts` assembles the native command boundary over those image,
 command and constraint components. Direct RI entries are compared with the canonical
@@ -4559,7 +4601,7 @@ reference checks retire command slots for reuse. Callback slots are fixed by the
 frame bound, cancellation listeners retire after each operation, and close fences callbacks
 and undelivered image leases before returning component credit. The root supplies a real
 child-capture/action executor and closes shared scratch/pins afterward. The compiled body host
-uses this boundary, while generic SQL enablement remains guarded.
+and the ordinary owner's SQL dispatch use this boundary.
 
 `NativeCommandChecks.captureChildren` seals an OLD parent key's complete child identity
 range through the prepaid native support-index cursor and shared spilled directory. It
@@ -4572,8 +4614,8 @@ helper alone does not enable FK/trigger scheduling.
 
 Native command records keep independent accepted-row checkpoints for uniqueness,
 original follow-input preparation and reference checks. Completing one phase cannot
-suppress another phase or later writes on the same token. This is bookkeeping for
-the guarded provider; no SQL path installs its follow preparation/action executor yet.
+suppress another phase or later writes on the same token. The ordinary owner's
+SQL dispatch installs its follow preparation and action executor.
 
 ### Concrete native RI continuations
 
@@ -4614,9 +4656,9 @@ adapter in the per-action uniqueness test is synthetic, not a compiled-body proo
 primary preflight still refuses auto-increment and wide/variable indexed domains. Native
 sequence defaults retain their kernel refusal; RI assignments to generated FK columns also
 refuse rather than silently recomputing away the assignment. The compiled COMPLETE-MODIFY body host
-is exercised with actual native RI and user-body ordering; owner admission/dispatch and
-SQL enablement remain unfinished. SQL firing and advanced-RI refusal guards remain in place.
-No stored format changes.
+is exercised with actual native RI and user-body ordering. Owner admission and SQL dispatch
+are enabled for qualified commands; the typed refusals that remain are listed under
+"Ordinary native SQL row triggers". No stored format changes.
 
 The source ordinary minimum includes the fixed native decoder/IO workspace. A wider point
 read first closes its decoder, arena and pin, returns unused producer credit, then funds the
@@ -4633,8 +4675,8 @@ mutation routes in a charged catalog-sized matrix. It tracks root/body budgets1/
 keeps RI in its containing frame, includes generated rekeys and informational follow,
 and counts one row's queue scratch. Terminal matching triggers remain runtime errors;
 their unreachable bodies are not compiled. Its preparation charge retires after pending
-task work unwinds. This is owner-admission groundwork, not SQL enablement or a complete
-root working-set minimum.
+task work unwinds. It is one part of the owner's initial reservation, not a complete root
+working-set minimum.
 
 ### Portable snapshot load
 
@@ -5015,8 +5057,8 @@ Caller-owned rule bindings, preparation and grants remain caller-owned.
 
 `nativeCommandRootSetupBytes` measures this assembler's setup bound. It excludes caller
 preparation/bindings and complete source, image, binding and writer progress. The funding ports
-must supply that complete admitted work; this helper is not an execution minimum. Owner admission
-and SQL dispatch still keep their guards. Generated PG traces/errors, an actual compiled follow
+must supply that complete admitted work; this helper is not an execution minimum. The ordinary owner
+adds those parts (see "Ordinary native SQL row triggers"). Generated PG traces/errors, an actual compiled follow
 observer, foreign-scope/cancellation fences and competing-credit64MiB roots exercise the assembler.
 The initial SUM observer probe hit the existing initPlan refusal; no initPlan capability was added.
 
@@ -5146,7 +5188,8 @@ the native writer's governor, without treating temporary pressure as an intrinsi
 refusal. Multi-segment queries prepay the existing mixed-source recipe metadata;
 the single-segment shortcut remains available. Input-only producers do not reserve a second, unused generic modification
 spool. Single complete-key probes use their existing row-ID order; multiple probes
-and composite prefixes keep the bounded locator sort. SQL trigger dispatch remains guarded.
+and composite prefixes keep the bounded locator sort. The qualified ordinary owner supplies
+SQL trigger dispatch.
 
 Serialized-array CASE/COALESCE selectors use the same bounded projection progress as
 text and bytes. Their one-row path borrows the original encoded payload, preserving
@@ -5186,3 +5229,205 @@ coverage of its pinned visible generation; deletes, overlays and partial selecti
 fallback. Summary validation does not validate unread value pages. Integer AVG keeps C11's
 float64 output and the same final conversion and division as the ordinary scan; NUMERIC AVG
 keeps NUMERIC output. All summary reads, parses and arithmetic must be admitted before work.
+
+The reusable trigger ordering campaign lives in `testing/trigger-ordering.test-support.ts`.
+`orderingScript(history)` supplies inline native DDL, independently compiled PostgreSQL
+trigger functions, seeds, the root mutation and an ordered observation query. The same strict
+PGlite runner accepts a `TriggerOrderingFactory`: an adapter runs that history and fences
+cleanup before the next one starts. An unsupported native operation must reject, never become
+an empty trace or an accepted skip. The original campaign uses the real controller with an explicitly synthetic source/row/RI
+fixture. The separate native factory described below now qualifies B5b's concrete command
+provider. Production owner admission and SQL dispatch have their own evidence under
+"Ordinary native SQL row triggers".
+The generated histories vary row counts (including zero and spill-sized queues), before/after
+names, UTF8 boundaries, creation order, event and body-command count. Existing controller
+contract seeds and run counts stay intact in their separate suite.
+
+### Concrete native trigger ordering consumer (qualification)
+
+`testing/native-trigger-ordering.test.ts` supplies the reusable campaign with the real
+`NativeCommandRoot`/compiled body host, accepted primary writes and native RI executor.
+Both PostgreSQL and native bodies record their strict sequence with actual SQL updates to
+one untriggered text accumulator, before the existing log/audit inserts. This preserves
+nested body frames and exact ordering without requiring unsupported volatile sequence defaults.
+The original sequence-backed/controller-only campaign stays separate, with its seeds and
+counts unchanged. Native histories additionally vary resident/published source state.
+
+The consumer checks accepted root count and reads actual stored trace data after native
+statement completion/commit. Fixture close fences the graph, grants, rules and spill files.
+The fixture is an already-funded component caller; its spare workspace is not a production
+admission recipe. Production admission and dispatch are described under "Ordinary native SQL row triggers".
+
+The native campaign replays the identical seed/arbitraries/four examples in two bounded
+case groups, assigning each history by row parity. A ledger audit checks equal generated
+inputs, exactly one completed native execution per history, and the combined declared Reach.
+The twelve-run configuration and all large histories stay unchanged; split bodies reduce
+coverage instrumentation's longest test without changing its deadline.
+
+### Native trigger statement rollback and enclosing savepoints
+
+`owner/trigger-statement.ts` runs one already-funded native command graph. It drains graph
+callbacks and IO before undoing a failed statement; it neither admits a separate pool nor
+commits the transaction. Caller-owned rule bindings and grants stay live through that drain.
+A close failure after successful statement end needs the caller's enclosing transaction or
+savepoint recovery; an ended statement cannot be undone by `Statement.rollback()`.
+
+The native savepoint campaign uses the real writer across several triggering statements,
+with independently pinned read-own observations and PGlite comparison. It checks failures
+in parent and RI-child AFTER bodies after nested effects, exact statement undo before
+rollback-to, successful body effects undone by rollback-to, continued triggering writes,
+and exact committed parent/child/log/audit/trace rows. Both generated seeds replay the same
+eight runs and two examples in bounded location/parity groups; an exactly-once ledger and declared
+Reach audit the split. Its fixed test funding is not production admission.
+
+Inline bodies remain INSERT/UPDATE/DELETE only. CREATE TRIGGER rejects in-body SAVEPOINT or
+ROLLBACK with a typed planning error before changing the catalog or executing a body. The
+PostgreSQL comparison checks its own trigger-function execution refusal and statement undo;
+the different grammars do not imply identical refusal stages or diagnostics. Enclosing
+savepoints belong to the caller transaction. The ordinary owner installs the qualified consumer.
+
+The concrete body campaign compares native and shipped INSERT/UPDATE/DELETE bodies with
+independently compiled PostgreSQL functions. It checks OLD/NEW expressions, ordered
+noncommuting UPDATE commands, DELETE, multi-value INSERT, NULL bindings and exact stored
+rows under BEFORE/AFTER firing from resident or published sources. The supported root and
+one-further-trigger levels match PG's data. A third matching trigger level follows Minnow's
+shipped product cap: native and shipped reject and undo the whole statement, while the PG
+function succeeds. The test states that difference explicitly, rather than treating PG's
+successful deeper execution as native parity. This is still component qualification;
+the ordinary-owner qualification below supplies production admission and SQL dispatch.
+
+The concrete competing-error campaign checks PGlite's first SQLSTATE in thirteen qualified
+shapes: input/BEFORE/AFTER, generated and CHECK evaluation, later-row errors, root/body
+uniqueness, RI uniqueness/CHECK/BEFORE, and named parent versus child AFTER work. Each
+failure must undo every actual source, child, guard, nested log and unique-target row before
+an empty transaction commit. The generator varies source width in rows, publication and
+trigger creation order. This checks those error paths, rather than claiming all error
+precedence is identical to PostgreSQL: native statement-end uniqueness remains the approved
+product rule. SQL failed-session policy and owner dispatch are still outside this fixture.
+
+The original-target follow campaign compares exact native stored rows, OLD/NEW log
+multisets and nested-body totals against real PostgreSQL execution. Disjoint enforced
+rekeys use explicit PG CASCADE. Swaps, rotations and informational references use a PG
+reference with stable logical target identities and an explicit relational follow UPDATE;
+this models Minnow's documented extension, not PostgreSQL's omitted ON UPDATE default.
+Its generated histories vary self/external references, orphans, NULLs, unchanged roots,
+publication and nested bodies. A ledger splits the same twelve runs and six examples
+per seed between self/external cases and proves exactly-once execution. Native phase/FIFO
+laws remain covered by the provider's follow-group campaigns. Observation reads return
+retired command credit first; the test caller is still not a production funding recipe.
+
+The native cancellation campaign injects an AbortSignal or a checkpoint failure at the
+first, middle and final measured checkpoint of the real root/RI/nested-body graph.
+After its fences drain, no failed-statement effects may commit; parent, child, log,
+audit and trace rows must be unchanged. Prefix reader registrations, retained chunks,
+write-path state, grants and spill ownership must retire. Cleanup aggregates may retain
+the original failure as their cause; the comparison does not require Error identity.
+The shared pipeline observes even an already-cancelled wait's producer promise, so a
+later producer rejection cannot escape as an unhandled rejection. This does not wait
+for the producer before reporting cancellation; native source and image cleanup still
+fence outstanding borrows separately. Owner cancel-versus-commit and lost-reply policy
+remain separate qualification work; the campaign itself does not dispatch SQL.
+
+The native owner funding controller uses the real statement's protected-step witness and
+the same governor. It reserves retained root metadata, parameters, rule workspace and the
+next source once, then transfers only fresh credit. A changed native footprint retries
+funding alone; it never retries SQL or a default/generated expression. Rule credit remains
+protected while image metadata is funded. Source/image producers and progress loans must
+retire before a fresh wait. Premature root-account close refuses to uncharge live callers.
+Generated histories cover both existing admission modes, invalidation, competing grants,
+cancellation and cleanup on the real native boundary. The ordinary owner's SQL dispatch
+uses this controller.
+
+### Ordinary native SQL row triggers
+
+The internal ordinary owner dispatches qualified INSERT/UPDATE/DELETE commands through
+`owner/native-command.ts`, the real graph, writer, governor and spill service. Root/image
+and row-rule funding stay separate. Graph I/O and leases retire before rules and credit.
+There is no public override, package-entry change or default-engine switch.
+
+Preparation is metered under a growing reservation and never waits while holding preparation. Each
+table rule set and trigger body is charged a base share, linear in stored text
+(`owner/native-preparation-bound.ts`: SQL tokens and characters, bindings, and the columns, stored
+DEFAULT/generated text and keys of each table the text names), before it is built. The copies of one
+source subtree that the shared parser, optimizer and lowering are known to make are charged as they
+happen: the private-rebuild copy meter (`engine/copy-meter.ts`) is installed only around native
+preparation, and the copy helpers (`cloneTreeValue`, the expression copy sites such as simple CASE
+operands, BETWEEN, row predicates, statistical aggregates, alias and merged-column references and
+grouping sets, repeated DEFAULT cells and per-join column lists in lowering) charge each node before
+copying it. Passes that copied every descendant's list again at each ancestor (top-level name
+resolution, correlated references), re-typed every subtree at each node (integer typing, and
+datetime typing, which every subtraction asks of both operands) now do work linear in the shapes the
+scaling test below lowers. Inner-join ordering no longer allocates closures per candidate conjunct
+or rescans the whole conjunct pool per unit and per step: it allocates in proportion to the
+conjuncts. Its greedy order still compares every remaining unit at each step, so its CPU is
+quadratic in the joined tables. The released engine installs no meter; it shares these passes, so
+its compile gives the same results with less work. When a charge does not fit, the attempt is
+abandoned: every attempt object and charge is released, and the reservation is admitted again from
+nothing at max(known need, min(2 x previous, cap)). A reservation the cap cannot grant beside the
+writer is reduced to the largest that fits, so only a known need above it is a typed 53200. Setup,
+rule and parameter workspaces, sized from the built preparation, take the same path. Attempts are at
+most ceil(log2(cap / first reservation)) + 1. A cached root plan learns its measured need, not the
+padding of the reservation that found it, so a later execution admits exactly that need in one
+attempt. After every body has run, the root takes one last native step with its idle minima dropped:
+the writer then funds the statement-end full-text step beside the root's bytes (only when a
+full-text index or pending full-text state exists), so ending never waits while the root holds
+credit; a native statement end that finds that minimum unfunded fails rather than wait. A body's
+query sizes its batches from what its root can afford beside the writer's protected floor (sizing
+only: admission and refusal still use the cap). Parameters are sized for every execution, in their
+own admission before the first attempt, because a reused plan can receive values of a different size
+(a NUMERIC beyond int64). Wide ROLLUP and CUBE charge every grouping-set array and every lowered
+reference to their columns before building them, and each grouping set's member block charges the
+parts it shares. The factor that covers a copy's lowered IR (`COPY_IR_FACTOR`, 8) is empirical:
+generated bodies retain at most about 0.6 of their charge. Three checks back this: the retained plan
+graph against the charge over generated bodies; heap growth after a wide ROLLUP's lowering aborts on
+its budget; and a scaling test (`testing/native-preparation-scaling.test.ts`) that lowers each shape
+it lists at N and 8N: operator chains over int, numeric, text, boolean, comparison, date, timestamp
+and interval operands, date differences, nesting, CASE arms, IN and row IN lists, inner and USING
+join chains, grouping sets, DEFAULT rows and correlated subqueries. Array-builtin volume, and the
+bytes each JS function allocates (garbage included, sampled by V8's heap profiler, builtins counted
+in their caller), must grow no faster than the faster-growing part of the charge. Its limits: a
+shape it does not list is not judged; a join chain's metered charge is itself quadratic (each join
+lists its inputs' columns), so sites in join shapes are judged at quadratic order and an uncharged
+quadratic site there passes (a cubic one fails); a site allocating under 16 KiB at N is judged
+against 16 KiB; and it measures the interpreter and baseline tiers (TurboFan and Maglev are off
+while it samples, at fixed intervals), so the measure repeats exactly but does not see what
+optimized code would allocate. None of these checks proves that every allocation is charged, so a
+new kind of copy is caught when it changes scaling or retained size, not by construction.
+
+The same funded/SQL histories run at 32 MiB with `MINNOW_TRIGGER_CAP_MIB=32` and at
+64 MiB by default. They compare PostgreSQL BEFORE/AFTER name order, RI and nested bodies,
+statement rollback, failed transaction state, enclosing savepoint recovery, successful-body
+undo and exact committed rows. Shipped-body comparisons pin the product's one-further-level
+cascade rule; a third matching trigger fails with 54001 and undoes the whole statement.
+FOR EACH STATEMENT and transaction control inside bodies remain syntax refusals.
+
+Informational-FK capture decodes only the actual key operands, through the publication-stable
+point reader. No column payload is borrowed across funding. All original target identities are
+sealed before RI writes begin. Internal RI sort keys use fixed-width IDs within the reserved
+name family, preserving FK allocation order across decimal widths. User names retain UTF8
+ordering around that family; native suffixes are not PostgreSQL OID spellings.
+
+Typed 0A000 refusals remain for RETURNING/conflict/MERGE roots, volatile/FTS/init-plan inputs,
+auto-increment or indexed domains missing native preflight, parameterized or growing/
+structural CHECK/generated workspace. A trigger body subquery with more than one grouping set
+(ROLLUP, CUBE, or GROUPING SETS with several members) keeps the executor's existing set-operation
+refusal; a single grouping set runs as an ordinary grouped subquery. Raw executor calls do not
+install this owner controller.
+
+### Native compiled-input phase memory
+
+Native root and body inputs are fully sealed before their row effects run. Their immutable
+plans, schemas and small handles stay retained; compiled producer state is admitted and
+retired per input. Complete setup reserves the largest compiled producer, rather than the
+sum of producers that never run together. Graph I/O, parameter and sink fences finish before
+that workspace is returned. This changes no write-owner floor: inactive merges keep the
+permanent joint floor, and an active merge still counts once under its existing contract.
+
+### Informational-reference source phases
+
+The native command controller captures informational foreign-key targets through selected
+point reads. It seals every original target identity before running referential writes.
+Only the actual FK operands are decoded; unrelated payloads and hypothetical publication
+buffers are not part of that read. Each point decoder, recipe and payload pin retires before
+funding the next source. Native-owned locator/deletion metadata keeps its existing charge.
+The visitor does not create an extra output image or retain a decoded key after comparison.

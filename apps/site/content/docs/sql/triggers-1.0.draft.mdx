@@ -4,9 +4,9 @@ description: Trigger bodies, foreign-key action order, and changes from the 0.x 
 draft: true
 ---
 
-> **Unpublished 1.0 draft.** Native trigger firing is not enabled yet. Keep this page out of
-> the documentation collection and navigation until the joint native execution tests pass.
-> This page describes the intended 1.0 contract; it does not change the shipped 0.x engine.
+> **Unpublished 1.0 draft.** Qualified native row-trigger firing is enabled internally. Keep
+> this page out of the documentation collection and navigation until the public 1.0 cutover.
+> This page describes the 1.0 contract; it does not change the shipped 0.x engine.
 
 ## Writing a trigger
 
@@ -31,11 +31,14 @@ END
 `DROP TRIGGER record_change` removes the trigger. Trigger names are global within a database.
 Bodies contain ordered INSERT, UPDATE, or DELETE statements. INSERT bodies use VALUES into
 keyless tables; UPDATE and DELETE bodies target keyed tables. User parameters, ON CONFLICT,
-and RETURNING in a body are refused. Views cannot own triggers or be body targets.
+and RETURNING in a body are refused. Views cannot own triggers or be body targets. A subquery
+in a body may use one grouping set; ROLLUP, CUBE, or GROUPING SETS with several sets are not
+supported yet, and the statement that would fire such a body fails with `0A000`.
 
 Later statements in a body see earlier writes and their completed trigger effects. A body
-statement finishes its own AFTER work before the next body statement starts. Separate body
-statements may update the same row; duplicate targets within one body command are refused.
+statement finishes its own AFTER work before the next body statement starts, except inside a
+key-follow group (see [Key-follow groups](#key-follow-groups)). Separate body statements may
+update the same row; duplicate targets within one body command are refused.
 
 ## Row and foreign-key action order
 
@@ -46,8 +49,10 @@ The 1.0 engine follows PostgreSQL's trigger-name ordering:
 3. After the command's primary writes pass uniqueness checks, process its queued AFTER work.
    Referential actions and user AFTER triggers share this name order.
 4. A referential action runs the affected children's own BEFORE triggers, row rules and writes.
-   It checks any new child uniqueness conflicts before returning. Child AFTER events append
-   behind the events already waiting in the containing statement's queue.
+   An explicit action (such as `ON DELETE CASCADE` or `ON UPDATE CASCADE`) checks any new child
+   uniqueness conflicts before returning. A key-follow group checks once for the whole group
+   instead (see below). Child AFTER events append behind the events already waiting in the
+   containing statement's queue.
 
 Names compare by UTF8 identifier order, not creation order or the user's locale. Unquoted
 names fold to lowercase; quoted names keep their spelling. For example, `"A_log"` sorts
@@ -55,11 +60,35 @@ before an internal `RI_ConstraintTrigger_*` action, while `z_log` sorts after it
 
 A child's AFTER trigger can therefore run after remaining parent AFTER triggers. It does not
 jump ahead just because the child write happened during a cascade. User body statements have
-their own nested AFTER work, which completes before their containing trigger continues.
+their own nested AFTER work, which completes before their containing trigger continues, except
+inside a key-follow group.
 
-A uniqueness conflict created by an RI action is an error at that action, even when the
-parent command and earlier RI actions already passed their uniqueness checks. A later
+A uniqueness conflict created by an explicit RI action is an error at that action, even when
+the parent command and earlier RI actions already passed their uniqueness checks. A later
 AFTER body's error cannot replace it.
+
+## Key-follow groups
+
+When a statement changes a parent key and the foreign key has no `ON UPDATE` action, Minnow
+moves the referencing children to the new key. This is a key follow. PostgreSQL would report a
+foreign-key error instead; the follow is a deliberate Minnow difference.
+
+Minnow follows all of the statement's affected children for that foreign key as one group, then
+checks the group's child uniqueness once. Parent keys can then swap or rotate without a false
+conflict halfway through. For example, `UPDATE parents SET id = 3 - id` over parents 1 and 2
+succeeds even when the children's `parent_id` column is `UNIQUE`.
+While the group runs:
+
+- user AFTER triggers fired by statements nested inside the group (for example, by a child's
+  BEFORE trigger body) wait until the group's uniqueness check, then run in their usual queue
+  order;
+- BEFORE triggers, nested referential actions and foreign-key checks still run immediately;
+- the group's children, including versions written by nested statements, are checked for
+  uniqueness at the group check. A conflict there is `23505` and names the child constraint.
+  Rows outside the group keep their normal checks.
+
+Explicit actions such as `ON UPDATE CASCADE` keep the per-action order and checks described
+above.
 
 ## Change from 0.x: BEFORE runs before cascading children
 

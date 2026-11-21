@@ -49,6 +49,7 @@ import {
   rules,
   locators,
   rowsOf,
+  nativeEndStep,
 } from "../write/test-support.js";
 
 async function code(run: () => unknown): Promise<string | null> {
@@ -1437,6 +1438,7 @@ for (const seed of seedsFor("next-native-ri-restriction", [0xb635, 0xb636]))
                     for await (const entry of execution.rowReferentialEntries(f.root, oldRef))
                       await execution.executeReferentialId(entry.id, hooks, signal);
                     await execution.verifyCommandReferences(f.root, signal);
+                    await nativeEndStep(f.statement, signal);
                   },
                 }),
                 oldInput = batch(ints([key]), ints([key]), texts(["seed"])),

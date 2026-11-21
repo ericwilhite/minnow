@@ -97,7 +97,8 @@ must be exact integers without negative zero; payload bytes under SQL NULL stay 
 their expected predecessor version, checked before any effects from that transaction replay.
 Catalog pages participate in ordinary reachability and reclamation.
 These are unreleased development formats, not a change to the published 0.x formats or a public
-snapshot API. Triggers and full-text search remain required work before the 1.0 format freeze.
+snapshot API. Trigger definitions are part of these catalog bytes; full-text search lifecycle
+state remains required work before the 1.0 format freeze.
 
 The remaining byte contracts on this page describe the existing 0.x engine.
 

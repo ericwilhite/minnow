@@ -22,6 +22,7 @@ import { allocateFlat, type Batch, type FlatVector } from "../vector/vector.js";
 import { decodeUtf8, VarlenBuilder } from "../vector/varlen.js";
 import { MEMORY_CHUNK_ROWS } from "./columns.js";
 import { WritePathImpl, type EngineInput } from "./engine.js";
+import type { StatementImpl } from "./transaction.js";
 import { listedRootExtents, reachableExtents } from "../format/reachable.js";
 import type { StorageBackend } from "../storage/contract.js";
 import type { ExtentSpace } from "../storage/extents.js";
@@ -29,6 +30,20 @@ import { MemoryBackend } from "../storage/memory-store.js";
 import { openExtentSpace } from "../storage/space.js";
 
 export const INT: PhysicalType = { kind: "int32", bits: 32 };
+
+/** A test root's last native step, after its bodies and before its statement ends: the writer
+ * funds the statement-end work (FTS) then, so ending never waits (as NativeCommandRoot does).
+ * `rootBytes` is what the test root still holds. */
+export async function nativeEndStep(
+  statement: { prepareNativeStep: StatementImpl["prepareNativeStep"] },
+  signal: AbortSignal,
+  rootBytes = 0,
+): Promise<void> {
+  const boundary = await statement.prepareNativeStep(rootBytes, signal, {
+    includesProgress: true,
+  });
+  boundary.release();
+}
 export const BIG: PhysicalType = { kind: "int64" };
 export const TEXT: PhysicalType = { kind: "text" };
 

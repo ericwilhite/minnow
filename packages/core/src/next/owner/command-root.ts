@@ -39,8 +39,11 @@ import {
 } from "./referential-mutations.js";
 import { NativeCommandExecution, nativeCommandExecutionBytes } from "./command-execution.js";
 import { NativeFollowUnique, nativeFollowUniqueBytes } from "./follow-unique.js";
-import { nativeInputProgramBytes } from "./native-input.js";
-import { NativeBodyPrograms, type NativeBodyPlan } from "./body-programs.js";
+import {
+  nativeBodyProgramMinimumBytes,
+  NativeBodyPrograms,
+  type NativeBodyPlan,
+} from "./body-programs.js";
 import { NativeBodyHost, nativeBodyHostBytes, type NativeBodyHostScope } from "./body-host.js";
 export interface NativeRootFunding {
   readonly metadata: Grant;
@@ -51,6 +54,13 @@ export interface NativeRootFunding {
   prepareSource(bytes: number, signal: AbortSignal): Promise<void>;
   prepareRules: NativeRowScope["prepareRules"];
   releaseIdleStep(): void;
+  /** The root's last native step, before its statement ends: returns idle credit, then lets the
+   * writer fund the statement-end work (FTS) beside the root's remaining bytes. A funding port
+   * without its own credit controller (a test root) omits it; the root then takes that step
+   * itself for the bytes its metadata and source grants hold. */
+  prepareEnd?(signal: AbortSignal): Promise<void>;
+  /** What a body query may size its working set for (sizing only); omitted: the cap. */
+  sourceRoom?(): number | null;
 }
 export interface NativeRootPreparation {
   readonly rootId: number;
@@ -103,15 +113,7 @@ export function nativeCommandRootSetupBytes(scope: NativeRootPreparation): numbe
     ids = scope.tableIds;
   let columns = 0;
   for (const table of catalog.tables) columns = Math.max(columns, table.columns.length);
-  let programBytes = 4096;
-  const add = (plan: NativeBodyPlan["plan"]) => {
-    programBytes +=
-      1024 +
-      256 * (plan.root.op === "modify" ? plan.root.input.output.length : 0) +
-      nativeInputProgramBytes(plan);
-  };
-  add(scope.root);
-  for (const trigger of scope.triggers) for (const body of trigger.bodies) add(body.plan);
+  const programBytes = nativeBodyProgramMinimumBytes(plans(scope));
   const bytes =
     baseBytes(scope) +
     REGISTRY_DIRECTORY_BYTES +
@@ -263,7 +265,9 @@ export class NativeCommandRoot {
           signal,
           checkpoint: () => this.#checkpoint(),
           referentialName: (id, kind) =>
-            `RI_ConstraintTrigger_${kind.startsWith("child") ? "c" : "a"}_${String(id)}`,
+            // Fixed-width native IDs preserve allocation order within the reserved
+            // family; raw decimal suffixes would sort FK10 before FK2.
+            `RI_ConstraintTrigger_${kind.startsWith("child") ? "c" : "a"}_${String(id).padStart(16, "0")}`,
         }),
         (v) => v.close(),
       ),
@@ -290,6 +294,8 @@ export class NativeCommandRoot {
           },
           scan: {
             reads: scope.execution.reads,
+            visit: (tableId, rowId, columns, signal, visitor) =>
+              prefix.visit(tableId, rowId, columns, signal, visitor),
             prepare: async (_t, n, s) => {
               await this.scope.funding.prepareSource(n, s);
               return this.scope.funding.source;
@@ -371,6 +377,18 @@ export class NativeCommandRoot {
           await (this.#controller ?? invalid("missing controller")).finishRoot();
         } finally {
           this.scope.funding.releaseIdleStep();
+        }
+        // Every body has run. The statement end that follows (FTS preparation) must find its
+        // work funded and never wait while this root holds credit, so take one last native step.
+        const funding = this.scope.funding;
+        if (funding.prepareEnd) await funding.prepareEnd(this.signal);
+        else {
+          const boundary = await this.scope.statement.prepareNativeStep(
+            funding.metadata.held + funding.source.held,
+            this.signal,
+            { includesProgress: true },
+          );
+          boundary.release();
         }
       },
       closeRoot: () => this.#shutdownCommands(),
@@ -485,6 +503,7 @@ export class NativeCommandRoot {
           signal,
           prepare: (n, s) => this.scope.funding.prepareSource(n, s),
           prepareMetadata: (n, s) => this.scope.funding.prepareMetadata(n, s),
+          sizingBytes: () => this.scope.funding.sourceRoom?.() ?? scope.governor.capBytes,
         },
         execution: scope.execution,
       }),

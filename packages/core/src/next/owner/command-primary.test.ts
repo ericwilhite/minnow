@@ -53,6 +53,7 @@ import {
   texts,
   rowsOf,
   locators,
+  nativeEndStep,
 } from "../write/test-support.js";
 async function result(run: () => Promise<unknown>): Promise<string | null> {
   try {
@@ -261,11 +262,13 @@ async function fixture(
       finished++;
       if (finishGate) {
         await finishGate();
+        await nativeEndStep(statement, stop);
         return;
       }
       await execution.verifyCommandUnique(command, stop);
       if (after) throw Object.assign(new Error("later AFTER callback"), { sqlState: "22P02" });
       await execution.verifyCommandReferences(command, stop);
+      await nativeEndStep(statement, stop);
     },
     closeRoot: async () => {
       await closeGate?.();
@@ -1144,7 +1147,7 @@ it.each(seedsFor("next-native-primary-close-fault", [0xb5f4]))(
           charge: root,
           signal: new AbortController().signal,
           commandBudget: () => 1,
-          finishRoot: async () => undefined,
+          finishRoot: (stop) => nativeEndStep(statement, stop),
           closeRoot: async () => {
             if (delayed) await yieldTask();
             throw fault;

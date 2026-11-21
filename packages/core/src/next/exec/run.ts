@@ -245,6 +245,16 @@ export class QueryRuntime {
   projectionAvailable(grant: Grant): number {
     return Math.max(0, grant.held - grant.allocated - grant.loaned) + this.#growthRoom();
   }
+  /**
+   * The capacity this query sizes its working set for: batch targets, operator minima and the
+   * choice of spilling alternatives. The whole cap, except where the governor says less is
+   * available to it (a native body query sees what its root can afford beside the writer's
+   * protected floor). Only sizing: admission still waits for, and refuses above, the cap.
+   */
+  get sizingBytes(): number {
+    const governor = this.request.governor;
+    return Math.min(governor.capBytes, governor.sizingBytes ?? governor.capBytes);
+  }
   #growthRoom(): number {
     return Math.max(
       0,
