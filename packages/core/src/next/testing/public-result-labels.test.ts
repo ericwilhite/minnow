@@ -112,24 +112,6 @@ for (const seed of seedsFor("next-public-result-labels", [46962, 46963]))
               );
               return row;
             });
-            if (shape === "union") {
-              // This base lowers UNION but its executor intentionally refuses it. Compare
-              // prepare metadata and preserve the typed refusal; do not enable a set operator here.
-              const prepared = await native.prepare(sql);
-              try {
-                expect(prepared.columns.map((column) => column.name)).toEqual(names);
-              } finally {
-                prepared.close();
-              }
-              await expect(native.query(sql)).rejects.toMatchObject({
-                code: "MINNOW_UNSUPPORTED_PLAN",
-                sqlState: "0A000",
-                construct: "setOp",
-              });
-              reach.reach("union");
-              reach.reach("prepared labels");
-              return;
-            }
             if (shape === "direct") {
               expect(compileQuery(sql).select.map((item) => item.alias)).toEqual([
                 label,

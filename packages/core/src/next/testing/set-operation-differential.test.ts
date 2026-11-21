@@ -175,7 +175,7 @@ for (const seed of seedsFor("next-set-operations", [0x5e71, 0x5e72]))
                   how === "grouping sets") &&
                 arms.some((a) => a.kind === "concat") &&
                 (error as { sqlState?: string }).sqlState === "0A000" &&
-                /inside a UNION ALL arm/u.test((error as Error).message);
+                (error as Error).message.includes("inside a UNION ALL arm");
               if (!unionAllPhase) throw error;
               reach.reach("phase arm refused under UNION ALL");
               return;
@@ -276,3 +276,50 @@ for (const seed of seedsFor("next-set-operations", [0x5e71, 0x5e72]))
       await pg.close();
     }
   }, 240000);
+
+it("compares blank-padded CHAR and json like PostgreSQL, or refuses", async () => {
+  const pg = new PGlite();
+  const core = await new StorageCore(32).open();
+  try {
+    for (const ddl of [
+      "CREATE TABLE p(id INT PRIMARY KEY, j JSON)",
+      "INSERT INTO p VALUES (1, '{\"x\":1}'), (2, '{\"x\":1}'), (3, '[1]')",
+      // next/ cannot write CHAR(n) values yet (bounded text casts are refused), so this table
+      // stays empty; the refusal below comes from planning, before any row is read.
+      "CREATE TABLE q(id INT PRIMARY KEY, c CHAR(3))",
+    ]) {
+      await pg.exec(ddl);
+      await core.execute(ddl);
+    }
+    for (const kind of ["UNION", "INTERSECT", "INTERSECT ALL", "EXCEPT", "EXCEPT ALL"]) {
+      // CHAR(n) compares without trailing blanks (bpchar equality, so 'a' = 'a  '). The
+      // hash-count operator keys the stored text, so next/ refuses rather than split them.
+      const chars = `SELECT c FROM q ${kind} SELECT c FROM q`;
+      expect((await pg.query(chars)).rows, chars).toEqual([]);
+      const refusal: unknown = await core.execute(chars).then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      expect(refusal, chars).toMatchObject({ sqlState: "0A000" });
+      expect(String(refusal), chars).toContain("blank-padded CHAR equality");
+      // json has no equality operator: PostgreSQL refuses every deduplicating set operation.
+      const json = `SELECT j FROM p ${kind} SELECT j FROM p`;
+      await expect(pg.query(json), json).rejects.toMatchObject({ code: "42883" });
+      await expect(core.execute(json), json).rejects.toMatchObject({ sqlState: "42883" });
+    }
+    // UNION ALL compares nothing, so both types run.
+    for (const all of [
+      "SELECT c FROM q UNION ALL SELECT c FROM q",
+      "SELECT j::text AS j FROM p UNION ALL SELECT j::text FROM p ORDER BY 1",
+    ]) {
+      const ran = await core.execute(all);
+      if (!("batches" in ran)) throw new Error(`Expected UNION ALL rows: ${all}`);
+      expect(rowsOf(oracleRows(ran)), all).toEqual(
+        rowsOf((await pg.query<Record<string, unknown>>(all)).rows),
+      );
+    }
+  } finally {
+    await core.close();
+    await pg.close();
+  }
+}, 60_000);

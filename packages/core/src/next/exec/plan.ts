@@ -3135,6 +3135,11 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
         };
       }
       case "setOp": {
+        // Lowering builds two-input set operations; fewer inputs is a malformed plan.
+        if (rel.inputs.length < 2)
+          throw new UnsupportedPlanError("a set operation over fewer than two inputs", {
+            construct: "setOp",
+          });
         if (rel.kind === "union" && rel.all) {
           // UNION ALL: every arm in order into one consumer; an arm's end is not the union's.
           // Lowering conforms each arm to the union's column types. Arms are not phase parents

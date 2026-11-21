@@ -397,7 +397,7 @@ not grow in RAM. A one-key collision pass guarantees progress when partition has
 Optional file write caches have one bounded shared allowance; exhaustion falls back to direct
 page writes. Typed execution limits: 1–31 hash-key columns, no CHAR blank-padding equality,
 JSONB/array semantic keys or locators. Plain JSON lacks equality and is rejected with PG 42883.
-UNION DISTINCT and INTERSECT remain explicit execution refusals. Stored formats and shipped SQL
+The same operator now runs INTERSECT [ALL] and distinct UNION (see README "Set operations"). Stored formats and shipped SQL
 behavior are unchanged. Generated SQL and resident/spilled real-scratch campaigns compare
 multiplicities, NULLs and representative float/NUMERIC/INTERVAL output exactly with PGlite.
 Wide EXCEPT rows preflight key encoding, the copied key and representative together. Spill

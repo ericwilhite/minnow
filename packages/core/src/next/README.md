@@ -3452,7 +3452,8 @@ not require a home cache directory.
   phase. ROLLUP, CUBE and GROUPING SETS with several sets lower to a UNION ALL of grouped
   aggregates over the same input, so such an expression in their input is refused too. EXCEPT, INTERSECT and distinct UNION share one hash-count operator (exec/except.ts) that
   counts every distinct row's copies on each side and emits PostgreSQL's count for the kind;
-  their arms are phase parents, so such expressions run there.
+  their arms are phase parents, so such expressions run there. They compare rows, so json arms
+  are refused with PostgreSQL's 42883 and blank-padded CHAR arms with 0A000.
 - A FULL JOIN with no hash-joinable condition lowers, though PostgreSQL refuses it (0A000): an
   intended extension (R24.2), checked against PostgreSQL's LEFT JOIN UNION ALL anti-join rewrite.
 - Integer and timestamp GENERATE_SERIES in FROM streams fixed prepaid batches with NULL/zero-step rules,
