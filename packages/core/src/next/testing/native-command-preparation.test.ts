@@ -277,8 +277,8 @@ for (const seed of seedsFor("next-native-command-preparation", [49701, 49702]))
                 tx.rollback();
                 tx = null;
                 reach.reach("above-cap refusal at the cap");
-              } else if (refusal) {
-                // Only the largest generated bodies at 32 MiB; never below the cap.
+              } else if (refusal && mode === "cancel") {
+                // A cancelled history may still be refused above the cap before it waits.
                 expect(refusal.sqlState).toBe("53200");
                 expect(refusal.bytes).toBeGreaterThan(refusal.capacity);
                 tx.rollback();
@@ -368,9 +368,3 @@ for (const seed of seedsFor("next-native-command-preparation", [49701, 49702]))
       await pg.close();
     }
   }, 600000);
-
-// At 32 MiB the writer's next-step floor (19.5 MB: rows 4 MiB, commit buffers 6 MiB, merge
-// 4.73 MB, metadata headroom, fixed caches) beside a large generated body's preparation (14.5 MB)
-// exceeds the cap, so those histories refuse with 53200. Sizing the floor from the statement is
-// the writer-floors follow-up; then every generated free history fits at 32 MiB.
-it.todo("fits every generated free history at 32 MiB once writer floors are sized per statement");
