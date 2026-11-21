@@ -20,6 +20,7 @@ import {
   captureNativeLease,
   restoreNativeImage,
   monitorNativeCapacity,
+  watchDurableWrites,
 } from "./lib/native-storage-image.mts";
 
 const hash = (bytes: Uint8Array): string => createHash("sha256").update(bytes).digest("hex");
@@ -190,8 +191,11 @@ for (const seed of seedsFor("native-bench-image-sql", [0xb7c2, 0xb7c3]))
       );
       expect(monitor.lease.signal.aborted).toBe(false);
       await restoreNativeImage(second.harness.backend, join(directory, "image"), "fixture");
+      // The same build opens its own image without writing log, data or root files.
+      const watch = watchDurableWrites(second.harness.backend);
       await second.open();
       secondOpen = true;
+      expect(watch.stop()).toBe(0);
       const result = await second.execute(query);
       if (!("batches" in result)) throw new Error("expected query");
       expect(oracleRows(result)).toEqual(expected);
@@ -221,3 +225,49 @@ for (const seed of seedsFor("native-bench-image-sql", [0xb7c2, 0xb7c3]))
       await rm(directory, { recursive: true, force: true });
     }
   }, 30000);
+
+/** The named slots, each required. */
+function slotsOf(lease: OwnerLease) {
+  const all = slots(lease);
+  const named = (name: string): SyncFile => {
+    const file = all[name];
+    if (file === undefined) throw new Error(`no ${name} slot`);
+    return file;
+  };
+  return {
+    log: named("log"),
+    data: named("data"),
+    root1: named("root1"),
+    metadata: named("metadata"),
+    "metadata-index": named("metadata-index"),
+  };
+}
+it("counts writes to an image's durable files only, and uninstalls", async () => {
+  const backend = new MemoryBackend();
+  const watch = watchDurableWrites(backend);
+  const lease = await backend.acquire();
+  try {
+    const files = slotsOf(lease);
+    files.metadata.write(Uint8Array.of(1, 2), { at: 0 });
+    files["metadata-index"].truncate(0);
+    expect(watch.stop()).toBe(0);
+  } finally {
+    await lease.release();
+  }
+  const again = watchDurableWrites(backend);
+  const second = await backend.acquire();
+  try {
+    const files = slotsOf(second);
+    files.data.write(Uint8Array.of(1), { at: 0 });
+    files.root1.truncate(0);
+    files.log.write(Uint8Array.of(2), { at: 0 });
+    files.metadata.write(Uint8Array.of(3), { at: 0 });
+    expect(again.stop()).toBe(3);
+    // Stopped: the files' own methods are back, and later writes are not counted.
+    files.data.write(Uint8Array.of(4), { at: 1 });
+    expect(again.stop()).toBe(3);
+    expect(Object.getOwnPropertyDescriptor(files.data, "write")).toBeUndefined();
+  } finally {
+    await second.release();
+  }
+});

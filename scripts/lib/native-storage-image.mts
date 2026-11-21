@@ -102,6 +102,61 @@ export function monitorNativeCapacity(backend: StorageBackend) {
   };
 }
 
+/** The files that hold database state. `metadata` and `metadata-index` are owner-private,
+ * reconstructible caches that every open rewrites; they are never recovered as state.
+ */
+const durable = (name: string): boolean =>
+  name === "log" || name === "data" || /^root\d+$/u.test(name);
+
+/** Install before opening a restored image: counts writes and truncations of its durable files
+ * (log, data, roots). Opening an image in a build that reads its stored format writes none; a
+ * conversion or upgrade must. `stop()` uninstalls and returns the count.
+ */
+export function watchDurableWrites(backend: StorageBackend) {
+  const descriptor = Object.getOwnPropertyDescriptor(backend, "acquire");
+  const acquire = backend.acquire.bind(backend);
+  const undo: Array<() => void> = [];
+  let writes = 0,
+    stopped = false;
+  backend.acquire = async (options) => {
+    const lease = await acquire(options);
+    for (const [name, file] of filesOf(lease)) {
+      if (!durable(name)) continue;
+      const writeDescriptor = Object.getOwnPropertyDescriptor(file, "write"),
+        truncateDescriptor = Object.getOwnPropertyDescriptor(file, "truncate");
+      const write = file.write.bind(file),
+        truncate = file.truncate.bind(file);
+      file.write = (buffer, options) => {
+        writes++;
+        return write(buffer, options);
+      };
+      file.truncate = (size) => {
+        writes++;
+        truncate(size);
+      };
+      undo.push(() => {
+        if (writeDescriptor === undefined) Reflect.deleteProperty(file, "write");
+        else Object.defineProperty(file, "write", writeDescriptor);
+        if (truncateDescriptor === undefined) Reflect.deleteProperty(file, "truncate");
+        else Object.defineProperty(file, "truncate", truncateDescriptor);
+      });
+    }
+    return lease;
+  };
+  return {
+    stop(): number {
+      if (!stopped) {
+        stopped = true;
+        if (descriptor === undefined) Reflect.deleteProperty(backend, "acquire");
+        else Object.defineProperty(backend, "acquire", descriptor);
+        for (const restore of undo) restore();
+        undo.length = 0;
+      }
+      return writes;
+    },
+  };
+}
+
 /** Caller must quiesce the writer first and keep it quiescent throughout this copy.
  * Borrow the existing lease without releasing it: capturing the committed log tail before
  * close preserves the original input rather than forcing a final checkpoint/row reorder.
