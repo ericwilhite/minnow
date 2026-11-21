@@ -29,6 +29,7 @@ async function freshScope(f: Awaited<ReturnType<typeof commandRootFixture>>) {
     },
   });
   if (!(statement instanceof StatementImpl)) throw new Error("Native statement required");
+  f.useStatement(statement);
   return { ...f.scope, statement };
 }
 function source(rows: number, published: boolean) {
