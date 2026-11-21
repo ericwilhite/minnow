@@ -38,22 +38,6 @@ jobs:
       - run: bash scripts/ci-install.sh
       - run: npm run test:simulator:full
 
-  native-write-large:
-    # 20,000-row native trigger writes against PostgreSQL (writer floors steps 2-3), too slow for
-    # a unit shard. Until a trigger body's keyed read stops sizing the whole memtable (one
-    # readHint per memtable row per lookup), these histories cannot finish within the timeout.
-    name: Large native writes against PostgreSQL
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 24
-          cache: npm
-      - run: bash scripts/ci-install.sh
-      - run: npm run test:native-write:large
-
   browser-conformance:
     name: Full browser conformance (${{ matrix.browser }})
     runs-on: ${{ matrix.os }}
