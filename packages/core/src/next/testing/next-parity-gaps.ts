@@ -17,11 +17,6 @@ export interface ParityGap {
 
 export const NEXT_PARITY_GAPS: readonly ParityGap[] = [
   {
-    id: "union-all",
-    message: /^The executor does not support set operation other than binary EXCEPT$/u,
-    reason: "UNION / UNION ALL / INTERSECT: the executor runs binary EXCEPT only (set operations)",
-  },
-  {
     id: "trigger-indexed-domain-preflight",
     message: /^The executor does not support native trigger indexed-domain preflight$/u,
     reason:

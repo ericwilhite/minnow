@@ -52,9 +52,6 @@ it.each(seedsFor("next-json-record-names", [0xb72a, 0xb72b]))(
           reach.beginHistory();
           const names = labels[shape] ?? labels[0];
           const expression = (i: number): string => {
-            // General computed UNION ALL arms remain a typed executor refusal.
-            // This arm exercises supported literal UNIONs with the same data.
-            if (wrapper === 9) return String(value + i);
             const base =
               expressionKind === 1
                 ? `(${String(value + i)}+0)`
