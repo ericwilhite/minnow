@@ -323,3 +323,33 @@ it("compares blank-padded CHAR and json like PostgreSQL, or refuses", async () =
     await pg.close();
   }
 }, 60_000);
+
+// Known divergence, pinned so the planning-time folding fix flips it: PostgreSQL folds immutable
+// constant expressions while planning (eval_const_expressions), so a constant 1/0 raises 22012
+// before any row is produced, whatever LIMIT says. next/ evaluates it lazily, like 0.20 and like
+// next/ without a set operation (SELECT 1/0 LIMIT 0). Data-dependent errors stay lazy in both.
+it("known divergence: a constant error in a later UNION ALL arm is skipped by LIMIT", async () => {
+  const pg = new PGlite();
+  const core = await new StorageCore(32).open();
+  try {
+    const sql = "SELECT 99 AS x UNION ALL SELECT 1/0 LIMIT 1";
+    await expect(pg.query(sql)).rejects.toMatchObject({ code: "22012" });
+    const result = await core.execute(sql);
+    if (!("batches" in result)) throw new Error("Expected rows");
+    expect(oracleRows(result)).toEqual([{ x: 99 }]);
+    // A data-dependent error behind the same stop is lazy in PostgreSQL too. (A VALUES source
+    // would not do: PostgreSQL pulls it up and folds 1 / (1 - 1) as a constant.)
+    for (const ddl of ["CREATE TABLE z(x INT)", "INSERT INTO z VALUES (1)"]) {
+      await pg.exec(ddl);
+      await core.execute(ddl);
+    }
+    const lazy = "SELECT 99 AS x UNION ALL SELECT 1 / (x - x) FROM z LIMIT 1";
+    expect((await pg.query(lazy)).rows).toEqual([{ x: 99 }]);
+    const lazyResult = await core.execute(lazy);
+    if (!("batches" in lazyResult)) throw new Error("Expected rows");
+    expect(oracleRows(lazyResult)).toEqual([{ x: 99 }]);
+  } finally {
+    await core.close();
+    await pg.close();
+  }
+});
