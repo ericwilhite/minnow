@@ -5,10 +5,10 @@ import {
   capturedWriterReferences,
   type CapturedWriterExtents,
 } from "../storage/writer-extents.js";
-import { ChangeFeed } from "../access/changes.js";
+import { CHANGE_FEED_BYTES, ChangeFeed } from "../access/changes.js";
 import { freshDatabaseIdentity } from "../format/database-identity.js";
 import type { RetirementInventory } from "../storage/retirement-contract.js";
-import { FtsMutations, type FtsMutationCommit } from "./fts-mutations.js";
+import { FTS_MUTATION_BASE_BYTES, FtsMutations, type FtsMutationCommit } from "./fts-mutations.js";
 import { ftsMutationScan } from "./fts-undo.js";
 import { checkpointFtsMutations } from "./fts-mutation-checkpoint.js";
 import { ftsReplayCoverage } from "./fts-replay.js";
@@ -154,7 +154,7 @@ import {
 } from "../memory/governor.js";
 import { CommandMaintenance, waitCommandMaintenance } from "./command-wait.js";
 import { WriteCredits, WRITE_ROW_STEP_BYTES, type PreparedWriteCredit } from "./credits.js";
-import { NativeWriteSteps } from "./native-step.js";
+import { NATIVE_WRITE_STEP_BYTES, NativeWriteSteps } from "./native-step.js";
 import { FIXED_CACHE_BYTES } from "../storage/page-cache.js";
 import type {
   NativeWriteStepBoundary,
@@ -180,6 +180,7 @@ import {
   CommitBuffers,
   SMALL_COMMIT_BYTES,
   StreamCommit,
+  COMMIT_BUFFER_OVERHEAD,
 } from "./commit-buffers.js";
 import { ByteWindow } from "./window.js";
 import { sortDeleteOrder, streamBody } from "./stream-body.js";
@@ -751,7 +752,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
       stabilize: (owner, bytes, capacity, signal) =>
         this.#stabilizeNativeStep(owner, bytes, capacity, signal),
     });
-    credits.onNativeStepChange(this.#nativeProgress);
+    // Credit transitions (a merge step returned, headroom retired) can make forecasts retirable.
+    credits.onNativeStepChange((growth) => {
+      this.#nativeProgress(growth);
+      this.#reclaimable();
+    });
     this.#arenaPool = new ArenaPool(
       grant,
       Math.min(8 * 1024 * 1024, Math.floor(input.governor.capBytes / 32)),
@@ -812,7 +817,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
       governor: input.governor,
       space,
       budget: grant,
-      readers: new ReaderRegistry(this.#nativeProgress),
+      // A reader closing can release what only older readers kept (a dropped table's memtables,
+      // retired run readers): wake reclaim for it, as any transition that frees credit does.
+      readers: new ReaderRegistry(() => {
+        this.#nativeProgress();
+        this.#reclaimable();
+      }),
       pinState: (state, label) => this.#pinState(state, label),
       runReader: (ref) => this.#runReader(ref),
       groupRoot: (ref, budget) => this.#metadata.groupRoot(ref, budget),
@@ -905,13 +915,16 @@ export class WritePathImpl implements WritePath, EngineHooks {
         : {
             rows: engine.#recovering ? MINIMUM_BYTES : 0,
             // A running attempt must finish or unwind before its prepaid window moves.
-            metadata:
+            metadata: Math.max(
               engine.#metadataWriters > 0 ||
-              credits.hasMergeStep ||
-              engine.#commitEncoding > 0 ||
-              (!engine.#recovering && engine.#appender.hasPendingWork)
+                credits.hasMergeStep ||
+                engine.#commitEncoding > 0 ||
+                (!engine.#recovering && engine.#appender.hasPendingWork)
                 ? metadataGrant.held
                 : 0,
+              // A refused metadata attempt's funded credit, until that attempt settles.
+              engine.#metadataBudget.fundedBytes,
+            ),
             commits:
               engine.#commitEncoding > 0 || (!engine.#recovering && engine.#appender.hasPendingWork)
                 ? COMMIT_MINIMUM_BYTES
@@ -920,9 +933,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
     );
     const reclaimWriter = () => {
       if (engine !== null) engine.#arenaPool.clear();
-      return engine !== null && engine.#canRetireIdleForecasts()
-        ? credits.reclaimIdleForecasts()
-        : credits.reclaimRows();
+      if (engine === null || !engine.#canRetireIdleForecasts()) return credits.reclaimRows();
+      // Idle state only a flush or publication frees is spilled; it funds itself through the
+      // ordinary growth paths only for what it needs (no up-front minimum that would stand in
+      // front of a request that already fits).
+      engine.#spillIdleMemtables();
+      return credits.reclaimIdleForecasts();
     };
     grant.onReclaimRequest(reclaimWriter);
     // Before any growth wait: pooled arenas are live but dependent (rebuilt on demand), so
@@ -945,7 +961,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
       input.governor.capBytes,
       (wanted) => credits.growTo(metadataGrant, wanted),
       () => {
-        if (engine) engine.#nativeProgress();
+        // Freed metadata (a snapshot's pins, readers or a dropped table's charge) is credit a
+        // queued request may now reclaim.
+        if (engine) {
+          engine.#nativeProgress();
+          engine.#reclaimable();
+        }
       },
     );
     let commitBuffers: CommitBuffers | null = null;
@@ -1079,6 +1100,13 @@ export class WritePathImpl implements WritePath, EngineHooks {
       // scanLogIncremental has returned its buffer. Its open-only reservation
       // cannot remain ahead of an independently admitted query after readiness.
       credits.retireRowsMinimum(MINIMUM_BYTES - RECOVERY_SCAN_BYTES);
+      // Lifetime holdings (GOVERNOR-WAIT-POLICY): the page cache's fixed slabs, permanent
+      // storage and the resident metadata stay charged until close, whatever reclaim asks, so
+      // an admission only their release could serve is refused at once. The owner's own
+      // holdings (scratch control) are registered by the owner, never counted twice here.
+      const ready = engine;
+      engine.#unregisterLifetime =
+        input.governor.registerPermanent?.(() => ready.#lifetimeBytes()) ?? null;
       if (input.deferInitialMaintenance !== true) engine.startInitialMaintenance();
       return engine;
     } catch (error) {
@@ -1334,7 +1362,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
       },
       this.#commitBuffers,
       () => this.#check(),
-      () => this.#credits.retireMetadataHeadroom(0),
+      () => {
+        this.#credits.retireMetadataHeadroom(0);
+        // Pending log work has drained: the commit forecasts may now be retirable.
+        this.#reclaimable();
+      },
     );
   }
 
@@ -1803,15 +1835,20 @@ export class WritePathImpl implements WritePath, EngineHooks {
   #currentPin: SpacePin | null = null;
 
   #publishState(): void {
+    const tables = new Map<number, TableView>();
+    for (const [id, state] of this.#tables) tables.set(id, state.view);
+    const next: WriteState = { root: this.#root, tables };
+    // Funded before it is exposed (review 10): the pin's charge may be refused (the caller's
+    // metadata retry then grows and publishes again); until it succeeds the previous state, already
+    // pinned, stays current, so a concurrent begin() or snapshot never pins an unfunded state.
+    const pin = this.#pinState(next, "current state");
     if (this.#root.fts.staged === null) {
       this.#ftsPending = null;
       this.#ftsUnclaimed = false;
     }
-    const tables = new Map<number, TableView>();
-    for (const [id, state] of this.#tables) tables.set(id, state.view);
-    this.#state = { root: this.#root, tables };
+    this.#state = next;
     const previous = this.#currentPin;
-    this.#currentPin = this.#pinState(this.#state, "current state");
+    this.#currentPin = pin;
     previous?.release();
   }
 
@@ -2028,6 +2065,20 @@ export class WritePathImpl implements WritePath, EngineHooks {
   };
 
   /** Reclaim dormant forecasts only while no native step can still consume them. */
+  #reclaimWake = false;
+  /** A transition that can make forecasts retirable (a writable statement or transaction
+   * ending, maintenance, a metadata writer, commit encoding, a flush or merge finishing) wakes
+   * the governor, so a queued admission is offered the reclaim it now allows instead of waiting
+   * for an unrelated release. Deferred to a microtask: never re-enter the governor mid-operation. */
+  #reclaimable(): void {
+    if (this.#reclaimWake) return;
+    this.#reclaimWake = true;
+    queueMicrotask(() => {
+      this.#reclaimWake = false;
+      if (!this.#closed && this.#canRetireIdleForecasts()) this.#credits.notifyReclaimable();
+    });
+  }
+
   #canRetireIdleForecasts(): boolean {
     // This is a phase boundary, not a guess that a pending writer will soon finish.
     // A queued/retrying preparation must either recheck its own admission or keep
@@ -2047,6 +2098,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       !this.#flushScheduled &&
       !this.#mergeScheduled &&
       !this.#merging &&
+      !this.#spilling &&
       // A holder excludes maintenance from the single writer slot. A recycler
       // queued behind that holder owns no step and cannot pin future credit.
       (this.#recycling === null || this.#holder !== null) &&
@@ -2210,6 +2262,53 @@ export class WritePathImpl implements WritePath, EngineHooks {
     return () => this.#ownerHoldings.delete(bytes);
   }
 
+  #unregisterLifetime: (() => void) | null = null;
+
+  /** Charged until close and never released on a reclaim request (GOVERNOR-WAIT-POLICY,
+   * lifetime holdings): the page cache's fixed slabs, permanent storage, the current state's
+   * resident metadata and pin; the engine's fixed controls on the rows grant; the resident commit
+   * writers and the log header on the commit buffers. Only what lives until close, or for as long
+   * as the current state needs it, never what a finite holder releases: not run readers or
+   * table metadata kept only by older snapshots (they go when those close), FTS mutation entries
+   * (metadata reclaim drops them once a publication covers them), pending index records (a
+   * publication settles them), pooled arenas (reclaim clears them), memtable content (the idle
+   * spill flushes it), or anything a statement, commit, flush or merge holds while it runs. */
+  #lifetimeBytes(): number {
+    const writer = (bytes: ByteWriter) =>
+      bytes.bytes.byteLength === 0 ? 0 : bytes.bytes.byteLength + COMMIT_BUFFER_OVERHEAD;
+    let metadata =
+      (this.#roots.get(this.#root)?.bytes ?? 0) +
+      this.#ftsMetadataBytes +
+      (this.#ftsMutations === null ? 0 : FTS_MUTATION_BASE_BYTES);
+    const readers = new Set<RunReader>();
+    for (const state of this.#tables.values()) {
+      metadata += state.metadataBytes + state.view.groups.chargedBytes;
+      for (const runs of state.view.runs.values())
+        for (const run of runs) {
+          const reader = this.#runReaders.get(blobKey(run.entries));
+          if (reader !== undefined && !(reader instanceof Promise)) readers.add(reader);
+        }
+    }
+    for (const reader of readers) metadata += reader.bytes;
+    return (
+      FIXED_CACHE_BYTES +
+      this.#space.stats.permanentBytes +
+      metadata +
+      // The change feed, created on first use, lives until close: its base and the rekey history
+      // it keeps for live queries. Listener cells are their subscribers' (finite) holdings.
+      (this.#changes === null ? 0 : CHANGE_FEED_BYTES + this.#changes.historyBytes) +
+      (this.#currentPin === null ? 0 : (this.#statePins.get(this.#state)?.pin.bytes ?? 0)) +
+      OBJECT_OVERHEAD_BYTES +
+      NATIVE_WRITE_STEP_BYTES +
+      ArenaPool.overhead +
+      this.keys.residentBytes +
+      writer(this.#columns) +
+      writer(this.#body) +
+      writer(this.#sequenceBody) +
+      this.#appender.residentBytes
+    );
+  }
+
   #mandatoryOwnerBytes(): number {
     let total = FIXED_CACHE_BYTES + this.#space.stats.permanentBytes;
     for (const bytes of this.#ownerHoldings) total += bytes();
@@ -2253,6 +2352,44 @@ export class WritePathImpl implements WritePath, EngineHooks {
   /** Only a root whose data/producer leases have retired calls this operation. Relief
    * changes representation, not accepted effects; staging keeps the shared undo exact. */
   async #stabilizeNativeStep(
+    owner: object,
+    rootBytes: number,
+    capacity: number,
+    signal: AbortSignal,
+  ): Promise<void> {
+    // A native root's statement end must never wait while the root holds credit. Once the
+    // statement holds FTS-keyed undo, this compound step funds the statement-end FTS minimum
+    // beside the root's bytes, against the root's own capacity; ending then finds it held.
+    this.#checkNativeStep(owner);
+    const holder = owner.tx;
+    let funded = false;
+    if (!holder.ftsMutationPrepared && this.#ftsRelevant(holder.catalog)) {
+      const keyed = owner.needsFtsPreparation();
+      if (keyed instanceof Promise ? await keyed : keyed) {
+        holder.ftsMutationPrepared = funded = true;
+        this.#nativeSteps.changed(true);
+      }
+    }
+    try {
+      await this.#stabilizeNativeStepOnce(owner, rootBytes, capacity, signal);
+    } catch (error) {
+      if (funded) {
+        // A refused or cancelled step owns no future FTS step (as in prepareFtsMutation).
+        holder.ftsMutationPrepared = false;
+        this.#credits.retireMetadataHeadroom(
+          Math.max(
+            this.#minimumMetadata,
+            (this.#ftsMutations?.appliedLsn ?? 0) > this.#ftsCoveredLsn
+              ? FTS_PUBLICATION_MINIMUM_BYTES
+              : 0,
+          ),
+        );
+      }
+      throw error;
+    }
+  }
+
+  async #stabilizeNativeStepOnce(
     owner: object,
     rootBytes: number,
     capacity: number,
@@ -2720,10 +2857,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
       }
     } catch (error) {
       this.#claimed = false;
+      this.#reclaimable();
       this.#passSlot();
       throw error;
     }
     this.#claimed = false;
+    this.#reclaimable();
     const tx = new TransactionImpl(this, this.appliedLsn);
     this.#holder = tx;
     return tx;
@@ -2786,6 +2925,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     )
       this.#ftsUnclaimed = true;
     this.#holder = null;
+    this.#reclaimable();
     this.#passSlot();
     // A frozen memtable may have waited for this writer's pending rows.
     if (this.#hasFrozen()) this.#scheduleFlush();
@@ -2829,14 +2969,38 @@ export class WritePathImpl implements WritePath, EngineHooks {
     return false;
   }
 
+  /** Whether an FTS publication can follow this transaction's writes: an FTS index in the
+   * catalog, FTS state in the root, or FTS mutations not yet covered (writeStepMinimum's test). */
+  #ftsRelevant(catalog: Catalog): boolean {
+    const fts = this.#state.root.fts;
+    return (
+      catalog.fts.length > 0 ||
+      fts.checkpoint !== null ||
+      fts.staged !== null ||
+      (this.#ftsMutations?.appliedLsn ?? 0) > this.#ftsCoveredLsn
+    );
+  }
+
   /** Accepted keyed writes reserve their whole future publication phase before command end.
    * Check/source views have retired; no borrowed vector or second loan crosses this wait. */
+  statementEnded(): void {
+    this.#reclaimable();
+  }
+
   prepareFtsMutation(signal?: AbortSignal): MaybePromise<void> {
     this.#check();
     signal?.throwIfAborted();
     if (this.#holder === null) throw new Error("FTS mutation without native writer");
     const tx = this.#holder,
       wasPrepared = tx.ftsMutationPrepared;
+    // Without an FTS index or FTS state, no publication can follow: nothing to reserve.
+    if (!this.#ftsRelevant(tx.catalog)) return undefined;
+    // A native root funded this minimum in its last native step (#stabilizeNativeStep); waiting
+    // here, while the root still holds its credit, would be hold-and-wait.
+    if (tx.nativeCommands && !wasPrepared)
+      throw new TransactionStateError(
+        "A native root's statement end found its FTS minimum unfunded",
+      );
     tx.ftsMutationPrepared = true;
     const refused = (error: unknown): never => {
       // A failed admission owns no future FTS step. Do not leave an unfunded minimum
@@ -2854,7 +3018,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
       throw error;
     };
     try {
-      const admission = this.#prepareMinimum(tx.catalog, signal);
+      // Native roots fund every step against the whole cap; so does their statement end.
+      const admission = this.#prepareMinimum(tx.catalog, signal, tx.nativeCommands);
       return admission instanceof Promise ? admission.catch(refused) : admission;
     } catch (error) {
       return refused(error);
@@ -3089,6 +3254,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       } finally {
         if (hadWriter) {
           this.#metadataWriters--;
+          this.#reclaimable();
           this.#credits.retireMetadataHeadroom(0);
         }
       }
@@ -3183,6 +3349,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       return await this.#encodepreflightCommit(tx, request, staged);
     } finally {
       this.#commitEncoding--;
+      this.#reclaimable();
       this.#credits.retireMetadataHeadroom(0);
     }
   }
@@ -3249,6 +3416,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       return await this.#encodestreamCommit(tx, request, staged);
     } finally {
       this.#commitEncoding--;
+      this.#reclaimable();
       this.#credits.retireMetadataHeadroom(0);
     }
   }
@@ -3621,6 +3789,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
   async #closeNow(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
+    this.#unregisterLifetime?.();
+    this.#unregisterLifetime = null;
     this.#nativeSteps.cancel(new WritePathClosedError());
     this.#credits.cancel(new WritePathClosedError());
     this.#commitAbort.abort(new WritePathClosedError());
@@ -3651,6 +3821,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
     // An idle publication already started finishes (or, not yet publishing, sees close and
     // stops) before anything is released: nothing publishes after close resolves.
     await this.#idleRun;
+    // An idle spill already started (freeze, flush, no-change publication) finishes or, not yet
+    // publishing, sees close and stops, like the idle publication.
+    await this.#spillRun;
+    await this.#flushes;
     try {
       if (this.#appender.failure === null) await this.#appender.close();
     } finally {
@@ -3822,26 +3996,130 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#flushScheduled = true;
     this.#flushes = this.#flushes.then(async () => {
       this.#flushScheduled = false;
-      for (;;) {
-        if (this.failure !== null || this.#closed) return;
-        const work = this.#nextFlush();
-        if (work === null) {
-          this.#armIdlePublish();
-          return;
+      try {
+        for (;;) {
+          if (this.failure !== null || this.#closed) return;
+          const work = this.#nextFlush();
+          if (work === null) {
+            this.#armIdlePublish();
+            return;
+          }
+          const before = this.#flushProgress();
+          try {
+            await work;
+          } catch (error) {
+            if (!this.closed)
+              this.#failure ??= error instanceof Error ? error : new Error(String(error));
+            return;
+          }
+          // Invariant: every flush the loop runs makes progress (a publication, an abandoned
+          // flush of a dropped table, or durability for a wait); otherwise it stops rather than
+          // spin.
+          if (this.#flushProgress() === before) return;
         }
-        const before = this.#flushProgress();
-        try {
-          await work;
-        } catch (error) {
-          if (!this.closed)
-            this.#failure ??= error instanceof Error ? error : new Error(String(error));
-          return;
-        }
-        // Invariant: every flush the loop runs makes progress (a publication, an abandoned flush
-        // of a dropped table, or durability for a wait); otherwise it stops rather than spin.
-        if (this.#flushProgress() === before) return;
+      } finally {
+        // The flushed memtables' arenas are now idle credit a queued admission may reclaim.
+        this.#reclaimable();
       }
     });
+  }
+
+  #spilling = false;
+  /** The running idle spill; close waits for it (nothing publishes after close resolves). */
+  #spillRun: Promise<void> | null = null;
+  /** The last logged change an idle-spill publication covered (none: -1). */
+  #spillPublishedAt = -1;
+
+  /** Idle state only a publication releases, not yet published for: FTS mutation entries past
+   * the covered LSN, or pending index records. */
+  #unpublishedIdleState(): boolean {
+    if (this.#spillPublishedAt === this.#appender.lastLsn) return false;
+    const mutations = this.#ftsMutations;
+    return (
+      this.#pendingIndexes.size > 0 ||
+      (mutations !== null && Math.min(mutations.appliedLsn, this.durableLsn) > this.#ftsCoveredLsn)
+    );
+  }
+
+  /** The table's live memtable when it holds unflushed content of any kind: rows, index key
+   * deltas (inserts, tombstones, updates) or deletions (no transaction is open: all committed). */
+  #liveContent(state: TableState): Memtable | null {
+    const memtable = state.view.memtables[state.view.memtables.length - 1];
+    return memtable?.state === "live" &&
+      (memtable.rowCount > 0 || hasDeltaEntries(memtable) || memtable.deletions.size > 0)
+      ? memtable
+      : null;
+  }
+
+  /**
+   * Reclaim on an idle writer (GOVERNOR-WAIT-POLICY, lifetime holdings): unflushed memtable rows
+   * are credit only a flush frees, and without another write no flush comes, so a queued
+   * admission would wait on them indefinitely. They are spilled instead: frozen and flushed, as
+   * memtable pressure does (`#relieve`). Only with no transaction on the write slot, so every
+   * frozen row is committed. Deferred out of the governor's drain: republishing the state
+   * charges its pin, which may need the metadata grant to grow.
+   */
+  #spillIdleMemtables(): boolean {
+    if (this.#spilling) return true;
+    if (this.#closed || this.failure !== null || this.#holder !== null) return false;
+    if (
+      ![...this.#tables.values()].some((state) => this.#liveContent(state) !== null) &&
+      !this.#unpublishedIdleState()
+    )
+      return false;
+    this.#spilling = true;
+    this.#spillRun = Promise.resolve()
+      .then(() =>
+        this.#metadataRetry(() => {
+          // Re-checked on every attempt: a transaction may take the slot while this waits.
+          if (this.#holder !== null) return false;
+          let frozen = false;
+          for (const state of this.#tables.values()) {
+            const memtable = this.#liveContent(state);
+            if (memtable === null) continue;
+            memtable.state = "frozen";
+            state.view = { ...state.view };
+            frozen = true;
+          }
+          // Republished even when an earlier attempt froze and then failed to pin.
+          this.#publishState();
+          return frozen || this.#hasFrozen();
+        }),
+      )
+      .then(async (frozen) => {
+        if (frozen) {
+          this.#scheduleFlush();
+          await this.#flushes;
+        }
+        // State only a publication releases (uncovered FTS mutation entries, unsettled index
+        // records): one root with no table changes, once per logged change, so repeated reclaim
+        // requests never publish in a loop.
+        if (
+          !this.#closed &&
+          this.failure === null &&
+          this.#holder === null &&
+          this.#unpublishedIdleState()
+        ) {
+          const at = this.#appender.lastLsn;
+          // Marked only once published: a skipped publication (a transaction took the slot)
+          // leaves the state eligible for the next idle reclaim.
+          if (
+            await this.#metadataAsync(() =>
+              this.#publishUnchanged("idle spill", () => !this.closed && this.#holder === null),
+            )
+          )
+            this.#spillPublishedAt = at;
+        }
+      })
+      .catch((error: unknown) => {
+        if (!this.closed)
+          this.#failure ??= error instanceof Error ? error : new Error(String(error));
+      })
+      .finally(() => {
+        this.#spilling = false;
+        this.#reclaimable();
+      });
+    return true;
   }
 
   /** The next table flush that can run now (null when none), or a wait for durability. */
@@ -4340,6 +4618,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         if (writing) this.#flushesWriting -= 1;
       } finally {
         this.#metadataWriters--;
+        this.#reclaimable();
         this.#credits.retireMetadataHeadroom(0);
       }
     }
@@ -4726,6 +5005,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         }
       } finally {
         this.#metadataWriters--;
+        this.#reclaimable();
         this.#credits.retireMetadataHeadroom(0);
       }
     }
@@ -5124,6 +5404,16 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#armIdlePublish();
       return;
     }
+    // The lock may wait: closed, or garbage reclaimed by a publish meanwhile.
+    if (
+      await this.#publishUnchanged("idle publish", () => !this.closed && this.#garbageOverBound())
+    )
+      this.maintenance.idlePublishes += 1;
+  }
+
+  /** Publishes one root with no table changes (its FTS checkpoint and index settlements still
+   * apply), if `wanted` still holds once the publication lock is held. */
+  async #publishUnchanged(label: string, wanted: () => boolean): Promise<boolean> {
     const unlock = await this.#lock();
     let madeRoot: ManifestRoot | null = null;
     const delta = new DeltaPublication(
@@ -5135,15 +5425,14 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#sinkFailed,
       this.#pinBudget,
     );
-    const writer = this.#space.beginWrite("idle publish", {
+    const writer = this.#space.beginWrite(label, {
       ownershipBudget: this.#metadataBudget,
     });
     this.#metadataWriters++;
     try {
-      // The lock may have waited: closed, or garbage reclaimed by a publish meanwhile.
-      if (this.closed || !this.#garbageOverBound()) {
+      if (!wanted()) {
         await writer.abort();
-        return;
+        return false;
       }
       const released: ExtentRef[] = [];
       let root = await this.#nextRoot(writer, released, new Map(), delta);
@@ -5162,7 +5451,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#pruneCatalogs(root.globalLsn);
       this.#adoptTableRoots(root);
       this.#publishState();
-      this.maintenance.idlePublishes += 1;
+      return true;
     } catch (error) {
       if (writer.state === "open") await writer.abort().catch(() => undefined);
       throw error;
@@ -5173,6 +5462,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         unlock();
       } finally {
         this.#metadataWriters--;
+        this.#reclaimable();
         this.#credits.retireMetadataHeadroom(0);
       }
     }
@@ -5230,6 +5520,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     await this.#takeSlot("maintenance");
     if (this.#closed) {
       this.#maintenanceHolds = false;
+      this.#reclaimable();
       this.#passSlot();
       return;
     }
@@ -5382,10 +5673,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
         if (madeRoot !== null) this.#releaseRoot(madeRoot);
         unlock?.();
         this.#maintenanceHolds = false;
+        this.#reclaimable();
         this.#passSlot();
       } finally {
         if (writer !== null) {
           this.#metadataWriters--;
+          this.#reclaimable();
           this.#credits.retireMetadataHeadroom(0);
         }
       }
@@ -5420,6 +5713,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#mergeScheduled = true;
     this.#merges = this.#merges.then(async () => {
       this.#mergeScheduled = false;
+      this.#reclaimable();
       for (;;) {
         if (this.failure !== null || this.#closed) return;
         const job = this.#nextMerge();
@@ -5672,6 +5966,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     } finally {
       try {
         this.#merging = false;
+        this.#reclaimable();
         await delta.settle();
         if (madeRoot !== null) this.#releaseRoot(madeRoot);
         unlock?.();
@@ -5679,6 +5974,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         if (!mergeCreditReleased) this.#credits.releaseMerge(grant);
       } finally {
         this.#metadataWriters--;
+        this.#reclaimable();
         this.#credits.retireMetadataHeadroom(0);
         this.#nativeProgress();
       }
@@ -6181,9 +6477,15 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const seen = new Set<string>();
     // Use the worker deadline across tables, publications and prior exec/write work.
     // A cached metadata promise is not a task boundary.
-    for await (const reached of walkReachable(single, manifestReader(this.#metadata, this.#grant), {
-      skipCatalog: true,
-    })) {
+    // Through the metadata budget: a refused read is retried after growth (the publication runs
+    // in the metadata retry), never a ReadDeniedError on an idle writer's retired forecasts.
+    for await (const reached of walkReachable(
+      single,
+      manifestReader(this.#metadata, this.#metadataBudget),
+      {
+        skipCatalog: true,
+      },
+    )) {
       this.#check();
       this.#signal?.throwIfAborted();
       if (taskClock.due()) {

@@ -1,5 +1,5 @@
 /** Shipped trigger bodies have two derived write levels, including the terminal spent budget.
- * This component checks packet/frame capacity, not native SQL firing (still disabled).
+ * This component checks packet/frame capacity, not ordinary-owner SQL dispatch.
  */
 import fc from "fast-check";
 import { expect, it } from "vitest";

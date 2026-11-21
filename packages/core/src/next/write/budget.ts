@@ -54,6 +54,16 @@ export class MetadataBudget implements ByteBudget {
     readonly changed?: () => void,
   ) {}
 
+  readonly #funded: number[] = [];
+
+  /** Metadata credit a refused attempt was funded for and has not yet settled: reclaim keeps
+   * it (the writer's working minimum includes it). */
+  get fundedBytes(): number {
+    let most = 0;
+    for (const bytes of this.#funded) most = Math.max(most, bytes);
+    return most;
+  }
+
   ordinarySource(): ByteBudget {
     return this.grant;
   }
@@ -109,12 +119,36 @@ export class MetadataBudget implements ByteBudget {
     work: () => MaybePromise<T>,
     check: () => void,
     grow?: (wanted: number) => Promise<void>,
+    funded = 0,
   ): MaybePromise<T> {
     const refused = (error: unknown): MaybePromise<T> => {
       if (!(error instanceof MetadataPressure)) throw error;
-      return this.#wait(error.wanted, check, grow).then(() => {
+      // An earlier attempt of this work was funded to `funded`, and the grant fell below it
+      // without this refusal's allocations: the attempt itself moved credit out (a page read's
+      // charge handed to the cache). Fund that again on top, or every retry falls short by the
+      // same bytes and grows by just that much again.
+      const lost = Math.max(0, funded - this.grant.held);
+      const target = error.wanted + lost;
+      return this.#wait(target, check, grow).then(() => {
         check();
-        return this.retry(work, check, grow);
+        // The credit was grown for this attempt: reclaim keeps it until the attempt settles.
+        // An attempt awaits (a lock, a writer) before it allocates; without this a queued
+        // request's reclaim could take it back in between, and grow and retry would repeat.
+        this.#funded.push(target);
+        const settle = () => {
+          const at = this.#funded.indexOf(target);
+          if (at >= 0) this.#funded.splice(at, 1);
+        };
+        let result: MaybePromise<T>;
+        try {
+          result = this.retry(work, check, grow, target);
+        } catch (error) {
+          settle();
+          throw error;
+        }
+        if (result instanceof Promise) return result.finally(settle);
+        settle();
+        return result;
       });
     };
     try {

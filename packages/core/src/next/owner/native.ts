@@ -42,6 +42,10 @@ export async function openNativeOwnerEngine(
     minimumBytes: SCRATCH_CONTROL_BYTES,
     spillable: false,
   });
+  // Held for the owner's lifetime and never released on a reclaim request: a permanent holding,
+  // so an admission that only its release could serve is refused at once (53200).
+  const unregisterPermanent =
+    governor.registerPermanent?.(() => spillCredit.held) ?? (() => undefined);
   const scratchMemory = governor.registerCache({ evictableBytes: 0, evict: () => 0 });
   let spill: ScratchSpillService | undefined;
   const closeStorage = async () => {
@@ -65,6 +69,8 @@ export async function openNativeOwnerEngine(
       label: "native owner startup",
       minimumBytes: 8 << 20,
       spillable: true,
+      // The owner's scratch control grant stays held through this wait.
+      holdsCredit: true,
     });
     space = await openExtentSpace(session, {
       reachable: listedRootExtents(),
@@ -211,6 +217,7 @@ export async function openNativeOwnerEngine(
             await spill?.close();
           } finally {
             scratchMemory.unregister?.();
+            unregisterPermanent();
             spillCredit.close();
           }
         }
@@ -228,6 +235,7 @@ export async function openNativeOwnerEngine(
           await spill?.close();
         } finally {
           scratchMemory.unregister?.();
+          unregisterPermanent();
           spillCredit.close();
         }
       }

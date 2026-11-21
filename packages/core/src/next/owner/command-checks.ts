@@ -16,7 +16,7 @@ import { encodeKeyBatch, KeyBatch, type KeyColumn } from "../keys/key-encoding.j
 import { MinimumBudget } from "../memory/working-set.js";
 import type { Grant } from "../memory/governor.js";
 import type { ByteCharge } from "../vector/varlen.js";
-import { BATCH_ROWS, type Vector } from "../vector/vector.js";
+import { BATCH_ROWS, type Batch, type Vector } from "../vector/vector.js";
 import type { RegistryTargets } from "./registry-targets.js";
 import type { AcceptedCommandRow } from "./registry-commands.js";
 import { isNullAt } from "../write/columns.js";
@@ -63,6 +63,14 @@ export interface NativeCommandCheckScope {
   /** Shared root source step for informational references without a support index. */
   readonly scan?: {
     readonly reads: ChunkReads;
+    /** Production point decoder: one actual, publication-stable source step at a time. */
+    visit?(
+      tableId: number,
+      rowId: number,
+      columns: readonly number[],
+      signal: AbortSignal,
+      visitor: (batch: Batch, row: number) => boolean,
+    ): Promise<boolean>;
     prepare(table: TableDef, minimum: number, signal: AbortSignal): Promise<Grant>;
   };
 }
@@ -362,6 +370,58 @@ export class NativeCommandChecks {
     if (key && key.length > previous.length) invalid();
     if (key) previous.set(key);
     const length = key?.length ?? 0;
+    if (source.visit) {
+      const visit = source.visit.bind(source);
+      return targets.capture(async function* (stop) {
+        if (!key) return;
+        const combined = AbortSignal.any([signal, stop]);
+        signal.throwIfAborted();
+        stop.throwIfAborted();
+        // Locator/deletion metadata stays under the native snapshot's existing owner.
+        // No column chunk or source lease is borrowed across a point-source admission.
+        // The complete target set is sealed before ANY referential writer can run.
+        const pin = scope.statement.readOwn();
+        try {
+          const table = pin.internalTable(child.id);
+          for (const segment of table.segments) {
+            const deleted = await segment.deletions();
+            signal.throwIfAborted();
+            stop.throwIfAborted();
+            pin.checkRead();
+            for (let position = 0; position < segment.rowCount; position++) {
+              if (deleted?.isDeleted(position)) continue;
+              const rowId = table.rowId(segment.index * 65536 + position);
+              const equal = await visit(child.id, rowId, ids, combined, (batch, row) => {
+                const parts: KeyColumn[] = batch.columns.map((vector) => ({
+                  vector,
+                  direction: "asc",
+                  nulls: "first",
+                }));
+                if (parts.some((part) => isNullAt(part.vector, row))) return false;
+                one[0] = row;
+                const encoded = encodeKeyBatch(
+                  "equality",
+                  parts,
+                  { length: batch.length, selection: { rows: one, count: 1 } },
+                  keys,
+                );
+                if (!encoded.done || encoded.encoded !== 1) invalid();
+                const candidate = keys.key(0);
+                if (candidate.length !== length) return false;
+                for (let i = 0; i < length; i++) if (candidate[i] !== previous[i]) return false;
+                return true;
+              });
+              signal.throwIfAborted();
+              stop.throwIfAborted();
+              pin.checkRead();
+              if (equal) yield { tableId: child.id, rowId };
+            }
+          }
+        } finally {
+          pin.release();
+        }
+      });
+    }
     return targets.capture(async function* (stop) {
       if (!key) return;
       signal.throwIfAborted();

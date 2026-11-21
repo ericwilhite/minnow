@@ -456,11 +456,13 @@ export class KeyBatch {
   readonly writer: KeyWriter;
   readonly targetBytes: number;
   readonly #charge: ByteCharge;
+  readonly #initialBytes: number;
   offsets: Int32Array;
   count = 0;
 
   constructor(charge: ByteCharge, targetBytes = BATCH_TARGET_BYTES, initialBytes = 4096) {
     this.#charge = charge;
+    this.#initialBytes = initialBytes;
     this.targetBytes = targetBytes;
     this.writer = new KeyWriter(initialBytes, charge);
     this.writer.target = targetBytes;
@@ -481,6 +483,12 @@ export class KeyBatch {
     this.#charge.free(4 * this.offsets.length);
     this.offsets = grown;
     return true;
+  }
+
+  /** Bytes kept between batches: the key writer shrinks back to its initial buffer on reset;
+   * the offsets never shrink. */
+  get residentBytes(): number {
+    return this.#initialBytes + this.offsets.byteLength;
   }
 
   /** Bytes allocated from the charge. */

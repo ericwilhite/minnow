@@ -9,6 +9,7 @@
  * UPDATE … FROM and DELETE … USING join the target with their sources (lower/from.ts; a row
  * matched twice is updated once, `onRepeat: "first"`); MERGE is `lowerMerge`.
  */
+import { chargeExactBytes, copyMeterActive, subtreeBytes } from "../../engine/copy-meter.js";
 import type { ColumnDef, IndexDef, TableDef } from "../access/catalog.js";
 import type { OutputColumn, Rel, ScalarExpr } from "../ir/ir.js";
 import {
@@ -24,7 +25,13 @@ import type { Expression, JoinPlan, Predicate, TableSource } from "../../plan/mo
 import { crossJoinPlan } from "../../plan/model.js";
 import { coerce, settle, type Typed } from "./coerce.js";
 import { PlanningError, unsupported } from "./errors.js";
-import { asBool, lowerCondition, lowerExpression, type Scope } from "./expressions.js";
+import {
+  asBool,
+  lowerCondition,
+  lowerExpression,
+  type ExpressionState,
+  type Scope,
+} from "./expressions.js";
 import { parseQuery, prepareQuery } from "./frontend.js";
 import { lowerFrom, SOURCE_STRIDE, sourceOf, virtual, type FromClause } from "./from.js";
 import {
@@ -236,6 +243,24 @@ function generatedAssignmentError(def: ColumnDef): PlanningError {
   return new PlanningError(`column "${def.name}" can only be updated to DEFAULT`, "428C9");
 }
 
+/**
+ * An explicit DEFAULT cell lowers the column's stored default again, with its own literal
+ * buffers. The first copy per column is part of the statement's text-linear preparation bound;
+ * under a copy meter (engine/copy-meter.ts) every later copy charges the measured size of the
+ * first one, twice (the transient parse and the retained IR), before it is lowered.
+ */
+const loweredDefaults = new WeakMap<ExpressionState, Map<ColumnDef, number>>();
+function repeatedDefault(def: ColumnDef, state: ExpressionState): Typed {
+  if (!copyMeterActive()) return defaultValue(def, state);
+  let sizes = loweredDefaults.get(state);
+  if (sizes === undefined) loweredDefaults.set(state, (sizes = new Map<ColumnDef, number>()));
+  const prior = sizes.get(def);
+  if (prior !== undefined) chargeExactBytes(2 * prior);
+  const typed = defaultValue(def, state);
+  if (prior === undefined) sizes.set(def, subtreeBytes(typed.expr));
+  return typed;
+}
+
 export function lowerInsert(statement: Insert, builder: PlanBuilder): LoweredWrite {
   const table = targetTable(statement.table, builder);
   const names =
@@ -280,7 +305,7 @@ export function lowerInsert(statement: Insert, builder: PlanBuilder): LoweredWri
         );
       return targets.map((def, index): Typed => {
         const value = row[index] ?? null;
-        if (isDefaultInsertValue(value)) return defaultValue(def, state);
+        if (isDefaultInsertValue(value)) return repeatedDefault(def, state);
         if (def.generatedSql !== null || def.identityAlways === true)
           throw new PlanningError(
             `cannot insert a non-DEFAULT value into column "${def.name}"`,

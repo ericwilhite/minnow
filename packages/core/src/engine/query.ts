@@ -4,6 +4,14 @@ import {
   copyIdentifierSource,
 } from "./identifier-sources.js";
 import {
+  asLoweredCopy,
+  asTransientCopy,
+  chargeNode,
+  chargeSlotArrays,
+  chargeSubtree,
+  copyMeterActive,
+} from "./copy-meter.js";
+import {
   rememberAlwaysIdentity,
   rememberForeignKeyActions,
   type ForeignKeyActionSource,
@@ -2527,7 +2535,7 @@ export function subqueryResolutionSteps(plan: CompiledQuery): {
   steps: SubqueryResolutionStep[];
 } {
   if (!blockHasSubqueries(plan)) return { plan, steps: [] };
-  const clone = clonePlanTree(plan);
+  const clone = clonePlanRoot(plan);
   const steps: SubqueryResolutionStep[] = [];
   const rewrite = (expression: Expression, replace: (next: Expression) => void): void => {
     if (expression.kind === "subquery") {
@@ -3052,12 +3060,53 @@ export function clonePlanTree<T>(value: T): T {
   return cloneTreeValue(value) as T;
 }
 
+/** A whole-plan pass copy (the pass returns it in place of its input). Metered at its own size. */
+/** Grouping-set arrays about to be rebuilt by a map: their slots are metered first. */
+function chargedSets<T extends ReadonlyArray<readonly unknown[]>>(sets: T): T {
+  if (copyMeterActive()) chargeSlotArrays(sets.map((set) => set.length));
+  return sets;
+}
+
+function groupingSetSlots(sets: ReadonlyArray<readonly unknown[]>): number {
+  let slots = 0;
+  for (const set of sets) slots += set.length;
+  return slots;
+}
+
+function bitCount(mask: number): number {
+  let count = 0;
+  for (let rest = mask; rest !== 0; rest &= rest - 1) count++;
+  return count;
+}
+
+export function clonePlanRoot<T>(value: T): T {
+  return asTransientCopy(() => clonePlanTree(value));
+}
+
+/**
+ * One expression copy that is lowered again on its own (an operand repeated by a desugaring).
+ * Identical to `clonePlanTree` unless a private-rebuild copy meter is installed, which then
+ * charges the copy and the IR it becomes before allocating (engine/copy-meter.ts).
+ */
+function copyLowered<T>(value: T): T {
+  return asLoweredCopy(() => clonePlanTree(value));
+}
+
+/** The `structuredClone` copy of an ordered-set aggregate's sort expression, metered alike. */
+function copyLoweredStructured<T>(value: T): T {
+  return asLoweredCopy(() => {
+    chargeSubtree(value);
+    return structuredClone(value);
+  });
+}
+
 /** Test-only count of whole-plan copies, which prepared executions are meant never to make. */
 export const planCloneStats = { clones: 0 };
 
 function cloneTreeValue(value: unknown): unknown {
   if (typeof value !== "object" || value === null) return value;
   if (value instanceof Date) {
+    chargeNode(value);
     const copy = copyDate(value);
     if (recordDeclaredTypes) {
       const source = timestampLiteralSources.get(value);
@@ -3066,13 +3115,18 @@ function cloneTreeValue(value: unknown): unknown {
     return copy;
   }
   if (Array.isArray(value)) {
+    chargeNode(value);
     const copy = new Array<unknown>(value.length);
     for (let index = 0; index < value.length; index += 1)
       copy[index] = cloneTreeValue(value[index]);
     return copy;
   }
   const prototype = Object.getPrototypeOf(value) as unknown;
-  if (prototype !== Object.prototype && prototype !== null) return structuredClone(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    chargeSubtree(value);
+    return structuredClone(value);
+  }
+  chargeNode(value);
   const copy: Record<string, unknown> = {};
   for (const key of Object.keys(value)) {
     copy[key] = cloneTreeValue((value as Record<string, unknown>)[key]);
@@ -3101,7 +3155,7 @@ export function bindPlanParameters(
   const count = plan.parameterCount ?? 0;
   validateParameters(count, params);
   if (count === 0) return plan;
-  const clone = clonePlanTree(plan);
+  const clone = clonePlanRoot(plan);
   bindBlock(clone, params ?? []);
   delete clone.parameterCount;
   annotatePlanIntegerDivision(clone);
@@ -3138,7 +3192,7 @@ export function bindStatementParameters(
     throw new TypeError("DDL statements take no parameters");
   }
   const values = params ?? [];
-  const clone = clonePlanTree(statement);
+  const clone = clonePlanRoot(statement);
   delete clone.parameterCount;
   if (clone.kind === "insert") {
     if (clone.query !== undefined) bindBlock(clone.query, values);
@@ -3952,12 +4006,15 @@ function assertTopLevelNamesResolve(
   const aliases = sources.map((source) => source.alias);
   const known = sources.map((source) => columnsOf(source.table));
   const outputs = new Set(plan.select.map((item) => item.alias));
-  const references = (expression: Expression): string[] =>
-    expression.kind === "column"
-      ? !recordDeclaredTypes || rowFieldSource(expression) === undefined
-        ? [expression.reference]
-        : []
-      : childExpressions(expression).flatMap(references);
+  // One accumulator in depth-first order: a per-level flatMap would copy every descendant's
+  // references again at each ancestor, quadratic in the expression depth.
+  const references = (expression: Expression, found: string[] = []): string[] => {
+    if (expression.kind === "column") {
+      if (!recordDeclaredTypes || rowFieldSource(expression) === undefined)
+        found.push(expression.reference);
+    } else for (const child of childExpressions(expression)) references(child, found);
+    return found;
+  };
   const check = (expression: Expression): void => {
     for (const reference of references(expression)) {
       const dot = reference.indexOf(".");
@@ -4636,9 +4693,47 @@ function someNestedBlock(block: CompiledQuery, test: (nested: CompiledQuery) => 
  * columns are DATE. A column the caller cannot type is not an integer, so the compiler's static
  * answer only ever widens once the catalog is known.
  */
+/**
+ * Per-pass memo for `integerTypedExpression` and `datetimeTypeKind` while
+ * `annotateIntegerDivision` runs. That pass types every node bottom-up; without the memo each
+ * node re-types its whole subtree, which is quadratic in an operator chain. Keyed by the column resolver, so a subquery block's own scope
+ * never shares answers with its parent. Cleared when the outermost pass returns.
+ */
+let typingMemo: WeakMap<object, WeakMap<Expression, unknown>> | null = null;
+
+/** One answer of `compute` per expression and resolver while the pass memo is active (integer
+ * typing, and `datetimeTypeKind`, which every subtraction asks of both operands). */
+function memoizedType<T>(resolver: object, expression: Expression, compute: () => T): T {
+  if (typingMemo === null) return compute();
+  let memo = typingMemo.get(resolver);
+  if (memo === undefined) typingMemo.set(resolver, (memo = new WeakMap()));
+  if (memo.has(expression)) return memo.get(expression) as T;
+  const answer = compute();
+  memo.set(expression, answer);
+  return answer;
+}
+
 export function integerTypedExpression(
   expression: Expression,
   columnInteger: (reference: string) => boolean = () => false,
+  tableIntegerColumns?: (table: string) => IntegerColumns | undefined,
+  columnDatetime: (reference: string) => DatetimeTypeKind | undefined = () => undefined,
+  tableDatetimes?: (table: string) => DatetimeColumns | undefined,
+): boolean {
+  return memoizedType(columnInteger, expression, () =>
+    integerTypedExpressionOnce(
+      expression,
+      columnInteger,
+      tableIntegerColumns,
+      columnDatetime,
+      tableDatetimes,
+    ),
+  );
+}
+
+function integerTypedExpressionOnce(
+  expression: Expression,
+  columnInteger: (reference: string) => boolean,
   tableIntegerColumns?: (table: string) => IntegerColumns | undefined,
   columnDatetime: (reference: string) => DatetimeTypeKind | undefined = () => undefined,
   tableDatetimes?: (table: string) => DatetimeColumns | undefined,
@@ -4835,6 +4930,35 @@ export function integerQuotient(left: number, right: number): number | null {
 export function annotateIntegerDivision(
   expression: Expression,
   columnInteger: (reference: string) => boolean = () => false,
+  tableIntegerColumns?: (table: string) => IntegerColumns | undefined,
+  columnDatetime: (reference: string) => DatetimeTypeKind | undefined = () => undefined,
+  tableDatetimes?: (table: string) => DatetimeColumns | undefined,
+): void {
+  if (typingMemo !== null)
+    return annotateIntegerDivisionOnce(
+      expression,
+      columnInteger,
+      tableIntegerColumns,
+      columnDatetime,
+      tableDatetimes,
+    );
+  typingMemo = new WeakMap();
+  try {
+    annotateIntegerDivisionOnce(
+      expression,
+      columnInteger,
+      tableIntegerColumns,
+      columnDatetime,
+      tableDatetimes,
+    );
+  } finally {
+    typingMemo = null;
+  }
+}
+
+function annotateIntegerDivisionOnce(
+  expression: Expression,
+  columnInteger: (reference: string) => boolean,
   tableIntegerColumns?: (table: string) => IntegerColumns | undefined,
   columnDatetime: (reference: string) => DatetimeTypeKind | undefined = () => undefined,
   tableDatetimes?: (table: string) => DatetimeColumns | undefined,
@@ -5168,6 +5292,14 @@ function unifiedDatetimeKind(
 export function datetimeTypeKind(
   expression: Expression,
   column: (reference: string) => DatetimeTypeKind | undefined = () => undefined,
+  tables?: (table: string) => DatetimeColumns | undefined,
+): DatetimeTypeKind | undefined {
+  return memoizedType(column, expression, () => datetimeTypeKindOnce(expression, column, tables));
+}
+
+function datetimeTypeKindOnce(
+  expression: Expression,
+  column: (reference: string) => DatetimeTypeKind | undefined,
   tables?: (table: string) => DatetimeColumns | undefined,
 ): DatetimeTypeKind | undefined {
   const kind = (candidate: Expression): DatetimeTypeKind | undefined =>
@@ -5781,7 +5913,7 @@ export function foldIdentifierCase(
   };
   rewriteBlock(plan);
   if (!pass.needed) return plan;
-  const cloned = clonePlanTree(plan);
+  const cloned = clonePlanRoot(plan);
   pass.probing = false;
   rewriteBlock(cloned);
   return cloned;
@@ -5890,7 +6022,7 @@ export function expandRowReferences(
   };
   rewriteBlock(plan);
   if (!pass.needed) return plan;
-  const cloned = clonePlanTree(plan);
+  const cloned = clonePlanRoot(plan);
   pass.probing = false;
   rewriteBlock(cloned);
   return cloned;
@@ -5987,7 +6119,7 @@ export function extendGroupByWithKeyDependents(
   };
   rewriteBlock(plan);
   if (!pass.needed) return plan;
-  const cloned = clonePlanTree(plan);
+  const cloned = clonePlanRoot(plan);
   pass.probing = false;
   rewriteBlock(cloned);
   return cloned;
@@ -6040,7 +6172,7 @@ export function resolveStatementDatetimes(
     ["CURRENT_TIMESTAMP", { kind: "literal", value: copyDate(now) }],
     ["LOCALTIME", { kind: "literal", value: iso.slice(11, 19) }],
   ]);
-  const resolved = clonePlanTree(plan);
+  const resolved = clonePlanRoot(plan);
   const substitute = (expression: Expression): Expression => {
     if (expression.kind === "subquery" || expression.kind === "exists") {
       resolveBlock(expression.block);
@@ -6153,7 +6285,7 @@ export function expandFtsColumns(
   searchableColumnsFor: (tableName: string) => readonly string[] | undefined,
 ): CompiledQuery {
   if (!planContainsFts(plan)) return plan;
-  plan = clonePlanTree(plan);
+  plan = clonePlanRoot(plan);
   const expand = (expression: Expression, block: CompiledQuery): void => {
     if (expression.kind === "subquery" || expression.kind === "exists") {
       expandBlock(expression.block);
@@ -6211,7 +6343,7 @@ export function annotateAvgArgumentScales(
   const roots: Expression[] = [];
   forEachBlockExpression(plan, (expression) => roots.push(expression));
   if (!roots.some(needsScale)) return plan;
-  plan = clonePlanTree(plan);
+  plan = clonePlanRoot(plan);
   const sources = [plan.base, ...plan.joins];
   const declaredScale = (reference: string): number | undefined => {
     const parts = reference.split(".");
@@ -6629,7 +6761,7 @@ export function executeRowQueryInternal(
   // executions against different rows.
   plan =
     resolution.plan === plan && planContainsFts(plan, "bm25")
-      ? clonePlanTree(plan)
+      ? clonePlanRoot(plan)
       : resolution.plan;
   tables = resolveDerivedRowTables(plan, tables, memory);
   plan = expandDistinctWildcard(plan, wildcardRowColumns(tables));
@@ -10779,12 +10911,25 @@ class Parser {
         throw new TypeError("CUBE supports at most 5 expressions (32 grouping sets)");
       }
       const sets: Expression[][] = [];
+      if (copyMeterActive()) {
+        chargeSlotArrays(Array.from({ length: 1 << columns.length }, (_, mask) => bitCount(mask)));
+        // Each column is lowered again in every set that keeps it: 2^(n-1) of them.
+        for (const column of columns) chargeSubtree(column, 1 << (columns.length - 1));
+      }
       for (let mask = (1 << columns.length) - 1; mask >= 0; mask -= 1) {
         sets.push(columns.filter((_, index) => (mask & (1 << index)) !== 0));
       }
       return sets;
     }
     const sets: Expression[][] = [];
+    // Every prefix is its own array: quadratic in the column count, so meter it before building.
+    if (copyMeterActive()) {
+      chargeSlotArrays(Array.from({ length: columns.length + 1 }, (_, length) => length));
+      // Each column is lowered again in every prefix that keeps it: column i in n - i of them.
+      columns.forEach((column, index) => {
+        chargeSubtree(column, columns.length - index);
+      });
+    }
     for (let length = columns.length; length >= 0; length -= 1) {
       sets.push(columns.slice(0, length));
     }
@@ -11607,8 +11752,8 @@ class Parser {
     const pair = (index: number, op: ComparisonOperator): Expression => ({
       kind: "condition",
       operator: op,
-      left: clonePlanTree(left[index] ?? { kind: "literal", value: null }),
-      right: clonePlanTree(right[index] ?? { kind: "literal", value: null }),
+      left: copyLowered(left[index] ?? { kind: "literal", value: null }),
+      right: copyLowered(right[index] ?? { kind: "literal", value: null }),
     });
     if (operator === "=" || operator === "!=" || operator === "<>") {
       const join = operator === "=" ? "and" : "or";
@@ -11814,8 +11959,8 @@ class Parser {
       const rangeOver = (low: Expression, high: Expression): Expression => ({
         kind: "logical",
         operator: "and",
-        left: { kind: "condition", operator: ">=", left: clonePlanTree(left), right: low },
-        right: { kind: "condition", operator: "<=", left: clonePlanTree(left), right: high },
+        left: { kind: "condition", operator: ">=", left: copyLowered(left), right: low },
+        right: { kind: "condition", operator: "<=", left: copyLowered(left), right: high },
       });
       // SYMMETRIC also accepts the bounds reversed.
       const range: Expression = symmetric
@@ -11823,7 +11968,7 @@ class Parser {
             kind: "logical",
             operator: "or",
             left: rangeOver(lower, upper),
-            right: rangeOver(clonePlanTree(upper), clonePlanTree(lower)),
+            right: rangeOver(copyLowered(upper), copyLowered(lower)),
           }
         : rangeOver(lower, upper);
       return negated ? { kind: "not", operand: range } : range;
@@ -12225,7 +12370,7 @@ class Parser {
         let when = this.#expression();
         // The simple form CASE x WHEN v desugars to searched equality comparisons.
         if (operand !== undefined) {
-          when = { kind: "condition", operator: "=", left: clonePlanTree(operand), right: when };
+          when = { kind: "condition", operator: "=", left: copyLowered(operand), right: when };
         }
         this.#keyword("THEN");
         branches.push({ when, then: this.#expression() });
@@ -13002,7 +13147,7 @@ class Parser {
     return {
       kind: "call",
       name,
-      arguments: [structuredClone(sorted.expression), ...direct],
+      arguments: [copyLoweredStructured(sorted.expression), ...direct],
       aggregateOrderBy: [sorted],
     };
   }
@@ -13017,13 +13162,13 @@ class Parser {
     const aggregate = (fn: AggregateName, operand: Expression): Expression => ({
       kind: "call",
       name: fn,
-      arguments: [clonePlanTree(operand)],
+      arguments: [copyLowered(operand)],
     });
     const squares = aggregate("SUM", {
       kind: "binary",
       operator: "*",
-      left: clonePlanTree(argument),
-      right: clonePlanTree(argument),
+      left: copyLowered(argument),
+      right: copyLowered(argument),
     });
     const total = aggregate("SUM", argument);
     // COUNT is an integer, and over an integer argument so are both sums: left integer-typed, the
@@ -13047,9 +13192,9 @@ class Parser {
           kind: "binary",
           operator: "*",
           left: total,
-          right: clonePlanTree(total),
+          right: copyLowered(total),
         },
-        right: clonePlanTree(count),
+        right: copyLowered(count),
       },
     };
     // Bare VARIANCE and STDDEV are the sample forms, as in PostgreSQL.
@@ -13058,10 +13203,10 @@ class Parser {
       ? {
           kind: "binary",
           operator: "-",
-          left: clonePlanTree(count),
+          left: copyLowered(count),
           right: { kind: "literal", value: 1 },
         }
-      : clonePlanTree(count);
+      : copyLowered(count);
     const variance: Expression = { kind: "binary", operator: "/", left: spread, right: divisor };
     if (name.startsWith("VAR")) return variance;
     return { kind: "call", name: "SQRT", arguments: [variance] };
@@ -13454,6 +13599,12 @@ function desugarGroupingSets(parts: SelectBlockParts, nextSequence: () => number
     }
   }
   const signatureOf = (expression: Expression): string => encodeQueryIdentity(expression);
+  if (copyMeterActive()) {
+    chargeSlotArrays([2 * groupingSetSlots(sets)]);
+    // Every member block shares the source, joins, filters and unchanged select items by
+    // reference, and each member lowers them again into its own IR.
+    if (sets.length > 1) chargeSubtree(blockParts, sets.length - 1);
+  }
   const universe = new Set(sets.flat().map(signatureOf));
   const members = sets.map((set) => {
     const setSignatures = new Set(set.map(signatureOf));
@@ -13510,12 +13661,12 @@ function desugarGroupingSets(parts: SelectBlockParts, nextSequence: () => number
             return {
               kind: "call",
               name: "NULLIF",
-              arguments: [clonePlanTree(expression), clonePlanTree(expression)],
+              arguments: [copyLowered(expression), copyLowered(expression)],
             };
           }
           return mapChildExpressions(expression, nullify);
         };
-        const nullified = nullify(clonePlanTree(item.expression));
+        const nullified = nullify(copyLowered(item.expression));
         if (away.count === 0) return item;
         return {
           alias: item.alias,
@@ -13527,7 +13678,7 @@ function desugarGroupingSets(parts: SelectBlockParts, nextSequence: () => number
         ...blockParts,
         sql: "(grouping set)",
         select,
-        groupBy: clonePlanTree(set),
+        groupBy: copyLowered(set),
         orderBy: [],
       },
       nextSequence,
@@ -13664,7 +13815,7 @@ function resolveGroupByReferences(
       if (hasAggregate(item.expression) || containsWindow(item.expression)) {
         throw new TypeError("GROUP BY ordinals cannot name an aggregate or window column");
       }
-      resolved.push(clonePlanTree(item.expression));
+      resolved.push(copyLowered(item.expression));
       continue;
     }
     if (expression.kind !== "column" || expression.reference.includes(".")) {
@@ -13686,7 +13837,7 @@ function resolveGroupByReferences(
     }
     const inputColumn = sourceHasColumn(expression.reference);
     if (inputColumn === undefined) return undefined;
-    resolved.push(inputColumn ? expression : clonePlanTree(item.expression));
+    resolved.push(inputColumn ? expression : copyLowered(item.expression));
   }
   return resolved;
 }
@@ -13725,6 +13876,8 @@ function unifyGroupedReferences<
     groupingSets?: Expression[][];
   },
 >(block: T, resolve: (reference: string) => string | undefined): T {
+  if (copyMeterActive() && block.groupingSets !== undefined)
+    chargeSlotArrays([3 * (block.groupBy.length + groupingSetSlots(block.groupingSets))]);
   const groupingReferences = [...block.groupBy, ...(block.groupingSets ?? []).flat()].flatMap(
     (expression) => (expression.kind === "column" ? [expression.reference] : []),
   );
@@ -13789,7 +13942,7 @@ function unifyGroupedReferences<
     ),
     ...(block.groupingSets === undefined
       ? {}
-      : { groupingSets: block.groupingSets.map((set) => set.map(respell)) }),
+      : { groupingSets: chargedSets(block.groupingSets).map((set) => set.map(respell)) }),
   };
   return respelled > 0 ? unified : block;
 }
@@ -14051,7 +14204,7 @@ function desugarComposedFullJoin(
       })),
       ...(parts.groupingSets === undefined
         ? {}
-        : { groupingSets: parts.groupingSets.map((set) => set.map(rewrite)) }),
+        : { groupingSets: chargedSets(parts.groupingSets).map((set) => set.map(rewrite)) }),
     },
     nextSequence,
   );
@@ -14224,7 +14377,7 @@ function lowerSelectBlock(
   if (parts.groupByResolved !== true) {
     const sourceHasColumn = sourceColumnPresence([parts.base, ...parts.joins], columnsOf);
     const groupBy = resolveGroupByReferences(parts.groupBy, parts.select, sourceHasColumn);
-    const groupingSets = parts.groupingSets?.map((set) =>
+    const groupingSets = (parts.groupingSets && chargedSets(parts.groupingSets))?.map((set) =>
       resolveGroupByReferences(set, parts.select, sourceHasColumn),
     );
     if (groupBy === undefined || groupingSets?.includes(undefined) === true) {
@@ -14482,7 +14635,7 @@ export function expandViewSources(
       expandBlock(inner, depth);
     });
   };
-  const resolved = clonePlanTree(plan);
+  const resolved = clonePlanRoot(plan);
   expandBlock(resolved, 0);
   return resolved;
 }
@@ -14725,7 +14878,7 @@ export function bindPendingSelectShapes(
   columnsOf: (tableName: string) => readonly string[] | undefined,
 ): CompiledQuery {
   if (!planHasPendingSelectShapes(plan)) return plan;
-  const bound = clonePlanTree(plan);
+  const bound = clonePlanRoot(plan);
   const preserveUnoptimizedShape = bound.preserveUnoptimizedShape === true;
   delete bound.preserveUnoptimizedShape;
   let sequence = 0;
@@ -14914,6 +15067,8 @@ export function expandNaturalJoins(
           throw new TypeError(`A NATURAL join needs known columns for: ${source.table}`);
         return own;
       };
+      // One prefix per NATURAL join: quadratic in the join count, so metered first.
+      if (copyMeterActive()) chargeSlotArrays([index + 1]);
       const preceding = sources.slice(0, index + 1);
       const shared: Array<{ left: string; name: string }> = [];
       for (const name of columnsFor(join)) {
@@ -14947,7 +15102,7 @@ export function expandNaturalJoins(
       }));
     });
   };
-  const expanded = clonePlanTree(plan);
+  const expanded = clonePlanRoot(plan);
   expandBlock(expanded);
   return expanded;
 }
@@ -15005,7 +15160,7 @@ export function expandSourceColumnAliases(
     forEachNestedBlock(block, renameBlock);
     for (const source of [block.base, ...block.joins]) rename(source);
   };
-  const expanded = clonePlanTree(plan);
+  const expanded = clonePlanRoot(plan);
   renameBlock(expanded);
   return expanded;
 }
@@ -15055,7 +15210,7 @@ function expandQualifiedWildcards(
     });
     numberRepeatedOutputs(block.select);
   };
-  const expanded = clonePlanTree(plan);
+  const expanded = clonePlanRoot(plan);
   expandBlock(expanded);
   return expanded;
 }
@@ -15733,7 +15888,7 @@ function rewriteMergedReferences(
       const replacement = expression.reference.includes(".")
         ? undefined
         : replacements.get(expression.reference);
-      return replacement === undefined ? expression : clonePlanTree(replacement);
+      return replacement === undefined ? expression : copyLowered(replacement);
     }
     if (expression.kind === "subquery" || expression.kind === "exists") return expression;
     return mapChildExpressions(expression, rewrite);
@@ -15814,6 +15969,7 @@ function joinMergedNames(
   if (join === undefined) return [];
   if (join.using !== undefined) return join.using;
   if (join.natural !== true) return [];
+  if (copyMeterActive()) chargeSlotArrays([index]);
   const preceding = sources.slice(0, index);
   return (columnsFor(join) ?? []).filter((name) =>
     preceding.some((source) => columnsFor(source)?.includes(name) === true),
@@ -15893,6 +16049,8 @@ export function mergeJoinColumns(
       if (join.using === undefined && join.natural !== true) return;
       const names = joinMergedNames(sources, index + 1, columnsFor);
       const conditions: Expression[] | null = nativeFull ? [] : null;
+      // One prefix per merged name per join: metered before each is built.
+      if (copyMeterActive()) chargeSlotArrays(names.map(() => index + 1));
       const owners = names.map((name) => {
         const owner = sources
           .slice(0, index + 1)
@@ -15949,7 +16107,7 @@ export function mergeJoinColumns(
     });
     if (replacements.size > 0) rewriteMergedReferences(block, replacements);
   };
-  const merged = clonePlanTree(plan);
+  const merged = clonePlanRoot(plan);
   mergeBlock(merged);
   return merged;
 }

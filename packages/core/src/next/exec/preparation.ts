@@ -106,12 +106,10 @@ export class PreparationGovernor implements MemoryGovernor {
   }
   /**
    * The most one request can ever be granted: the cap (less the reserve unless it includes
-   * private progress), less lifetime holdings. Lifetime holdings are not registered with the
-   * governor yet; when #11 adds Governor.usableCapacity, this becomes
-   * `return this.governor.usableCapacity(includesProgress);`.
+   * private progress), less the registered lifetime holdings (Governor.usableCapacity).
    */
   usableCapacity(includesProgress = false): number {
-    return includesProgress ? this.capBytes : this.capBytes - this.reserveBytes;
+    return this.governor.usableCapacity(includesProgress);
   }
   registerCache(cache: EvictableCache): ReturnType<MemoryGovernor["registerCache"]> {
     return this.governor.registerCache(cache);

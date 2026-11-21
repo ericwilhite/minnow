@@ -37,6 +37,46 @@ model as well as OS, architecture and Node major version, and refuses a host who
 has no calibrated profile instead of comparing it with another machine's thresholds. No package
 code or stored format changes.
 
+The private 1.0 owner enables qualified BEFORE/AFTER row triggers through the native writer,
+with PostgreSQL trigger/FK ordering, original-target rekey-follow, cancellable funding and
+statement-atomic rollback. Enclosing savepoints recover failed statements. The shipped
+one-further-level cascade limit remains; a deeper matching trigger fails with 54001.
+FOR EACH STATEMENT and transaction control inside bodies remain refused. Internal RI IDs
+keep FK creation order across decimal widths. Compiled producer workspace is charged once
+per input phase; informational references read only their actual key fields. Trigger
+preparation charges every rule program and body plan, and the known copies the parser, optimizer
+and lowering make of one source subtree (such as an explicit DEFAULT cell or a simple CASE
+operand), before allocating them. Compile passes that were quadratic in a chain's length
+(top-level name checks, correlated references, integer and datetime typing) are now linear for the
+operator chains, nesting and lists the preparation scaling test lowers. Inner-join ordering no
+longer allocates per candidate conjunct or rescans the whole conjunct pool at each step, so its
+allocation is linear in the conjuncts; its greedy order still compares every remaining unit at
+each step, which is quadratic CPU in the number of joined tables. It grows its reservation by doubling and never waits while holding
+preparation; only a need above the memory cap is refused, with 53200. The released engine's
+parse and compile give the same results; its bundles grow by about 1.5 KiB raw for the inert
+copy hooks and the linear typing pass (main 1,182,025 raw / 354,678 gzip, OPFS
+1,594,462 / 461,614, IndexedDB worker 1,590,462 / 459,029, worker plus client 574,475 gzip,
+core tarball 1,029,643 bytes), and those caps rise once accordingly. A native statement funds
+its statement-end work (the full-text publication step) in its last native step, beside the
+root's bytes, so ending never waits while the root holds credit; the governor serves growth from an owner that holds credit it cannot release (a
+native root's retained base, the writer inside a native step) before queued new admissions, so
+such an owner never waits behind a request only its own release could serve; an admission that
+could be served only by releasing an owner's lifetime holdings (including what the write engine
+keeps until close: its cache slabs, permanent storage, the current state's resident metadata and
+the change feed once used, and a live-query runtime while it is open)
+is refused with 53200 at once instead of waiting, while a request that only an open snapshot's
+release can serve waits for it; an idle writer flushes unflushed changes (inserted rows, deletions,
+index updates) when another request needs their memory, and a statement or transaction ending or a
+snapshot closing wakes requests waiting for that memory; that step is
+reserved only when
+a full-text index or pending full-text state exists. A trigger body's query sizes its batches
+from what its root can afford beside the writer. These changes keep the qualified SQL histories
+within 32 MiB. At 32 MiB the largest generated preparation bodies are refused with 53200: the
+writer's next-step floor (19.5 MB) beside their preparation (about 14.5 MB) exceeds the cap.
+Unqualified native roots retain typed 0A000
+refusals. Public 0.x behavior, package entry points and stored formats are unchanged; no
+migration is required.
+
 The unexported 1.0 rebuild reserves wide sort merge workspace independently of source batch size, including encoded keys and the `WITH TIES` boundary row when a competing query forces a smaller source recipe.
 
 The private 1.0 writer preserves exact BIGINT values when updating or deleting persisted
@@ -201,8 +241,7 @@ A private compiled body host
 seals complete modification inputs, uses typed OLD/NEW parameters and runs bodies without ending
 the root statement. Its query workspace is funded by the root, and cancellation drains borrowed
 inputs before releasing credit. A low-level root assembler connects the native graph and fences
-its producer and complete end continuation; commit stays with its caller. SQL firing remains
-guarded while owner admission and dispatch are integrated. Fixed decoder workspace is admitted before native source reads.
+its producer and complete end continuation; commit stays with its caller. The qualified private owner now supplies admission and SQL dispatch. Fixed decoder workspace is admitted before native source reads.
 Wide native OLD-row reads now close their decoder and pin and return unused producer credit
 before funding a larger ordinary read step. They no longer mistake that step for a value-sized
 reserve loan. Cancellation waits for readmission cleanup.
@@ -221,7 +260,7 @@ reader after a modification leaves both published rows and a new memory tail.
 Native command commits keep the statement's protected-memory policy after its command scope closes. Commit funds its own work without waiting to reserve a future background merge; actual merges still fund their complete workspace before running.
 The private native write owner now supplies a cancellable, invalidatable memory boundary.
 It stabilizes writer/storage holdings before root funding, counts their protected memory
-once, and preserves separate image and rule workspace. This does not enable SQL triggers.
+once, and preserves separate image and rule workspace. This boundary alone does not dispatch SQL; the qualified private owner consumes it.
 No released API, stored-format or migration change is required.
 
 The private 1.0 owner client accepts cancellation signals on buffered requests.
@@ -377,20 +416,18 @@ The private trigger runtime adds typed OLD/NEW parameter scopes. Repeated refere
 one charged copy, wide values copy in cancellable fragments, and image borrows end before
 body execution. The non-ending body protocol seals input, retires copied parameters before
 writes, and fences input retirement before releasing its prefix pin, including cancellation
-during cleanup. These are runtime components; native SQL trigger firing remains disabled
-until the joint command, registry and body-runner integration is verified. The injected
+during cleanup. These components now serve qualified private ordinary-owner SQL; the released 0.x engine is unchanged. The injected
 named controller merges user and referential-action events, preserving statement FIFO and
 nested body-command drains; it does not enable native SQL firing by itself.
 
 The private rebuild adds a spillable AFTER-event queue with bounded metadata. It preserves
 the shipped limit of two derived writes, including terminal RI work with a spent
-trigger budget. Child events append behind the existing frame; pending IO and continuations drain before cleanup. This is
-runtime groundwork only: native trigger SQL stays disabled until the joint firing integration.
+trigger budget. Child events append behind the existing frame; pending IO and continuations drain before cleanup. The qualified private ordinary owner consumes this queue for row triggers.
 
 The private trigger runner's current-prefix pin has a read phase, then a locator-only phase.
 It refuses data rereads, including from pre-created index cursors, after statement mutation
 begins, while later write batches retain locator resolution. Generated prefix tests cover publication, index maintenance, cancellation,
-and native row-account and reader-registration cleanup; this does not enable trigger firing.
+and native row-account and reader-registration cleanup; component fixtures do not install an owner dispatcher.
 
 The private 1.0 catalog retains exact DELETE/UPDATE foreign-key actions and records omitted
 `ON UPDATE` as an explicit row-identity follow mode, preserving Minnow's documented difference
@@ -399,9 +436,9 @@ identities. Its catalog metadata type can describe the added action spellings an
 `onUpdate`; consumers with exhaustive action switches should handle the added spellings.
 The shipped 0.x SQL input/runtime behavior stays unchanged. Duplicate action clauses
 are refused with PostgreSQL's syntax error in the native front end. Native action execution and
-trigger firing still require the joint execution integration; metadata alone does not enable them.
-Until that driver is installed, explicit native ON UPDATE modes, ON DELETE SET DEFAULT and
-informational rekeys refuse with 0A000 rather than falling through to a different action.
+row firing use the private owner's qualified integration; metadata alone does not execute them.
+Low-level raw executors still refuse explicit native ON UPDATE modes, ON DELETE SET DEFAULT
+and informational rekeys with 0A000; use the qualified ordinary-owner route.
 Non-key updates, DO NOTHING and enforced omitted-update follow remain executable.
 The shared parser and schema-action comparison measure 1,179,776 raw / 353,876 gzip bytes
 for the main bundle, 1,592,207 / 460,862 with OPFS, and 1,588,242 / 458,212 for the
@@ -412,7 +449,8 @@ raise the combined worker/client cap by 256 (573,644 measured) and packed core c
 The private 1.0 catalog adds dialect-versioned trigger definitions, stable OLD/NEW and target
 column dependencies, and CREATE/DROP TRIGGER lowering. WAL/checkpoint reopen retains trigger
 identity and ordered bodies; dependent schema changes are refused. This changes unreleased
-catalog bytes only; runtime firing and the joint referential-action hook remain in progress.
+catalog bytes only. Runtime firing and the referential-action hook arrived later in this
+release line; see the native row-trigger entries above.
 The native-only name-folding guard adds 99 raw / 28 gzip bytes to the shared main entry,
 100 / 27 to OPFS and 100 / 28 to the IndexedDB worker. Raise only the IndexedDB worker's gzip
 cap once by 128 bytes (457,994 measured, 10 over the prior cap); package isolation stays intact.
@@ -458,7 +496,7 @@ expressions, NOT NULL and CHECK validation preserve row and constraint-name erro
 this ordering claim does not cover unique or foreign-key checks. Generated recomputation
 keeps the old row intact for key checks.
 This internal module changes no published behavior or stored format. DML routing now uses
-these kernels; trigger firing remains a separate integration.
+these kernels; the qualified private owner also uses them for trigger firing.
 
 The unexported rebuild retains named enum identities, owned identity and schema counters,
 managed table/view flags, index directions, view outputs and stable expression dependencies in

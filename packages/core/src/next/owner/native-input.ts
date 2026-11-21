@@ -25,6 +25,8 @@ import type { Operator } from "../exec/pipeline.js";
 /** Maximum legal PG NUMERIC (131072 integral + 16383 fractional digits) needs less
  * than 256 KiB for the codec's four BigInt/limb overlap copies. Varlen payloads stream. */
 export const NATIVE_INPUT_CAPTURE_BYTES = 256 * 1024;
+/** A transient producer keeps only its immutable plan reference between invocations. */
+export const NATIVE_INPUT_HANDLE_BYTES = 256;
 /** Retained literal buffers are counted once, at their real size. Recipe maps,
  * optimizer nodes and key strings use separate per-object metadata; multiplying a large
  * immutable payload would manufacture a minimum above the cap instead of spilling. */
@@ -67,17 +69,18 @@ export class NativeInputProgram {
   constructor(
     readonly plan: PhysicalPlan,
     charge: ByteCharge,
+    readonly transient = false,
   ) {
     // Eager source materialization must not move volatile side effects before an earlier
     // BEFORE/CHECK. These kernels remain refused until there is an ordered provider.
     if (plan.volatile) throw new UnsupportedPlanError("volatile native modification input");
     if (plan.ftsQueries?.length)
       throw new UnsupportedPlanError("native body FTS prefix preparation");
-    this.#bytes = nativeInputProgramBytes(plan);
+    this.#bytes = transient ? NATIVE_INPUT_HANDLE_BYTES : nativeInputProgramBytes(plan);
     if (!charge.allocate(this.#bytes))
       throw new RangeError("Native input program must be admitted");
     try {
-      this.#program = compileModificationInput(plan);
+      if (!transient) this.#program = compileModificationInput(plan);
       this.#charge = charge;
     } catch (error) {
       charge.free(this.#bytes);
@@ -90,14 +93,31 @@ export class NativeInputProgram {
     request: NativeInputRequest,
     sink: Operator | ((capture: ImageCaptureContext) => Operator),
   ): Promise<ExecutionError | CardinalityViolationError | null> {
-    if (!this.#program || this.#running)
+    if (!this.#charge || this.#running)
       throw new TypeError("Native input program is closed or active");
     request.signal.throwIfAborted();
     if (request.inputView.released) throw new SnapshotReleasedError();
     if (request.inputView.catalog.version !== this.plan.catalogVersion)
       throw new PlanStaleError(this.plan.catalogVersion, request.inputView.catalog.version);
-    const program = this.#program;
-    const work = (async () => {
+    const charge = this.#charge;
+    let program = this.#program,
+      compiledBytes = 0;
+    if (this.transient) {
+      // The retained handle is already part of the legacy program envelope.
+      const bytes = nativeInputProgramBytes(this.plan) - NATIVE_INPUT_HANDLE_BYTES;
+      if (!charge.allocate(bytes)) throw new RangeError("Transient input program must be admitted");
+      try {
+        program = compileModificationInput(this.plan);
+      } catch (error) {
+        charge.free(bytes);
+        throw error;
+      }
+      compiledBytes = bytes;
+    }
+    if (!program) throw new TypeError("Native input program is not compiled");
+    const input = program;
+    // Publish #running before a producer/visitor can synchronously reenter close.
+    const work = Promise.resolve().then(async () => {
       let binding: NativeParameterBinding | null = null,
         runtime: QueryRuntime | null = null;
       const deferred = new DeferredGrant("native input unused result share");
@@ -170,7 +190,7 @@ export class NativeInputProgram {
         });
         runtime.enablePhases();
         runtime.atomicResult(deferred, 0);
-        await program(runtime, target);
+        await input(runtime, target);
         request.signal.throwIfAborted();
         if (request.inputView.released) throw new SnapshotReleasedError();
       } catch (error) {
@@ -206,8 +226,9 @@ export class NativeInputProgram {
       if (failure && terminal === null) throw failure.reason;
       if (cleanup) throw cleanup.reason;
       return terminal;
-    })();
+    });
     const pending = work.finally(() => {
+      if (compiledBytes) charge.free(compiledBytes);
       if (this.#running === pending) this.#running = null;
     });
     this.#running = pending;

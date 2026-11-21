@@ -17,6 +17,52 @@
  * (`packages/db/tests/oracle-reach.ts`). Like ./seeds.ts, this module is excluded from the
  * published tarball.
  */
+export const B9_DECIMAL_SUFFIX_REACH = [
+  "flat",
+  "dictionary",
+  "constant",
+  "PG first rows",
+  "bitmap",
+  "sparse pages",
+  "generic first",
+  "members",
+  "restored",
+  "NULL",
+  "leading zero fallback",
+  "large suffix fallback",
+  "other prefix fallback",
+  "dictionary identity",
+  "selection",
+  "owned prefix",
+  "funded growth",
+  "empty prefix",
+  "UTF8 prefix",
+  "released",
+] as const;
+
+export const B9_DECIMAL_SUFFIX_PRESSURE_REACH = [
+  "checkpoint",
+  "no holdings between phases",
+  "PG count",
+  "membership before suffix",
+  "local dictionaries",
+  "selection",
+  "16 MiB",
+  "released",
+] as const;
+/** Scalar exact DISTINCT funds the actual slot-load boundary before allocating. */
+export const B9_SCALAR_DISTINCT_GROWTH_REACH = [
+  "first slot growth",
+  "later slot growth",
+  "flat",
+  "dictionary",
+  "NULL",
+  "selection",
+  "PostgreSQL count",
+  "bounded charge",
+  "released",
+] as const;
+
 export const EXECUTION_RETIREMENT_REACH = [
   "task-yield cancellation",
   "IO cancellation",
@@ -11620,6 +11666,435 @@ export const BIGINT_REPOINT_REACH = [
   "zero charge",
 ] as const;
 
+export const TRIGGER_ORDERING_HARNESS_REACH = [
+  "UPDATE",
+  "DELETE",
+  "empty root",
+  "row work",
+  "reverse creation",
+  "forward creation",
+  "two body commands",
+  "one body command",
+  "multiple BEFORE names",
+  "UTF8 names",
+  "spill sized parent queue",
+  "strict PG trace",
+  "adapter cleanup fenced",
+] as const;
+
+export const NATIVE_TRIGGER_ORDERING_REACH = [
+  ...TRIGGER_ORDERING_HARNESS_REACH,
+  "resident source",
+  "published source",
+  "exact parent and child rows",
+  "exact nested body rows",
+] as const;
+
+export const NATIVE_TRIGGER_SAVEPOINT_REACH = [
+  "pre-savepoint trigger and RI effects",
+  "successful body effects rolled back",
+  "whole statement rollback includes RI and nested bodies",
+  "late child AFTER failure",
+  "late parent AFTER failure",
+  "exact pre-savepoint restoration",
+  "continued triggering transaction",
+  "published source",
+  "resident source",
+  "two parent rows",
+  "more parent rows",
+  "exact committed rows",
+  "zero native ownership",
+] as const;
+
+export const NATIVE_TRIGGER_BODIES_REACH = [
+  "insert",
+  "update",
+  "delete",
+  "BEFORE",
+  "AFTER",
+  "published source",
+  "resident source",
+  "root trigger only",
+  "one further trigger level succeeds",
+  "third matching level refuses and undoes all effects",
+  "PG exact supported body results",
+  "OLD and NEW bindings",
+  "multi-value INSERT and NULL binding",
+  "noncommuting ordered UPDATE bodies",
+  "DELETE body",
+  "zero native ownership",
+] as const;
+
+export const NATIVE_TRIGGER_ERRORS_REACH = [
+  "before-input",
+  "after-input",
+  "before-generated",
+  "after-generated",
+  "check-before-next-row",
+  "root-unique",
+  "body-unique",
+  "ri-unique",
+  "ri-check",
+  "child-before",
+  "parent-before-child-after",
+  "early-parent-after",
+  "before-restrict",
+  "published source",
+  "resident source",
+  "reverse creation",
+  "forward creation",
+  "exact statement undo",
+  "zero native ownership",
+] as const;
+
+export const NATIVE_TRIGGER_FOLLOW_REACH = [
+  "shift",
+  "swap",
+  "rotate",
+  "self reference",
+  "external child",
+  "informational orphan unchanged",
+  "enforced reference",
+  "published",
+  "resident",
+  "raw PG cascade counterpart",
+  "PG captured-identity reference",
+  "nested tally body",
+  "no further body",
+  "NULL payload",
+  "empty payload",
+  "UTF8 payload",
+  "NULL reference unchanged",
+  "unchanged roots still fire",
+  "exact original-target rows",
+  "zero native ownership",
+] as const;
+
+export const NATIVE_TRIGGER_CANCEL_REACH = [
+  "first",
+  "middle",
+  "last",
+  "checkpoint error",
+  "AbortSignal cancellation",
+  "published",
+  "resident",
+  "empty commit after statement undo",
+  "exact parent RI and nested rows",
+  "prefix registrations retired",
+  "zero native ownership",
+] as const;
+
+export const PIPELINE_ABORT_WAIT_REACH = [
+  "already aborted",
+  "abort during wait",
+  "producer rejects",
+  "producer resolves",
+  "pending producer",
+  "settled producer",
+  "original cancellation reason",
+] as const;
+
+export const NATIVE_ROOT_CREDITS_REACH = [
+  "control precharged",
+  "rule workspace protected from image funding",
+  "complete private mode",
+  "ordinary reserve mode",
+  "root floor included once",
+  "invalidated funding retried",
+  "loan cannot span funding",
+  "source cannot span funding",
+  "temporary pressure cancels",
+  "temporary pressure waits",
+  "premature close preserves ownership",
+  "zero root ownership",
+] as const;
+
+/** Static native preparation bounds cover the real lowerer and rule compiler. */
+export const NATIVE_PREPARATION_BOUND_REACH = [
+  "insert",
+  "update",
+  "delete",
+  "long chain",
+  "nested CASE",
+  "long IN list",
+  "long ASCII literal",
+  "long non-ASCII literal",
+  "subquery",
+  "subquery star",
+  "wide table",
+  "long defaults",
+  "generated columns",
+  "checks",
+  "several bodies",
+  "multi-row VALUES",
+  "DEFAULT cells",
+  "large repeated default",
+  "DEFAULT VALUES",
+  "copies simpleCase",
+  "copies nestedCase",
+  "copies between",
+  "copies symmetric",
+  "copies rowEq",
+  "copies rowLt",
+  "copies rowIn",
+  "copies variance",
+  "copies groupRefs",
+  "copies usingJoin",
+  "copies rowNotIn",
+  "copies notBetween",
+  "copies betweenInCase",
+  "copies quotedKeywords",
+  "copies groupingSet",
+  "copies rollup",
+  "copies rowNotInLiteral",
+  "copies rollupWide",
+  "copies cubeWide",
+] as const;
+
+/** Learned native preparation needs are reused exactly; concurrent statements grow safely. */
+/** Preparation allocation scales no faster than its charge, per grammar shape. */
+export const NATIVE_PREPARATION_SCALING_REACH = [
+  "chain int +",
+  "chain int -",
+  "chain int *",
+  "chain int /",
+  "chain numeric +",
+  "chain numeric -",
+  "chain numeric *",
+  "chain numeric /",
+  "chain text ||",
+  "chain boolean AND",
+  "chain boolean OR",
+  "chain comparison =",
+  "chain comparison <",
+  "chain date +",
+  "chain date -",
+  "chain timestamp +",
+  "chain timestamp -",
+  "chain interval +",
+  "chain interval -",
+  "date difference chain",
+  "binary chain",
+  "column chain",
+  "select column chain",
+  "nested parentheses",
+  "CASE arms",
+  "IN list",
+  "row IN list",
+  "row NOT IN list",
+  "function nesting",
+  "subquery nesting",
+  "join chain",
+  "USING join chain",
+  "grouping sets",
+  "DEFAULT rows",
+  "correlated select items",
+  "large size",
+] as const;
+
+/** Ordinary writer growth is served before an earlier foreign request its holdings block. */
+export const WRITER_HOLDER_GROWTH_REACH = [
+  "foreign request blocked by the writer's holdings",
+  "foreign request admitted after the writer's statement",
+  "update growth",
+  "no growth at this size",
+] as const;
+
+/** Holder growth is served before queued new admissions; everyone eventually progresses. */
+export const GOVERNOR_HOLDER_PRIORITY_REACH = [
+  "holder served ahead of an earlier new admission",
+  "new admission served after waiting",
+  "holder with progress credit",
+  "holder without progress credit",
+  "new admission of almost all room",
+  "holder queued inside a reclaim callout",
+  "holder granted while a new admission waits",
+] as const;
+
+/** The write engine's lifetime holdings and idle spill (GOVERNOR-WAIT-POLICY, reviews 8–9). */
+export const LIFETIME_HOLDINGS_REACH = [
+  "secondary index",
+  "deletion of memtable rows",
+  "deletion of published rows",
+  "unindexed published deletions",
+  "deletion-only memtable",
+  "table dropped",
+  "table dropped under a snapshot",
+  "waited for a snapshot, then settled",
+  "current run readers open",
+  "change feed created",
+  "change feed listener removed",
+  "transaction begun during idle reclaim",
+  "exact after publication",
+] as const;
+
+/** A native trigger statement on an FTS-indexed table ends without waiting. */
+export const NATIVE_COMMAND_FTS_END_REACH = [
+  "keyed delete ended",
+  "nothing deleted",
+  "published source",
+  "resident source",
+] as const;
+
+/** A cold native preparation and a foreign governor client grow while contending. */
+export const NATIVE_COMMAND_CONTENTION_REACH = [
+  "root and foreign client waited at once holding nothing",
+  "copies grew the need",
+  "large body",
+  "zero ownership",
+] as const;
+
+export const NATIVE_COMMAND_REUSE_REACH = [
+  "reuse in one attempt",
+  "parameter sizing changed on reuse",
+  "statement and foreign client growing at once",
+  "reuse with memory full after admission",
+  "large NUMERIC parameter",
+  "large body",
+  "exact PG rows",
+  "zero ownership",
+] as const;
+
+/** Native trigger preparation admits its whole bound before building and never waits holding it. */
+export const NATIVE_COMMAND_PREPARATION_REACH = [
+  "no competing credit",
+  "granted after release",
+  "cancelled while waiting",
+  "waited holding nothing",
+  "admissions checked",
+  "released and retried",
+  "above-cap refusal at the cap",
+  "learned working set in one attempt",
+  "exact PG rows",
+  "large body",
+  "several triggers",
+  "wide default rules",
+  "zero retained ownership",
+] as const;
+
+export const NATIVE_COMMAND_FUNDED_REACH = [
+  "pressure cancellation",
+  "pressure release",
+  "exact root count",
+  "update RI",
+  "delete RI",
+  "nested bodies and ordered trace",
+  "empty root",
+  "nonempty root",
+  "published source",
+  "resident source",
+  "zero retained ownership",
+] as const;
+
+/** Guarded production SQL owner: same native provider, with no fixture funding slack. */
+export const NATIVE_TRIGGER_SQL_REACH = [
+  "update RI",
+  "delete RI",
+  "BEFORE and AFTER name order",
+  "published source",
+  "resident source",
+  "late parent failure",
+  "late child failure",
+  "failed SQL transaction",
+  "exact savepoint recovery",
+  "successful body undo",
+  "transaction continues",
+  "exact committed rows",
+  "zero ownership",
+] as const;
+
+export const NATIVE_TRIGGER_SQL_FOLLOW_REACH = [
+  "shift",
+  "swap",
+  "rotate",
+  "self",
+  "child",
+  "enforced",
+  "informational",
+  "published",
+  "resident",
+  "raw PG cascade",
+  "captured-identity PG",
+  "nested bodies",
+  "root counts",
+  "exact rows",
+  "zero ownership",
+] as const;
+export const NATIVE_TRIGGER_SQL_CANCEL_REACH = [
+  "update",
+  "delete",
+  "published",
+  "resident",
+  "cancel after earlier rows",
+  "no committed effects",
+  "transaction continues",
+  "exact PG rows",
+  "zero ownership",
+] as const;
+
+export const NATIVE_TRIGGER_SQL_INSERT_REACH = [
+  "empty input",
+  "nonempty input",
+  "NULL binding",
+  "integer binding",
+  "published target",
+  "resident target",
+  "BEFORE and AFTER bodies",
+  "one further level",
+  "PG and shipped exact rows",
+  "root count",
+  "zero ownership",
+] as const;
+
+export const NATIVE_PROGRAM_STEP_REACH = [
+  "fitting legacy minimum never rises",
+  "one immutable plan",
+  "many immutable plans",
+  "successful producer",
+  "terminal error prefix",
+  "repeated invocations",
+  "compiled state retired at each fence",
+  "zero ownership",
+] as const;
+
+export const NATIVE_PREFIX_VISIT_REACH = [
+  "resident",
+  "published",
+  "nullable",
+  "nonnullable",
+  "exact selected operands",
+  "no output image copy",
+  "no source at funding",
+  "zero ownership",
+] as const;
+
+export const NATIVE_TRIGGER_SQL_DEPTH_REACH = [
+  "root trigger only",
+  "one further level",
+  "third matching level rolls back",
+  "BEFORE root",
+  "AFTER root",
+  "published",
+  "resident",
+  "empty source fires nothing",
+  "PG and shipped accepted rows",
+  "zero ownership",
+] as const;
+
+export const NATIVE_TRIGGER_SQL_RI_ORDER_REACH = [
+  "one FK",
+  "several FKs",
+  "IDs cross decimal width",
+  "UPDATE CASCADE",
+  "DELETE CASCADE",
+  "published",
+  "resident",
+  "user names before and after RI",
+  "child BEFORE and deferred AFTER",
+  "exact rows and trace",
+  "zero ownership",
+] as const;
+
 /** PC2/PC4/R15.7: immutable native validation is reused only within its owner. */
 export const DIRECTORY_CACHE_NATIVE_REACH = [
   "same blob",
@@ -11719,130 +12194,6 @@ export const DIRECTORY_CACHE_LATE_REACH = [
   "nullable payload",
   "all-valid payload",
   "complete PostgreSQL rows",
-  "all credit returned",
-] as const;
-
-export const B9_STAR_FLOAT_DEMAND_REACH = [
-  "native bits or exact error",
-  "same plan deterministic",
-  "finite extremes",
-  "NaN",
-  "infinities",
-  "signed zero",
-  "all NULL",
-] as const;
-
-export const B9_STAR_SHAPE_REACH = [
-  "composite keys",
-  "AVG transition",
-  "additional SUM",
-  "ordered aggregate",
-  "volatile plan",
-] as const;
-
-export const B9_STAR_BUCKET_REACH = [
-  "native transition order",
-  "multiple native chunks",
-  "PostgreSQL bags",
-  "nullable groups",
-  "strict key misses",
-  "bounded empty bucket steps",
-  "all credit returned",
-] as const;
-
-export const B9_STAR_LOOKUP_SQL_REACH = [
-  "native unordered row order",
-  "ordinary SQL sink reached",
-  "native float bits",
-  "PostgreSQL groups",
-  "reversed source ordinals",
-  "forward source ordinals",
-  "NULL grouping values",
-  "all ownership returned",
-] as const;
-
-export const B9_STAR_PRESSURE_REACH = [
-  "sparse buckets keep native state",
-  "dense resident sink",
-  "exact default bits",
-  "64 MiB cap",
-  "cancelled native wait",
-  "no hold while waiting",
-  "uncontended completion",
-  "all credit returned",
-] as const;
-
-/** Ordinary owner's bound TEXT must reach the exact-order star without weakening input demand. */
-export const B9_STAR_BOUND_TEXT_REACH = [
-  "explicit TEXT slot",
-  "owner normalized literal",
-  "PGlite exact ordered bags",
-  "same native bits",
-  "lookup and proof route reached",
-  "NULL binding",
-  "string binding",
-  "empty binding",
-  "Unicode BOM binding",
-  "1024-unit boundary",
-  "zero final credits",
-] as const;
-
-/** Invalid parameter forms must not add optional dictionary proof reads. */
-export const B9_STAR_TEXT_DEMAND_REACH = [
-  "missing",
-  "NUL",
-  "bool",
-  "number",
-  "overbound",
-  "extra",
-  "old binding outcome",
-  "no optional proof demand",
-] as const;
-
-/** Bound TEXT cannot enable a different dictionary recipe or ancestor family. */
-export const B9_STAR_TEXT_SCOPE_REACH = [
-  "one join",
-  "two joins",
-  "AVG",
-  "COUNT only",
-  "parameter LIMIT",
-  "computed sort",
-  "exact native fallback",
-  "no optional proof demand",
-] as const;
-
-export const B9_STAR_SOURCE_DEMAND_REACH = [
-  "facts fail before A and B demand",
-  "A fails before B demand",
-  "native source phase order",
-  "finite prefix forwards B failure",
-  "multiple B batches",
-  "PGlite22003",
-  "native22003",
-  "selected lookup no fault",
-  "native stops before late B failure",
-  "lookup retains22003",
-  "zero charges",
-] as const;
-
-/** Staging preserves prefix demand without changing native duplicate/NULL visitation. */
-export const B9_STAR_STAGED_PREFIX_REACH = [
-  "skipped staged A",
-  "staged NULL payload",
-  "duplicate B visits",
-  "nonmonotonic query IDs",
-  "bounded prefix steps",
-  "native B A fact order",
-  "all credit returned",
-] as const;
-
-/** Constructor census observes native backing capacities before allocation returns. */
-export const B9_STAR_BACKING_REACH = [
-  "actual backing independent of charges",
-  "A and B sidecars",
-  "8 MiB cap",
-  "multiple fact batches",
-  "matrix domain",
   "all credit returned",
 ] as const;
 
@@ -12190,453 +12541,6 @@ export const UTF8_DURABILITY_REACH = [
   "four bytes",
   "BOM catalog and payload",
   "zero retained",
-] as const;
-
-/** Flat TEXT batches intern keys in one loop and grow exactly as the per-row route. */
-export const FLAT_BYTE_BATCH_REACH = [
-  "nonzero offset base",
-  "ordinary frozen lookup",
-  "partial selection",
-  "hash collision",
-  "pinned competitor",
-  "second batch",
-  "NULL then flat",
-  "dictionary then flat",
-  "independent backing",
-  "reversed selection",
-  "duplicates",
-  "unique growth",
-  "unaligned view",
-  "UUID36",
-  "hash boundary",
-  "zero charges",
-] as const;
-
-/** Native flat byte grouping retains exact PG results after a denied growth spills. */
-export const FLAT_BYTE_PG_REACH = [
-  "PG exact",
-  "pinned 8 MiB",
-  "spill",
-  "later pass",
-  "selection",
-  "NULL",
-  "non-NULL flat",
-  "UUID36 width",
-  "zero state and spill",
-] as const;
-
-/**
- * Declared reach for a generated campaign.
- *
- * A generated suite enforces its laws only in the states its histories actually enter. A run can
- * pass any number of seeds and still check nothing where a law matters: the generator never
- * produced a matching UPDATE, every fault hit a missing row, every live delivery was a full
- * re-run. Counting passing runs does not show that; seed 1349451771 in regression-seeds.json is
- * the case where it did not.
- *
- * A campaign declares the states its laws depend on. Each history (a seed's plan, a fast-check
- * run) starts with `beginHistory()` and calls `reach(state)` when it enters one. After the
- * campaign, `assertReached()` fails for every declared state fewer than `minimum` histories
- * entered. A history counts once per state however often it enters it.
- *
- * A `MINNOW_SEED` replay checks one history, not the campaign, so the assertion stands aside
- * then; so does a filtered run in which no history ran. The idea and the name are TanStack DB's
- * (`packages/db/tests/oracle-reach.ts`). Like ./seeds.ts, this module is excluded from the
- * published tarball.
- */
-export const B9_DECIMAL_SUFFIX_REACH = [
-  "flat",
-  "dictionary",
-  "constant",
-  "PG first rows",
-  "bitmap",
-  "sparse pages",
-  "generic first",
-  "members",
-  "restored",
-  "NULL",
-  "leading zero fallback",
-  "large suffix fallback",
-  "other prefix fallback",
-  "dictionary identity",
-  "selection",
-  "owned prefix",
-  "funded growth",
-  "empty prefix",
-  "UTF8 prefix",
-  "released",
-] as const;
-
-export const B9_DECIMAL_SUFFIX_PRESSURE_REACH = [
-  "checkpoint",
-  "no holdings between phases",
-  "PG count",
-  "membership before suffix",
-  "local dictionaries",
-  "selection",
-  "16 MiB",
-  "released",
-] as const;
-
-/** Scalar exact DISTINCT funds the actual slot-load boundary before allocating. */
-export const B9_SCALAR_DISTINCT_GROWTH_REACH = [
-  "first slot growth",
-  "later slot growth",
-  "flat",
-  "dictionary",
-  "NULL",
-  "selection",
-  "PostgreSQL count",
-  "bounded charge",
-  "released",
-] as const;
-
-/** Encoded selection avoids unused decode scratch; real fallbacks still fund and release it. */
-export const PAGE_SELECTION_WORKSPACE_REACH = [
-  "int32",
-  "int64 FOR",
-  "decimal FOR",
-  "int64 plain",
-  "decimal128 plain",
-  "multiple pages",
-  "range",
-  "refine",
-  "mask",
-  "nullable",
-  "null predicate",
-  "encoded without workspace",
-  "fallback refused before allocation",
-  "fallback charged",
-  "workspace reused",
-  "closed and released",
-] as const;
-
-/** S1 encoded scan COUNT: semantic and admission states, each reached by committed seeds. */
-export const ENCODED_SCAN_REACH = [
-  "encoded count without value vectors",
-  "metadata refusal uses ordinary batches",
-  "empty selection",
-  "nulls",
-  "visibility",
-  "sparse selection",
-  "dense selection",
-  "multiple logical steps",
-  "dictionary validity without expansion",
-  "close returns all credit",
-  "pure column remap",
-  "shared sum and average",
-  "missing column uses complete ordinary step",
-  "nested duplicate-column bindings",
-] as const;
-
-/** S1 real encoded page reductions; inspected physical paths, not generator labels. */
-export const ENCODED_PAGE_VALUES_REACH = [
-  "plain int32",
-  "FOR u8",
-  "FOR u16",
-  "delta checkpoints",
-  "plain float",
-  "scaled float",
-  "float patches",
-  "nulls",
-  "repeated positions",
-  "selected input order",
-  "all-null page",
-  "constant page",
-  "contiguous range",
-  "delta zero-width",
-  "delta u16",
-  "scaled zero-width",
-  "scaled u8",
-  "scaled u16",
-  "scaled u32",
-] as const;
-
-/** Ordered float8pl demand and prefix preservation for raw encoded pages. */
-export const ENCODED_PAGE_FLOAT_ERRORS_REACH = [
-  "positive overflow",
-  "negative overflow",
-  "infinity first",
-  "NaN first",
-  "signed zero",
-  "repeated positions before failure",
-  "plain payload error transitions",
-  "scaled payload error transitions",
-  "all-valid error transitions",
-  "nullable error transitions",
-] as const;
-
-/** Metadata-only and synchronous payload ownership at the S1 reader seam. */
-export const ENCODED_PAGE_BORROW_REACH = [
-  "metadata before payload",
-  "empty span without payload",
-  "unloaded page refused before callback",
-  "span endpoints checked",
-  "loaded page borrowed without new capacity",
-  "closed reader refused",
-  "close returns credit",
-  "loaded eligibility without transition",
-] as const;
-
-/** Expired ordinary payload and temporary column mappings cannot outlive encoded readiness. */
-export const ENCODED_PROJECT_BORROW_REACH = [
-  "single projection",
-  "nested projections",
-  "after readiness",
-  "synchronous readiness",
-  "receiver error",
-  "successful consumption",
-  "expired source collected",
-  "binding metadata collected",
-] as const;
-
-/** Ordinary SQL planning reaches encoded consumption, including a decoded memory tail. */
-export const ENCODED_NATIVE_REACH = [
-  "native encoded recipe",
-  "counted scan rows preserved",
-  "duplicate aggregate column binding",
-  "stored and memory transitions",
-  "null columns",
-  "deleted rows",
-  "retained generation pinned before update",
-  "updated generation flushed",
-  "encoded retained generation after flush",
-  "scan retained generation after flush",
-  "encoded newer generation",
-  "scan newer generation",
-  "generations keep distinct answers",
-  "complete native cleanup",
-] as const;
-
-/** Reader-legal u32 FOR/delta int32 pages which the size-choosing writer does not emit. */
-export const ENCODED_PAGE_WIDE32_REACH = [
-  "FOR u32",
-  "delta u32",
-  "signed modulo wrap",
-  "nullable FOR",
-  "duplicate positions",
-  "contiguous range",
-] as const;
-
-/** COUNT cannot hide a demanded safe-number corruption or inspect an unselected scalar. */
-export const ENCODED_COUNT_VALIDATION_REACH = [
-  "declined before count transition",
-  "demanded unsafe value refused",
-  "unselected unsafe value remains undemanded",
-  "wide lane retains direct count",
-  "int64",
-  "decimal",
-  "interval",
-] as const;
-
-/** Source-only columns retain ordinary dense/gather validation before raw reductions. */
-export const ENCODED_SOURCE_DEMAND_REACH = [
-  "int64",
-  "decimal",
-  "interval",
-  "dense unselected scalar stays demanded",
-  "entire unselected page stays demanded",
-  "sparse unsafe scalar stays undemanded",
-  "wide source stays direct",
-  "undemanded page stays direct",
-  "COUNT star",
-  "COUNT other column",
-  "pure projection hides source column",
-  "close returns all credit",
-] as const;
-
-/** Source-only out-of-line reads keep dense/gather error order and bounded fallback. */
-export const ENCODED_SOURCE_LARGE_DEMAND_REACH = [
-  "dense source value remains demanded",
-  "wholly unselected value page remains demanded",
-  "sparse value stays undemanded",
-  "separate undemanded page stays direct",
-  "COUNT star",
-  "COUNT other column",
-  "pure projection hides source column",
-  "close returns all credit",
-] as const;
-
-/** Noneligible recipes perform no encoded-capability discovery or batch dispatch. */
-export const ENCODED_COST_REACH = [
-  "plain",
-  "selective",
-  "grouped",
-  "minmax",
-  "expression",
-  "distinct",
-  "filter",
-  "numeric",
-  "mixed",
-  "limited",
-  "residual",
-  "partial residual",
-  "no capability probes",
-  "no aggregate capability discovery",
-  "no encoded transitions",
-  "nullable source",
-  "ordinary memory tail",
-  "eligible reduction remains encoded",
-  "complete cleanup",
-] as const;
-
-/** A metadata-only eligibility probe agrees with the scan splitter without payload reads. */
-export const PUSHDOWN_ELIGIBILITY_REACH = [
-  "int16",
-  "int32",
-  "int64 safe",
-  "float32",
-  "float64",
-  "float32 from f64",
-  "float64 from f32",
-  "date",
-  "timestamp",
-  "timestamptz",
-  "time",
-  "bool",
-  "int64 wide",
-  "numeric safe",
-  "numeric int64",
-  "numeric int128",
-  "numeric wide",
-  "numeric NaN",
-  "numeric Infinity",
-  "numeric -Infinity",
-  "text",
-  "bytes",
-  "uuid",
-  "interval",
-  "json",
-  "jsonb",
-  "array",
-  "enum",
-  "locator",
-  "compare",
-  "flipped",
-  "in",
-  "negated in",
-  "is null",
-  "parameter",
-  "and",
-  "mixed and",
-  "or",
-  "empty and",
-  "null literal",
-  "nonnull literal",
-  "empty literal",
-  "mismatched layout",
-  "missing column",
-  "C collation",
-  "non C collation",
-  "residual filter",
-  "accepted pushdown",
-  "no payload reads",
-  "text compare nonC",
-  "text IN nonC",
-  "null IN member accepted",
-  "null compare residual",
-] as const;
-
-export const EXECUTOR_DEMAND_ADMISSION_REACH = [
-  "pinned competitor denies optional growth",
-  "PGlite exact ordered rows",
-  "declared widths",
-  "unknown widths",
-  "descending physical reorder",
-  "ascending physical reorder",
-  "LIMIT zero",
-  "unbounded LIMIT",
-  "bound LIMIT",
-  "oversized row",
-  "nullable input",
-  "minimum versus charged peak",
-  "zero final query credit",
-] as const;
-
-export const READ_DEMAND_COVERAGE_REACH = [
-  "physical prefix is not complete chunk",
-  "whole chunk covers every subinterval",
-  "unused byte target not retained",
-  "one-row hints cover whole source",
-  "zero sizing credits",
-] as const;
-
-export const EXECUTOR_DEMAND_PUBLICATION_REACH = [
-  "resident source retained before publication",
-  "publication after complete admission",
-  "old snapshot exact values after publication",
-  "8MiB query zero final credit",
-] as const;
-
-export const RESIDENT_RANGE_REACH = [
-  "bounded resident minimum",
-  "real delta replacement keeps captured arrays",
-  "publication before open",
-  "cancel before open",
-  "cancel transferred input before next",
-  "cancel pending input keeps charge until settle",
-  "descending exact locators",
-  "ascending exact locators",
-  "pinned optional growth denied",
-  "zero cursor credits",
-] as const;
-
-export const EXECUTOR_LEGACY_DEMAND_REACH = [
-  "optional range capability absent",
-  "complete query fits8MiB",
-  "PGlite exact direct projection",
-  "ascending",
-  "descending",
-  "legacy diagnostic cursor exercised",
-  "operator requests within reserved capacity",
-  "zero final credits",
-] as const;
-
-/** Independent factory allocations across input/output batch and variable width boundaries. */
-export const EXECUTOR_DEMAND_BOUNDARIES_REACH = [
-  "BYTEA",
-  "JSON",
-  "JSONB",
-  "native",
-  "ties",
-  "distinct",
-  "sql-distinct",
-  "2047",
-  "2048",
-  "2049",
-  "4097",
-  "8193",
-  "DISTINCT returns rows beyond offset",
-  "wide payload",
-  "variable NUMERIC coefficients",
-  "safe coefficient source",
-  "int64 coefficient source",
-  "int128 coefficient source",
-  "LIMIT above batch",
-  "OFFSET crosses batch",
-  "independent backing credit",
-  "pinned pressure",
-  "PGlite exact rows",
-  "zero final credit",
-] as const;
-
-/** One-locator admission must retain full physical-position workspace. */
-export const EXECUTOR_KEY_ORDER_DEMAND_REACH = [
-  "2",
-  "257",
-  "2049",
-  "int",
-  "text",
-  "numeric",
-  "resident",
-  "stored",
-  "ASC",
-  "DESC",
-  "OFFSET",
-  "no OFFSET",
-  "PG exact",
-  "independent backing",
-  "released",
 ] as const;
 
 export const NATIVE_WRITE_DICTIONARY_PRESSURE_REACH = [
@@ -12995,6 +12899,354 @@ export const WRITE_WARM_CREDIT_REACH = [
   "zero final charge",
 ] as const;
 
+/** Encoded selection avoids unused decode scratch; real fallbacks still fund and release it. */
+export const PAGE_SELECTION_WORKSPACE_REACH = [
+  "int32",
+  "int64 FOR",
+  "decimal FOR",
+  "int64 plain",
+  "decimal128 plain",
+  "multiple pages",
+  "range",
+  "refine",
+  "mask",
+  "nullable",
+  "null predicate",
+  "encoded without workspace",
+  "fallback refused before allocation",
+  "fallback charged",
+  "workspace reused",
+  "closed and released",
+] as const;
+
+/** S1 encoded scan COUNT: semantic and admission states, each reached by committed seeds. */
+export const ENCODED_SCAN_REACH = [
+  "encoded count without value vectors",
+  "metadata refusal uses ordinary batches",
+  "empty selection",
+  "nulls",
+  "visibility",
+  "sparse selection",
+  "dense selection",
+  "multiple logical steps",
+  "dictionary validity without expansion",
+  "close returns all credit",
+  "pure column remap",
+  "shared sum and average",
+  "missing column uses complete ordinary step",
+  "nested duplicate-column bindings",
+] as const;
+
+/** S1 real encoded page reductions; inspected physical paths, not generator labels. */
+export const ENCODED_PAGE_VALUES_REACH = [
+  "plain int32",
+  "FOR u8",
+  "FOR u16",
+  "delta checkpoints",
+  "plain float",
+  "scaled float",
+  "float patches",
+  "nulls",
+  "repeated positions",
+  "selected input order",
+  "all-null page",
+  "constant page",
+  "contiguous range",
+  "delta zero-width",
+  "delta u16",
+  "scaled zero-width",
+  "scaled u8",
+  "scaled u16",
+  "scaled u32",
+] as const;
+
+/** Ordered float8pl demand and prefix preservation for raw encoded pages. */
+export const ENCODED_PAGE_FLOAT_ERRORS_REACH = [
+  "positive overflow",
+  "negative overflow",
+  "infinity first",
+  "NaN first",
+  "signed zero",
+  "repeated positions before failure",
+  "plain payload error transitions",
+  "scaled payload error transitions",
+  "all-valid error transitions",
+  "nullable error transitions",
+] as const;
+
+/** Metadata-only and synchronous payload ownership at the S1 reader seam. */
+export const ENCODED_PAGE_BORROW_REACH = [
+  "metadata before payload",
+  "empty span without payload",
+  "unloaded page refused before callback",
+  "span endpoints checked",
+  "loaded page borrowed without new capacity",
+  "closed reader refused",
+  "close returns credit",
+  "loaded eligibility without transition",
+] as const;
+
+/** Expired ordinary payload and temporary column mappings cannot outlive encoded readiness. */
+export const ENCODED_PROJECT_BORROW_REACH = [
+  "single projection",
+  "nested projections",
+  "after readiness",
+  "synchronous readiness",
+  "receiver error",
+  "successful consumption",
+  "expired source collected",
+  "binding metadata collected",
+] as const;
+
+/** Ordinary SQL planning reaches encoded consumption, including a decoded memory tail. */
+export const ENCODED_NATIVE_REACH = [
+  "native encoded recipe",
+  "counted scan rows preserved",
+  "duplicate aggregate column binding",
+  "stored and memory transitions",
+  "null columns",
+  "deleted rows",
+  "retained generation pinned before update",
+  "updated generation flushed",
+  "encoded retained generation after flush",
+  "scan retained generation after flush",
+  "encoded newer generation",
+  "scan newer generation",
+  "generations keep distinct answers",
+  "complete native cleanup",
+] as const;
+
+/** Reader-legal u32 FOR/delta int32 pages which the size-choosing writer does not emit. */
+export const ENCODED_PAGE_WIDE32_REACH = [
+  "FOR u32",
+  "delta u32",
+  "signed modulo wrap",
+  "nullable FOR",
+  "duplicate positions",
+  "contiguous range",
+] as const;
+
+/** COUNT cannot hide a demanded safe-number corruption or inspect an unselected scalar. */
+export const ENCODED_COUNT_VALIDATION_REACH = [
+  "declined before count transition",
+  "demanded unsafe value refused",
+  "unselected unsafe value remains undemanded",
+  "wide lane retains direct count",
+  "int64",
+  "decimal",
+  "interval",
+] as const;
+
+/** Source-only columns retain ordinary dense/gather validation before raw reductions. */
+export const ENCODED_SOURCE_DEMAND_REACH = [
+  "int64",
+  "decimal",
+  "interval",
+  "dense unselected scalar stays demanded",
+  "entire unselected page stays demanded",
+  "sparse unsafe scalar stays undemanded",
+  "wide source stays direct",
+  "undemanded page stays direct",
+  "COUNT star",
+  "COUNT other column",
+  "pure projection hides source column",
+  "close returns all credit",
+] as const;
+
+/** Source-only out-of-line reads keep dense/gather error order and bounded fallback. */
+export const ENCODED_SOURCE_LARGE_DEMAND_REACH = [
+  "dense source value remains demanded",
+  "wholly unselected value page remains demanded",
+  "sparse value stays undemanded",
+  "separate undemanded page stays direct",
+  "COUNT star",
+  "COUNT other column",
+  "pure projection hides source column",
+  "close returns all credit",
+] as const;
+
+/** Noneligible recipes perform no encoded-capability discovery or batch dispatch. */
+export const ENCODED_COST_REACH = [
+  "plain",
+  "selective",
+  "grouped",
+  "minmax",
+  "expression",
+  "distinct",
+  "filter",
+  "numeric",
+  "mixed",
+  "limited",
+  "residual",
+  "partial residual",
+  "no capability probes",
+  "no aggregate capability discovery",
+  "no encoded transitions",
+  "nullable source",
+  "ordinary memory tail",
+  "eligible reduction remains encoded",
+  "complete cleanup",
+] as const;
+
+/** A metadata-only eligibility probe agrees with the scan splitter without payload reads. */
+export const PUSHDOWN_ELIGIBILITY_REACH = [
+  "int16",
+  "int32",
+  "int64 safe",
+  "float32",
+  "float64",
+  "float32 from f64",
+  "float64 from f32",
+  "date",
+  "timestamp",
+  "timestamptz",
+  "time",
+  "bool",
+  "int64 wide",
+  "numeric safe",
+  "numeric int64",
+  "numeric int128",
+  "numeric wide",
+  "numeric NaN",
+  "numeric Infinity",
+  "numeric -Infinity",
+  "text",
+  "bytes",
+  "uuid",
+  "interval",
+  "json",
+  "jsonb",
+  "array",
+  "enum",
+  "locator",
+  "compare",
+  "flipped",
+  "in",
+  "negated in",
+  "is null",
+  "parameter",
+  "and",
+  "mixed and",
+  "or",
+  "empty and",
+  "null literal",
+  "nonnull literal",
+  "empty literal",
+  "mismatched layout",
+  "missing column",
+  "C collation",
+  "non C collation",
+  "residual filter",
+  "accepted pushdown",
+  "no payload reads",
+  "text compare nonC",
+  "text IN nonC",
+  "null IN member accepted",
+  "null compare residual",
+] as const;
+
+export const EXECUTOR_DEMAND_ADMISSION_REACH = [
+  "pinned competitor denies optional growth",
+  "PGlite exact ordered rows",
+  "declared widths",
+  "unknown widths",
+  "descending physical reorder",
+  "ascending physical reorder",
+  "LIMIT zero",
+  "unbounded LIMIT",
+  "bound LIMIT",
+  "oversized row",
+  "nullable input",
+  "minimum versus charged peak",
+  "zero final query credit",
+] as const;
+
+export const READ_DEMAND_COVERAGE_REACH = [
+  "physical prefix is not complete chunk",
+  "whole chunk covers every subinterval",
+  "unused byte target not retained",
+  "one-row hints cover whole source",
+  "zero sizing credits",
+] as const;
+
+export const EXECUTOR_DEMAND_PUBLICATION_REACH = [
+  "resident source retained before publication",
+  "publication after complete admission",
+  "old snapshot exact values after publication",
+  "8MiB query zero final credit",
+] as const;
+
+export const RESIDENT_RANGE_REACH = [
+  "bounded resident minimum",
+  "real delta replacement keeps captured arrays",
+  "publication before open",
+  "cancel before open",
+  "cancel transferred input before next",
+  "cancel pending input keeps charge until settle",
+  "descending exact locators",
+  "ascending exact locators",
+  "pinned optional growth denied",
+  "zero cursor credits",
+] as const;
+
+export const EXECUTOR_LEGACY_DEMAND_REACH = [
+  "optional range capability absent",
+  "complete query fits8MiB",
+  "PGlite exact direct projection",
+  "ascending",
+  "descending",
+  "legacy diagnostic cursor exercised",
+  "operator requests within reserved capacity",
+  "zero final credits",
+] as const;
+
+/** Independent factory allocations across input/output batch and variable width boundaries. */
+export const EXECUTOR_DEMAND_BOUNDARIES_REACH = [
+  "BYTEA",
+  "JSON",
+  "JSONB",
+  "native",
+  "ties",
+  "distinct",
+  "sql-distinct",
+  "2047",
+  "2048",
+  "2049",
+  "4097",
+  "8193",
+  "DISTINCT returns rows beyond offset",
+  "wide payload",
+  "variable NUMERIC coefficients",
+  "safe coefficient source",
+  "int64 coefficient source",
+  "int128 coefficient source",
+  "LIMIT above batch",
+  "OFFSET crosses batch",
+  "independent backing credit",
+  "pinned pressure",
+  "PGlite exact rows",
+  "zero final credit",
+] as const;
+
+/** One-locator admission must retain full physical-position workspace. */
+export const EXECUTOR_KEY_ORDER_DEMAND_REACH = [
+  "2",
+  "257",
+  "2049",
+  "int",
+  "text",
+  "numeric",
+  "resident",
+  "stored",
+  "ASC",
+  "DESC",
+  "OFFSET",
+  "no OFFSET",
+  "PG exact",
+  "independent backing",
+  "released",
+] as const;
+
 /** Indexed SELECTs share complete query admission and scan-equivalent pinned visibility. */
 export const QUERY_INDEX_REACH = [
   "mixed serial set inputs",
@@ -13162,4 +13414,161 @@ export const QUERY_INDEX_SEEN_REACH = [
   "fenced cleanup",
   "read after cancel",
   "zero ownership",
+] as const;
+
+export const B9_STAR_FLOAT_DEMAND_REACH = [
+  "native bits or exact error",
+  "same plan deterministic",
+  "finite extremes",
+  "NaN",
+  "infinities",
+  "signed zero",
+  "all NULL",
+] as const;
+
+export const B9_STAR_SHAPE_REACH = [
+  "composite keys",
+  "AVG transition",
+  "additional SUM",
+  "ordered aggregate",
+  "volatile plan",
+] as const;
+
+export const B9_STAR_BUCKET_REACH = [
+  "native transition order",
+  "multiple native chunks",
+  "PostgreSQL bags",
+  "nullable groups",
+  "strict key misses",
+  "bounded empty bucket steps",
+  "all credit returned",
+] as const;
+
+export const B9_STAR_LOOKUP_SQL_REACH = [
+  "native unordered row order",
+  "ordinary SQL sink reached",
+  "native float bits",
+  "PostgreSQL groups",
+  "reversed source ordinals",
+  "forward source ordinals",
+  "NULL grouping values",
+  "all ownership returned",
+] as const;
+
+export const B9_STAR_PRESSURE_REACH = [
+  "sparse buckets keep native state",
+  "dense resident sink",
+  "exact default bits",
+  "64 MiB cap",
+  "cancelled native wait",
+  "no hold while waiting",
+  "uncontended completion",
+  "all credit returned",
+] as const;
+
+/** Ordinary owner's bound TEXT must reach the exact-order star without weakening input demand. */
+export const B9_STAR_BOUND_TEXT_REACH = [
+  "explicit TEXT slot",
+  "owner normalized literal",
+  "PGlite exact ordered bags",
+  "same native bits",
+  "lookup and proof route reached",
+  "NULL binding",
+  "string binding",
+  "empty binding",
+  "Unicode BOM binding",
+  "1024-unit boundary",
+  "zero final credits",
+] as const;
+
+/** Invalid parameter forms must not add optional dictionary proof reads. */
+export const B9_STAR_TEXT_DEMAND_REACH = [
+  "missing",
+  "NUL",
+  "bool",
+  "number",
+  "overbound",
+  "extra",
+  "old binding outcome",
+  "no optional proof demand",
+] as const;
+
+/** Bound TEXT cannot enable a different dictionary recipe or ancestor family. */
+export const B9_STAR_TEXT_SCOPE_REACH = [
+  "one join",
+  "two joins",
+  "AVG",
+  "COUNT only",
+  "parameter LIMIT",
+  "computed sort",
+  "exact native fallback",
+  "no optional proof demand",
+] as const;
+
+export const B9_STAR_SOURCE_DEMAND_REACH = [
+  "facts fail before A and B demand",
+  "A fails before B demand",
+  "native source phase order",
+  "finite prefix forwards B failure",
+  "multiple B batches",
+  "PGlite22003",
+  "native22003",
+  "selected lookup no fault",
+  "native stops before late B failure",
+  "lookup retains22003",
+  "zero charges",
+] as const;
+
+/** Staging preserves prefix demand without changing native duplicate/NULL visitation. */
+export const B9_STAR_STAGED_PREFIX_REACH = [
+  "skipped staged A",
+  "staged NULL payload",
+  "duplicate B visits",
+  "nonmonotonic query IDs",
+  "bounded prefix steps",
+  "native B A fact order",
+  "all credit returned",
+] as const;
+
+/** Constructor census observes native backing capacities before allocation returns. */
+export const B9_STAR_BACKING_REACH = [
+  "actual backing independent of charges",
+  "A and B sidecars",
+  "8 MiB cap",
+  "multiple fact batches",
+  "matrix domain",
+  "all credit returned",
+] as const;
+
+/** Flat TEXT batches intern keys in one loop and grow exactly as the per-row route. */
+export const FLAT_BYTE_BATCH_REACH = [
+  "nonzero offset base",
+  "ordinary frozen lookup",
+  "partial selection",
+  "hash collision",
+  "pinned competitor",
+  "second batch",
+  "NULL then flat",
+  "dictionary then flat",
+  "independent backing",
+  "reversed selection",
+  "duplicates",
+  "unique growth",
+  "unaligned view",
+  "UUID36",
+  "hash boundary",
+  "zero charges",
+] as const;
+
+/** Native flat byte grouping retains exact PG results after a denied growth spills. */
+export const FLAT_BYTE_PG_REACH = [
+  "PG exact",
+  "pinned 8 MiB",
+  "spill",
+  "later pass",
+  "selection",
+  "NULL",
+  "non-NULL flat",
+  "UUID36 width",
+  "zero state and spill",
 ] as const;

@@ -149,6 +149,8 @@ export class StreamingRangeCursor implements IndexCursor {
         let owned = shared.governor.tryAdmit(options);
         owned ??= (yield shared.governor.admit({
           ...options,
+          // Inside a write statement: the writer holds its floors and the statement its rows.
+          holdsCredit: true,
           signal: this.#abort.signal,
         })) as Grant;
         this.#ownedGrant = owned;

@@ -8,7 +8,7 @@ import {
   NATIVE_CHILD_INPUT_FENCE_REACH,
 } from "../../testing/reach.js";
 import { valueAt, decimal, decimals } from "../exec/kernels/test-support.js";
-import { batch, ints, texts } from "../write/test-support.js";
+import { batch, ints, texts, nativeEndStep } from "../write/test-support.js";
 import { yieldTask } from "../task.js";
 import { RegistryTargets } from "./registry-targets.js";
 import { NativeChildInputs, NATIVE_CHILD_INPUT_BYTES } from "./child-inputs.js";
@@ -110,7 +110,7 @@ for (const seed of seedsFor("next-native-child-input", [0xb62e, 0xb62f]))
                   expect(token).toBe(command);
                   return 1;
                 },
-                finishRoot: async () => undefined,
+                finishRoot: (stop) => nativeEndStep(f.statement, stop),
                 closeRoot: async () => undefined,
               }),
               first = handles[0];

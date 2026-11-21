@@ -27,6 +27,9 @@ export interface PrepaidQueryScope {
    * Root may reclaim/wait cancellably for the COMPLETE next producer minimum. */
   prepare(bytes: number, signal: AbortSignal): Promise<void>;
   prepareMetadata(bytes: number, signal: AbortSignal): Promise<void>;
+  /** What this query may size its working set for: the root's capacity beside the writer's
+   * protected floor, less the root's own non-source holdings. Defaults to the cap. */
+  sizingBytes?(): number;
 }
 export class PrepaidQueryGovernor implements MemoryGovernor {
   #first: PrepaidShare | null = null;
@@ -52,6 +55,9 @@ export class PrepaidQueryGovernor implements MemoryGovernor {
   }
   get capBytes() {
     return this.scope.governor.capBytes;
+  }
+  get sizingBytes() {
+    return this.scope.sizingBytes?.() ?? this.scope.governor.capBytes;
   }
   get reserveBytes() {
     return this.scope.governor.reserveBytes;

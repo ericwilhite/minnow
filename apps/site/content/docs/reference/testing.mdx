@@ -48,6 +48,20 @@ after generated declarations or asynchronous signatures change.
 | `npm run check`                    | Format, types, lint, build, API contract, coverage, fast SQLLogicTest, and `test:packed`                                                                        | The local merge gate                            |
 | `npm run check:release`            | The local gate, full SQL/simulator (also forced-packed), performance, and browser runners                                                                       | Release candidates                              |
 
+### Failing fast on a memory wait
+
+`MINNOW_GOVERNOR_STALL_MS` turns on the governor's stall guard in a Vitest run. A memory request
+that waits that many milliseconds while nothing in the governor changes (no credit taken or
+returned, no request queued, served or withdrawn) fails with a `GovernorStallError`. It names the
+waiting request, every holder and where the request was queued, instead of hanging until the test
+timeout. It is a no-progress window, not a proof of deadlock: a holder that computes for longer
+than the window without touching the governor is reported too. The trigger and write suites pass
+with it set to 10 seconds:
+
+```bash
+MINNOW_GOVERNOR_STALL_MS=10000 npx vitest run packages/core/src/next/write
+```
+
 Install the browser binaries once before using a browser runner:
 
 ```bash
@@ -1854,7 +1868,8 @@ The figure each measured engine shows on the page is the `download` field in
 
 The unit suite also compares fresh bundles against the installed SQLite Wasm loader plus its
 Wasm file. The engine with OPFS must stay smaller after gzip. The generic worker with all
-stores plus its separately bundled client has a tight 547 KiB combined budget; those two
+stores plus its separately bundled client has a tight combined gzip budget (set in
+`scripts/library-sizes.test.ts`); those two
 downloads repeat some code and exceed SQLite's single loader-plus-Wasm measurement. The report
 and test share the same measurement code. Per-entry budgets in
 `packages/core/src/tree-shaking.test.ts` separately bound the main engine, the IndexedDB worker,

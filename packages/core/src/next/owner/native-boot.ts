@@ -83,6 +83,7 @@ async function openResources(
   let session: StoreSession | null = null,
     startup: Grant | null = null,
     scratchControl: Grant | null = null,
+    unregisterScratch: (() => void) | null = null,
     scratchMemory: CacheMemory | null = null,
     space: ExtentSpace | null = null,
     path: WritePath | null = null,
@@ -93,6 +94,7 @@ async function openResources(
     (storageClosing ??= cleanup([
       () => (spill instanceof ScratchSpillService ? spill.close() : spill?.sweep()),
       () => {
+        unregisterScratch?.();
         scratchControl?.close();
         scratchMemory?.unregister?.();
       },
@@ -141,6 +143,8 @@ async function openResources(
     } else {
       scratchControl = await governor.admit({
         label: "shared scratch control",
+        // The write path is open: its owner minimum stays held through this wait.
+        holdsCredit: true,
         minimumBytes: SCRATCH_CONTROL_BYTES,
         spillable: false,
         ...(options.signal === undefined ? {} : { signal: options.signal }),
@@ -150,6 +154,8 @@ async function openResources(
       // Permanent beside the write engine: part of every write growth step's complete minimum.
       const control = scratchControl;
       openedPath.retainOwnerHoldings(() => control.held);
+      // Held for the owner's lifetime, never released on a reclaim request: permanent.
+      unregisterScratch = governor.registerPermanent(() => control.held);
     }
     // Native recovery must finish before old temporary ownership is swept.
     await spill.sweep();
