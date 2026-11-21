@@ -10754,6 +10754,17 @@ export const FOLLOW_NESTED_PRESSURE_REACH = [
   "zero native charge",
 ] as const;
 
+/** Native trigger bodies' input queries: point and range lookups on prepaid shares. */
+export const NATIVE_BODY_SIZING_REACH = [
+  "published",
+  "resident",
+  "competitor holds the spare credit",
+  "native body admitted",
+  "point lookup in nested AFTER",
+  "range lookup in nested AFTER",
+  "range lookup past the last key",
+] as const;
+
 export const FOLLOW_NESTED_BOUNDARY_REACH = [
   "published",
   "resident",

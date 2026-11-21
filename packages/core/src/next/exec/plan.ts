@@ -186,6 +186,7 @@ import {
   type IndexShape,
   type AdmittedIndexRead,
 } from "./key-order.js";
+import { holdsAcrossAdmission } from "./preparation.js";
 import {
   WindowOperator,
   windowMinimumBytes,
@@ -4394,11 +4395,12 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
             );
           // A lookup's keys name its segments. The list and the sizing that follows are
           // preparation admissions: one that would wait while the list is held releases the whole
-          // attempt and prepares again with a credit covering both (exec/preparation.ts).
+          // attempt and prepares again with a credit covering both (exec/preparation.ts). Without
+          // the facade (a native body's prepaid shares) the source is sized whole.
           let bound: ReadBound;
           const lookup = lookupSizing.get(source.id);
           const found =
-            lookup === undefined
+            lookup === undefined || !holdsAcrossAdmission(runtime.governor)
               ? null
               : yield* readValue(
                   lookupSegments(runtime, plan, lookup.rel, lookup.keyMinimum(runtime)),
@@ -4746,8 +4748,9 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
         // (its own released scratch grant, a fresh plan on this pinned view): only the
         // segments it names are sized. A larger or unbounded window sizes the whole source.
         // The window's own scratch must fit the cap: it may never refuse a query that whole-
-        // source sizing admits.
+        // source sizing admits. Only the preparation facade may hold the list across sizing.
         const sizingPlan =
+          holdsAcrossAdmission(runtime.governor) &&
           resident === null &&
           bounds.limit !== null &&
           bounds.limit <= BATCH_ROWS &&

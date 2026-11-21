@@ -354,6 +354,16 @@ export function baseGovernor(governor: MemoryGovernor): MemoryGovernor {
   return governor instanceof PreparationGovernor ? governor.governor : governor;
 }
 
+/**
+ * Whether a preparation may keep memory (a sizing pass's segment list) while it admits more.
+ * Only under the facade: an admission that would wait while anything is held restarts the
+ * attempt instead (PreparationWouldWait). A native trigger body's prepaid shares refuse any
+ * admission while a share is held (owner/prepaid-query.ts), so its sources are sized whole.
+ */
+export function holdsAcrossAdmission(governor: MemoryGovernor): boolean {
+  return governor instanceof PreparationGovernor;
+}
+
 /** The facade for a request's governor, or null when it is not the reference governor. */
 export function preparationGovernor(
   governor: MemoryGovernor,
