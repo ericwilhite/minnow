@@ -153,12 +153,10 @@ it("never asks for more than the usable capacity: lifetime holdings cap the doub
     spillable: false,
   });
   if (lifetime === null) throw new Error("lifetime");
-  // Lifetime holdings, as #11 will register them: the usable capacity is 4 MiB smaller.
+  // Registered as a lifetime holding (#11): the governor's usable capacity is 4 MiB smaller.
+  const unregister = governor.registerPermanent(() => lifetime.held);
   const facade = new PreparationGovernor(governor);
-  vi.spyOn(facade, "usableCapacity").mockImplementation(
-    (progress = false) =>
-      (progress ? governor.capBytes : governor.capBytes - governor.reserveBytes) - 4 * MiB,
-  );
+  expect(governor.usableCapacity()).toBe(10 * MiB);
   expect(facade.usableCapacity()).toBe(10 * MiB);
   const wait = (needed: number) =>
     new PreparationWouldWait("probe", MiB, false, needed - MiB, [
@@ -183,6 +181,7 @@ it("never asks for more than the usable capacity: lifetime holdings cap the doub
     sqlState: "53200",
   });
   facade.close();
+  unregister();
   lifetime.close();
   expect(governor.usedBytes).toBe(0);
 });

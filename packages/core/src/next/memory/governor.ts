@@ -1326,10 +1326,12 @@ export class Governor implements MemoryGovernor {
 
   /** Registers one more cache (rule 6); every registered cache is evicted before anything waits. */
   registerCache(cache: EvictableCache) {
+    this.assertMutable();
     if (!this.#caches.includes(cache)) this.#caches.push(cache);
     let active = true;
     return {
       takeFrom: (source: unknown, bytes: number): boolean => {
+        this.assertMutable();
         if (!Number.isSafeInteger(bytes) || bytes < 0) throw new RangeError("Bad transfer size");
         if (
           !active ||
@@ -1348,6 +1350,7 @@ export class Governor implements MemoryGovernor {
         return true;
       },
       charge: (bytes: number): boolean => {
+        this.assertMutable();
         if (
           this.#loans.length > 0 ||
           this.#reads.length > 0 ||
@@ -1361,9 +1364,11 @@ export class Governor implements MemoryGovernor {
         return true;
       },
       release: (bytes: number): void => {
+        this.assertMutable();
         this.give(bytes);
       },
       unregister: (): void => {
+        this.assertMutable();
         active = false;
         const at = this.#caches.indexOf(cache);
         if (at >= 0) this.#caches.splice(at, 1);

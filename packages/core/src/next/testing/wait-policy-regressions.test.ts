@@ -233,6 +233,50 @@ describe("preparation credit interactions", () => {
     expect(governor.usedBytes).toBe(0);
   });
 
+  it("refuses cache charges and other cache mutators inside a growth observer (review 11)", async () => {
+    const governor = new Governor(32 << 20);
+    const cache = governor.registerCache({ evictableBytes: 0, evict: () => 0 });
+    expect(cache.charge(1024)).toBe(true);
+    const grant = await governor.admit({ label: "observed", minimumBytes: 0, spillable: true });
+    expect(grant.allocate(0)).toBe(true);
+    const seen: Array<[string, unknown, number]> = [];
+    governor.observeGrowth(grant, () => {
+      for (const [name, mutate] of [
+        ["charge", () => cache.charge(1024)],
+        ["release", () => cache.release(1024)],
+        ["takeFrom", () => cache.takeFrom(grant, 0)],
+        ["unregister", () => cache.unregister()],
+        ["registerCache", () => governor.registerCache({ evictableBytes: 0, evict: () => 0 })],
+      ] as const) {
+        const before = governor.usedBytes;
+        try {
+          mutate();
+          seen.push([name, "allowed", governor.usedBytes - before]);
+        } catch (error) {
+          seen.push([name, error, governor.usedBytes - before]);
+        }
+      }
+    });
+    expect(grant.tryGrow(4096)).toBe(true);
+    governor.observeGrowth(grant, null);
+    expect(seen.map(([name]) => name)).toEqual([
+      "charge",
+      "release",
+      "takeFrom",
+      "unregister",
+      "registerCache",
+    ]);
+    for (const [name, error, delta] of seen) {
+      expect(error, name).toBeInstanceOf(GrowthObserverReentryError);
+      expect(delta, name).toBe(0);
+    }
+    // Outside the observer the cache works as before.
+    cache.release(1024);
+    cache.unregister();
+    grant.close();
+    expect(governor.usedBytes).toBe(0);
+  });
+
   it("counts carving, adoption and credit returned to a parent as holder activity", async () => {
     const governor = new Governor(8 << 20);
     const parent = await governor.admit({
