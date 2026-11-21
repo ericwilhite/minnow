@@ -29,9 +29,9 @@ describe("next/ speed-claim protocol arithmetic", () => {
     expect(signTestP(9, 0)).toBeCloseTo(2 / 512, 12);
     expect(signTestP(7, 2)).toBeCloseTo((2 * (36 + 9 + 1)) / 512, 12);
     expect(signTestP(0, 0)).toBe(1);
-    // Nine pairs can never survive a 45-cell correction; fifteen can.
-    expect(signTestP(9, 0) * 45).toBeGreaterThan(0.05);
-    expect(signTestP(15, 0) * 45).toBeLessThan(0.05);
+    // Nine pairs can never survive a 47-cell correction; fifteen can.
+    expect(signTestP(9, 0) * 47).toBeGreaterThan(0.05);
+    expect(signTestP(15, 0) * 47).toBeLessThan(0.05);
   });
 
   it("applies Holm's step-down adjustment", () => {
@@ -218,7 +218,7 @@ describe("next/ claim report", () => {
     await expect(claimManifest({ ...base, targets: ["no_such_cell"] })).rejects.toThrow(/Target/u);
     await expect(claimManifest({ ...base, control: "main" })).rejects.toThrow(/SHA/u);
     const declared = await claimManifest({ ...base, datasets: ["W1M", "S1"] });
-    expect(declared.datasets.map((d) => d.cells.length)).toEqual([29, 16]);
+    expect(declared.datasets.map((d) => d.cells.length)).toEqual([31, 16]);
   });
 
   // Review of #12, second round (P2): manifests were neither validated nor bound to results.

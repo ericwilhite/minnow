@@ -195,6 +195,18 @@
       "completes": true,
       "note": "≤20 ms cold"
     },
+    "W1M/lookup_point_pk": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true,
+      "note": "primary-key point read"
+    },
+    "W1M/lookup_range_pk": {
+      "gate": "B",
+      "ratio": 1,
+      "completes": true,
+      "note": "100-key primary-key range"
+    },
     "W1M/sort_topn": {
       "gate": "B",
       "ratio": 1,

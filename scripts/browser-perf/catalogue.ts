@@ -231,6 +231,19 @@ export const WIDE_QUERIES: readonly AnalyticsQuery[] = [
     ordered: true,
     sql: "SELECT id, d00, f09 FROM events_wide ORDER BY id LIMIT 100 OFFSET ${R90}",
   },
+  // Primary-key lookups: a point read and a 100-key range (#29 sizes them over named groups).
+  {
+    id: "lookup_point_pk",
+    family: "scan",
+    check: "count",
+    sql: "SELECT * FROM events_wide WHERE id = ${R50}",
+  },
+  {
+    id: "lookup_range_pk",
+    family: "scan",
+    ordered: true,
+    sql: "SELECT id, d00, f09 FROM events_wide WHERE id BETWEEN ${R50} AND ${R50+99} ORDER BY id",
+  },
   {
     id: "sort_topn",
     family: "sort",
@@ -392,6 +405,8 @@ export const SPILL_DATASETS: readonly string[] = ["W1M", "W5M", "W50K"];
 export function sqlFor(query: AnalyticsQuery, engine: EngineId, rows: number): string {
   const text = (engine === "sqlite" ? query.sqlite : undefined) ?? query.sql;
   return text
+    .replaceAll("${R50}", String(Math.floor(rows * 0.5)))
+    .replaceAll("${R50+99}", String(Math.floor(rows * 0.5) + 99))
     .replaceAll("${R90}", String(Math.floor(rows * 0.9)))
     .replaceAll("${R99}", String(Math.floor(rows * 0.99)));
 }

@@ -22,7 +22,7 @@ on:
         type: choice
         options: [both, W1M, S1]
       pairs:
-        description: "Fresh-process pairs per cell (at least 9; 15 lets the 45-cell screen pass Holm)"
+        description: "Fresh-process pairs per cell (at least 9; 15 lets the 47-cell screen pass Holm)"
         default: "15"
       only:
         description: "Optional comma-separated subset of cells (default: every Gate B cell)"
