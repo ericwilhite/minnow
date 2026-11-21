@@ -4788,10 +4788,11 @@ function isUniqueViolation(error: unknown): boolean {
 function isMissingParent(error: unknown): boolean {
   return errorChainSome(
     error,
-    (name, message, sqlState) =>
+    (name, message, sqlState, problem) =>
       (name === "TypeError" && /^FOREIGN KEY \S+ has no \S+ row with /u.test(message ?? "")) ||
-      // PostgreSQL's foreign_key_violation; the statement (insert/update) names the side.
-      sqlState === "23503",
+      // PostgreSQL's foreign_key_violation on the referencing side ("is not present in table"):
+      // the rebuild engine types that side as problem "missingParent".
+      (sqlState === "23503" && problem === "missingParent"),
   );
 }
 
@@ -4799,11 +4800,14 @@ function isMissingParent(error: unknown): boolean {
 function isRestricted(error: unknown): boolean {
   return errorChainSome(
     error,
-    (name, message, sqlState) =>
+    (name, message, sqlState, problem) =>
       (name === "TypeError" &&
         /^FOREIGN KEY \S+ still has \d+ \S+ row\(s\) referencing /u.test(message ?? "")) ||
-      // PostgreSQL's foreign_key_violation; the statement (delete) names the side.
-      sqlState === "23503",
+      // PostgreSQL's foreign_key_violation on the referenced side ("is still referenced from
+      // table"), typed "referenced" by the rebuild engine, or restrict_violation (23001) for an
+      // explicit RESTRICT.
+      (sqlState === "23503" && problem === "referenced") ||
+      sqlState === "23001",
   );
 }
 
@@ -4902,6 +4906,7 @@ function errorChainSome(
     name: string | undefined,
     message: string | undefined,
     sqlState: string | undefined,
+    problem: string | undefined,
   ) => boolean,
 ): boolean {
   return findErrorInChain(error, predicate) !== undefined;
@@ -4913,6 +4918,7 @@ function findErrorInChain(
     name: string | undefined,
     message: string | undefined,
     sqlState: string | undefined,
+    problem: string | undefined,
   ) => boolean,
 ): Record<string, unknown> | undefined {
   const seen = new Set<unknown>();
@@ -4922,7 +4928,9 @@ function findErrorInChain(
     const name = typeof current.name === "string" ? current.name : undefined;
     const message = typeof current.message === "string" ? current.message : undefined;
     const sqlState = typeof current.sqlState === "string" ? current.sqlState : undefined;
-    if (predicate(name, message, sqlState)) return current;
+    // The rebuild engine's typed foreign-key side ("missingParent" | "referenced").
+    const problem = typeof current.problem === "string" ? current.problem : undefined;
+    if (predicate(name, message, sqlState, problem)) return current;
     current = current.cause;
   }
   return undefined;
