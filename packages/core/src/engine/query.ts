@@ -15259,7 +15259,6 @@ function mergedWildcardSelect(
   return items;
 }
 
-/** Wraps compound members into the set-operation source the executor folds left to right. */
 /**
  * The select list naming a set-operation member's output columns. A member that is itself a
  * compound (a leading INTERSECT chain, or a parenthesized set operation) selects `*` over its
@@ -15277,6 +15276,7 @@ function setOutputSelect(block: CompiledQuery | undefined): readonly SelectItem[
   return member?.select ?? [];
 }
 
+/** Wraps compound members into the set-operation source the executor folds left to right. */
 export function compoundSelectBlock(
   sql: string,
   blocks: CompiledQuery[],
