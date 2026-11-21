@@ -10768,6 +10768,25 @@ export const DML_COMPUTED_REACH = [
   "delete returning",
 ] as const;
 
+/** Set operations against PostgreSQL (set-operation-differential). */
+export const SET_OPERATION_REACH = [
+  "two arms",
+  "three or more arms",
+  "coerced arm",
+  "empty arm",
+  "duplicates kept",
+  "bag",
+  "ordered",
+  "aggregated",
+  "grouped",
+  "joined",
+  "insert",
+  "rollup",
+  "cube",
+  "grouping sets",
+  "refused like PostgreSQL",
+] as const;
+
 export const FOLLOW_NESTED_PRESSURE_REACH = [
   "prepaid writer progresses with competitor retained",
   "published",

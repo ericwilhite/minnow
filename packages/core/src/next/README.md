@@ -2509,8 +2509,9 @@ shipped-engine or stored-format change.
   `aggregationProgress: false` retains the unexported parent benchmark control. The Node
   benchmark also accepts `--control-executor` for a pinned main executor over the same
   stored fixture; shared owner contract/error modules must preserve class identity.
-  Ordinary hash aggregation still refuses GROUPING SETS and string/array/JSON aggregates
-  (`UnsupportedPlanError`, construct `aggregate`, before allocation). Numeric ordered-set-only
+  Ordinary hash aggregation still refuses string/array/JSON aggregates (`UnsupportedPlanError`,
+  construct `aggregate`, before allocation). Several grouping sets (ROLLUP, CUBE, GROUPING SETS)
+  lower to a UNION ALL of ordinary grouped aggregates, one per set, and run as such. Numeric ordered-set-only
   lists retain `agg/ordered-set.ts` as their bounded external fallback. Numeric percentile
   lists may instead use `agg/percentile.ts`: exact dictionary-domain planning bounds at most
   1024 byte-key groups and 2^21 source rows on the same pinned snapshot. The complete typed
@@ -3443,7 +3444,11 @@ not require a home cache directory.
   supports multiple FULL joins, FULL joins under windows, and NATURAL FULL JOIN; the shipped
   executor retains its separate sole-FULL-join rewrite and NATURAL FULL refusal.
 - Set operations resolve each pair's column types as PostgreSQL does: an unknown-typed constant
-  (NULL, a string literal) takes the other arm's type, and two unknowns are text.
+  (NULL, a string literal) takes the other arm's type, and two unknowns are text. UNION ALL runs
+  each arm in order into one consumer, holding no rows of its own; a stop (LIMIT) between arms
+  ends it early, and each arm sees the consumer's remaining demand. An expression evaluated in
+  producer phases (text concatenation, JSON expansion, a JSON aggregate) inside a UNION arm is
+  refused (0A000): earlier arms' rows would already be downstream when a later arm cut a phase.
 - A FULL JOIN with no hash-joinable condition lowers, though PostgreSQL refuses it (0A000): an
   intended extension (R24.2), checked against PostgreSQL's LEFT JOIN UNION ALL anti-join rewrite.
 - Integer and timestamp GENERATE_SERIES in FROM streams fixed prepaid batches with NULL/zero-step rules,
@@ -5419,9 +5424,9 @@ ordering around that family; native suffixes are not PostgreSQL OID spellings.
 
 Typed 0A000 refusals remain for RETURNING/conflict/MERGE roots, volatile/FTS/init-plan inputs,
 auto-increment or indexed domains missing native preflight, parameterized or growing/
-structural CHECK/generated workspace. A trigger body subquery with more than one grouping set
-(ROLLUP, CUBE, or GROUPING SETS with several members) keeps the executor's existing set-operation
-refusal; a single grouping set runs as an ordinary grouped subquery. Raw executor calls do not
+structural CHECK/generated workspace. A trigger body subquery with grouping sets runs as
+PostgreSQL's does: one set as an ordinary grouped subquery, several (ROLLUP, CUBE, GROUPING
+SETS) as a UNION ALL of grouped aggregates. Raw executor calls do not
 install this owner controller.
 
 ### Native compiled-input phase memory

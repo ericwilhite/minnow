@@ -509,7 +509,7 @@ it("counts tokens without building them", () => {
   expect(scan.tokens).toBe(23);
 });
 
-it("runs single-set grouping and quoted keyword bodies like PostgreSQL", async () => {
+it("runs single-set grouping, multi-set ROLLUP and quoted keyword bodies like PostgreSQL", async () => {
   const owner = await publicOwner({ capBytes: 64 << 20 }),
     db = new MinnowDatabaseClient(owner.client, { ready: Promise.resolve() }),
     pg = new PGlite();
@@ -548,16 +548,16 @@ it("runs single-set grouping and quoted keyword bodies like PostgreSQL", async (
     await pg.exec(mutation);
     for (const sql of state)
       expect((await db.query(sql)).rows(), sql).toEqual((await pg.query(sql)).rows);
-    // A multi-set ROLLUP keeps the executor's existing unsupported refusal and changes nothing.
-    await db.execute(
-      "CREATE TRIGGER r AFTER UPDATE ON p BEGIN UPDATE t SET v = 0 WHERE k IN (SELECT k FROM u GROUP BY ROLLUP (k, w)); END",
+    // A multi-set ROLLUP lowers to a UNION ALL of its grouping sets, which runs now (it was
+    // refused before UNION ALL): the body behaves as PostgreSQL's.
+    const rollup = "UPDATE t SET v = 0 WHERE k IN (SELECT k FROM u GROUP BY ROLLUP (k, w))";
+    await db.execute(`CREATE TRIGGER r AFTER UPDATE ON p BEGIN ${rollup}; END`);
+    await pg.exec(
+      `CREATE FUNCTION r() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN ${rollup}; RETURN NEW; END $$;
+       CREATE TRIGGER r AFTER UPDATE ON p FOR EACH ROW EXECUTE FUNCTION r()`,
     );
-    const error = await db.execute(mutation).then(
-      () => null,
-      (e: unknown) => e as { sqlState?: string; message?: string },
-    );
-    expect(error?.sqlState).toBe("0A000");
-    expect(error?.message).toMatch(/set operation other than binary EXCEPT/u);
+    expect((await db.execute(mutation)).affectedRows).toBe(2);
+    await pg.exec(mutation);
     for (const sql of state)
       expect((await db.query(sql)).rows(), sql).toEqual((await pg.query(sql)).rows);
   } finally {
