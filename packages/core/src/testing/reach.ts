@@ -10743,6 +10743,27 @@ export const FOLLOW_NESTED_AFTER_REACH = [
   "body expression reads immediate RI",
 ] as const;
 
+/** Computed INSERT ... SELECT, UPDATE and DELETE against PostgreSQL (dml-computed-differential). */
+export const DML_COMPUTED_REACH = [
+  "series source",
+  "table source",
+  "values source",
+  "join source",
+  "aggregate source",
+  "limited subquery source",
+  "concatenation",
+  "cast",
+  "arithmetic",
+  "coalesce",
+  "nullif",
+  "case",
+  "null text propagated",
+  "concatenation predicate",
+  "update concatenation",
+  "delete concatenation predicate",
+  "large insert",
+] as const;
+
 export const FOLLOW_NESTED_PRESSURE_REACH = [
   "prepaid writer progresses with competitor retained",
   "published",

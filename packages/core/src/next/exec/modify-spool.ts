@@ -22,6 +22,8 @@ export class ModifySpool implements Operator {
   #pending: Promise<void> = Promise.resolve();
   #closing: Promise<void> | null = null;
   #sealed = false;
+  /** Rows appended; a producer-phase handoff requires none (see handoff). */
+  #rows = 0;
   readonly #ownsPool: boolean;
   #readMultiplier = 1;
   constructor(
@@ -65,6 +67,7 @@ export class ModifySpool implements Operator {
   async #append(batch: Batch): Promise<void> {
     if (this.#sealed) throw new TypeError("Modification input spool is sealed");
     const count = batch.selection?.count ?? batch.length;
+    this.#rows += count;
     let at = 0;
     while (at < count) {
       this.signal.throwIfAborted();
@@ -114,6 +117,18 @@ export class ModifySpool implements Operator {
     );
     await this.#pending;
     await sink.finish();
+  }
+  /**
+   * A producer phase hands off (exec/plan.ts phases). A producer's ancestors stay empty while it
+   * spools, and the modification root is an ancestor of every producer, so rows reach this spool
+   * only after the last cut: it holds none here. Its buffers sit on the result reservation that
+   * the handoff parks idle, so they are released now; the next phase builds its own spool.
+   */
+  async handoff(): Promise<void> {
+    await this.#pending;
+    if (this.#rows !== 0)
+      throw new Error("Modification input reached its spool before a producer phase handoff");
+    await this.close();
   }
   abort(): void {
     /* The execution aborts signal; close fences outstanding spill I/O. */

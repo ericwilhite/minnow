@@ -1219,6 +1219,8 @@ export class QueryRuntime {
   async suspendProducer(sink: ProgramSink, idleCredit: Grant): Promise<void> {
     if (!this.#handoff || this.#scope !== null || this.#atomicResult === null)
       throw new Error("Producer graph must retire before phase admission");
+    // The modification spool's buffers share the result reservation parked below.
+    await this.modification?.spool.handoff();
     await sink.suspendBudget();
     const target = this.#atomicResult.detach();
     try {
