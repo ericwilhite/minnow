@@ -190,8 +190,7 @@ speed relative to Minnow differs between CPU families: hosted Intel runners make
 faster than the AMD runners the Linux thresholds were pinned on. A host whose CPU model has no
 calibrated profile is refused before any timing, never compared with another machine's thresholds.
 Each Intel profile takes the highest value from the gate's own `--update` runs on that model:
-Xeon 6975P-C from five runs and Platinum 8573C from four. The Platinum 8370C profile comes from a
-single run and is provisional: recalibrate it once more runners of that model have been drawn.
+Xeon 6975P-C and Platinum 8370C from five runs each, and Platinum 8573C from four.
 `.github/workflows/browser-performance.yml` runs the [browser performance lane](#browser-performance-lane)
 nightly, also off the merge path, and uploads its JSON lines and summary as an artifact.
 `.github/workflows/head-to-head.yml` is the 1.0 rebuild's progress lane, nightly and on demand and
