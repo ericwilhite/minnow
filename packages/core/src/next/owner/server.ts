@@ -167,6 +167,8 @@ interface SessionSlot {
    * no transaction, a read-only statement need not wait behind the queue (see #bypasses).
    */
   blocking: number;
+  /** Bypassing reads still running: requests queued after them wait for them (#serveBeside). */
+  readonly bypassing: Set<Promise<void>>;
 }
 
 const hexToBytes = (hex: string): Uint8Array => {
@@ -756,6 +758,7 @@ class Connection {
         busy: false,
         pending: 0,
         blocking: 0,
+        bypassing: new Set(),
         retireSequence: null,
         timer: new IdleTransactionTimer(timeoutMs, () => {
           created.engine?.expire();
@@ -921,7 +924,11 @@ class Connection {
     };
     const queued = { cancelled: false, close: false };
     this.#queued.set(request.seq, queued);
-    this.#enqueue(slot, () => {
+    // A read that bypassed the queue was issued before this request: whatever this is (BEGIN,
+    // DDL, another write), it waits for those reads to settle, as strict order would have made it.
+    // Only the write already ahead of a bypassing read runs beside it.
+    const earlier = slot.bypassing.size === 0 ? null : [...slot.bypassing];
+    const serve = (): void | Promise<void> => {
       this.#queued.delete(request.seq);
       // Cancelled while it waited behind its session: never admitted, never run.
       if (queued.cancelled) {
@@ -939,7 +946,10 @@ class Connection {
       if (isPromise(result)) return result.finally(unblock);
       unblock();
       return result;
-    });
+    };
+    this.#enqueue(slot, () =>
+      earlier === null ? serve() : Promise.allSettled(earlier).then(serve),
+    );
   }
 
   /**
@@ -1004,8 +1014,13 @@ class Connection {
     } catch {
       result = undefined;
     }
-    if (isPromise(result)) result.then(done, done);
-    else done();
+    if (!isPromise(result)) {
+      done();
+      return;
+    }
+    const settled = result.then(done, done);
+    slot.bypassing.add(settled);
+    void settled.then(() => slot.bypassing.delete(settled));
   }
 
   #answerCancelledBeforeStart(request: Request, slot: SessionSlot, close: boolean): void {

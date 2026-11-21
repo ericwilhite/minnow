@@ -11,6 +11,8 @@ import { afterEach, expect, it, vi } from "vitest";
 import { ProtocolClient } from "../owner/client.js";
 import { MinnowDatabaseClient } from "../owner/database-client.js";
 import type { EngineSession } from "../owner/engine.js";
+import type { PreparedPlan } from "../exec/executor.js";
+import type { PhysicalPlan } from "../ir/ir.js";
 import { publicOwner } from "./public-owner.test.fixture.js";
 
 type Owner = Awaited<ReturnType<typeof publicOwner>>;
@@ -191,4 +193,110 @@ it("the bypassing read runs on its own session, and a prepared read bypasses too
     "INSERT INTO t VALUES (4, 'queued')",
     "SELECT id FROM t ORDER BY id",
   ]);
+});
+
+/**
+ * Holds the first read's execution after it ran: `started` resolves when it is held; `release`
+ * lets it settle, failing it when asked. Writes (modify plans) are untouched.
+ */
+function holdFirstRead(owner: Owner, outcome: "fail" | "succeed") {
+  let started!: () => void;
+  const running = new Promise<void>((resolve) => (started = resolve));
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  // The composed engine prepares every plan it runs (owner/compose.ts); not on the owner interface.
+  const engine = owner.engine as unknown as { prepare(plan: PhysicalPlan): PreparedPlan };
+  const prepare = engine.prepare.bind(engine);
+  let held = false;
+  vi.spyOn(engine, "prepare").mockImplementation((plan) => {
+    const prepared = prepare(plan);
+    if (held || plan.root.op === "modify") return prepared;
+    held = true;
+    return {
+      ...prepared,
+      execute(options) {
+        const execution = prepared.execute(options);
+        return {
+          ...execution,
+          executed: execution.executed.then(async (summary) => {
+            started();
+            await gate;
+            if (outcome === "fail") throw new Error("held read failed");
+            return summary;
+          }),
+        };
+      },
+    };
+  });
+  return { running, release };
+}
+
+it("a bypassing read that fails late never fails a transaction its session opens afterwards", async () => {
+  const { owner, a, b } = await setup();
+  await a.execute("BEGIN");
+  const queued = b.execute("INSERT INTO t VALUES (2, 'queued')");
+  expect(await settlesWithin(queued, 100)).toBe(false);
+  const hold = holdFirstRead(owner, "fail");
+  const read = b.query("SELECT id FROM t ORDER BY id");
+  read.catch(() => undefined);
+  await hold.running;
+  await a.execute("COMMIT");
+  await queued;
+  // Issued after the read: B's BEGIN waits for it, then opens a transaction the read cannot fail.
+  const begin = b.execute("BEGIN");
+  expect(await settlesWithin(begin, 200)).toBe(false);
+  hold.release();
+  await expect(read).rejects.toThrow("held read failed");
+  await begin;
+  try {
+    await b.execute("INSERT INTO t VALUES (3, 'later transaction')");
+    await b.execute("COMMIT");
+  } catch (error) {
+    await b.execute("ROLLBACK");
+    throw error;
+  }
+  expect(await ids(b)).toEqual([2, 3]);
+});
+
+it("requests issued after a slow bypassing read wait for it, then succeed in order", async () => {
+  const { owner, a, b } = await setup();
+  await a.execute("BEGIN");
+  const queued = b.execute("INSERT INTO t VALUES (2, 'queued')");
+  expect(await settlesWithin(queued, 100)).toBe(false);
+  const hold = holdFirstRead(owner, "succeed");
+  const read = b.query("SELECT id FROM t ORDER BY id");
+  await hold.running;
+  await a.execute("COMMIT");
+  await queued;
+  const begin = b.execute("BEGIN");
+  const insert = b.execute("INSERT INTO t VALUES (3, 'later transaction')");
+  expect(await settlesWithin(begin, 200)).toBe(false);
+  expect(await settlesWithin(insert, 50)).toBe(false);
+  hold.release();
+  expect((await read).rows()).toEqual([]);
+  await begin;
+  await insert;
+  await b.execute("COMMIT");
+  expect(await ids(b)).toEqual([2, 3]);
+});
+
+it("a statement that started outside a transaction never fails one opened while it ran (session level)", async () => {
+  const { owner } = await setup();
+  const session = owner.engine.openSession("attribution", 1, "1");
+  const hold = holdFirstRead(owner, "fail");
+  const signal = new AbortController().signal;
+  const read = session.run(session.plan("SELECT id FROM t ORDER BY id"), [], {
+    signal,
+    request: null,
+    windowBytes: 1 << 20,
+    frameRows: null,
+  });
+  read.done.catch(() => undefined);
+  await hold.running;
+  await session.begin(false, signal);
+  hold.release();
+  await expect(read.done).rejects.toThrow("held read failed");
+  expect(session.transaction).toBe("open");
+  session.rollback();
+  session.close();
 });
