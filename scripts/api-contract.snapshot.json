@@ -8714,7 +8714,7 @@
               "name": "INTERACTION_REACH_STATES",
               "kind": "value",
               "declarations": [
-                "INTERACTION_REACH_STATES: readonly [\n    \"update-matched\",\n    \"delete-matched\",\n    \"write-refused\",\n    \"limit-truncated\",\n    \"rollback-discarded\",\n    \"concurrent-read\",\n    \"fault-landed\",\n    \"fault-discarded\",\n    \"reopen-with-rows\",\n    \"rekey-moved\",\n    \"rekey-refused\",\n    \"retired-key-read\",\n    \"unique-refused\",\n    \"alter-populated\",\n    \"index-lookup-rows\"\n]"
+                "INTERACTION_REACH_STATES: readonly [\n    \"update-matched\",\n    \"delete-matched\",\n    \"write-refused\",\n    \"limit-truncated\",\n    \"rollback-discarded\",\n    \"concurrent-read\",\n    \"fault-landed\",\n    \"fault-discarded\",\n    \"reopen-with-rows\",\n    \"rekey-moved\",\n    \"rekey-refused\",\n    \"retired-key-read\",\n    \"unique-refused\",\n    \"alter-populated\",\n    \"index-lookup-rows\",\n    \"read-bypassed-queued-write\"\n]"
               ]
             },
             {

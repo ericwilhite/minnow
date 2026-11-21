@@ -38,7 +38,9 @@ workers over the same database — and keeps it until its commit or rollback has
 Concurrent `write()` calls therefore run one after another, never against each other: no scope
 spends a retry on a sibling, no callback runs twice, and a failed scope rolls back and hands the
 turn to the next writer. Reads through `query()` do not take turns and never wait behind a
-callback; they keep snapshot isolation and see their own scope's staged rows.
+callback; they keep snapshot isolation and see their own scope's staged rows. Outside a scope, a
+read does not wait behind its own connection's write that is still waiting for its turn either:
+it sees every write that has already resolved, and not that pending one until it resolves.
 
 Inside the callback, use `tx` for every write. Another `db.write()`, a standalone batch write, or
 an autocommit SQL mutation awaited from inside the callback waits for the callback to return, so
