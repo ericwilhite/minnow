@@ -72,13 +72,7 @@ import {
   exceptMinimumBytes,
   type ExceptCheckpoint,
 } from "./except.js";
-import {
-  readValue,
-  boundSource,
-  SizingWouldWait,
-  type ReadSource,
-  type ReadBound,
-} from "../page/read-bounds.js";
+import { readValue, boundSource, type ReadSource, type ReadBound } from "../page/read-bounds.js";
 import { directoryCacheFor } from "../page/directory-cache.js";
 import { batchTargetFor, type Grant } from "../memory/governor.js";
 import { jsonLiteralBytes, jsonInputsBounded, phaseRetainingParents } from "./json-plan.js";
@@ -4735,14 +4729,14 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                   sizingPlan,
                   bounds.offset,
                   bounds.limit,
-                  runtime.request.governor,
+                  runtime.governor,
                   runtime.signal,
                 ),
               )
             : undefined;
-        // While the window's segment list is held, sizing may not wait for memory: it tries
-        // every admission at once. A refusal (a queued admission is ahead) releases the list,
-        // then the whole source is sized normally, holding nothing while it waits.
+        // The window's segment list and the sizing that follows are both preparation admissions
+        // (exec/preparation.ts): one that would wait while the list is held releases the whole
+        // attempt and prepares again with a credit covering both, so sizing never waits holding.
         const sizePayload = (segments?: Uint32Array) =>
           boundSource(
             runtime.sourceView(),
@@ -4754,7 +4748,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
               windowBytes: 0,
               stagingBytes: memoryScanBufferBytes(shape.types),
               rows: null,
-              ...(segments === undefined ? {} : { segments, noWait: true as const }),
+              ...(segments === undefined ? {} : { segments }),
             },
             runtime.governor,
             runtime.signal,
@@ -4762,16 +4756,14 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
             BATCH_ROWS,
             runtime.metadataCaches(),
           );
-        let payload: ReadBound | null = null;
+        let payload: ReadBound;
         if (window !== undefined)
           try {
             payload = yield* readValue(sizePayload(window.segments));
-          } catch (error) {
-            if (!(error instanceof SizingWouldWait)) throw error;
           } finally {
             window.release();
           }
-        payload ??= yield* readValue(sizePayload());
+        else payload = yield* readValue(sizePayload());
         const read: AdmittedIndexRead = {
           plan: range,
           cursor: cursorIdentity,

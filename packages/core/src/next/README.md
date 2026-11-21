@@ -1838,10 +1838,10 @@ locator, charged before allocation), skips OFFSET and reads up to LIMIT locators
 closes at once on cancellation; its scratch is released only after its pending index call
 settles, and always before execution is admitted. The same admission charges the window's
 distinct segment list (`key-order/window-segments`, 4 bytes a locator, sorted in place). Only
-the groups those locators name are then sized, and while the list is held that sizing never waits
-for memory: each admission is tried at once (`ReadSource.noWait`). If one would wait (a queued
-admission is ahead), the list is released and the whole source is sized normally, holding
-nothing while it waits, so a queued admission blocked by the list cannot deadlock with it. The execution cursor reads the same window from the
+the groups those locators name are then sized. The list, the window scratch and that sizing are
+preparation admissions (see Memory): if one would wait while the list is held, the query releases
+the whole attempt, including the list, and prepares again with a credit that covers them
+together, so it never waits holding the list. The execution cursor reads the same window from the
 same snapshot, so every group it fetches was sized. Such a query therefore opens exactly two
 cursors (sizing, then execution), each closed and each reading at most LIMIT + OFFSET rows.
 Larger or unbounded windows, LIMIT 1 over a resident one-chunk table (its single-use resident
