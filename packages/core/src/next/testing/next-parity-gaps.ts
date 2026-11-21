@@ -22,6 +22,18 @@ export const NEXT_PARITY_GAPS: readonly ParityGap[] = [
     reason:
       "a rekey whose native trigger bodies need an indexed-domain preflight (writes stop the plan)",
   },
+  {
+    // 0.20 runs these. Cause: a producer-phase cut restarts the graph from the root, and the
+    // UNION ALL concat recipe keeps no continuation, so it would replay arms already delivered.
+    // Closing it: record completed arms across a cut (skip them on restart), allow UNION ALL in
+    // phaseRetainingParents, drop the refusal; then the differential's concatenating arms
+    // compare with PostgreSQL. Estimate: about a day (~100 engine lines, ~200 test lines).
+    id: "union-all-phase-arm",
+    message:
+      /^The executor does not support an expression evaluated in producer phases \(text concatenation, JSON expansion or a JSON aggregate\) inside a UNION ALL arm/u,
+    reason:
+      "text concatenation or JSON work inside a UNION ALL arm, or in the input of ROLLUP, CUBE or GROUPING SETS",
+  },
 ];
 
 /** The listed gap `error` (or an error in its cause chain) is, or null. */

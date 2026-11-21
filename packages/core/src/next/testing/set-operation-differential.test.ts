@@ -11,6 +11,7 @@ import { seedsFor } from "../../testing/seeds.js";
 import { createReach, SET_OPERATION_REACH } from "../../testing/reach.js";
 import { StorageCore } from "./storage-core.js";
 import { oracleRows } from "./differential-adapter.js";
+import { listedGap } from "./next-parity-gaps.js";
 
 type State = (typeof SET_OPERATION_REACH)[number];
 const normal = (value: unknown): unknown =>
@@ -188,8 +189,7 @@ for (const seed of seedsFor("next-set-operations", [0x5e71, 0x5e72]))
                   how === "cube" ||
                   how === "grouping sets") &&
                 arms.some((a) => a.kind === "concat") &&
-                (error as { sqlState?: string }).sqlState === "0A000" &&
-                (error as Error).message.includes("inside a UNION ALL arm");
+                listedGap(error)?.id === "union-all-phase-arm";
               if (!unionAllPhase) throw error;
               reach.reach("phase arm refused under UNION ALL");
               return;
