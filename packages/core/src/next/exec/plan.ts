@@ -60,6 +60,7 @@ import { rankingBounds } from "./window-topk-plan.js";
 import { Slice, runSliced, type SlicedJob } from "./slices.js";
 /** Immutable pipeline recipes; every execution instantiates its own operators and kernels. */
 import type { MaybePromise } from "../access/key-index.js";
+import { columnsRead } from "../ir/columns-read.js";
 import type { PhysicalPlan, Rel, ScalarExpr, SortKey } from "../ir/ir.js";
 import { ResultSink, resultRowStepBytes } from "./result-sink.js";
 import { aggregateProgressLayout, simpleAggregateType } from "./agg/parameter-copies.js";
@@ -778,6 +779,34 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
     loanSlots: number;
   }> = [];
   const compoundColumns = new Map<number, number>();
+  /**
+   * Join output columns its consumer reads (absent: every column). The consumer is a direct
+   * parent projection, or a parent inner join that passes on its own demand plus its keys.
+   */
+  const joinOutputDemand = new Map<number, ReadonlySet<number>>();
+  /** Whether an inner join's demand can narrow what it gathers and what its inputs supply. */
+  const prunable = (join: Extract<Rel, { op: "join" }>): boolean =>
+    (join.kind === "inner" || join.kind === "cross") &&
+    join.residual === null &&
+    (join.filter ?? null) === null;
+  /**
+   * Build store columns an inner join need not gather: key-only columns it added past the
+   * build input, and input columns its consumer never reads. Not for a residual, a filter or
+   * an outer/semi/mark join. A star rewrite changes column types only, never positions.
+   */
+  const unusedBuildOf = (
+    join: Rel,
+    probeWidth: number,
+    buildWidth: number,
+    storeWidth: number,
+  ): { unusedBuild?: number[] } => {
+    if (join.op !== "join" || !prunable(join)) return {};
+    const read = joinOutputDemand.get(join.id);
+    const unused: number[] = [];
+    for (let c = 0; c < storeWidth; c++)
+      if (c >= buildWidth || (read !== undefined && !read.has(probeWidth + c))) unused.push(c);
+    return unused.length === 0 ? {} : { unusedBuild: unused };
+  };
   const compoundCopies = new Map<number, number>();
   const indexFetchOwners = new Set<number>();
   interface IndexWorkspace {
@@ -1556,113 +1585,13 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           });
       }
       case "scan": {
-        if (!pageScan) {
-          const input = types(rel).slice(0, rel.columns.length),
-            filter = rel.filter;
-          // Only the terminal full-table export has no downstream consumer that may re-read.
-          // Other scans keep their selective/cache policy; TableScan also handles deletion,
-          // reader capability, memory refusal, pacing and cancellation fallbacks itself.
-          const terminal =
-            rel === terminalInput &&
-            filter === null &&
-            rel.runtimeFilters.length === 0 &&
-            !rel.emitLocator;
-          readSources.set(rel.id, {
-            id: rel.id,
-            tableId: rel.tableId,
-            columns: rel.columns,
-            types: input,
-            stagingBytes: memoryScanBufferBytes(input),
-            windowBytes: terminal ? 64 * 1024 * 1024 : 0,
-            rows: null,
-          });
-          const kernelBytes =
-            filter === null
-              ? 0
-              : measureCompilerBuffers(
-                  compilation,
-                  input,
-                  BATCH_ROWS,
-                  (context) => new FilterOperator(filter, context, DISCARD),
-                  (filter) => filter.abort(undefined),
-                );
-          fixed(rel, (cap) => kernelBytes + batchTargetFor(cap, 4) + BATCH_ROWS * 16);
-          // Star lookups compose registered scan recipes (scanRecipes), on either path.
-          const ordinaryScan: Recipe = (runtime, downstream, stops, rowsNeeded) => {
-            if (stops.some((stop) => stop())) return downstream.finish();
-            const target = batchTargetFor(runtime.governor.capBytes, 4);
-            return instantiate(
-              runtime,
-              rel,
-              input,
-              kernelBytes + target + BATCH_ROWS * 16,
-              BATCH_ROWS,
-              (context, grant) => ({ context, grant }),
-              ({ context, grant }) =>
-                then(runtime.table(rel.tableId, grant), (table) => {
-                  const terminalFull =
-                    terminal &&
-                    rel.columns.length === table.columns.length &&
-                    rel.columns.every((id, k) => id === table.columns[k]?.id);
-                  const owner = terminalFull
-                    ? downstream instanceof ResultSink
-                      ? downstream
-                      : exportOwners.get(downstream)
-                    : undefined;
-                  const output = owner?.grant;
-                  const directories = directoryCacheFor(runtime.view.pages);
-                  const scan = new TableScan({
-                    table,
-                    pages: runtime.readPages(runtime.view.pages),
-                    reads: runtime.request.reads,
-                    ...(directories === undefined
-                      ? {}
-                      : { directories, directoryOnce: !runtime.sourceRetains(rel.id) }),
-                    budget: grant,
-                    columns: rel.columns,
-                    filter: rel.filter,
-                    emitLocator: rel.emitLocator,
-                    context,
-                    loans: { borrow: (bytes) => grant.borrow(bytes, runtime.signal) },
-                    // Larger batches remain restricted to explicit relinquishing export consumers.
-                    targetBytes: runtime.request.outputBuffers
-                      ? (owner?.terminalBatchTarget(2 * target) ?? target)
-                      : target,
-                    boundedMemory: true,
-                    readWindowBytes: terminalFull ? runtime.sourceWindow(rel.id) : 0,
-                    ...(output === undefined
-                      ? {}
-                      : {
-                          transferOutputs: "dictionary" as const,
-                          outputBudget: output,
-                          ...(runtime.request.outputBuffers
-                            ? { outputBuffers: runtime.request.outputBuffers }
-                            : {}),
-                          outputDictionary: (dictionary) =>
-                            owner?.admitDictionary(dictionary) ?? false,
-                          borrowOutputOnRefusal: true,
-                        }),
-                    ...(runtime.sourceBatchRows(rel.id) === undefined
-                      ? rowsNeeded === undefined
-                        ? {}
-                        : { rowsNeeded }
-                      : { rowsNeeded: () => Math.min(rowsNeeded?.() ?? BATCH_ROWS, 1) }),
-                  });
-                  const books = starBooks.get(runtime);
-                  const outputSink = books?.shape.columns.has(rel.id)
-                    ? starColumns((batch) => books.encode(rel.id, batch), downstream)
-                    : downstream;
-                  return fts.scan(runtime, rel, scan, counted(runtime, rel, outputSink), stops);
-                }),
-            );
-          };
-          scanRecipes.set(rel.id, ordinaryScan);
-          return ordinaryScan;
-        }
+        // One recipe for both scan forms: a page-consuming parent (pageScan) selects encoded
+        // pages and page counting; otherwise ordinary batches. Both size their target from the
+        // bounded demand (sourceTarget), so the two forms cannot drift apart.
         const input = types(rel).slice(0, rel.columns.length),
           filter = rel.filter,
-          count = countedPages,
-          Scan = EncodedTableScan;
+          count = pageScan ? countedPages : counted,
+          Scan = pageScan ? EncodedTableScan : TableScan;
         // Only the terminal full-table export has no downstream consumer that may re-read.
         // Other scans keep their selective/cache policy; TableScan also handles deletion,
         // reader capability, memory refusal, pacing and cancellation fallbacks itself.
@@ -1723,7 +1652,8 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                   ? starColumns((batch) => books.encode(rel.id, batch), downstream)
                   : downstream;
                 const countedSink = count(runtime, rel, outputSink);
-                const pageConsumer = !fts.enabled && !books ? countedSink.pageConsumer : undefined;
+                const pageConsumer =
+                  pageScan && !fts.enabled && !books ? countedSink.pageConsumer : undefined;
                 const oneRow = runtime.sourceBatchRows(rel.id) !== undefined;
                 const demand = oneRow
                   ? () => Math.min(rowsNeeded?.() ?? BATCH_ROWS, 1)
@@ -1802,6 +1732,12 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
       case "filter":
       case "project":
       case "limit": {
+        // A projection over a join reads only these join output columns (output demand).
+        // An expression the walker cannot classify leaves the join's full output demanded.
+        if (rel.op === "project" && rel.input.op === "join") {
+          const read = columnsRead(rel.exprs);
+          if (read !== null) joinOutputDemand.set(rel.input.id, read);
+        }
         const encoded = pageScan && rel.op === "project",
           count = encoded ? countedPages : counted,
           Project = encoded ? PageProjectOperator : ProjectOperator,
@@ -2971,6 +2907,21 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           throw new UnsupportedPlanError("a keyed nested-loop physical join", {
             construct: "join",
           });
+        // A child join supplies only what this join's demand and keys read.
+        const read = joinOutputDemand.get(rel.id);
+        if (read !== undefined && prunable(rel)) {
+          const width = rel.left.output.length,
+            probe = new Set<number>(),
+            build = new Set<number>();
+          for (const c of read) (c < width ? probe : build).add(c < width ? c : c - width);
+          // Keys the walker cannot classify leave that child fully demanded.
+          const probeRead = columnsRead(rel.leftKeys, probe),
+            buildRead = columnsRead(rel.rightKeys, build);
+          if (rel.left.op === "join" && probeRead !== null)
+            joinOutputDemand.set(rel.left.id, probeRead);
+          if (rel.right.op === "join" && buildRead !== null)
+            joinOutputDemand.set(rel.right.id, buildRead);
+        }
         const left = prepare(rel.left),
           right = prepare(rel.right),
           lt = types(rel.left),
@@ -3039,6 +2990,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
             ),
             // Runtime filters are optional acceleration; scans still evaluate every predicate.
             publishes: [],
+            ...unusedBuildOf(actual, lt.length, rt.length, rk.types.length),
           };
           if (runtime === undefined || grant === null) validateHashJoinSpec(spec);
           const join =

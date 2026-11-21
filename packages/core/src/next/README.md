@@ -2471,9 +2471,17 @@ shipped-engine or stored-format change.
   composite key with text or bytes length-prefixes them instead of escaping them (equality
   needs no order). A batch's encoded keys get one buffer of their exact size, charged before it
   is allocated, and each value is copied into it once, in budgeted pieces (no regrowth copies).
+- Byte keys of at most 64 bytes hash and compare without a nested generator. They
+  spend the same inspected bytes and yield before publishing hashes or acting on a match.
+  Longer keys retain resumable streaming, including the second hash and collision cursor.
 - The build store and table are allocated from the join's spillable grant. A dense integer key
   is direct-addressed; others use open addressing with the key's words inline. Matched outputs
   reuse probe key vectors for build key columns that are identical in representation.
+- Output demand: an inner join without a residual or filter gathers only the build columns its
+  consumer reads, and emits the rest as typed NULL constants nothing reads. The consumer is a
+  projection directly above it, or a parent inner join, which passes on its own demand plus the
+  columns its keys read. Star-encoded joins use the same demand (the rewrite changes column
+  types, not positions). The column store writes a NULL constant as one validity range.
 - When refused memory the join partitions 16 ways (grace/hybrid), reads back the partitions
   that fit, spills the rest of the probe, and joins each spilled pair one level down with
   independent hash bits. A partition that does not split, or an oversized mark join, runs in
@@ -5119,6 +5127,13 @@ Native command statements retain their memory policy across end and commit. Endi
 the command scope must not reintroduce a future background-merge estimate into the
 commit step while another admitted execution retains its workspace. The next live
 statement selects its own policy; actual merge acquisition still funds its full step.
+
+Short raw join-key batches borrow one DataView over their existing source bytes
+for16–64-byte XXH32 word reads. This is the existing checksum with the same seed
+and byte range; long and encoded keys keep their original paths. The view stays
+local to extraction, and every key spends the same work before progress/yields.
+The incremental ordinary-build component is recorded separately from the short
+dispatch baseline in `scripts/bench-evidence/b9-j2-key-view-84d-2026-11-19.json`.
 
 Extent-delta capture remains internal preparation: allocate its immutable descriptor view
 before marking an external sink as entered. Internal `MetadataPressure` unwinds the
