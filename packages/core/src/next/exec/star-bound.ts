@@ -5,10 +5,11 @@
  * TEXT equality classes become integers. No spill partition may reorder float inputs.
  */
 import { safeLikePattern } from "./kernels/like.js";
+import { plainStarText, starParameterTypes } from "./join-star-parameters.js";
 import type { CatalogView } from "../access/catalog.js";
 import { MAX_BLOB_BYTES } from "../access/space.js";
 import type { PhysicalPlan, Rel, ScalarExpr } from "../ir/ir.js";
-import { layoutOf } from "../types.js";
+import { layoutOf, type PhysicalType } from "../types.js";
 import { BATCH_ROWS } from "../vector/vector.js";
 import type { PartitionBounds } from "./agg/partition-probe.js";
 import { ColumnStore } from "./column-store.js";
@@ -57,11 +58,19 @@ export function starPrimaryKeys(
 
 /** Only a terminal grouped star, with non-expanding, non-aliasing ancestors. */
 export function terminalStar(plan: PhysicalPlan, aggregate: number): boolean {
-  if (plan.volatile || plan.parameters.length !== 0) return false;
+  if (plan.volatile) return false;
+  const boundText = plan.parameters.length !== 0;
+  if (boundText && !starParameterTypes(plan)) return false;
   let node = plan.root;
   while (node.id !== aggregate) {
-    if (node.op === "sort" || node.op === "limit") node = node.input;
-    else if (node.op === "project") {
+    if (node.op === "sort") {
+      if (boundText && node.keys.some((key) => key.expr.op !== "column")) return false;
+      node = node.input;
+    } else if (node.op === "limit") {
+      if (boundText && (node.limit?.kind === "param" || node.offset?.kind === "param"))
+        return false;
+      node = node.input;
+    } else if (node.op === "project") {
       const seen = new Set<number>();
       for (const expr of node.exprs) {
         if (expr.op !== "column" || seen.has(expr.index)) return false;
@@ -74,15 +83,31 @@ export function terminalStar(plan: PhysicalPlan, aggregate: number): boolean {
 }
 
 /** Error-free scan predicates only: proof reads do not evaluate or reorder SQL errors. */
-export function starPredicate(expr: ScalarExpr | null): boolean {
+export function starPredicate(
+  expr: ScalarExpr | null,
+  parameters: readonly PhysicalType[] = [],
+): boolean {
   if (expr === null) return true;
   if (expr.op === "column" || expr.op === "literal") return true;
-  if (expr.op === "like") return safeLikePattern(expr) && starPredicate(expr.arg);
-  if (expr.op === "and" || expr.op === "or") return expr.args.every(starPredicate);
-  if (expr.op === "not" || expr.op === "isNull") return starPredicate(expr.arg);
+  if (expr.op === "param")
+    return (
+      Number.isInteger(expr.slot) &&
+      expr.slot >= 0 &&
+      plainStarText(parameters[expr.slot]) &&
+      plainStarText(expr.type)
+    );
+  if (expr.op === "like") return safeLikePattern(expr) && starPredicate(expr.arg, parameters);
+  if (expr.op === "and" || expr.op === "or")
+    return expr.args.every((arg) => starPredicate(arg, parameters));
+  if (expr.op === "not" || expr.op === "isNull") return starPredicate(expr.arg, parameters);
   if (expr.op === "compare")
-    return expr.collation === null && starPredicate(expr.left) && starPredicate(expr.right);
-  if (expr.op === "distinctFrom") return starPredicate(expr.left) && starPredicate(expr.right);
+    return (
+      expr.collation === null &&
+      starPredicate(expr.left, parameters) &&
+      starPredicate(expr.right, parameters)
+    );
+  if (expr.op === "distinctFrom")
+    return starPredicate(expr.left, parameters) && starPredicate(expr.right, parameters);
   return false;
 }
 
@@ -91,6 +116,7 @@ export function starBound(
   catalog: Pick<CatalogView, "table">,
   proofs: ReadonlyMap<number, PartitionBounds>,
   compiler: ReadonlyMap<number, number>,
+  parameters: readonly PhysicalType[] = [],
 ): StarBound | null {
   if (shape.aggregate.aggregates.length > 8) return null;
   const domains = shape.books.map(() => 0),
@@ -99,7 +125,7 @@ export function starBound(
     unique = new Map<number, ReadonlySet<number>>();
   let fields = 0;
   for (const scan of shape.scans) {
-    if (!starPredicate(scan.filter)) return null;
+    if (!starPredicate(scan.filter, parameters)) return null;
     const proof = proofs.get(scan.id),
       ids = shape.columns.get(scan.id),
       table = catalog.table(scan.tableId);
