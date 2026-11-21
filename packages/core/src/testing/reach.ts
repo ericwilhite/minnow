@@ -11952,6 +11952,36 @@ export const LIFETIME_HOLDINGS_REACH = [
   "exact after publication",
 ] as const;
 
+/** A commit window funded inside a native step under pressure (writer floors steps 2-3). */
+export const NATIVE_COMMIT_FUNDING_REACH = [
+  "forecasts retired before the step",
+  "commit funded as holder growth",
+  "served ahead of an earlier admission",
+  "refused above the cap",
+  "earlier admission served afterwards",
+] as const;
+
+/** Native writes under the writer floors, against PostgreSQL (writer floors steps 2-3), unit lane. */
+export const NATIVE_WRITE_FLOORS_REACH = [
+  "native insert",
+  "native update",
+  "native delete",
+  "wide rows",
+  "published before update and delete",
+  "PG exact rows",
+] as const;
+
+/** The same histories at 20,000 rows, conformance lane (MINNOW_NATIVE_WRITE_LARGE=1). */
+export const NATIVE_WRITE_FLOORS_LARGE_REACH = [
+  "large native insert",
+  "native insert",
+  "native update",
+  "native delete",
+  "wide rows",
+  "published before update and delete",
+  "PG exact rows",
+] as const;
+
 /** A native step's minimum at the capacity boundary (writer floors, review of #34). */
 export const NATIVE_MINIMUM_BOUNDARY_REACH = [
   "live row allocations",
