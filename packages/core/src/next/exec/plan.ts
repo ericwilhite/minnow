@@ -980,6 +980,24 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
     return found;
   };
   findJson(plan.root);
+  // Rels inside a UNION ALL arm: a phase producer there is refused (see the UNION ALL recipe).
+  const unionArms = new Set<number>();
+  const markUnionArms = (rel: Rel, inArm: boolean): void => {
+    if (inArm) unionArms.add(rel.id);
+    const arm = inArm || (rel.op === "setOp" && rel.kind === "union" && rel.all);
+    if ("input" in rel) markUnionArms(rel.input, arm);
+    if ("left" in rel && "right" in rel) {
+      markUnionArms(rel.left, arm);
+      markUnionArms(rel.right, arm);
+    }
+    if ("inputs" in rel) for (const input of rel.inputs) markUnionArms(input, arm);
+  };
+  markUnionArms(plan.root, false);
+  const unionArmPhase = (): UnsupportedPlanError =>
+    new UnsupportedPlanError(
+      "an expression evaluated in producer phases (text concatenation, JSON expansion or a JSON aggregate) inside a UNION ALL arm (ROLLUP, CUBE and GROUPING SETS run as UNION ALL arms)",
+      { construct: "setOp" },
+    );
   // Ordinary plans without possible JSON/hybrid cuts need no retention metadata.
   const {
     supported: phaseParents,
@@ -1830,6 +1848,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
             const deliveryCopies = nativeTextOutput
               ? checkpointDeliveryCopies(plan.root, rel)
               : undefined;
+            if (unionArms.has(rel.id)) throw unionArmPhase();
             if (!phaseParents.has(rel.id))
               throw new UnsupportedPlanError(
                 "expanding JSON under a join/window retaining parent (checkpoint seam pending)",
@@ -2126,6 +2145,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           jsonAggregateRecipes.set(rel.id, { minimum, loans, rel: aggregate, input });
           registerPhaseProducer(rel.id);
           fixed(rel, minimum, rel.id, loans);
+          if (unionArms.has(rel.id)) throw unionArmPhase();
           if (!phaseParents.has(rel.id))
             throw new UnsupportedPlanError("JSON aggregate phase parent", {
               construct: "aggregate",
@@ -3115,15 +3135,48 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
         };
       }
       case "setOp": {
-        if (rel.kind !== "except" || rel.inputs.length !== 2)
-          throw new UnsupportedPlanError("set operation other than binary EXCEPT", {
+        // Lowering builds two-input set operations; fewer inputs is a malformed plan.
+        if (rel.inputs.length < 2)
+          throw new UnsupportedPlanError("a set operation over fewer than two inputs", {
+            construct: "setOp",
+          });
+        if (rel.kind === "union" && rel.all) {
+          // UNION ALL: every arm in order into one consumer; an arm's end is not the union's.
+          // Lowering conforms each arm to the union's column types. Arms are not phase parents
+          // (json-plan.ts phaseRetainingParents): an earlier arm's rows would already be
+          // downstream when a later arm cut a phase, so such plans stay refused there.
+          const arms = rel.inputs.map((input) => prepare(input));
+          return async (runtime, downstream, stops, rowsNeeded) => {
+            const out = counted(runtime, rel, downstream);
+            const arm: Operator = {
+              get reclassifiesTransfers() {
+                return out.reclassifiesTransfers === true;
+              },
+              push: (batch, transfer) => out.push(batch, transfer),
+              ready: () => out.ready(),
+              finish: () => undefined,
+              abort: (reason) => {
+                out.abort(reason);
+              },
+            };
+            for (const recipe of arms) {
+              if (stops.some((stop) => stop()) || runtime.handingOff) break;
+              await recipe(runtime, arm, stops, rowsNeeded);
+            }
+            if (runtime.handingOff) return;
+            await out.finish();
+          };
+        }
+        // EXCEPT, INTERSECT and distinct UNION: one hash-count operator (exec/except.ts).
+        if (rel.inputs.length !== 2)
+          throw new UnsupportedPlanError("a set operation over other than two inputs", {
             construct: "setOp",
           });
         const [leftInput, rightInput] = rel.inputs;
         if (leftInput === undefined || rightInput === undefined)
-          throw new TypeError("Missing EXCEPT arm");
+          throw new TypeError("Missing set operation arm");
         const input = types(rel);
-        exceptKeyLayout(input);
+        exceptKeyLayout(input, rel.kind.toUpperCase());
         compoundColumns.set(rel.id, variableColumns(input));
         const left = prepare(leftInput),
           right = prepare(rightInput);
@@ -3147,6 +3200,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                   signal: runtime.signal,
                 },
                 counted(runtime, rel, downstream),
+                rel.kind,
               ),
             (operator) => {
               runtime.onAbort((reason) => operator.abort(reason));
