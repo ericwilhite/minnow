@@ -19,6 +19,6 @@ it("keeps the dimension rows and SQL catalogue", () => {
     "9a65d5fcfe0538b0ed2352049803399ae536011916a3f64f7b0b03581b646c2c",
   );
   expect(hash([queries.W_QUERIES, queries.S_QUERIES, queries.S_TABLES])).toBe(
-    "8bca028db9e008c0d6f67128614d1948c02500f71db90b32d3d7711bef311a8b",
+    "70fab9afa62a9aa22b2b889418ca9044a694a2eaf7166d63f800fe1825216669",
   );
 });
