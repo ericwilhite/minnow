@@ -11998,6 +11998,14 @@ export const MEMORY_SIZING_WORK_REACH = [
   "summaries read",
 ] as const;
 
+/** Commit encoding linear in the undo log (write/stream-body.ts effects). */
+export const COMMIT_EFFECTS_LINEAR_REACH = [
+  "streamed commit",
+  "root then body inserts",
+  "root then body deletes",
+  "several thousand undo entries",
+] as const;
+
 /** A native step's minimum at the capacity boundary (writer floors, review of #34). */
 export const NATIVE_MINIMUM_BOUNDARY_REACH = [
   "live row allocations",
