@@ -11982,6 +11982,35 @@ export const NATIVE_COMMIT_FUNDING_REACH = [
   "earlier admission served afterwards",
 ] as const;
 
+/** Memtable sizing summaries against one-row hints (write/memtable.ts valueSummary). */
+export const MEMORY_SIZING_SUMMARY_REACH = [
+  "several chunks",
+  "updated rows",
+  "deleted rows",
+  "rolled back rows",
+  "published chunk",
+  "added column",
+  "null values",
+  "several varlen columns",
+  "exact for one varlen column",
+] as const;
+
+/** Trigger-body point lookups whose sizing work does not grow with the memtable. */
+export const MEMORY_SIZING_WORK_REACH = [
+  "100-row memtable",
+  "1,000-row memtable",
+  "20,000-row memtable",
+  "summaries read",
+] as const;
+
+/** Commit encoding linear in the undo log (write/stream-body.ts effects). */
+export const COMMIT_EFFECTS_LINEAR_REACH = [
+  "streamed commit",
+  "root then body inserts",
+  "root then body deletes",
+  "several thousand undo entries",
+] as const;
+
 /** Native writes under the writer floors, against PostgreSQL (writer floors steps 2-3), unit lane. */
 export const NATIVE_WRITE_FLOORS_REACH = [
   "native insert",

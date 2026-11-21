@@ -10,6 +10,8 @@ compatibility policy and release process.
 
 ## Unreleased
 
+The unexported 1.0 rebuild sizes a one-row read of recently written rows, such as a keyed lookup in a trigger body, from per-chunk summaries of those rows instead of visiting every recently written row. Before, each lookup cost time proportional to the rows written since the last flush, so a trigger statement over many rows slowed down with every row it wrote (about 77 ms per row at 1,000 rows); its cost per row is now flat. The summaries keep each 2,048-row chunk's largest and total value bytes and only grow, so a read's memory bound is never smaller than before; it can be larger when the widest values of different columns sit in different rows. Committing a large transaction (such as a trigger statement over many rows) no longer rereads its earlier changes for every change it logs, which made the commit's cost grow with the square of its changes. Results are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.
+
 The unexported 1.0 rebuild no longer fails `INSERT ... SELECT`, `UPDATE` or `DELETE` whose input computes text with `||` (for example `INSERT INTO t SELECT g, 'x' || g::text FROM generate_series(1, 50) g`) with the internal error "Result budget retained buffers at handoff". Results are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.
 
 The unexported 1.0 rebuild sizes a point or small range lookup on an index over only the groups its keys name, instead of every group of the table, except inside trigger bodies, which still size every group. Results are unchanged; released 0.x behavior is unchanged; no stored-format change or migration is required.
