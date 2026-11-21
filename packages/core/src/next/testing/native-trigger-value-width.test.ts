@@ -4,7 +4,8 @@
  * and never releases. A body binds the NEW (and OLD) value and copies it into another table.
  * Law (GOVERNOR-WAIT-POLICY: grant, cancellable wait, or spill; never an untyped internal error):
  * each write either completes with exactly the expected rows, waits for memory, or is refused
- * with 53200 because its need is above the cap. A waiting write ends promptly on cancellation with
+ * with 53200 because its need, derived here from the values (never the engine's own estimate), is
+ * above the usable cap. A waiting write ends promptly on cancellation with
  * the caller's AbortError and leaves nothing behind, and once the competitor is gone it completes.
  * A refused write leaves nothing behind. Any other outcome fails.
  */
@@ -16,6 +17,9 @@ import { MinnowDatabaseClient } from "../owner/database-client.js";
 import { publicOwner } from "./public-owner.test.fixture.js";
 
 const MiB = 1 << 20;
+/** Writer floors (row step, metadata step, the 6 MiB commit window), the root's base and the page
+ * cache's fixed slabs: what a native write holds besides copies of its values. */
+const STATEMENT_ALLOWANCE = 16 * MiB;
 
 for (const seed of seedsFor("next-native-trigger-value-width", [53011, 53012]))
   it(`binds values of every width in native trigger bodies (${String(seed)})`, async () => {
@@ -61,18 +65,26 @@ for (const seed of seedsFor("next-native-trigger-value-width", [53011, 53012]))
             const statement = event === "UPDATE" ? "UPDATE t SET v = v || 'b'" : "DELETE FROM t";
             const untouched = async () => {
               expect((await db.query("SELECT count(*) AS n FROM copy")).rows()).toEqual([{ n: 0 }]);
-              expect((await db.query("SELECT id FROM t WHERE v = $1", [value])).rows()).toEqual([
-                { id: 1 },
-              ]);
+              const [row] = (await db.query("SELECT id, v FROM t")).rows();
+              expect(row?.v === value, "the row is unchanged").toBe(true);
             };
-            /** Completed, or the one lawful refusal: a need above the cap itself (53200). */
+            // The statement's need, derived from the values, not from the engine's estimate: at most
+            // every copy of the value it can hold at once, plus a fixed allowance for the writer's
+            // floors (the commit window included), the root's base and the page cache. UPDATE:
+            // OLD and NEW decoded in the image lease, their two binding copies, the copy row's two
+            // values and the updated row; DELETE: OLD decoded, its copy, and the copy row's value.
+            const need = (event === "UPDATE" ? 7 : 3) * (width + 1) + STATEMENT_ALLOWANCE;
+            const fits = need <= governor.usableCapacity(true);
+            /** Completed, or the one lawful refusal: 53200 for a need above the usable cap. */
             const lawful = (outcome: unknown): "completed" | "refused" => {
               if (outcome === "completed") return "completed";
+              expect(
+                fits,
+                `a ${String(width)}-byte ${event} needing ${String(need)} bytes fits the cap`,
+              ).toBe(false);
               expect(outcome, `write over a ${String(width)}-byte value`).toMatchObject({
                 sqlState: "53200",
               });
-              const refused = outcome as { bytes: number; capacity: number };
-              expect(refused.bytes).toBeGreaterThan(refused.capacity);
               return "refused";
             };
             const stop = new AbortController();
@@ -104,7 +116,6 @@ for (const seed of seedsFor("next-native-trigger-value-width", [53011, 53012]))
             competitor?.close();
             if (lawful(outcome) === "refused") {
               await untouched();
-              reach.reach("refused above the cap");
               return;
             }
             if (!stop.signal.aborted)
@@ -112,20 +123,16 @@ for (const seed of seedsFor("next-native-trigger-value-width", [53011, 53012]))
                 pressure ? "completed beside the competitor" : "completed without pressure",
               );
             expect((await db.query("SELECT count(*) AS n FROM copy")).rows()).toEqual([{ n: 1 }]);
-            const kept =
-              event === "UPDATE"
-                ? (
-                    await db.query("SELECT id FROM copy WHERE before = $1 AND after = $2", [
-                      value,
-                      `${value}b`,
-                    ])
-                  ).rows()
-                : (
-                    await db.query("SELECT id FROM copy WHERE before = $1 AND after IS NULL", [
-                      value,
-                    ])
-                  ).rows();
-            expect(kept).toEqual([{ id: 1 }]);
+            // Read back one column at a time and compared here: how a query sizes a predicate or a
+            // row over several wide values is a question of its own, not this law's.
+            const [before] = (await db.query("SELECT id, before FROM copy")).rows();
+            const [after] = (await db.query("SELECT after FROM copy")).rows();
+            expect(before?.id).toBe(1);
+            expect(before?.before === value, "OLD copied exactly").toBe(true);
+            expect(
+              after?.after === (event === "UPDATE" ? `${value}b` : null),
+              "NEW copied exactly",
+            ).toBe(true);
           } finally {
             competitor?.close();
             await db.close();

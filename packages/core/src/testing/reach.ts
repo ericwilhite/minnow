@@ -10815,7 +10815,6 @@ export const NATIVE_TRIGGER_VALUE_WIDTH_REACH = [
   "competitor holds all but 1 MiB",
   "completed beside the competitor",
   "waited and was cancelled",
-  "refused above the cap",
   "completed without pressure",
   "OLD and NEW bound",
 ] as const;

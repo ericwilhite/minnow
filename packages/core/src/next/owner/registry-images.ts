@@ -12,7 +12,7 @@ import {
 import { SpillCorruptionError } from "../spill/contract.js";
 import { samePhysicalType } from "../types.js";
 import type { ByteCharge } from "../vector/varlen.js";
-import { dataBytes, type Batch, type Vector } from "../vector/vector.js";
+import type { Batch, Vector } from "../vector/vector.js";
 import type { RegistryDirectory } from "./registry-directory.js";
 import type { RegistryFragments } from "./registry-fragments.js";
 import {
@@ -556,7 +556,6 @@ export class RegistryImages {
       const { table, oldHead, nextHead, hasOld, hasNext } = await this.#info(ref, signal);
       if (projection) this.#validateProjection(table, projection);
       let scalarBytes = 0,
-        imageExtra = 0,
         workspace = 0,
         copyBytes = 0;
       // A binding read (a projection) also funds one binding copy of each column it reads, sized
@@ -572,7 +571,6 @@ export class RegistryImages {
         if (!column) corrupt();
         const retained = registryScalarBytes(scalar, column.type);
         scalarBytes += retained;
-        imageExtra += Math.max(0, retained - dataBytes(column.type, 1) - 4);
         workspace = Math.max(workspace, registryScalarWorkspaceBytes(scalar, column.type));
         if (side) {
           const copy = bindingCopyBytes(scalar, column.type);
@@ -601,15 +599,13 @@ export class RegistryImages {
       else if (nextHead !== 0) corrupt();
       const bytes = 2 * table.columns.length * 1024 + scalarBytes;
       // No image lease or native input progress is held here. The host owns the shared
-      // progress step and may wait cancellably. A binding read funds exactly what that step
-      // allocates: this lease (`bytes`, allocated next; funding the step releases idle credit
-      // above it, so no earlier slack can be relied on), the decode workspace, and one binding
-      // copy of each read column (bindingCopyBytes, what BindingScope charges). A full image read
-      // keeps its out-of-line estimate.
-      await this.scope.prepare(
-        copies ? bytes + workspace + copyBytes : imageExtra + scalarBytes + workspace,
-        signal,
-      );
+      // progress step and may wait cancellably. It funds exactly what that step allocates: this
+      // lease (`bytes`, allocated next; funding the step releases idle credit above it, so no
+      // earlier slack can be relied on) and the decode workspace, and for a binding read one
+      // binding copy of each read column (bindingCopyBytes, what BindingScope charges). The lease
+      // already holds every decoded payload: counting the payload again would refuse a write
+      // whose need fits the cap.
+      await this.scope.prepare(bytes + workspace + (copies ? copyBytes : 0), signal);
       this.#check(signal);
       if (!this.scope.charge.allocate(bytes)) throw new RangeError("Image lease must be admitted");
       let old: Array<Vector | typeof ROW_IMAGE_UNREAD> | null = null,
