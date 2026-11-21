@@ -70,6 +70,7 @@ import type { Batch, Selection } from "../vector/vector.js";
 import type { CatalogChange, CatalogView } from "./catalog.js";
 import type { MaybePromise } from "./key-index.js";
 import type { Snapshot } from "./snapshot.js";
+import type { Grant } from "../memory/governor.js";
 
 export interface StatementOptions {
   /** Owner-classified query: retains a read view but may not open row or DDL writers.
@@ -124,6 +125,12 @@ export interface Statement {
   end(signal?: AbortSignal): Promise<void>;
   /** Undoes everything the statement wrote, including its DDL. Idempotent. */
   rollback(): void;
+  /**
+   * The writer's grants while this statement holds the writer turn (none for a read-only
+   * statement): part of what the statement cannot release while one of its requests waits
+   * (`MemoryGovernor.servableBeside`). Optional for statements without a native writer.
+   */
+  writerGrants?(): readonly Grant[];
 }
 
 export interface TableWriteOptions {

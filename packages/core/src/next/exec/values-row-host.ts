@@ -72,6 +72,8 @@ export interface RowHostOptions {
   readonly label: string;
   /** Admits the row grant as holder growth (`holdsCredit`), metered by the query runtime. */
   readonly admitRow: (bytes: number) => Grant | Promise<Grant>;
+  /** What the statement holds and cannot release while the row waits (`ownGrants`). */
+  readonly ownGrants: () => readonly Grant[];
 }
 
 export class ValuesRowHost implements JsonHost {
@@ -200,6 +202,15 @@ export class ValuesRowHost implements JsonHost {
     // refuses above its own (also less permanent holdings) with the same 53200.
     const usable = options.governor.capBytes - options.governor.reserveBytes;
     if (need > usable) throw new MemoryAdmissionError(`${options.label}/row`, need, usable);
+    // Nor wait for room only this statement could free (GOVERNOR-WAIT-POLICY point 5): the
+    // memory it and its writer hold stays held until the row is served.
+    const servable = await options.governor.servableBeside?.(
+      options.ownGrants(),
+      need,
+      options.signal,
+    );
+    if (servable !== undefined && need > servable)
+      throw new MemoryAdmissionError(`${options.label}/row`, need, Math.max(0, servable));
     // Nothing of this row is held while we wait: the old row grant is empty, so close it
     // before asking for the larger one.
     this.#rowGrant?.close();

@@ -2987,6 +2987,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#reclaimable();
   }
 
+  writerGrants(): readonly Grant[] {
+    return this.#credits.grants();
+  }
+
   prepareFtsMutation(signal?: AbortSignal): MaybePromise<void> {
     this.#check();
     signal?.throwIfAborted();

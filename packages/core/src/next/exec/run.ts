@@ -1162,6 +1162,15 @@ export class QueryRuntime {
       });
   }
 
+  /**
+   * What this statement holds that it cannot release while one of its requests waits: its
+   * accounted grants (reserved shares are inside them) and, while it holds the writer turn,
+   * the writer's (`MemoryGovernor.servableBeside`).
+   */
+  ownGrants(): readonly Grant[] {
+    return [...this.#grants, ...(this.request.statement?.writerGrants?.() ?? [])];
+  }
+
   /** The result grant is tracked but survives pipeline disposal until result delivery. */
   resultGrant(grant: Grant): void {
     this.#meter(grant, undefined, this.#atomicResult === null);

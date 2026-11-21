@@ -90,7 +90,9 @@ const cell = fc
         reach.push("json constructor", "parameter");
         break;
       case "to_jsonb":
-        jsonSql = `to_jsonb(${param(text(width, which + 2))})`;
+        // Typed: PostgreSQL cannot resolve to_jsonb(anyelement) from an untyped parameter
+        // (42804), which next/ accepts as text (reported separately).
+        jsonSql = `to_jsonb(${param(text(width, which + 2))}::text)`;
         reach.push("json constructor", "parameter");
         break;
     }
@@ -119,6 +121,13 @@ for (const seed of seedsFor("next-values-row-host", [0x7a11, 0x7a12]))
         fc.asyncProperty(fc.array(cell, { minLength: 1, maxLength: 4 }), async (rows) => {
           reach.beginHistory();
           grown.length = 0;
+          // Each run starts from an empty table on both sides, so one failure cannot leave
+          // the two out of step for the runs fast-check shrinks after it.
+          await pg.query("DELETE FROM t");
+          await core.execute("DELETE FROM t").catch((error: unknown) => {
+            throw new Error("next/ DELETE FROM t failed", { cause: error });
+          });
+          id = 0;
           const params: string[] = [];
           const tuples = rows.map((make) => {
             const c = make(params.length);
@@ -129,8 +138,14 @@ for (const seed of seedsFor("next-values-row-host", [0x7a11, 0x7a12]))
           reach.reach(rows.length > 1 ? "several rows" : "one row");
           const sql = `INSERT INTO t VALUES ${tuples.join(", ")}`;
           const total = params.reduce((sum, value) => sum + value.length, 0);
-          const before = await core.execute("SELECT count(*) AS n FROM t");
-          await pg.query(sql, params);
+          const before = await core
+            .execute("SELECT count(*) AS n FROM t")
+            .catch((error: unknown) => {
+              throw new Error("next/ count before failed", { cause: error });
+            });
+          await pg.query(sql, params).catch((error: unknown) => {
+            throw new Error(`PostgreSQL refused ${sql.slice(0, 300)}`, { cause: error });
+          });
           const result = await core.execute(sql, params).then(
             () => null,
             (error: unknown) => error,
@@ -152,8 +167,14 @@ for (const seed of seedsFor("next-values-row-host", [0x7a11, 0x7a12]))
           }
           if (grown.length > 0) reach.reach("row grant admitted");
           const check = "SELECT id, v, j::text AS j FROM t ORDER BY id";
-          const mine = await core.execute(check);
+          const mine = await core.execute(check).catch((error: unknown) => {
+            throw new Error(`next/ check failed after ${sql.slice(0, 200)}`, { cause: error });
+          });
           if (!("batches" in mine)) throw new Error("rows");
+          expect(
+            oracleRows(mine).map((row) => row.id),
+            sql.slice(0, 400),
+          ).toEqual((await pg.query<{ id: number }>(check)).rows.map((row) => row.id));
           expect(oracleRows(mine)).toEqual((await pg.query(check)).rows);
         }),
         { seed, numRuns: 25 },
@@ -169,7 +190,11 @@ for (const seed of seedsFor("next-values-row-host", [0x7a11, 0x7a12]))
     }
   }, 300_000);
 
-it("refuses a row above the usable cap with 53200 before any wait, writing nothing", async () => {
+/** GOVERNOR-WAIT-POLICY point 5: a row that only its own statement could make room for. */
+it("refuses a row that could never be served beside its own statement, promptly, writing nothing", async () => {
+  // A wait would hang; the stall guard turns it into a named failure instead.
+  const stall = Governor.stallAfterMs;
+  Governor.stallAfterMs = 1500;
   const core = await smallCore();
   const events: GrantEvent[] = [];
   const stop = governorOf(core).observeGrants((event) => events.push(event));
@@ -177,24 +202,89 @@ it("refuses a row above the usable cap with 53200 before any wait, writing nothi
     await core.execute("CREATE TABLE t(id INT PRIMARY KEY, v TEXT)");
     await core.execute("INSERT INTO t VALUES (1, 'kept')");
     events.length = 0;
-    // A 2 MiB parameter, small to bind and admit, concatenated into a row far above the
-    // usable cap: only the row host can see this need.
-    const chain = Array.from({ length: 20 }, () => "$1").join(" || ");
+    // A 2 MiB parameter concatenated four times: the row needs about 10 MiB, below the usable
+    // cap (28 MiB), but this statement and its writer hold about 19 MiB they cannot release
+    // until the row is served.
+    const started = performance.now();
     const refusal: unknown = await core
-      .execute(`INSERT INTO t VALUES (2, 'a' || 'b'), (3, ${chain})`, ["w".repeat(2 * MiB)])
+      .execute("INSERT INTO t VALUES (2, 'a' || 'b'), (3, $1 || $1 || $1 || $1)", [
+        "w".repeat(2 * MiB),
+      ])
       .then(
         () => undefined,
         (error: unknown) => error,
       );
     expect(refusal).toMatchObject({ sqlState: "53200" });
-    expect(String(refusal)).toContain("/row");
-    // Refused before asking the governor for the row: no row grant was ever admitted.
+    expect((refusal as Error).message).toContain("values#");
+    expect(performance.now() - started).toBeLessThan(1000);
+    // Refused before any wait: no row grant was asked for.
     expect(events.filter((event) => event.label.endsWith("/row"))).toEqual([]);
     const rows = await core.execute("SELECT id, v FROM t ORDER BY id");
     if (!("batches" in rows)) throw new Error("rows");
     expect(oracleRows(rows)).toEqual([{ id: 1, v: "kept" }]);
+    // The engine is still usable.
+    await core.execute("INSERT INTO t VALUES (4, 'x' || 'y')");
+    const after = await core.execute("SELECT v FROM t WHERE id = 4");
+    if (!("batches" in after)) throw new Error("rows");
+    expect(oracleRows(after)).toEqual([{ v: "xy" }]);
   } finally {
     stop();
+    Governor.stallAfterMs = stall;
+    await core.close();
+  }
+});
+
+it("waits for, and is served after, another statement that holds the room it needs", async () => {
+  const stall = Governor.stallAfterMs;
+  Governor.stallAfterMs = 5000;
+  // 64 MiB: room for the row beside this statement's own holdings, once reclaim has run.
+  const core = await smallCore(64 * MiB);
+  const governor = governorOf(core);
+  let competitor: ReturnType<typeof governor.tryAdmit> = null;
+  let waited = false;
+  try {
+    await core.execute("CREATE TABLE t(id INT PRIMARY KEY, v TEXT)");
+    const grow = governor.grow.bind(governor);
+    // The competitor arrives when the row first grows the VALUES operator's grant past its
+    // slack: it takes everything free but 1 MiB, so the row has to wait, then finishes 300 ms
+    // later.
+    governor.grow = (grant, bytes) => {
+      if (competitor === null && grant.label.includes("/values#") && bytes >= 256 * 1024) {
+        competitor = governor.tryAdmit({
+          label: "competitor",
+          minimumBytes: governor.capBytes - governor.reserveBytes - governor.usedBytes - MiB,
+          spillable: false,
+        });
+        setTimeout(() => {
+          waited = true;
+          competitor?.close();
+        }, 300);
+      }
+      return grow(grant, bytes);
+    };
+    const rowGrants: GrantEvent[] = [];
+    const observe = governor.observeGrants((event) => {
+      if (event.label.endsWith("/row")) rowGrants.push(event);
+    });
+    const value = "p".repeat(MiB);
+    await core.execute("INSERT INTO t VALUES (1, $1 || $1 || $1 || $1 || $1 || $1 || $1 || $1)", [
+      value,
+    ]);
+    observe();
+    expect(competitor).not.toBeNull();
+    // It waited once, as holder growth for its row grant. Each later measured retry learned a
+    // larger need and was admitted at once.
+    expect(rowGrants[0]?.source).toBe("holder");
+    expect(rowGrants.slice(1).every((event) => event.source === "tryAdmit")).toBe(true);
+    // Served only after the competitor finished, and correctly.
+    expect(waited).toBe(true);
+    const rows = await core.execute("SELECT v FROM t");
+    if (!("batches" in rows)) throw new Error("rows");
+    const stored = oracleRows(rows).map((row) => row.v);
+    expect(stored.length).toBe(1);
+    expect(stored[0] === value.repeat(8)).toBe(true);
+  } finally {
+    Governor.stallAfterMs = stall;
     await core.close();
   }
 });
@@ -275,6 +365,7 @@ it("refuses to grow row room while the previous row is still borrowed", async ()
     signal: new AbortController().signal,
     label: "values#test",
     admitRow: () => Promise.reject(new Error("no growth in this test")),
+    ownGrants: () => [],
   });
   const batch = { length: 1, columns: [], selection: null };
   await host.row([], batch, new AbortController().signal);

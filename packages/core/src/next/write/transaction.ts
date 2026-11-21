@@ -89,6 +89,7 @@ import {
 } from "./view.js";
 import { need, MemtableMemoryError, byteString } from "./bytes.js";
 import type { PreparedWriteCredit } from "./credits.js";
+import type { Grant } from "../memory/governor.js";
 import { NativePrimaryAdapter, type NativePrimaryScope } from "./primary-command.js";
 import type {
   NativeWriteStepBoundary,
@@ -112,6 +113,8 @@ export interface EngineHooks {
   checkNativeStepReady?(statement: StatementImpl): void;
   /** A statement closed (ended or rolled back): its forecasts may now be reclaimable. */
   statementEnded?(): void;
+  /** The write owner's grants, held for whichever statement holds the writer turn. */
+  writerGrants?(): readonly Grant[];
   closeNativeStep?(statement: StatementImpl): Promise<void>;
   readonly shared: Shared;
   /** The one key batch writers encode into (one writer at a time; consumed before reuse). */
@@ -807,6 +810,10 @@ export class StatementImpl implements Statement {
 
   get touched(): Map<number, Set<number>> {
     return (this.#touchedMap ??= new Map());
+  }
+  /** A writable statement holds the writer turn, and with it the write owner's grants. */
+  writerGrants(): readonly Grant[] {
+    return this.readOnly ? [] : (this.tx.hooks.writerGrants?.() ?? []);
   }
   /** Whether this statement inserted row `rowId` of `tableId` (ON CONFLICT `statement`). */
   inserted(tableId: number, rowId: number): boolean {

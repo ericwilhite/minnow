@@ -147,6 +147,17 @@ export interface MemoryGovernor {
    * registrations change. Returns the unregistration. Optional for wrapping governors.
    */
   registerPermanent?(bytes: () => number): () => void;
+  /**
+   * GOVERNOR-WAIT-POLICY point 5: the most a request could ever be served beside the memory its
+   * own statement holds: capacity − reserve − registered lifetime holdings − what `own` (that
+   * statement's grants, and its writer's while it holds the writer turn) still holds. When a
+   * request for `bytes` would not fit, the reclaim callouts of `own`'s spillable grants run
+   * first, so nothing reclaim could return counts against it. A request above the result can
+   * never be served while it waits, and is refused with 53200 before any wait; one at or below
+   * it may wait for other statements to release. Optional for wrapping governors that never
+   * wait (a prepaid native body's).
+   */
+  servableBeside?(own: Iterable<Grant>, bytes: number, signal?: AbortSignal): Promise<number>;
   /** Moves idle ordinary credit within this owner. No allocation or global admission occurs. */
   transferCredit(source: Grant, target: Grant, bytes: number): boolean;
   /**
@@ -522,6 +533,38 @@ export class Governor implements MemoryGovernor {
    * progress: a waiter has stalled only if no grant anywhere changed during the window. */
   activity = 0;
   readonly #permanent = new Set<() => number>();
+
+  async servableBeside(own: Iterable<Grant>, bytes: number, signal?: AbortSignal): Promise<number> {
+    this.assertMutable();
+    const grants = [...new Set(own)].filter(
+      (grant): grant is GrantImpl => grant instanceof GrantImpl && grant.governor === this,
+    );
+    const servable = () =>
+      this.capBytes -
+      this.reserveBytes -
+      this.permanentBytes -
+      grants.reduce((sum, grant) => sum + (grant.closed ? 0 : grant.held), 0);
+    // Never refuse while reclaim could still return what is needed: the statement's own
+    // spillable holders (and the writer's) return idle credit or spill first.
+    for (const grant of grants) {
+      if (bytes <= servable()) break;
+      if (grant.closed || !grant.spillable) continue;
+      checkSignal(signal);
+      const work = this.#ask(grant, bytes - servable());
+      if (work !== undefined)
+        // As in reclaimRoom: cancellation ends this wait, not the holder's own reclaim.
+        await new Promise<void>((resolve, reject) => {
+          const abort = () => reject(abortReason(signal));
+          signal?.addEventListener("abort", abort, { once: true });
+          void work
+            .then(resolve, reject)
+            .finally(() => signal?.removeEventListener("abort", abort));
+          if (signal?.aborted) abort();
+        });
+    }
+    checkSignal(signal);
+    return servable();
+  }
 
   registerPermanent(bytes: () => number): () => void {
     this.assertMutable();

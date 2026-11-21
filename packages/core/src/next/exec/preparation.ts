@@ -78,6 +78,9 @@ export class PreparationGovernor implements MemoryGovernor {
   get reserveBytes(): number {
     return this.governor.reserveBytes;
   }
+  servableBeside(own: Iterable<Grant>, bytes: number, signal?: AbortSignal): Promise<number> {
+    return this.governor.servableBeside(own, bytes, signal);
+  }
   get usedBytes(): number {
     return this.governor.usedBytes;
   }

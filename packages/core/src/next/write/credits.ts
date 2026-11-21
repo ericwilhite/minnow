@@ -266,6 +266,13 @@ export class WriteCredits {
     }
   }
 
+  /** Every grant the owner holds now: its four floors and an active merge step. */
+  grants(): readonly Grant[] {
+    const grants = [this.rows, this.metadata, this.commits, this.merge];
+    if (this.#mergeActive !== null) grants.push(this.#mergeActive);
+    return grants;
+  }
+
   #check(): void {
     this.#stop.signal.throwIfAborted();
     if (this.#closed) throw new GrantClosedError("write owner minimum");

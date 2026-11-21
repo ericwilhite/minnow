@@ -3275,6 +3275,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
             signal: runtime.signal,
             label,
             admitRow: (bytes) => runtime.admit(`${label}/row`, bytes, false, rel, true),
+            ownGrants: () => runtime.ownGrants(),
           });
           let at = 0;
           let arena: OutputArena | null = null;
