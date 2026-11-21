@@ -41,6 +41,8 @@ const arm = fc.oneof(
   // Text concatenation evaluates in producer phases.
   fc.record({ kind: fc.constant("concat" as const) }),
   fc.record({ kind: fc.constant("big" as const) }),
+  // Other column names: a compound's output columns are its first arm's (PostgreSQL).
+  fc.record({ kind: fc.constant("renamed" as const) }),
 );
 type Arm = typeof arm extends fc.Arbitrary<infer T> ? T : never;
 const armSql = (a: Arm): string => {
@@ -55,6 +57,8 @@ const armSql = (a: Arm): string => {
       return "SELECT NULL AS k, NULL AS v";
     case "concat":
       return "SELECT k AS k, v || '!' AS v FROM a";
+    case "renamed":
+      return "SELECT k AS n, w AS label FROM b";
     case "big":
       return "SELECT big AS k, 'big' AS v FROM c";
   }
@@ -71,6 +75,7 @@ const operator = fc.constantFrom(...OPERATORS);
 const wrap = fc.constantFrom(
   "bag",
   "ordered",
+  "ordinal",
   "aggregated",
   "grouped",
   "joined",
@@ -124,28 +129,37 @@ for (const seed of seedsFor("next-set-operations", [0x5e71, 0x5e72]))
             if (arms.some((a) => "filter" in a && a.filter.includes("99")))
               reach.reach("empty arm");
             reach.reach(how);
+            if (arms.some((a) => a.kind === "renamed")) reach.reach("renamed arm");
+            // A leading INTERSECT chain followed by UNION or EXCEPT is a nested first member:
+            // the compound's output columns are that chain's first arm's (PostgreSQL).
+            const nestedFirst =
+              used[0]?.startsWith("INTERSECT") === true &&
+              used.some((op) => !op.startsWith("INTERSECT"));
+            if (how === "ordinal" && nestedFirst) reach.reach("ordinal over a nested first member");
             const sql =
               how === "insert"
                 ? `INSERT INTO dst ${union}`
                 : how === "bag"
                   ? union
                   : how === "ordered"
-                    ? // Names, not ordinals: the front end refuses ordinals over a regrouped mixed chain.
-                      `${union} ORDER BY k NULLS LAST, v NULLS LAST LIMIT ${String(limit)} OFFSET ${String(offset)}`
-                    : how === "aggregated"
-                      ? `SELECT count(*) AS n, count(k) AS kn, sum(k) AS s, min(v) AS lo FROM (${union}) u(k, v)`
-                      : how === "grouped"
-                        ? `SELECT k, count(*) AS n FROM (${union}) u(k, v) GROUP BY k ORDER BY k NULLS LAST`
-                        : how === "joined"
-                          ? `SELECT u.k, b.w FROM (${union}) u(k, v) JOIN b ON b.k = u.k ORDER BY 1, 2`
-                          : // Several grouping sets lower to a UNION ALL of grouped aggregates.
-                            `SELECT k, v, count(*) AS n, sum(k) AS s FROM (${union}) u(k, v) GROUP BY ${
-                              how === "rollup"
-                                ? "ROLLUP (k, v)"
-                                : how === "cube"
-                                  ? "CUBE (k, v)"
-                                  : "GROUPING SETS ((k), (v), ())"
-                            } ORDER BY 1 NULLS LAST, 2 NULLS LAST, 3, 4 NULLS LAST`;
+                    ? `${union} ORDER BY k NULLS LAST, v NULLS LAST LIMIT ${String(limit)} OFFSET ${String(offset)}`
+                    : how === "ordinal"
+                      ? // Ordinals name the compound's output columns.
+                        `${union} ORDER BY 2 DESC NULLS FIRST, 1 NULLS LAST LIMIT ${String(limit)} OFFSET ${String(offset)}`
+                      : how === "aggregated"
+                        ? `SELECT count(*) AS n, count(k) AS kn, sum(k) AS s, min(v) AS lo FROM (${union}) u(k, v)`
+                        : how === "grouped"
+                          ? `SELECT k, count(*) AS n FROM (${union}) u(k, v) GROUP BY k ORDER BY k NULLS LAST`
+                          : how === "joined"
+                            ? `SELECT u.k, b.w FROM (${union}) u(k, v) JOIN b ON b.k = u.k ORDER BY 1, 2`
+                            : // Several grouping sets lower to a UNION ALL of grouped aggregates.
+                              `SELECT k, v, count(*) AS n, sum(k) AS s FROM (${union}) u(k, v) GROUP BY ${
+                                how === "rollup"
+                                  ? "ROLLUP (k, v)"
+                                  : how === "cube"
+                                    ? "CUBE (k, v)"
+                                    : "GROUPING SETS ((k), (v), ())"
+                              } ORDER BY 1 NULLS LAST, 2 NULLS LAST, 3, 4 NULLS LAST`;
             if (how === "insert") {
               await pg.query("DELETE FROM dst");
               await core.execute("DELETE FROM dst");
@@ -195,6 +209,11 @@ for (const seed of seedsFor("next-set-operations", [0x5e71, 0x5e72]))
             if (!("batches" in result)) throw new Error(`no rows: ${sql}`);
             const actual = rowsOf(oracleRows(result));
             const wanted = rowsOf(expected.rows);
+            // Output column names are the first arm's.
+            expect(
+              expected.fields.map((field) => field.name),
+              sql,
+            ).toEqual(result.columns.map((column) => column.name));
             if (how === "bag") {
               expect(bag(actual), sql).toEqual(bag(wanted));
               if (new Set(actual.map((row) => JSON.stringify(row))).size < actual.length)
@@ -207,6 +226,24 @@ for (const seed of seedsFor("next-set-operations", [0x5e71, 0x5e72]))
           seed,
           numRuns: 60,
           examples: [
+            [
+              [{ kind: "a", filter: "" }, { kind: "renamed" }, { kind: "a", filter: "" }],
+              ["INTERSECT", "UNION", "UNION ALL"],
+              "ordinal",
+              6,
+              0,
+            ],
+            [
+              [
+                { kind: "a", filter: "" },
+                { kind: "a", filter: " WHERE k > 2" },
+                { kind: "b", filter: "" },
+              ],
+              ["INTERSECT", "UNION", "UNION ALL"],
+              "ordinal",
+              6,
+              1,
+            ],
             [
               [
                 { kind: "a", filter: "" },
