@@ -360,7 +360,10 @@ it.each(seedsFor("next-registry-images", [0xb5df]))(
               try {
                 expect(projection.old?.[1] ?? ROW_IMAGE_UNREAD).toBe(ROW_IMAGE_UNREAD);
                 expect(projection.new?.[1] ?? ROW_IMAGE_UNREAD).toBe(ROW_IMAGE_UNREAD);
-                expect(f.maxProgress).toBeLessThan(256); // Unreferenced text is never decoded.
+                // Unreferenced text is never decoded: a projected read funds its lease's fixed
+                // envelope (2 KiB a column, which the step allocates) and the referenced values with
+                // their binding copies, never the unreferenced text's length.
+                expect(f.maxProgress).toBeLessThan(2 * f.table.columns.length * 1024 + 256);
                 expect(projection.old === null).toBe(row % 3 === 0);
                 expect(projection.new === null).toBe(row % 3 === 2);
                 reach.reach(

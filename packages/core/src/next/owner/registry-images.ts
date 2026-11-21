@@ -18,6 +18,7 @@ import type { RegistryFragments } from "./registry-fragments.js";
 import {
   loadRegistryScalar,
   registryScalarBytes,
+  bindingCopyBytes,
   registryScalarVarlenBytes,
   registryScalarStoreBytes,
   registryScalarWorkspaceBytes,
@@ -556,24 +557,59 @@ export class RegistryImages {
       if (projection) this.#validateProjection(table, projection);
       let scalarBytes = 0,
         imageExtra = 0,
-        workspace = 0;
-      const measure = async (position: number, scalar: Uint8Array) => {
+        workspace = 0,
+        copyBytes = 0;
+      // A binding read (a projection) also funds one binding copy of each column it reads, sized
+      // from the same records before anything is decoded (registry-scalar.ts bindingCopyBytes).
+      const copies = projection
+        ? {
+            old: hasOld ? new Array<number>(table.columns.length).fill(0) : null,
+            new: hasNext ? new Array<number>(table.columns.length).fill(0) : null,
+          }
+        : null;
+      const measure = (side: number[] | null) => async (position: number, scalar: Uint8Array) => {
         const column = table.columns[position];
         if (!column) corrupt();
         const retained = registryScalarBytes(scalar, column.type);
         scalarBytes += retained;
         imageExtra += Math.max(0, retained - dataBytes(column.type, 1) - 4);
         workspace = Math.max(workspace, registryScalarWorkspaceBytes(scalar, column.type));
-        if (!Number.isSafeInteger(scalarBytes)) corrupt();
+        if (side) {
+          const copy = bindingCopyBytes(scalar, column.type);
+          side[position] = copy;
+          copyBytes += copy;
+        }
+        if (!Number.isSafeInteger(scalarBytes) || !Number.isSafeInteger(copyBytes)) corrupt();
       };
-      if (hasOld) await this.#walk(table, oldHead, projection?.old ?? null, measure, signal);
+      if (hasOld)
+        await this.#walk(
+          table,
+          oldHead,
+          projection?.old ?? null,
+          measure(copies?.old ?? null),
+          signal,
+        );
       else if (oldHead !== 0) corrupt();
-      if (hasNext) await this.#walk(table, nextHead, projection?.new ?? null, measure, signal);
+      if (hasNext)
+        await this.#walk(
+          table,
+          nextHead,
+          projection?.new ?? null,
+          measure(copies?.new ?? null),
+          signal,
+        );
       else if (nextHead !== 0) corrupt();
       const bytes = 2 * table.columns.length * 1024 + scalarBytes;
       // No image lease or native input progress is held here. The host owns the shared
-      // progress step, including one unique binding copy; it may wait cancellably.
-      await this.scope.prepare(imageExtra + scalarBytes + workspace, signal);
+      // progress step and may wait cancellably. A binding read funds exactly what that step
+      // allocates: this lease (`bytes`, allocated next; funding the step releases idle credit
+      // above it, so no earlier slack can be relied on), the decode workspace, and one binding
+      // copy of each read column (bindingCopyBytes, what BindingScope charges). A full image read
+      // keeps its out-of-line estimate.
+      await this.scope.prepare(
+        copies ? bytes + workspace + copyBytes : imageExtra + scalarBytes + workspace,
+        signal,
+      );
       this.#check(signal);
       if (!this.scope.charge.allocate(bytes)) throw new RangeError("Image lease must be admitted");
       let old: Array<Vector | typeof ROW_IMAGE_UNREAD> | null = null,
@@ -619,6 +655,7 @@ export class RegistryImages {
         transferred = true;
         return {
           tableId: table.id,
+          ...(copies ? { copyBytes: copies } : {}),
           get old() {
             check();
             return old;

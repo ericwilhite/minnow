@@ -198,6 +198,18 @@ export function registryScalarWorkspaceBytes(record: Uint8Array, type: PhysicalT
   return length + 3 * (length + 32);
 }
 
+/**
+ * What one trigger binding copy of this stored value takes (exec/trigger-bindings.ts): its decoded
+ * bytes (`registryScalarBytes`) plus a binding's own offsets and validity word. Known from the
+ * record's header before anything is decoded, so the image read funds the copy with the image
+ * (owner/registry-images.ts), and the copy charges exactly this: one function for both.
+ */
+export function bindingCopyBytes(record: Uint8Array, type: PhysicalType): number {
+  return registryScalarBytes(record, type) + BINDING_COPY_OVERHEAD_BYTES;
+}
+/** A binding copy's offsets pair and validity word beyond the decoded value. */
+export const BINDING_COPY_OVERHEAD_BYTES = 8 + 4;
+
 /** The caller owns/refunds registryScalarBytes, and drops the vector before returning it.
  * Allocate only after that reservation; fixed lanes never alias the reusable record buffer. */
 export async function loadRegistryScalar(
