@@ -77,7 +77,7 @@ interface Snapshot {
           readonly kind: "group";
           readonly rowCount: number;
           readonly liveRowCount?: number;
-          readonly group: { readonly root: BlobRef };
+          readonly group: { readonly root: BlobRef; readonly deletions?: BlobRef | null };
         }
     >;
   }>;
@@ -454,11 +454,15 @@ export function boundSource(
           (yield* readValue(scratchMinimum(governor, "read-step/sizing", capacity, signal)));
         const budget = new SizingBudget(grant, immediate === null ? capacity : preferred);
         const readers: ChunkReader[] = [];
+        const bitmapBytes = segment.group.deletions?.length ?? 0;
         let root: import("../format/reachable.js").Held<ScanRootFacts> | null = null;
         let retry = false,
           required = capacity;
         try {
           io = Math.max(io, Math.min(MAX_READ_BYTES, segment.group.root.length));
+          // The scan reads this group's deletion bitmap through its own budget (write/view.ts
+          // deletions()): its bytes belong to the same bound as the group's other reads.
+          io = Math.max(io, Math.min(MAX_READ_BYTES, bitmapBytes));
           root = yield* readValue(
             retention.retain === false || caches === undefined
               ? metadata.groupRoot(segment.group.root, budget)
@@ -699,7 +703,8 @@ export function boundSource(
                   largestOpen +
                   (held[w] ?? 0) +
                   4 * (values[w] ?? 0) +
-                  output,
+                  output +
+                  bitmapBytes,
               );
             }
           } finally {

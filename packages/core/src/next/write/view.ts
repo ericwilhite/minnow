@@ -182,13 +182,15 @@ class GroupSegmentImpl implements GroupSegment {
     return this.rowCount - this.#deleted;
   }
 
-  deletions(): MaybePromise<DeletionVector | null> {
+  /** `budget` pays for a bitmap read (default: this view's budget). */
+  deletions(budget: ByteBudget = this.view.budget): MaybePromise<DeletionVector | null> {
     this.view.snapshot.checkRead();
     const delta = groupDeletions(this.view.tableView, this.#groupId, this.view.snapshot.bound);
     const ref = this.directory.deletions(this.position);
     if (ref === null) return deletionVector(this.rowCount, null, delta);
     if (this.portable) return this.#portableDeletions(ref, delta);
-    return settle(this.view.snapshot.shared.bitmap(ref, this.rowCount), (bits) =>
+    // A scan passes its own budget, whose read bound includes the bitmap (read-bounds.ts).
+    return settle(this.view.snapshot.shared.bitmap(ref, this.rowCount, budget), (bits) =>
       deletionVector(this.rowCount, bits, delta),
     );
   }
