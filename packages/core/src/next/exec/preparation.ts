@@ -20,7 +20,7 @@
  * above it is the typed MemoryAdmissionError (53200). It is twice the previous request when that
  * is admissible at once, else the measured peak alone: a restart never waits for more than it
  * needs. The wait carries what the statement keeps through it (its result grant, its writer's
- * holdings: `NativeGrantGroupOptions.servable`), so a credit that could never be served beside
+ * holdings: `NativeGrantGroupOptions.holdings`), so a credit that could never be served beside
  * them is refused with 53200 rather than left waiting. Each credit is larger than the last and
  * covers the stopped attempt's peak, so an attempt that repeats its admissions gets past the one
  * that stopped the last. Restarts are therefore at most ceil(log2(usable / first request)) + 1
@@ -288,7 +288,7 @@ export class PreparationGovernor implements MemoryGovernor {
         grants: options.grants,
         includesProgress: progress,
         ...(options.signal === undefined ? {} : { signal: options.signal }),
-        ...(options.servable === undefined ? {} : { servable: options.servable }),
+        ...(options.holdings === undefined ? {} : { holdings: options.holdings }),
       };
       if (this.governor.canAdmitNow(total, progress) || this.#holdsNothing())
         return this.governor
@@ -321,7 +321,7 @@ export class PreparationGovernor implements MemoryGovernor {
    * The credit is twice the previous one when that is admissible at once (at most the usable
    * capacity), else the attempt's peak need: it never waits for more than it needs. `beside` is
    * what the statement still keeps while it waits (its result grant, and its writer's holdings
-   * while it holds the turn): the wait carries it (`NativeGrantGroupOptions.servable`), so a
+   * while it holds the turn): the wait carries it (`NativeGrantGroupOptions.holdings`), so a
    * credit that could never be served beside it is refused with 53200, at once or when the
    * writer's own work ends, never left waiting.
    */
@@ -349,9 +349,7 @@ export class PreparationGovernor implements MemoryGovernor {
       label: wait.label,
       includesProgress: progress,
       signal,
-      ...(beside === undefined
-        ? {}
-        : { servable: () => this.governor.servableNow(beside(), progress) }),
+      ...(beside === undefined ? {} : { holdings: beside }),
       grants: [
         ...wait.parts,
         {

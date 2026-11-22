@@ -912,8 +912,7 @@ export class QueryRuntime {
       grants: parts,
       includesProgress: atomic,
       signal: this.signal,
-      servable: () =>
-        this.governor.servableNow?.(this.waitingHoldings(), atomic) ?? Number.POSITIVE_INFINITY,
+      holdings: () => this.waitingHoldings(),
     });
     const install = (grants: readonly Grant[]): MaybePromise<void> => {
       if (this.#closed || this.signal.aborted) {

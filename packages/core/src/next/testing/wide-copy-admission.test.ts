@@ -131,7 +131,7 @@ it("serves the settled usable capacity to the first request after the copy and r
       .admitGroup({
         label: "read",
         includesProgress: true,
-        servable: () => governor.servableNow({ grants: [] }, true),
+        holdings: () => ({ grants: [] }),
         grants: [{ label: "read", minimumBytes: settled, spillable: false }],
       })
       .then(

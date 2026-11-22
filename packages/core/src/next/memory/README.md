@@ -132,13 +132,17 @@ holds the writer turn, what the writer keeps until the statement ends
 - Left out always: an older snapshot's metadata and run readers, a dropped table's state, other
   statements' grants, evictable cache entries. Each is released by its own holder.
 
-An execution's fixed buffers and a preparation restart's credit carry that value
-(`NativeGrantGroupOptions.servable`). The governor evaluates it whenever the group is the head
-of its queue and does not fit, first on the drain that queues it (before any wait), and only
-after the reclaim requests that drain made have completed, so the statement's and the writer's
-idle credit is returned first. A group above it is refused with 53200. The writer wakes the
-queue when its own work ends; its holdings are then exact, and a group above them is refused
-instead of waiting forever. Anything at or below it waits and is served once the
+An execution's fixed buffers and a preparation restart's credit carry their statement's
+holdings (`NativeGrantGroupOptions.holdings`), and the governor checks every queued group
+against that value on every drain, wherever it sits in its queue, starting with the drain that
+queues it (before any wait). There the statement's own spillable grants count nothing: their
+reclaim is not asked yet. At the head of its queue, once the reclaim requests that drain made
+have completed, it is checked against all its holdings, so the statement's and the writer's
+idle credit is returned first. A group above its value is refused with 53200; groups within
+it keep their FIFO order. The writer wakes the queue when its own work ends; its holdings are
+then exact, and a group above them is refused instead of waiting forever. Work queued behind
+the statement's turn (a recycle waiting for the writer slot) frees nothing for it and does not
+count as the writer's own work. Anything at or below it waits and is served once the
 finite holders release (`testing/servable-beside-writer.test.ts` checks both sides: the value is
 served, one byte more is refused). A queued admission asks a holder whose reclaim is asynchronous
 once, so asks that free nothing do not loop; an owner's wake (`release(0)`, the writer's

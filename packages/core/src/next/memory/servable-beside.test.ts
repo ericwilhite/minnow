@@ -34,7 +34,7 @@ function group(governor: Governor, bytes: number, holdings: WaitingHoldings) {
     .admitGroup({
       label: "q/fixed-buffers",
       grants: [{ label: "part", minimumBytes: bytes, spillable: false }],
-      servable: () => governor.servableNow(holdings),
+      holdings: () => holdings,
     })
     .then(
       (grants) => {
@@ -192,5 +192,91 @@ it("asks a reclaimer again after its owner's wake, so a covered release is not m
   expect(await within(waiting)).toBe("served");
   expect(asked).toBe(2);
   writer.close();
+  expect(governor.usedBytes).toBe(0);
+});
+
+it("refuses a group above its bound behind another waiter, then serves the waiter its release frees", async () => {
+  const governor = new Governor(CAP);
+  const writer = await governor.admit({
+    label: "writer",
+    minimumBytes: 10 * MiB,
+    spillable: false,
+  });
+  // A foreign admission at the head needs the writer's credit back.
+  const foreign = governor
+    .admit({ label: "foreign", minimumBytes: USABLE, spillable: false })
+    .then((grant) => {
+      grant.close();
+      return "served" as const;
+    });
+  // The writer's statement asks, behind it, for more than could ever fit beside its writer.
+  const lent = { grants: [writer], retained: () => writer.held };
+  const mine = group(governor, USABLE - 10 * MiB + 1, { grants: [], lent });
+  expect(await within(mine)).toMatchObject({ name: "MemoryAdmissionError", sqlState: "53200" });
+  // The refused statement ends and its writer's credit returns: the foreign waiter is served.
+  expect(await within(foreign)).toBe(PENDING);
+  writer.close();
+  expect(await within(foreign)).toBe("served");
+  expect(governor.usedBytes).toBe(0);
+});
+
+it("keeps FIFO for a group within its bound behind another waiter", async () => {
+  const governor = new Governor(CAP);
+  const other = await governor.admit({ label: "other", minimumBytes: 10 * MiB, spillable: false });
+  const order: string[] = [];
+  const first = governor
+    .admit({ label: "first", minimumBytes: USABLE - 5 * MiB, spillable: false })
+    .then((grant) => {
+      order.push("first");
+      grant.close();
+    });
+  const second = group(governor, USABLE - 5 * MiB, { grants: [] }).then((outcome) => {
+    order.push("second");
+    return outcome;
+  });
+  expect(await within(second)).toBe(PENDING);
+  other.close();
+  await first;
+  expect(await within(second)).toBe("served");
+  expect(order).toEqual(["first", "second"]);
+  expect(governor.usedBytes).toBe(0);
+});
+
+it("counts the statement's own spillable holding once its reclaim returned what it could", async () => {
+  const governor = new Governor(CAP);
+  // Spillable, but its reclaim returns nothing (all of it is in use).
+  const own = await governor.admit({ label: "own", minimumBytes: 10 * MiB, spillable: true });
+  expect(own.allocate(10 * MiB)).toBe(true);
+  let asked = 0;
+  own.onReclaimRequest(async () => {
+    asked++;
+    await Promise.resolve();
+  });
+  // Before its reclaim is asked it may yet return everything; after, the 10 MiB stays.
+  const outcome = await within(group(governor, USABLE - 5 * MiB, { grants: [own] }));
+  expect(asked).toBe(1);
+  expect(outcome).toMatchObject({ name: "MemoryAdmissionError", sqlState: "53200" });
+  own.free(10 * MiB);
+  own.close();
+  expect(governor.usedBytes).toBe(0);
+});
+
+it("serves a waiter that was behind a group refused for its bound", async () => {
+  const governor = new Governor(CAP);
+  const own = await governor.admit({ label: "own", minimumBytes: 8 * MiB, spillable: false });
+  const other = await governor.admit({ label: "other", minimumBytes: 4 * MiB, spillable: false });
+  // At the head, a group that never fits beside its statement's 8 MiB: refused.
+  const refused = group(governor, USABLE - 8 * MiB + 1, { grants: [own] });
+  // Behind it, a plain admission that fits once `other` releases.
+  const behind = governor
+    .admit({ label: "behind", minimumBytes: USABLE - 8 * MiB, spillable: false })
+    .then((grant) => {
+      grant.close();
+      return "served" as const;
+    });
+  expect(await within(refused)).toMatchObject({ sqlState: "53200" });
+  other.close();
+  expect(await within(behind)).toBe("served");
+  own.close();
   expect(governor.usedBytes).toBe(0);
 });

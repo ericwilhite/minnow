@@ -2147,7 +2147,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     queueMicrotask(() => {
       this.#reclaimWake = false;
       // Idle forecasts may retire; and the writer's holdings are now exactly known, so a
-      // request waiting beside its turn can be decided (`NativeGrantGroupOptions.servable`).
+      // request waiting beside its turn can be decided (`NativeGrantGroupOptions.holdings`).
       if (!this.#closed && this.#ownWorkIdle()) this.#credits.notifyReclaimable();
     });
   }
@@ -2347,8 +2347,6 @@ export class WritePathImpl implements WritePath, EngineHooks {
    * publication settles them), pooled arenas (reclaim clears them), memtable content (the idle
    * spill flushes it), or anything a statement, commit, flush or merge holds while it runs. */
   #lifetimeBytes(): number {
-    const writer = (bytes: ByteWriter) =>
-      bytes.bytes.byteLength === 0 ? 0 : bytes.bytes.byteLength + COMMIT_BUFFER_OVERHEAD;
     let metadata =
       (this.#roots.get(this.#root)?.bytes ?? 0) +
       this.#ftsMetadataBytes +
@@ -2372,10 +2370,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       (this.#changes === null ? 0 : CHANGE_FEED_BYTES + this.#changes.historyBytes) +
       (this.#currentPin === null ? 0 : (this.#statePins.get(this.#state)?.pin.bytes ?? 0)) +
       this.#rowsLifetimeBytes() +
-      writer(this.#columns) +
-      writer(this.#body) +
-      writer(this.#sequenceBody) +
-      this.#appender.residentBytes
+      this.#commitsLifetimeBytes()
     );
   }
 
@@ -3075,6 +3070,19 @@ export class WritePathImpl implements WritePath, EngineHooks {
     };
   }
 
+  /** The resident commit writers and log buffers charged to the commit account (part of
+   * `#lifetimeBytes`). */
+  #commitsLifetimeBytes(): number {
+    const writer = (bytes: ByteWriter) =>
+      bytes.bytes.byteLength === 0 ? 0 : bytes.bytes.byteLength + COMMIT_BUFFER_OVERHEAD;
+    return (
+      writer(this.#columns) +
+      writer(this.#body) +
+      writer(this.#sequenceBody) +
+      this.#appender.residentBytes
+    );
+  }
+
   /** The lifetime controls charged to the row account (part of `#lifetimeBytes`). */
   #rowsLifetimeBytes(): number {
     return (
@@ -3097,9 +3105,16 @@ export class WritePathImpl implements WritePath, EngineHooks {
   }
 
   /**
-   * The writer runs no work of its own: no flush, merge, commit encoding, log append, recycle,
-   * metadata step or recovery. While it does, that work may move idle credit between the
-   * writer's accounts and release it, or retire the metadata step it prepaid.
+   * The writer runs no work of its own that could free or move its credit before a statement
+   * holding the turn ends: no flush, merge, commit encoding, log append, metadata step, run
+   * reader load or recovery. Such work may move idle credit between the writer's accounts and
+   * release it, or retire the metadata step it prepaid.
+   *
+   * Work queued behind the turn does not count: it runs only once the statement ends, so it frees
+   * nothing for it (review #51). A recycle or other maintenance counts only once it holds the
+   * writer slot (`#maintenanceHolds`), not while it waits for it (`#recycling`). Flushes and
+   * merges never wait for the turn: they count. The idle spill and idle publication count while
+   * they run: with a statement holding the turn they re-check and return at once.
    */
   #ownWorkIdle(): boolean {
     return (
@@ -3118,7 +3133,6 @@ export class WritePathImpl implements WritePath, EngineHooks {
       !this.#mergeScheduled &&
       !this.#merging &&
       !this.#spilling &&
-      this.#recycling === null &&
       this.#idleRun === null &&
       this.#runReadersPending === 0
     );

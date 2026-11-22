@@ -200,10 +200,12 @@ export interface MemoryGovernor {
    * waits: the usable capacity (`usableCapacity(includesProgress)`: the cap, less the reserve for
    * an ordinary request, less every registered lifetime holding) less what that statement keeps
    * held while it waits (`WaitingHoldings`). A waiting group carries it as
-   * `NativeGrantGroupOptions.servable`. Optional for wrapping governors that never wait (a
+   * `NativeGrantGroupOptions.holdings`. With `unasked`, the statement's own spillable grants
+   * count nothing: their reclaim, not yet asked, may return all they hold. Optional for wrapping
+   * governors that never wait (a
    * prepaid native body's).
    */
-  servableNow?(own: WaitingHoldings, includesProgress?: boolean): number;
+  servableNow?(own: WaitingHoldings, includesProgress?: boolean, unasked?: boolean): number;
   /** Moves idle ordinary credit within this owner. No allocation or global admission occurs. */
   transferCredit(source: Grant, target: Grant, bytes: number): boolean;
   /**
@@ -259,15 +261,17 @@ export interface NativeGrantGroupOptions {
   /** The total includes private progress credit; its consumers never need the shared reserve. */
   readonly includesProgress?: boolean;
   /**
-   * The most this group could ever be served while it waits (`servableNow` beside the
-   * requesting statement's holdings). It is evaluated each time the group is at the head of its
-   * queue and does not fit, after the reclaim requests that drain made have completed, and a
-   * group above it is refused with 53200 then, also on its first drain, before any wait. It
-   * grows as finite holders release; it shrinks when an owner's own work ends and its holdings
-   * become exactly known (a writer's flush or merge: `LentHoldings.retained`), and the owner
-   * wakes the queue then.
+   * What the requesting statement keeps held while this group waits: its bound is
+   * `servableNow(holdings)` (GOVERNOR-WAIT-POLICY point 5). A group above its bound is refused
+   * with 53200 wherever it sits in its queue, never left waiting. Every queued group is checked on
+   * every drain, the one that queues it included (before it waits), with its own spillable grants
+   * counting nothing (their reclaim is not asked yet); at the head, after that drain's reclaim
+   * requests have completed, it is checked against all its holdings. The bound grows as finite
+   * holders release and shrinks when an owner's own work ends and its holdings become exactly
+   * known (a writer's flush or merge: `LentHoldings.retained`); the owner wakes the queue then.
+   * Groups within their bound keep their FIFO order.
    */
-  readonly servable?: () => number;
+  readonly holdings?: () => WaitingHoldings;
   /**
    * The caller holds credit it cannot release until this is served (a native root's retained
    * base; the writer's floors inside a native step): holder growth from this registered chain.
@@ -328,8 +332,8 @@ interface Request {
   readonly pending: Set<Promise<void>>;
   readonly includesProgress: boolean;
   readonly parts: NativeGrantGroupOptions["grants"] | null;
-  /** `NativeGrantGroupOptions.servable`, re-evaluated while this waits at the head. */
-  readonly servable: (() => number) | null;
+  /** `NativeGrantGroupOptions.holdings`: its bound is checked while it waits. */
+  readonly holdings: (() => WaitingHoldings) | null;
 }
 
 /** A growth observer (Governor.observeGrowth) tried to change grant or governor state. */
@@ -672,10 +676,15 @@ export class Governor implements MemoryGovernor {
       );
   }
 
-  servableNow(own: WaitingHoldings, includesProgress = false): number {
+  servableNow(own: WaitingHoldings, includesProgress = false, unasked = false): number {
     let held = 0;
     for (const grant of new Set(own.grants))
-      if (grant instanceof GrantImpl && grant.governor === this && !grant.closed)
+      if (
+        grant instanceof GrantImpl &&
+        grant.governor === this &&
+        !grant.closed &&
+        !(unasked && grant.spillable)
+      )
         held += grant.held;
     return this.usableCapacity(includesProgress) - held - (own.lent?.retained() ?? 0);
   }
@@ -706,6 +715,28 @@ export class Governor implements MemoryGovernor {
     return (
       (includesProgress ? this.capBytes : this.capBytes - this.reserveBytes) - this.permanentBytes
     );
+  }
+
+  /**
+   * Every queued group above its bound (`NativeGrantGroupOptions.holdings`), wherever it sits:
+   * 53200 now, never a wait. Its own spillable grants count nothing here (their reclaim is not
+   * asked yet), so this refuses no more than the head check after reclaim would.
+   */
+  #refuseAboveBound(): boolean {
+    let refused = false;
+    for (const queue of [this.#holders, this.#admissions])
+      for (const request of [...queue]) {
+        if (request.holdings === null || request.pending.size > 0) continue;
+        const most = this.servableNow(request.holdings(), request.includesProgress, true);
+        if (request.bytes <= most) continue;
+        this.#reject(
+          queue,
+          request,
+          new MemoryAdmissionError(request.label, request.bytes, Math.max(0, most)),
+        );
+        refused = true;
+      }
+    return refused;
   }
 
   /** A queued request that can never be served while the permanent holdings persist: 53200. */
@@ -965,7 +996,9 @@ export class Governor implements MemoryGovernor {
             if (this.#holders.length === 0) this.#serve(this.#admissions, false);
           }
         }
-      } while (this.#releasedDuringDrain());
+        // After serving: only a group still waiting is checked, so none that fits now is refused.
+        // A refused group may have blocked the ones behind it: serve again then.
+      } while (this.#refuseAboveBound() || this.#releasedDuringDrain());
     } finally {
       this.#draining = false;
     }
@@ -1056,7 +1089,11 @@ export class Governor implements MemoryGovernor {
           }
           // GOVERNOR-WAIT-POLICY point 5, again as holdings settle: never served while it waits.
           // Not while a reclaim it asked for is pending: its own holdings may still shrink.
-          const most = request.pending.size === 0 ? request.servable?.() : undefined;
+          const holdings = request.pending.size === 0 ? request.holdings?.() : undefined;
+          const most =
+            holdings === undefined
+              ? undefined
+              : this.servableNow(holdings, request.includesProgress);
           if (most !== undefined && demand() > most) {
             this.#reject(
               queue,
@@ -1141,8 +1178,8 @@ export class Governor implements MemoryGovernor {
       | "pending"
       | "includesProgress"
       | "parts"
-      | "servable"
-    > & { includesProgress?: boolean; servable?: (() => number) | null },
+      | "holdings"
+    > & { includesProgress?: boolean; holdings?: (() => WaitingHoldings) | null },
     signal?: AbortSignal,
     readRoom: number | null = null,
     parts: NativeGrantGroupOptions["grants"] | null = null,
@@ -1160,7 +1197,7 @@ export class Governor implements MemoryGovernor {
       const entry: Request = {
         ...request,
         includesProgress: request.includesProgress ?? false,
-        servable: request.servable ?? null,
+        holdings: request.holdings ?? null,
         asked: new Set(),
         pending: new Set(),
         readRoom,
@@ -1346,7 +1383,7 @@ export class Governor implements MemoryGovernor {
         label,
         spillable: false,
         includesProgress: includesProgress === true,
-        servable: options.servable ?? null,
+        holdings: options.holdings ?? null,
       },
       signal,
       null,

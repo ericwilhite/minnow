@@ -1661,7 +1661,7 @@ and the owner import it directly.
   nothing (the preparation credit, below), since readers each retaining a source recipe while
   waiting could otherwise wait on each other. A statement never waits for what it could never get
   beside its own holdings and what its writer keeps while it holds the turn: its fixed buffers
-  and a preparation restart carry that bound (`servableNow`, `NativeGrantGroupOptions.servable`)
+  and a preparation restart carry that bound (`servableNow`, `NativeGrantGroupOptions.holdings`)
   and are refused with 53200 above it, before they wait or when the writer's own work ends and
   its holdings are exact, and a restart waits for its measured need, never a doubled credit
   that is not admissible at once (memory/README.md). Policy: `holdsCredit`,
@@ -1690,7 +1690,7 @@ and the owner import it directly.
   when that is admissible at once, else the attempt's measured peak alone, at most the usable
   capacity (a peak need above it is `MemoryAdmissionError`, 53200). The wait carries what the
   statement keeps through it (its result grant, its writer's holdings:
-  `NativeGrantGroupOptions.servable`), so a credit that could never be served beside them is
+  `NativeGrantGroupOptions.holdings`), so a credit that could never be served beside them is
   refused with 53200 rather than left waiting. Each credit is larger than the last and covers
   the stopped attempt's peak, so restarts are at most `ceil(log2(usable / first request)) + 1`
   that doubled plus at most one per admission of an attempt that took its measured peak.

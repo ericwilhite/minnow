@@ -175,7 +175,7 @@ async function scenario(
             label: "statement request",
             includesProgress: true,
             grants: [{ label: "statement request", minimumBytes: bytes, spillable: false }],
-            servable: () => governor.servableNow(holdings, true),
+            holdings: () => holdings,
           })
           .then(
             (grants) => {
