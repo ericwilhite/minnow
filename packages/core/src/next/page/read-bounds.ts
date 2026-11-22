@@ -15,6 +15,7 @@ import { ChunkReader, PageBudgetError } from "../page/reader.js";
 import { MAX_VALUE_BYTES } from "./large-value.js";
 import { MAX_BLOB_BYTES, MAX_READ_BYTES } from "../storage/extents.js";
 import { BATCH_ROWS, dataBytes } from "../vector/vector.js";
+import { locatorPosition, locatorSegment } from "../vector/locator.js";
 import { INT32_MAX, type PhysicalType } from "../types.js";
 import { clockFor, pauseIfDue } from "../task.js";
 import { Int32DomainCertificate, type Int32Domain } from "./domain-certificate.js";
@@ -121,6 +122,13 @@ export interface ReadSource {
    * those segments only, so the caller must read no other segment of the same pinned view.
    */
   readonly segments?: Uint32Array;
+  /**
+   * With `selectedRow`: the only locators the source reads (ascending, distinct; a lookup's
+   * probe of the same pinned view). A memory segment is then sized from these rows' own widths,
+   * not from its chunks' maxima: a small selected row beside a wide one is not sized as the wide
+   * one. Without it, a selected-row source is sized for any one row of its segments.
+   */
+  readonly locators?: Float64Array;
 }
 export interface ReadBound {
   readonly batchRows?: 1;
@@ -133,6 +141,13 @@ export interface ReadBound {
   readonly valueBytes?: number;
   readonly windowBytes: number;
   readonly domain?: Int32Domain;
+  /**
+   * A selected-row source (`ReadSource.selectedRow`): `bytes` already funds the complete read
+   * step of any row it reads (sized from those rows, never a byte target), so the source's own
+   * progress lane funds nothing beyond it. `progress` keeps its meaning (four copies of the
+   * largest value) for every other operator's envelope.
+   */
+  readonly stepCovered?: true;
 }
 
 /** A sizing pass cannot grow or hold a partial reservation while awaiting a bigger one. */
@@ -299,10 +314,39 @@ export function boundSource(
               resident = 0,
               scratch = 0;
             try {
+              // Named selected rows are sized from their own widths, one exact hint each.
+              const selected =
+                source.selectedRow === true && source.locators !== undefined
+                  ? positionsIn(source.locators, index)
+                  : null;
+              for (const position of selected ?? []) {
+                const hint = yield* readValue(
+                  segment.readHint(
+                    {
+                      columns: source.columns,
+                      chunk: Math.floor(position / BATCH_ROWS),
+                      startRow: position % BATCH_ROWS,
+                      maxRows: 1,
+                      targetBytes: target,
+                    },
+                    { budget, pages: sizingPages, signal },
+                  ),
+                );
+                if (hint.rowCount !== 1)
+                  throw new RangeError("Memory sizing hint made no bounded progress");
+                totalOutput += Math.min(hint.outputBytes, Math.max(0, target - totalOutput));
+                largestOutput = Math.max(largestOutput, hint.outputBytes);
+                resident = Math.max(resident, hint.residentBytes);
+                scratch = Math.max(scratch, hint.scratchBytes);
+                io = Math.max(io, hint.ioBytes);
+                valueBytes = Math.max(valueBytes, hint.outputBytes);
+                const pause = pauseIfDue(task);
+                if (pause) yield pause;
+              }
               // One-row sizing reads one summary of every sized row instead of one hint per
               // row: the same terms, as upper bounds, at a cost independent of the rows.
               const summary =
-                source.batchRows === 1 && segment.readSummary !== undefined
+                selected === null && source.batchRows === 1 && segment.readSummary !== undefined
                   ? yield* readValue(
                       segment.readSummary(
                         { columns: source.columns, chunk: 0, rows },
@@ -318,7 +362,11 @@ export function boundSource(
                 io = Math.max(io, summary.ioBytes);
                 valueBytes = Math.max(valueBytes, summary.rowBytes);
               }
-              for (let first = 0; summary === null && first < rows; first += BATCH_ROWS) {
+              for (
+                let first = 0;
+                selected === null && summary === null && first < rows;
+                first += BATCH_ROWS
+              ) {
                 const end = Math.min(BATCH_ROWS, rows - first);
                 for (let start = 0; start < end;) {
                   const hint = yield* readValue(
@@ -744,8 +792,27 @@ export function boundSource(
       windowBytes,
       ...retention,
       ...(domain === undefined ? {} : { domain }),
+      ...(source.selectedRow === true ? { stepCovered: true as const } : {}),
     };
   }
+}
+
+/** The positions within segment `index` of the ascending `locators`. */
+function positionsIn(locators: Float64Array, index: number): number[] {
+  const out: number[] = [];
+  let low = 0,
+    high = locators.length;
+  while (low < high) {
+    const mid = (low + high) >>> 1;
+    if (locatorSegment(locators[mid] ?? 0) < index) low = mid + 1;
+    else high = mid;
+  }
+  for (let k = low; k < locators.length; k++) {
+    const locator = locators[k] ?? 0;
+    if (locatorSegment(locator) !== index) break;
+    out.push(locatorPosition(locator));
+  }
+  return out;
 }
 
 /** Resume inside the generator even on rejection, so its finally blocks release all holds. */

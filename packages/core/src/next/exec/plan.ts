@@ -186,6 +186,7 @@ import {
   windowSegments,
   type IndexShape,
   type AdmittedIndexRead,
+  type WindowSegments,
 } from "./key-order.js";
 import { holdsAcrossAdmission } from "./preparation.js";
 import {
@@ -3596,11 +3597,25 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
       }
       return resultRowStepBytes(widths);
     };
-    // This recipe belongs to aggregate outputs/unreturned grouping keys. Keep plain
-    // source/expression delivery on its existing envelope, including expanding kernels.
+    // The emitted row's own width: aggregate outputs and unreturned grouping keys, and plain
+    // delivery whose every column has a bounded input width (a source column, a literal, a
+    // parameter). An expanding kernel has none and keeps the source envelope. Plain delivery
+    // measures its columns only once its minimum is over the cap (`resultSizing`), so a fitting
+    // query sizes exactly as before; the result step then funds its own copy, not the source's
+    // four-copy read envelope again.
     const aggregateResult = aggregatePlanners.size + jsonAggregateRecipes.size > 0;
-    const knownResult = aggregateResult && resultWidth([], 0, true) !== null;
+    // A modification's result lane also funds its write step (exec/run.ts): it keeps its
+    // envelope unless an aggregate recipe already applied.
+    const knownResult =
+      (aggregateResult || plan.root.op !== "modify") && resultWidth([], 0, true) !== null;
+    // Plain delivery uses it only after the over-cap retry measured its columns (`resultSizing`):
+    // until then a fitting query keeps its envelope, frame progress lane included.
+    const plainSized = { on: false };
     if (aggregateResult) runtime.resultRowProgress((slots, largest) => resultWidth(slots, largest));
+    else if (knownResult)
+      runtime.resultRowProgress((slots, largest) =>
+        plainSized.on ? resultWidth(slots, largest) : null,
+      );
     let semanticActive = active;
     const jsonGroups = [...jsonAggregateRecipes.values()].filter(
       (p) => p.loans > 1 && active.has(p.rel.id),
@@ -4452,14 +4467,21 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
         // Each lookup's segment list stays held (charged, a preparation admission) through every
         // sizing of its source in this pass, so none of them sizes the whole table.
         const held: Array<{ release(): void }> = [];
-        const named = new Map<number, Uint32Array>();
-        const segmentsOf = (id: number): { segments?: Uint32Array } => {
-          const segments = named.get(id);
-          return segments === undefined ? {} : { segments };
-        };
+        const named = new Map<number, WindowSegments>();
+        // A lookup names its segments and its selected locators (page/read-bounds.ts).
+        const selection = (
+          found: WindowSegments | undefined,
+        ): { segments?: Uint32Array; locators?: Float64Array } =>
+          found === undefined
+            ? {}
+            : {
+                segments: found.segments,
+                ...(found.locators === undefined ? {} : { locators: found.locators }),
+              };
+        const segmentsOf = (id: number) => selection(named.get(id));
         try {
           for (const source of sources) {
-            const sizeMain = (segments?: Uint32Array) =>
+            const sizeMain = (found?: WindowSegments) =>
               boundSource(
                 runtime.sourceView(),
                 {
@@ -4470,7 +4492,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                     ? { retain: false }
                     : {}),
                   rows: demand.get(source.id) ?? null,
-                  ...(segments === undefined ? {} : { segments }),
+                  ...selection(found),
                 },
                 runtime.governor,
                 runtime.signal,
@@ -4499,10 +4521,10 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                   );
             if (found !== null) {
               held.push(found);
-              named.set(source.id, found.segments);
+              named.set(source.id, found);
             }
-            const segments = found === null ? {} : { segments: found.segments };
-            const bound: ReadBound = yield* readValue(sizeMain(found?.segments));
+            const segments = selection(found ?? undefined);
+            const bound: ReadBound = yield* readValue(sizeMain(found ?? undefined));
             bounds.set(source.id, bound);
             if (bound.batchRows === 1) {
               if (boundedColumns === null) {
@@ -4719,6 +4741,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           // Ordinary source-result copies keep the already proven read envelope.
           // Only an over-cap minimum needs these additional per-emitted-column facts.
           resultSizing = true;
+          plainSized.on = true;
           continue;
         }
         if (overCap && !singleRows && sources.some((source) => boundedScans.has(source.id))) {

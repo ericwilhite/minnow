@@ -139,7 +139,8 @@ async function readLookup(
     signal = runtime.signal;
   // One spare slot shows that the bound was exceeded.
   const locatorBytes = (bound + 1) * Float64Array.BYTES_PER_ELEMENT,
-    segmentBytes = bound * Uint32Array.BYTES_PER_ELEMENT,
+    // The segment list and the selected locators, both kept until sizing finishes.
+    segmentBytes = bound * (Uint32Array.BYTES_PER_ELEMENT + Float64Array.BYTES_PER_ELEMENT),
     scratchBytes = 2 * keyMinimum + locatorBytes;
   if (scratchBytes + segmentBytes > governor.capBytes - governor.reserveBytes) return null;
   const [grant, held] = await admitWorkingSet(governor, {
@@ -263,6 +264,11 @@ async function readLookup(
       }
     }
     if (state.over) return null;
+    // The selected locators, distinct and ascending, copied into the charged list.
+    const locators = new Float64Array(out.subarray(0, state.filled)).sort();
+    let rows = 0;
+    for (let k = 0; k < locators.length; k++)
+      if (k === 0 || locators[k] !== locators[k - 1]) locators[rows++] = locators[k] ?? 0;
     // Distinct, ascending, in place inside the charged list.
     const window = list.subarray(0, state.filled).sort();
     let distinct = 0;
@@ -272,6 +278,7 @@ async function readLookup(
     kept = true;
     return {
       segments: list.subarray(0, distinct),
+      locators: locators.subarray(0, rows),
       release() {
         if (released) return;
         released = true;
