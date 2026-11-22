@@ -47,8 +47,8 @@ for (const seed of seedsFor("next-native-write-owner-credit", [0xb715, 0xb716]))
                 check: (s: object) => {
                   expect(s).toBe(owner);
                 },
-                // The engine's native protocol (write/engine.ts, writer floors steps 1-3): a native
-                // step protects exactly the step it runs, no row, commit or merge minimum; an active
+                // The engine's native protocol (write/engine.ts, writer floors): a native step
+                // protects its row step and the commit window, no row or merge minimum; an active
                 // merge keeps its own floor.
                 protectedBytes: () => credits.nativeProtectedBytes(),
                 stabilize: async () => {
@@ -105,8 +105,7 @@ for (const seed of seedsFor("next-native-write-owner-credit", [0xb715, 0xb716]))
             }
             const rowFloor = payload + NATIVE_WRITE_STEP_BYTES + WRITE_ROW_STEP_BYTES + progress,
               activeMerge = active ? 2 * minimum.merge + units * 1024 : 0,
-              base = rowFloor + metadata + headroom,
-              // No commit is running or funded: the native step keeps no commit window.
+              base = rowFloor + metadata + headroom + minimum.commits,
               expected = base + activeMerge;
             if (donated) {
               credits.reclaimIdleForecasts();
@@ -114,7 +113,7 @@ for (const seed of seedsFor("next-native-write-owner-credit", [0xb715, 0xb716]))
               expect(
                 credits.protectedBytes(minimum.merge, headroom),
                 "the prospective minimum includes donated WAL credit",
-              ).toBe(base + minimum.commits + Math.max(minimum.merge, activeMerge));
+              ).toBe(base + Math.max(minimum.merge, activeMerge));
               reach.reach("native funding restored after idle donation");
             }
             boundary = await steps.prepare(owner, units * 1024, stop.signal, {
@@ -130,7 +129,8 @@ for (const seed of seedsFor("next-native-write-owner-credit", [0xb715, 0xb716]))
             expect(credits.metadata.held).toBe(metadata + headroom);
             // Active: the merge's credit moved to its own grant. Idle: the forecast is reclaimed.
             expect(credits.merge.held).toBe(0);
-            expect(credits.commits.held).toBe(0);
+            // The commit window stays with the native step.
+            expect(credits.commits.held).toBe(minimum.commits);
             primary.check();
             expect(rows[0]).toBe(61);
             expect(meta[0]).toBe(73);

@@ -1,9 +1,9 @@
 /**
- * A commit window funded inside a native step, under memory pressure (writer floors steps 2-3).
- * A native step keeps no commit minimum; a commit (or a sequence frame) funds its own window when it
- * starts (`prepareCommit`), as holder growth while the step holds its funded row step. SQL cannot
- * reach this today (sequence values in trigger bodies are refused with 0A000), so the mechanism is
- * checked here at the credits and governor level. Laws (GOVERNOR-WAIT-POLICY):
+ * A commit funding its window at commit time, under memory pressure. A native step keeps the
+ * commit window (`nativeCommitBytes`), but idle reclaim between statements returns it, so the
+ * commit of a transaction that went idle funds its window when it starts (`prepareCommit`), as
+ * holder growth while the transaction's rows stay protected. Checked at the credits and
+ * governor level. Laws (GOVERNOR-WAIT-POLICY):
  * - the commit funding is served before an earlier, queued new admission whenever it fits beside
  *   the step (holder priority), and is refused with 53200 at once when it cannot;
  * - nothing stalls (the stall guard is on);
@@ -21,7 +21,7 @@ const KiB = 1024,
   MiB = 1024 * KiB;
 
 for (const seed of seedsFor("next-native-commit-funding", [51031, 51032]))
-  it(`funds a commit window inside a native step under pressure (${String(seed)})`, async () => {
+  it(`funds a commit window at commit time under pressure (${String(seed)})`, async () => {
     const reach = createReach("native commit funding", NATIVE_COMMIT_FUNDING_REACH);
     const previousStall = Governor.stallAfterMs;
     Governor.stallAfterMs = previousStall ?? 2_000;
@@ -56,14 +56,14 @@ for (const seed of seedsFor("next-native-commit-funding", [51031, 51032]))
                 credits.reclaimIdleForecasts();
                 reach.reach("forecasts retired before the step");
               }
-              // The native step: its metadata step and its funded row step, nothing else.
-              await credits.prepareNativeMinimum(16 * KiB);
-              // As the engine does after funding a native step: idle forecasts beyond it go back.
-              credits.reclaimNativeStep();
+              // The transaction's rows, protected; then it goes idle between statements, and idle
+              // reclaim returns its forecasts, the commit window included.
+              await credits.prepareMetadata(16 * KiB);
               const step = stepKiB * KiB;
               await credits.growTo(credits.rows, credits.rows.allocated + step + 4 * KiB);
               primary = credits.protectRows(step);
-              expect(credits.commits.held, "a native step keeps no commit window").toBe(
+              credits.reclaimIdleForecasts();
+              expect(credits.commits.held, "idle reclaim returned the commit window").toBe(
                 credits.commits.allocated,
               );
               // Pressure: an earlier new admission for more than is free now.
@@ -83,7 +83,7 @@ for (const seed of seedsFor("next-native-commit-funding", [51031, 51032]))
                   (error: unknown) => error,
                 );
               await Promise.resolve();
-              // The commit window, funded inside the step.
+              // The commit window, funded when the commit starts.
               let outcome: unknown = "served";
               try {
                 await credits.prepareCommit();

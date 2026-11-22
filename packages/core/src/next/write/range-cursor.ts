@@ -137,6 +137,15 @@ export class StreamingRangeCursor implements IndexCursor {
       keyBytes,
     };
   }
+  /** Governor credit this cursor holds now: its grant, its inputs' buffers or a prepared lease. */
+  #holdsCredit(): boolean {
+    return (
+      this.#ownedGrant !== null ||
+      this.#grant !== null ||
+      this.#inputs.length > 0 ||
+      this.#prepared !== null
+    );
+  }
   *#open(): Generator<Promise<unknown>, void, unknown> {
     const shared = this.index.table.snapshot.shared;
     for (;;) {
@@ -148,17 +157,20 @@ export class StreamingRangeCursor implements IndexCursor {
         grant = this.#account;
       } else {
         let owned = shared.governor.tryAdmit(options);
-        // Only a statement view (bound above every LSN) grows here as a holder: inside a write
-        // statement the writer holds its floors and the statement its rows. A read snapshot is
-        // outside the writer chain (GOVERNOR-WAIT-POLICY point 6).
-        if (owned === null && this.index.table.snapshot.bound <= MAX_LSN)
+        // A statement view (bound above every LSN) waits as holder growth in the writer chain:
+        // inside a write statement the writer holds its floors and the statement its rows. A read
+        // snapshot is outside the writer chain and waits as a new admission, holding nothing
+        // (GOVERNOR-WAIT-POLICY point 6: readers are not holders). Checked, not assumed: a reader
+        // that would wait holding governor credit is the hold-and-wait the policy rules out.
+        const reader = this.index.table.snapshot.bound <= MAX_LSN;
+        if (owned === null && reader && this.#holdsCredit())
           throw new HolderChainInvariantError(
             options.label,
-            "would wait as a holder from a read snapshot, outside the writer chain",
+            "would wait from a read snapshot while holding governor credit",
           );
         owned ??= (yield shared.governor.admit({
           ...options,
-          holdsCredit: shared.holderChain,
+          ...(reader ? {} : { holdsCredit: shared.holderChain }),
           signal: this.#abort.signal,
         })) as Grant;
         this.#ownedGrant = owned;

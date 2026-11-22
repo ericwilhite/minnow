@@ -1641,7 +1641,10 @@ and the owner import it directly.
   owner work (boot, reopen, snapshot import) uses short-lived `"owner"` chains. Holder growth that
   names no open chain of the governor, or that comes from an owner chain while the writer chain
   has a writing transaction open, raises `HolderChainInvariantError` (XX000) before it queues.
-  This also covers a read snapshot that would wait as a holder. The case this rules out: a foreign
+  A read snapshot's range cursor (a query's ordered scan without an admitted plan) waits as a new
+  admission: it holds no governor credit then, and the cursor checks that, raising the same error
+  if it ever would. Holder priority does not starve it: it is served once the writer's statement
+  ends (`testing/read-cursor-admission.test.ts`). The case this rules out: a foreign
   holder whose growth fits only once the writer's rows are released, queued ahead of the writer's
   commit, with neither able to move. Test: `testing/holder-chain-invariant.test.ts`. Readers are not holders: query preparation waits only while holding
   nothing (the preparation credit, below), since readers each retaining a source recipe while

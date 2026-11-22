@@ -83,12 +83,10 @@ export class WriteCredits {
   }
 
   /**
-   * What a native step protects (writer floors, steps 1-3): exactly the step it runs. Live
-   * allocations and loans; the funded row step (`protectRows`); the metadata step and its
-   * headroom; a commit window only while a commit or log append is running or already funded;
-   * an active merge's own floor. No row, commit or merge minimum: a native step never commits
-   * or merges inside itself, and a commit, a sequence frame or a merge funds its own window
-   * when it starts (`prepareCommit`, `acquireMerge`, as holder growth).
+   * What a native step protects (writer floors, steps 1-3): live allocations and loans; the
+   * funded row step (`protectRows`), not the writer's row minimum; the metadata step and its
+   * headroom; the commit window (`nativeCommitBytes`); an active merge's own floor. No merge
+   * minimum: a native step never merges, and a merge admits its own credit when it runs.
    */
   nativeProtectedBytes(metadataHeadroom = this.#metadataHeadroom): number {
     return (
@@ -110,10 +108,19 @@ export class WriteCredits {
     return Math.max(this.#rowFloor, this.#workingMinimum().rows ?? 0);
   }
 
-  /** Commit credit a native step keeps: live buffers and loans, and the commit window only
-   * while a commit or log append runs or was funded. */
+  /**
+   * Commit credit a native step keeps: the commit window (`minimum.commits`) and anything more it
+   * holds, never reclaimed between native steps (as before writer floors). A native statement's
+   * commit and log frames then never grow while a competitor retains the rest of the cap
+   * (testing/referential-pressure.test.ts). Steps 2-3 first dropped it and funded the window at
+   * commit time; that regressed three referential laws, and holding it per transaction instead
+   * (the "pin") broke write-query-reclaim and writer-holder-growth. Idle reclaim between
+   * statements still returns it (`reclaimIdleForecasts`).
+   */
   get nativeCommitBytes(): number {
     return Math.max(
+      this.minimum.commits,
+      this.commits.held,
       this.commits.allocated + this.commits.loaned,
       this.#commitFunding,
       this.#workingMinimum().commits ?? 0,
@@ -125,11 +132,10 @@ export class WriteCredits {
     return Math.max(this.#workingMinimum().commits ?? 0, this.#commitFunding);
   }
 
-  /** A native step's own workspace is funded (no row, commit or merge minimum). */
+  /** A native step's own workspace is funded: its row step and the commit window (no row or
+   * merge minimum). */
   #nativeReady(): boolean {
-    return (
-      this.rows.held >= this.nativeRowFloorBytes && this.commits.held >= this.nativeCommitBytes
-    );
+    return this.rows.held >= this.nativeRowFloorBytes && this.commits.held >= this.minimum.commits;
   }
 
   /** Merge credit a native step must keep: an active merge's holdings and prepaid floor only. */
@@ -173,12 +179,11 @@ export class WriteCredits {
   }
 
   /** Return high-water estimates between native steps without using a live primary or a
-   * merge's progress: down to what a native step protects (`nativeProtectedBytes`). */
+   * merge's progress: down to what a native step protects (`nativeProtectedBytes`). Commit
+   * credit is never returned here (`nativeCommitBytes`). */
   reclaimNativeStep(): void {
     const released =
-      releaseIdle(this.rows, this.nativeRowFloorBytes) +
-      releaseIdle(this.commits, this.nativeCommitBytes) +
-      releaseIdle(this.merge, this.#mergeFloor);
+      releaseIdle(this.rows, this.nativeRowFloorBytes) + releaseIdle(this.merge, this.#mergeFloor);
     this.reclaimMetadata();
     if (released) this.#changed?.();
   }
@@ -523,6 +528,8 @@ export class WriteCredits {
       const desired = accounts.map((account, i) =>
         Math.max(account.allocated + account.loaned, floors[i] ?? 0),
       );
+      // A native step's commit window (`#nativeReady`); its row step is already `#rowFloor`.
+      if (nativeMinimum) desired[2] = Math.max(desired[2] ?? 0, this.minimum.commits);
       desired[target] = Math.max(desired[target] ?? 0, wanted);
       desired[1] = Math.max(desired[1] ?? 0, metadata);
       // First preserve warm WAL/merge windows when immediate credit can fund
