@@ -18,6 +18,7 @@ import { createReach, PUBLICATION_PRESSURE_REACH } from "../../testing/reach.js"
 import { seedsFor } from "../../testing/seeds.js";
 import { ftsDef } from "../access/fts-def.js";
 import { MetadataBudget, MetadataPressure } from "../write/budget.js";
+import { pinBytes } from "../storage/root-pins.js";
 import {
   autocommit,
   batch,
@@ -40,6 +41,8 @@ const allocate = Object.getOwnPropertyDescriptor(MetadataBudget.prototype, "allo
 afterEach(() => {
   MetadataBudget.prototype.allocate = allocate;
 });
+// The refusals below match publications by name in the stack: keep every frame.
+Error.stackTraceLimit = 100;
 
 /** The write path's publications (engine.ts): each switches to a new root, then publishes. */
 const PUBLICATIONS = [
@@ -67,9 +70,30 @@ function refuseAfterSwitch() {
   });
   firstRefusal.catch(() => undefined);
   const counts = { switches: 0 };
+  // Each publication's first pin funding is also refused once, before its switch: it must
+  // unwind and retry, leaving no charge behind (`metadata.balanced()`).
+  const fundingRefused = new Set<string>();
+  const metadata = {
+    budget: null as MetadataBudget | null,
+    /** At rest the grant holds the resident metadata plus the current state's pin, exactly. */
+    offset: null as number | null,
+    measure(path: { readonly residentMetadataBytes: number }): number {
+      if (this.budget === null) throw new Error("no metadata budget seen");
+      return this.budget.grant.allocated - path.residentMetadataBytes;
+    },
+  };
   MetadataBudget.prototype.allocate = function (bytes: number) {
+    const stack = new Error().stack ?? "";
+    if (stack.includes("#fundPins")) {
+      metadata.budget ??= this;
+      const publication = PUBLICATIONS.find((name) => stack.includes(name));
+      if (publication !== undefined && !fundingRefused.has(publication)) {
+        fundingRefused.add(publication);
+        throw new MetadataPressure(bytes, bytes);
+      }
+    }
     const current = switchedNow[switchedNow.length - 1];
-    if (current !== undefined && bytes > 0 && (new Error().stack ?? "").includes(current)) {
+    if (current !== undefined && bytes > 0 && stack.includes(current)) {
       refused.push(current);
       refuse(new Error(`${current} allocated ${String(bytes)} bytes after its switch`));
       throw new MetadataPressure(bytes, bytes);
@@ -88,11 +112,12 @@ function refuseAfterSwitch() {
     switchedNow.push(publication);
   };
   const step = <T>(work: Promise<T>): Promise<T> => Promise.race([work, firstRefusal]);
-  return { refused, counts, publicationSwitch, step };
+  return { refused, counts, publicationSwitch, step, fundingRefused, metadata };
 }
 
 it("funds every post-switch pin before the switch: no publication fails after its root is durable", async () => {
-  const { refused, counts, publicationSwitch, step } = refuseAfterSwitch();
+  const { refused, counts, publicationSwitch, step, fundingRefused, metadata } =
+    refuseAfterSwitch();
   const core = new StorageCore(8, {
     logRecycleBytes: 32 * 1024,
     merges: { mode: "auto" },
@@ -130,6 +155,13 @@ it("funds every post-switch pin before the switch: no publication fails after it
     expect(counts.switches).toBeGreaterThan(maintenance.flushes);
     // Nothing a publication did after its switch was ever refused.
     expect(refused).toEqual([]);
+    // Each refused funding unwound completely: at rest the metadata grant holds exactly the
+    // resident metadata plus the current state's pin, as before any publication.
+    expect([...fundingRefused].sort()).toEqual(
+      ["#mergePinned", "#recycleLog", "#stageFts", "#writeFlush"].sort(),
+    );
+    await step(core.harness.path.quiesce());
+    expect(metadata.measure(core.harness.path)).toBe(pinBytes("current state"));
     // The path is healthy and every acknowledged write is there.
     const rows = await sql("SELECT count(*) AS n FROM t");
     if (!("batches" in rows)) throw new Error("rows");
@@ -157,7 +189,7 @@ async function oneTable(path: WritePathImpl): Promise<number> {
 }
 
 it("funds the idle publication's state pin before its switch", async () => {
-  const { refused, publicationSwitch, step } = refuseAfterSwitch();
+  const { refused, publicationSwitch, step, fundingRefused, metadata } = refuseAfterSwitch();
   // As write/extent-deltas.test.ts drives an idle publish: any retired space is over the bound.
   const harness = new Harness("strict", "memory", 4, undefined, {
     merges: { mode: "manual", fanIn: 2 },
@@ -180,6 +212,9 @@ it("funds the idle publication's state pin before its switch", async () => {
     expect(path.maintenance.idlePublishes).toBeGreaterThan(0);
     expect(refused).toEqual([]);
     expect(path.failure).toBeNull();
+    expect(fundingRefused.has("#publishUnchanged")).toBe(true);
+    await step(path.quiesce());
+    expect(metadata.measure(path)).toBe(pinBytes("current state"));
   } finally {
     MetadataBudget.prototype.allocate = allocate;
     await harness.close();
@@ -321,3 +356,41 @@ for (const seed of seedsFor("next-publication-pressure", [0x9b11, 0x9b12]))
       });
     reach.assertReached();
   }, 600_000);
+
+/**
+ * Astra's reproducer (#50 review): a flush's page-index growth was charged before its pin
+ * funding, so a refused funding left that growth charged. Identical workloads, one with the
+ * flush's first funding refused, must end with identical metadata holdings.
+ */
+it("refunds a flush's page-index charge when its pin funding is refused", async () => {
+  const run = async (refuse: boolean) => {
+    const seen: { budget: MetadataBudget | null } = { budget: null };
+    let refused = 0;
+    MetadataBudget.prototype.allocate = function (bytes: number) {
+      const stack = new Error().stack ?? "";
+      if (stack.includes("#fundPins") && stack.includes("#writeFlush")) {
+        seen.budget = this;
+        if (refuse && refused++ === 0)
+          throw new MetadataPressure(bytes, this.grant.allocated + bytes);
+      }
+      return allocate.call(this, bytes);
+    };
+    const core = new StorageCore(8, { merges: { mode: "manual" } });
+    try {
+      await core.open();
+      await core.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)");
+      for (let i = 0; i < 40; i++)
+        await core.execute(`INSERT INTO t VALUES (${String(i)}, ${String(i)})`);
+      await core.harness.path.quiesce();
+      if (seen.budget === null) throw new Error("no flush funded its pins");
+      return { allocated: seen.budget.grant.allocated, refused };
+    } finally {
+      MetadataBudget.prototype.allocate = allocate;
+      await core.close();
+    }
+  };
+  const base = await run(false);
+  const pressure = await run(true);
+  expect(pressure.refused).toBeGreaterThan(0);
+  expect(pressure.allocated).toBe(base.allocated);
+});
