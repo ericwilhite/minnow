@@ -358,6 +358,27 @@ export class GrowthObserverReentryError extends Error {
   }
 }
 
+/**
+ * Test builds only (`Governor.observeHoldings` set when the grant is created): turns the grant's
+ * `held` and `loan` fields into accessors that report every change. Production grants keep plain
+ * fields: the governor's allocate, free, growth and release paths pay nothing for the hook.
+ */
+function observeHoldings(grant: GrantImpl): void {
+  for (const field of ["held", "loan"] as const) {
+    let value = grant[field];
+    Object.defineProperty(grant, field, {
+      configurable: true,
+      enumerable: true,
+      get: () => value,
+      set: (bytes: number) => {
+        const delta = bytes - value;
+        value = bytes;
+        if (delta !== 0) Governor.observeHoldings?.(grant, delta);
+      },
+    });
+  }
+}
+
 class GrantImpl implements Grant {
   group: readonly GrantImpl[] | null = null;
   /** A grant carved from held credit returns its bytes there while that credit is open. */
@@ -366,27 +387,11 @@ class GrantImpl implements Grant {
   grown: (() => void) | null = null;
   /** Holdings grew during the current operation; the observer runs once it completes. */
   pendingGrowth = false;
-  #held = 0;
-  #loan = 0;
-  /** Credit this grant holds. Every change is reported to `Governor.observeHoldings`. */
-  get held(): number {
-    return this.#held;
-  }
-  set held(bytes: number) {
-    const delta = bytes - this.#held;
-    this.#held = bytes;
-    if (delta !== 0) Governor.observeHoldings?.(this, delta);
-  }
+  /** Credit this grant holds. */
+  held = 0;
   allocated = 0;
-  /** Bytes lent from the reserve. Every change is reported to `Governor.observeHoldings`. */
-  get loan(): number {
-    return this.#loan;
-  }
-  set loan(bytes: number) {
-    const delta = bytes - this.#loan;
-    this.#loan = bytes;
-    if (delta !== 0) Governor.observeHoldings?.(this, delta);
-  }
+  /** Bytes lent from the reserve. */
+  loan = 0;
   loanPending = false;
   closed = false;
   reclaim: ((bytes: number) => unknown) | null = null;
@@ -395,7 +400,9 @@ class GrantImpl implements Grant {
     readonly governor: Governor,
     readonly label: string,
     readonly spillable: boolean,
-  ) {}
+  ) {
+    if (Governor.observeHoldings !== null) observeHoldings(this);
+  }
 
   allocate(bytes: number): boolean {
     this.governor.assertMutable();
@@ -629,9 +636,11 @@ export class Governor implements MemoryGovernor {
    */
   static stallAfterMs: number | null = null;
   /**
-   * Test builds only: called after every change to a grant's holdings (its `held` credit or its
-   * reserve `loaned` bytes), by `delta` bytes: growth, transfers, carving, releases, loans and
-   * close all pass here. Suites sum it per owner for exact peak holdings.
+   * Test builds only: called after every change to the holdings (its `held` credit or its reserve
+   * `loaned` bytes) of a grant created while this is set, by `delta` bytes: growth, transfers,
+   * carving, releases, loans and close all pass here. Suites install it before the grants they
+   * measure exist, and sum it per owner for exact peak holdings. Grants created while it is null
+   * keep plain fields and never call it.
    */
   static observeHoldings: ((grant: Grant, delta: number) => void) | null = null;
   /** Test builds: a waiter queued for this many windows is reported whatever other activity
