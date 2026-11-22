@@ -20,11 +20,20 @@ import {
   Governor,
   holderChain,
   HolderChainInvariantError,
+  type Grant,
   type HolderChain,
 } from "../memory/governor.js";
 import { MinnowDatabaseClient } from "../owner/database-client.js";
 import { WriteCredits } from "../write/credits.js";
 import { publicOwner } from "./public-owner.test.fixture.js";
+
+/** `promise`'s value, or `"stuck"` after `ms`: a bounded wait fails by assertion, not timeout. */
+function within<T>(promise: Promise<T>, ms: number): Promise<T | "stuck"> {
+  return Promise.race([
+    promise,
+    new Promise<"stuck">((resolve) => setTimeout(() => resolve("stuck"), ms)),
+  ]);
+}
 
 it.each([
   ["autocommit", false],
@@ -38,6 +47,10 @@ it.each([
     const stop = new AbortController();
     let foreign: Promise<unknown> | null = null;
     let chain: HolderChain | null = null;
+    // The test's own holdings, released first in cleanup whatever failed: a stalled request
+    // must never keep the commit (or the close) waiting on them.
+    let idle: Grant | null = null;
+    let run: Promise<void> | null = null;
     // eslint-disable-next-line @typescript-eslint/unbound-method -- called with its receiver
     const original = WriteCredits.prototype.prepareCommit;
     const prepareCommit = vi.spyOn(WriteCredits.prototype, "prepareCommit");
@@ -50,7 +63,7 @@ it.each([
         await db.execute(sql);
       // Outside any writing transaction an owner chain grows as a holder (startup, import).
       chain = holderChain(governor, "foreign holder");
-      const idle = await governor.admit({
+      idle = await governor.admit({
         label: "owner growth between transactions",
         minimumBytes: 1 << 20,
         spillable: false,
@@ -61,7 +74,7 @@ it.each([
         if (armed && foreign === null && chain !== null) {
           // The review's request: fits beside the foreign holder's own 1 MiB only once the
           // writer's rows (counted, not releasable before the commit) are released.
-          const want = governor.usableCapacity() - idle.held - 1024;
+          const want = governor.usableCapacity() - (idle?.held ?? 0) - 1024;
           foreign = governor
             .admitGroup({
               label: "earlier holder",
@@ -81,7 +94,7 @@ it.each([
       });
       const sql = "INSERT INTO t SELECT g, g FROM generate_series(1, 100) g";
       let done = false;
-      const run = (
+      run = (
         multi
           ? db.transaction(async (tx) => {
               await tx.execute(sql);
@@ -92,11 +105,14 @@ it.each([
       ).then(() => {
         done = true;
       });
-      await Promise.race([run, new Promise((resolve) => setTimeout(resolve, 5_000))]);
+      await within(run, 5_000);
       expect(done, "the commit completed: no foreign holder queued ahead of it").toBe(true);
       await run;
       // The foreign request was refused before it queued: the invariant, not a wait.
-      const outcome = await (foreign as Promise<unknown> | null);
+      const outcome: unknown = await within(
+        (foreign as Promise<unknown> | null) ?? Promise.resolve("never made"),
+        5_000,
+      );
       expect(outcome).toBeInstanceOf(HolderChainInvariantError);
       expect(outcome).toMatchObject({ code: "MINNOW_HOLDER_CHAIN_INVARIANT", sqlState: "XX000" });
       expect((outcome as Error).message).toContain('while the writer chain "write engine"');
@@ -112,10 +128,11 @@ it.each([
         holdsCredit: chain,
       });
       after.close();
-      idle.close();
     } finally {
+      idle?.close();
       stop.abort(new Error("test cleanup"));
-      await (foreign as Promise<unknown> | null);
+      await within((foreign as Promise<unknown> | null) ?? Promise.resolve(), 5_000);
+      await within(run ?? Promise.resolve(), 10_000);
       chain?.close();
       prepareCommit.mockRestore();
       await db.close();

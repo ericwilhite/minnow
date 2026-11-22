@@ -106,9 +106,9 @@ memory governor now checks the rule that keeps this order free of deadlocks: gro
 that holds memory it cannot release names a registered holder chain. The write engine is the only
 writer chain. Exclusive owner work (startup, reopen, snapshot import) uses owner chains, and those
 may not grow while a writing transaction is open. Anything else is an internal error (XX000),
-raised before it waits. A query's index range scan that waits for memory now waits as an ordinary
-request, since it holds nothing while it waits; inside a write statement it still waits as the
-writer's own growth.
+raised before it waits. A query's ordered index scan now funds its cursor as part of the query's
+own memory admission, so the cursor never waits for memory while the query holds its other
+buffers; inside a write statement a cursor still waits as the writer's own growth.
 Unqualified native roots retain typed 0A000
 refusals. Public 0.x behavior, package entry points and stored formats are unchanged; no
 migration is required.

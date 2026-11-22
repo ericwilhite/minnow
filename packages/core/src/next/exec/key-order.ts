@@ -239,6 +239,20 @@ export interface IndexShape {
   readonly fetch: OperatorIdentity;
   readonly restore: OperatorIdentity;
   readonly descending: boolean;
+  /**
+   * An unadmitted (diagnostic) ordered scan's cursor: funded as a fixed entry of the query, its
+   * planned minimum (`legacyCursorMinimum`), and opened on that grant. The cursor then never
+   * admits itself mid-query, while the query holds its other grants (GOVERNOR-WAIT-POLICY: no
+   * hold-and-wait). A reader with no range plan keeps its own `range()` cursor.
+   */
+  readonly cursor?: OperatorIdentity;
+}
+
+/** The planned minimum of an unadmitted ordered scan's cursor, or 0 without a range plan. */
+export function legacyCursorMinimum(runtime: QueryRuntime, shape: IndexShape, indexId: number) {
+  return (
+    planIndexRange(runtime.view.index(shape.tableId, indexId), shape.descending)?.minimumBytes ?? 0
+  );
 }
 /** A byte target chooses real read batches; it is never a certificate about a value.
  * Unknown/underestimated widths still pass through ordinary bounded source sizing,
@@ -316,9 +330,19 @@ export async function runIndexOrder(
   stopped?: () => boolean,
   admitted?: AdmittedIndexRead,
 ): Promise<void> {
+  // An unadmitted scan's cursor, funded with the query (`IndexShape.cursor`).
+  const legacy =
+    admitted === undefined && shape.cursor !== undefined
+      ? planIndexRange(runtime.view.index(shape.tableId, indexId), shape.descending)
+      : null;
   const entries = admitted
     ? admittedIndexMinimums(shape, runtime.governor.capBytes, admitted)
-    : indexMinimums(shape, runtime.governor.capBytes);
+    : [
+        ...indexMinimums(shape, runtime.governor.capBytes),
+        ...(legacy !== null && shape.cursor !== undefined
+          ? [{ rel: shape.cursor, minimum: legacy.minimumBytes }]
+          : []),
+      ];
   const grants = [];
   for (const entry of entries)
     grants.push(
@@ -370,11 +394,12 @@ export async function runIndexOrder(
   runtime.onAbort((reason) => fetch.abort(reason));
   runtime.dispose(() => fetch.closed);
   runtime.signal.throwIfAborted();
-  const cursorGrant = admitted ? grants.at(-1) : undefined;
-  if (admitted && !cursorGrant) throw new Error("Missing admitted cursor budget");
+  const planned = admitted?.plan ?? legacy;
+  const cursorGrant = planned ? grants.at(-1) : undefined;
+  if (planned && !cursorGrant) throw new Error("Missing admitted cursor budget");
   const cursor =
-    admitted && cursorGrant
-      ? admitted.plan.open({ budget: cursorGrant, signal: runtime.signal })
+    planned && cursorGrant
+      ? planned.open({ budget: cursorGrant, signal: runtime.signal })
       : runtime.view
           .index(shape.tableId, indexId)
           .range({ lower: null, upper: null }, shape.descending ? "desc" : "asc");

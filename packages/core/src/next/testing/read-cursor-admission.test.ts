@@ -1,14 +1,24 @@
 /**
  * Write index range cursor admission classes (GOVERNOR-WAIT-POLICY point 6, the holder-chain
  * invariant). Laws:
- * - a read snapshot's cursor waits as a new admission, holding nothing (readers are not holders);
+ * - a read snapshot's cursor waits as a new admission, and only while neither it nor its caller
+ *   holds governor credit (readers are not holders); a caller that holds credit funds its cursor
+ *   with its own admission, as the ordered scan does, so its cursor never waits mid-query;
+ * - a second cursor of a view whose first cursor owns a grant raises the invariant rather than
+ *   waiting behind a request only that grant's release could serve;
  * - a statement view's cursor waits as holder growth in the writer chain;
- * - holder priority never starves a reader: a read cursor waiting at admission while the writer
- *   keeps growing as a holder is served once the writer's statement ends, from what the writer
- *   returns, with no other memory released.
+ * - holder priority has no aging: a waiting reader is served once the writer's holdings become
+ *   reclaimable (its rows freed, its transaction ended), not merely when its statement ends.
  */
 import { expect, it, vi } from "vitest";
-import type { AdmitOptions, Grant, NativeGrantGroupOptions } from "../memory/governor.js";
+import {
+  HolderChainInvariantError,
+  type AdmitOptions,
+  type Grant,
+  type NativeGrantGroupOptions,
+} from "../memory/governor.js";
+import { createExecutor } from "../exec/create.js";
+import { StorageCore } from "./storage-core.js";
 import { yieldTask } from "../exec/pipeline.js";
 import { WriteCredits } from "../write/credits.js";
 import {
@@ -138,7 +148,7 @@ it("admits a read cursor as a new admission and a statement view's as writer-cha
   expect(h.governor.usedBytes).toBe(0);
 });
 
-it("serves a waiting read cursor once the writer's statement ends, however long it grows", async () => {
+it("serves a waiting read cursor once the writer's holdings become reclaimable, not at statement end", async () => {
   const { h, p, t, credits } = await opened();
   const holders: number[] = [];
   const admitGroup = h.governor.admitGroup.bind(h.governor);
@@ -185,10 +195,14 @@ it("serves a waiting read cursor once the writer's statement ends, however long 
       grown += live;
       expect(settled, "holder growth is served ahead of the waiting reader").toBe(false);
     }
-    // The statement ends: its rows go, and nothing else is released.
+    // The statement ends while its rows are retained (the transaction is open): holder priority
+    // has no aging, so the reader still waits. Pinned behaviour, not a law of progress.
+    await statement.end();
+    expect(await within(read, 500), "statement end alone, rows retained").toBe("stuck");
+    // The writer's holdings become reclaimable: its rows go and the transaction ends, and
+    // nothing else is released.
     credits.rows.free(grown);
     grown = 0;
-    await statement.end();
     tx.rollback();
     expect(await within(read, 5_000), "the reader is served from what the writer returned").toBe(1);
   } finally {
@@ -198,6 +212,135 @@ it("serves a waiting read cursor once the writer's statement ends, however long 
     held.close();
     spy.mockRestore();
     if (tx.state === "open") tx.rollback();
+    await h.close();
+  }
+  expect(h.governor.usedBytes).toBe(0);
+});
+
+it("funds an ordered scan's cursor with the query, so it never waits mid-query", async () => {
+  // The diagnostic ordered-scan plan (review of #41, Astra): an explicit full-range index scan.
+  const core = await new StorageCore().open();
+  const governor = core.harness.governor;
+  const diagnostic = createExecutor({ keyOrder: true });
+  await core.execute("CREATE TABLE t(id INT PRIMARY KEY, n INT)");
+  await core.execute("INSERT INTO t SELECT g, g FROM generate_series(1, 2305) g");
+  await core.harness.path.quiesce();
+  type PhysicalPlan = Parameters<typeof diagnostic.prepare>[0];
+  core.executor.prepare = (plan: PhysicalPlan) => {
+    interface Node {
+      op: string;
+      input: Node;
+      id: number;
+      tableId: number;
+      columns: number[];
+    }
+    const root = plan.root as unknown as Node;
+    const project = root.input,
+      scan = project.input;
+    if (root.op !== "sort" || project.op !== "project" || scan.op !== "scan")
+      throw new Error(`unexpected shape ${root.op}`);
+    const indexId = core.harness.path.catalog.table(scan.tableId)?.primaryKey ?? 0;
+    const range = {
+      id: scan.id,
+      op: "indexRange",
+      output: (scan as unknown as { output: unknown }).output,
+      tableId: scan.tableId,
+      indexId,
+      lower: null,
+      upper: null,
+      descending: false,
+      columns: scan.columns,
+      emitLocator: false,
+    };
+    return diagnostic.prepare({
+      ...plan,
+      root: { ...root, input: { ...project, input: range } },
+    } as unknown as PhysicalPlan);
+  };
+  const stop = new AbortController();
+  let earlier: Promise<Grant | null> | undefined;
+  const cursorAdmissions: string[] = [];
+  // Once the query holds its admission, a large request queues: it fits only after the query
+  // releases. A cursor that admitted itself then would wait behind it, holding the query.
+  const queueEarlier = () => {
+    earlier ??= governor
+      .admit({
+        label: "earlier admission",
+        minimumBytes: governor.usableCapacity() - (1 << 20),
+        spillable: false,
+        signal: stop.signal,
+      })
+      .catch(() => null);
+  };
+  const tryAdmit = governor.tryAdmit.bind(governor);
+  const spyTry = vi.spyOn(governor, "tryAdmit").mockImplementation((options) => {
+    if (options.label === "write index range") cursorAdmissions.push("tryAdmit");
+    const granted = tryAdmit(options);
+    if (granted !== null && options.label.startsWith("query#")) queueMicrotask(queueEarlier);
+    return granted;
+  });
+  const admitGroup = governor.admitGroup.bind(governor);
+  const spyGroup = vi.spyOn(governor, "admitGroup").mockImplementation((options) => {
+    const granted = admitGroup(options);
+    if (options.label.startsWith("query#")) void granted.then(queueEarlier, () => undefined);
+    return granted;
+  });
+  try {
+    const query = core.execute("SELECT id, n FROM t ORDER BY id");
+    expect(await within(query, 5_000), "the query completes beside the queued admission").not.toBe(
+      "stuck",
+    );
+    expect(earlier, "the large admission queued while the query held its grants").toBeDefined();
+    expect(cursorAdmissions, "the cursor never admitted itself").toEqual([]);
+  } finally {
+    stop.abort();
+    (await earlier)?.close();
+    spyTry.mockRestore();
+    spyGroup.mockRestore();
+    await core.close();
+  }
+});
+
+it("refuses a second read cursor's wait while its view's first cursor owns a grant", async () => {
+  // Review of #41 (Astra): the first cursor's grant is the caller's credit. A second cursor that
+  // waited as a new admission behind a request only that grant's release could serve would never
+  // be served; it raises the invariant instead, before anything queues.
+  const { h, p, t } = await opened();
+  (await pressure(h, p)).close();
+  const view = p.pin(),
+    pk = p.catalog.table(t)?.primaryKey ?? 0;
+  const first = view.index(t, pk).range(ALL, "asc");
+  const second = view.index(t, pk).range(ALL, "asc");
+  const out = new Float64Array(1),
+    stop = new AbortController();
+  expect(await first.next(out)).toBe(1);
+  const head = h.governor
+    .admit({
+      label: "earlier admission",
+      minimumBytes: h.governor.usableCapacity() - (1 << 20),
+      spillable: false,
+      signal: stop.signal,
+    })
+    .catch(() => null);
+  try {
+    await yieldTask();
+    const outcome = await within(
+      Promise.resolve()
+        .then(() => second.next(out))
+        .then(
+          () => "served",
+          (error: unknown) => error,
+        ),
+      5_000,
+    );
+    expect(outcome, "raised before waiting").toBeInstanceOf(HolderChainInvariantError);
+    expect((outcome as Error).message).toContain("its caller holds governor credit");
+  } finally {
+    stop.abort();
+    (await head)?.close();
+    first.close();
+    second.close();
+    view.release();
     await h.close();
   }
   expect(h.governor.usedBytes).toBe(0);

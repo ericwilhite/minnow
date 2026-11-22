@@ -200,6 +200,9 @@ for (const seed of seedsFor("next-overflow-summary-ranges", [0xb50b]))
                       watchCursor() {
                         return () => undefined;
                       },
+                      // The view's count of range cursors owning a grant (write/view.ts).
+                      rangeCreditHolders: 0,
+                      rangeCredit: () => undefined,
                     },
                     locator: (row: number) => row,
                   },

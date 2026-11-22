@@ -162,11 +162,15 @@ export class StreamingRangeCursor implements IndexCursor {
         // snapshot is outside the writer chain and waits as a new admission, holding nothing
         // (GOVERNOR-WAIT-POLICY point 6: readers are not holders). Checked, not assumed: a reader
         // that would wait holding governor credit is the hold-and-wait the policy rules out.
-        const reader = this.index.table.snapshot.bound <= MAX_LSN;
-        if (owned === null && reader && this.#holdsCredit())
+        const snapshot = this.index.table.snapshot;
+        const reader = snapshot.bound <= MAX_LSN;
+        // Its caller must hold nothing either: another cursor of this view that owns a grant is
+        // the caller's credit. A caller that holds credit funds its cursor with its own admission
+        // (`planRange` and `open`, as the ordered scan does), so it never waits here.
+        if (owned === null && reader && (this.#holdsCredit() || snapshot.rangeCreditHolders > 0))
           throw new HolderChainInvariantError(
             options.label,
-            "would wait from a read snapshot while holding governor credit",
+            "would wait from a read snapshot while it or its caller holds governor credit",
           );
         owned ??= (yield shared.governor.admit({
           ...options,
@@ -174,6 +178,7 @@ export class StreamingRangeCursor implements IndexCursor {
           signal: this.#abort.signal,
         })) as Grant;
         this.#ownedGrant = owned;
+        snapshot.rangeCredit(1);
         grant = owned;
       }
       this.#grant = grant;
@@ -183,6 +188,7 @@ export class StreamingRangeCursor implements IndexCursor {
       if (this.#ownedGrant !== null && current.minimum > this.#ownedGrant.held) {
         this.#ownedGrant.close();
         this.#ownedGrant = null;
+        this.index.table.snapshot.rangeCredit(-1);
         this.#grant = null;
         continue;
       }
@@ -485,8 +491,11 @@ export class StreamingRangeCursor implements IndexCursor {
       this.#account.free(this.#account.allocated);
       this.#account = null;
     }
-    this.#ownedGrant?.close();
-    this.#ownedGrant = null;
+    if (this.#ownedGrant !== null) {
+      this.#ownedGrant.close();
+      this.#ownedGrant = null;
+      this.index.table.snapshot.rangeCredit(-1);
+    }
     this.#unlink?.();
     this.#unlink = null;
     this.#grant = null;
