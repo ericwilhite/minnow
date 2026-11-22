@@ -11,8 +11,9 @@
  * and fixed arrays. A read whose need fits the usable cap must complete with the exact values.
  * Any other outcome may only be a typed 53200 whose need exceeds that cap. A one-row read (by key)
  * also admits no more than that need plus the remaining terms named below: a step funds what it
- * can use (as in #48). The admission is measured through every entry point that admits a query's
- * working set (a synchronous `tryAdmit`, else `admitGroup`), and must be measured (non-zero).
+ * can use (as in #48). What a read holds is measured, not what it asked: the peak of its grants'
+ * summed holdings (credit and reserve loans), observed at every change (`Governor.observeHoldings`:
+ * admissions, growth, transfers, carving, releases), and it must be measured (non-zero).
  * Sizing by the table's widest row, or funding the same row's copies twice, over-admits by several
  * times the row and refuses reads below the cap.
  *
@@ -96,6 +97,23 @@ const cases: Case[] = [
 it.each(cases)(
   "reads beside and of a wide row within its independent need (cap $cap MiB, width $width, copy $copy, stored $stored)",
   async ({ cap, width, copy, stored }) => {
+    // Every change to any grant's holdings (its credit or its reserve loans: growth, transfers,
+    // carving, releases), observed from before the owner opens. A read's holdings are those of
+    // the grants first seen while it runs, except the writer's own growth grants: one query runs
+    // at a time here, so that set is exactly the query's grants. Their summed holdings, at their
+    // peak, are what the read held.
+    const seen = new WeakSet();
+    const query = new WeakSet();
+    const holdings = { on: false, current: 0, peak: 0 };
+    Governor.observeHoldings = (grant, delta) => {
+      if (!seen.has(grant)) {
+        seen.add(grant);
+        if (holdings.on && !/^(write|complete grow)/u.test(grant.label)) query.add(grant);
+      }
+      if (!query.has(grant)) return;
+      holdings.current += delta;
+      holdings.peak = Math.max(holdings.peak, holdings.current);
+    };
     const owner = await publicOwner({ capBytes: cap * MiB });
     const db = new MinnowDatabaseClient(owner.client, { ready: Promise.resolve() });
     const governor = owner.core.harness.governor;
@@ -138,31 +156,6 @@ it.each(cases)(
       const b = copy ? wide : null;
       const tiny = 2 + 8,
         row = (copy ? 2 : 1) * (width + 1) + 8;
-      // The query's complete working set, as admitted, through every entry point that admits it
-      // (memory/working-set.ts: a synchronous `tryAdmit` of the whole, else `admitGroup`).
-      let admitted = 0;
-      const workingSet = (label: string) => /^query#\d+\/fixed-buffers$/u.test(label);
-      const admitGroup = governor.admitGroup.bind(governor);
-      governor.admitGroup = (options) => {
-        if (workingSet(options.label))
-          admitted = Math.max(
-            admitted,
-            options.grants.reduce((sum, part) => sum + part.minimumBytes, 0),
-          );
-        return admitGroup(options);
-      };
-      const tryAdmit = governor.tryAdmit.bind(governor);
-      governor.tryAdmit = (options) => {
-        const grant = tryAdmit(options);
-        if (grant !== null && workingSet(options.label))
-          admitted = Math.max(admitted, options.minimumBytes);
-        return grant;
-      };
-      const admit = governor.admit.bind(governor);
-      governor.admit = (options) => {
-        if (workingSet(options.label)) admitted = Math.max(admitted, options.minimumBytes);
-        return admit(options);
-      };
       const reads: Array<{
         sql: string;
         rowBytes: number;
@@ -213,7 +206,9 @@ it.each(cases)(
       for (const read of reads) {
         const derived = need(read.rowBytes);
         const capacity = governor.usableCapacity(true);
-        admitted = 0;
+        holdings.on = true;
+        holdings.current = 0;
+        holdings.peak = 0;
         const outcome = await db.query(read.sql).then(
           (result) =>
             read.unordered === true
@@ -221,6 +216,7 @@ it.each(cases)(
               : result.rows(),
           (error: unknown) => error,
         );
+        holdings.on = false;
         if (cap === 64 && width === 3 * MiB && copy && read.sql.endsWith("ORDER BY id")) {
           // Pinned known divergence (Limits): the request lands at the edge of the
           // usable-vs-grantable gap, so before #51 it may wait there (the stall report), be refused
@@ -281,8 +277,8 @@ it.each(cases)(
               : 0
             : MEMORY_READ_RESIDENT_BYTES + 4 * read.rowBytes);
         if (read.byKey === true && Array.isArray(outcome)) {
-          expect(admitted, `${read.sql}: its admission was measured`).toBeGreaterThan(0);
-          expect(admitted, `${read.sql}: admits no more than its need`).toBeLessThanOrEqual(
+          expect(holdings.peak, `${read.sql}: its holdings were measured`).toBeGreaterThan(0);
+          expect(holdings.peak, `${read.sql}: holds no more than its need`).toBeLessThanOrEqual(
             allowed,
           );
         }
@@ -290,6 +286,7 @@ it.each(cases)(
     } finally {
       await db.close();
       await owner.close();
+      Governor.observeHoldings = null;
     }
   },
   300_000,
