@@ -3553,22 +3553,24 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
       });
     }
     if (modification.op === "modify")
-      // The modification's spool holds each input row on the result progress lane. Size that
-      // lane from the row itself (concatenation sums its arguments), not from the bound
-      // parameters' bytes, which a computed row can exceed. A column read from a table is not
-      // bounded here (null): its row keeps the source-progress envelope.
-      runtime.modifyResultRow((slots, largest) => {
+      // The modification's spool holds each input row on the result progress lane. Its bound is
+      // composed column by column, never dropped: parameters, literals and concatenation keep
+      // their exact sizes (concatenation sums its arguments), a table column takes its source
+      // read's value bound, and a column no rule sizes is marked unknown (run.ts adds the
+      // source/parameter envelope for it).
+      runtime.modifyResultRow((slots, largest, source) => {
         const sizes = {
           parameter: (slot: number) => slots[slot] ?? largest,
-          source: () => null,
+          source: (id: number) => source(id),
         };
-        let row = 0;
+        let known = 0,
+          unknown = false;
         for (let c = 0; c < modification.input.output.length; c++) {
           const bytes = columnInputBytes(modification.input, c, sizes);
-          if (bytes === null) return null;
-          row += bytes;
+          if (bytes === null) unknown = true;
+          else known += bytes;
         }
-        return row;
+        return { known, unknown };
       });
     const jsonGroupSources = new Map<number, Set<number>>();
     const jsonGroupColumnBytes = new Map<number, Map<number, number>>();

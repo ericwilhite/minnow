@@ -134,6 +134,63 @@ it("writes a 2.5 MB row once a background flush that holds memory publishes", as
   }
 }, 60_000);
 
+/** Another connection's read of a 1.5 MB row, held undelivered until `end` (C1's holder). */
+async function holdRead(core: StorageCore) {
+  await core.execute("CREATE TABLE r(id INT PRIMARY KEY, v TEXT)");
+  await core.execute("INSERT INTO r VALUES (1, $1)", ["b".repeat(1_500_000)]);
+  const lowered = core.lowerer.lower("SELECT id, v FROM r", core.context());
+  if (lowered.kind !== "query") throw new Error("query plan required");
+  const other = core.start(core.executor.prepare(lowered.plan));
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  return async () => {
+    for (let frame = await other.execution.results.next(); frame !== null;) {
+      frame.release();
+      frame = await other.execution.results.next();
+    }
+    await other.execution.delivered;
+    other.release();
+  };
+}
+
+for (const capMiB of [32, 64])
+  it(`never refuses a row mixing a table column and a computed parameter by its lane, beside another connection's read, at ${String(capMiB)} MiB`, async () => {
+    // Astra's review of #53: one table column (`w`) dropped the whole row's lane bound, so the
+    // 3 MB computed `v` was refused part way at 32 MiB ("result/progress … 2771048 bytes, 0
+    // available"). At 64 MiB it is written. At 32 MiB the row is beyond what the writer's idle
+    // floors leave (the 3 MiB row pinned in wide-copy-admission.test.ts, until PR 2): it may only
+    // be refused typed, writing nothing (phase 2's fixed buffers, 16.32 MB beside 15.93 MB usable,
+    // or the memtable).
+    Governor.stallAfterMs = 5_000;
+    const core = new StorageCore();
+    Object.defineProperty(core.harness, "governor", { value: new Governor(capMiB * MiB) });
+    await core.open();
+    try {
+      await core.execute("CREATE TABLE t(id INT PRIMARY KEY, v TEXT, w TEXT)");
+      await core.execute("INSERT INTO t VALUES (1, 'old', 'x')");
+      const end = await holdRead(core);
+      const statement = core
+        .execute("INSERT INTO t SELECT id + 10, $1 || $1 || $1, w FROM t", ["a".repeat(1_000_000)])
+        .then(
+          () => null,
+          (error: unknown) => error,
+        );
+      // Written beside the read if it fits, else once the read ends.
+      const early = await within(statement, 500);
+      if (early !== PENDING) checked(early, "beside the read");
+      await end();
+      const written = checked(await statement, "after the read");
+      if (capMiB === 64) expect(written, "written at 64 MiB").toBe(true);
+      expect(await ids(core)).toEqual(written ? [1, 11] : [1]);
+      if (written) {
+        const stored = await value(core, 11);
+        if (stored !== null) expect(stored === "a".repeat(3_000_000)).toBe(true);
+      }
+      expect(core.harness.path.failure).toBeNull();
+    } finally {
+      await core.close();
+    }
+  }, 60_000);
+
 for (const seed of seedsFor("next-modify-row-progress", [0x5a01, 0x5a02]))
   it(`never refuses a modification by its result lane (seed ${String(seed)})`, async () => {
     const reach = createReach("modify row progress", MODIFY_ROW_PROGRESS_REACH);
@@ -143,32 +200,55 @@ for (const seed of seedsFor("next-modify-row-progress", [0x5a01, 0x5a02]))
         fc.constantFrom(4096, 200_000, 500_000, 1_000_000),
         fc.constantFrom("insert", "update"),
         fc.constantFrom(32, 64),
-        async (copies, width, kind, capMiB) => {
+        fc.constantFrom(0, 1, 300_000, 1_000_000),
+        fc.boolean(),
+        async (copies, width, kind, capMiB, tableColumn, beside) => {
           reach.beginHistory();
           Governor.stallAfterMs = 5_000;
           // A fresh database per run: only this run's own rows size its statements.
           const core = new StorageCore();
           Object.defineProperty(core.harness, "governor", { value: new Governor(capMiB * MiB) });
           await core.open();
+          let end: (() => Promise<void>) | null = null;
           try {
-            await core.execute("CREATE TABLE t(id INT PRIMARY KEY, v TEXT)");
-            await core.execute("INSERT INTO t VALUES (1, 'old')");
+            await core.execute("CREATE TABLE t(id INT PRIMARY KEY, v TEXT, w TEXT)");
+            // `w` is the table column a mixed row copies (0: the row has none).
+            const w = "x".repeat(Math.max(1, tableColumn));
+            await core.execute("INSERT INTO t VALUES (1, 'old', $1)", [w]);
             const parameter = "q".repeat(width);
             const expression = Array.from({ length: copies }, () => "$1").join(" || ");
             const row = copies * width;
             reach.reach(kind);
             if (copies > 1) reach.reach("row larger than its parameter");
             if (row > MiB) reach.reach("row over a MiB");
+            // An UPDATE's row always carries `w` from the table.
+            const mixed = kind === "update" || tableColumn > 0;
+            if (mixed) reach.reach("table column in the row");
+            if (mixed && tableColumn >= 300_000) reach.reach("wide table column in the row");
             const target = kind === "insert" ? 2 : 1;
             const sql =
               kind === "insert"
-                ? `INSERT INTO t SELECT ${String(target)}, ${expression}`
+                ? tableColumn > 0
+                  ? `INSERT INTO t SELECT ${String(target)}, ${expression}, w FROM t WHERE id = 1`
+                  : `INSERT INTO t(id, v) SELECT ${String(target)}, ${expression}`
                 : `UPDATE t SET v = ${expression} WHERE id = ${String(target)}`;
-            const outcome = await core.execute(sql, [parameter]).then(
+            if (beside) {
+              end = await holdRead(core);
+              reach.reach("beside another connection's read");
+            }
+            const statement = core.execute(sql, [parameter]).then(
               () => null,
               (error: unknown) => error,
             );
-            if (checked(outcome, `${sql} with a ${String(width)}-byte parameter`)) {
+            const context = `${sql} with a ${String(width)}-byte parameter, w ${String(tableColumn)}`;
+            if (end !== null) {
+              // Beside the read it may wait; whatever it settles to obeys the law.
+              const early = await within(statement, 300);
+              if (early !== PENDING) checked(early, `${context}, beside the read`);
+              await end();
+              end = null;
+            }
+            if (checked(await statement, context)) {
               expect(await ids(core)).toEqual(kind === "insert" ? [1, 2] : [1]);
               const stored = await value(core, target);
               if (stored !== null)
@@ -182,6 +262,7 @@ for (const seed of seedsFor("next-modify-row-progress", [0x5a01, 0x5a02]))
             expect(core.harness.path.failure).toBeNull();
           } finally {
             Governor.stallAfterMs = null;
+            if (end !== null) await end();
             await core.close();
           }
         },
@@ -190,10 +271,13 @@ for (const seed of seedsFor("next-modify-row-progress", [0x5a01, 0x5a02]))
         seed,
         numRuns: 24,
         examples: [
-          [3, 1_000_000, "insert", 32],
-          [3, 1_000_000, "update", 32],
+          [3, 1_000_000, "insert", 32, 0, false],
+          [3, 1_000_000, "update", 32, 0, false],
+          // Astra's review of #53: a table column beside a computed parameter, beside a read.
+          [3, 1_000_000, "insert", 32, 1, true],
+          [2, 500_000, "insert", 32, 1_000_000, true],
         ],
       },
     );
     reach.assertReached();
-  }, 600_000);
+  }, 900_000);

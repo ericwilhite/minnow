@@ -10760,6 +10760,9 @@ export const MODIFY_ROW_PROGRESS_REACH = [
   "update",
   "row larger than its parameter",
   "row over a MiB",
+  "table column in the row",
+  "wide table column in the row",
+  "beside another connection's read",
   "written",
 ] as const;
 

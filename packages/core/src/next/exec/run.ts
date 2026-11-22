@@ -1,6 +1,7 @@
 import type { NativeInputTargets } from "./native-target-guard.js";
 import type { NativeParameterBinding } from "./native-parameters.js";
 import { ModifySpool, modifySpoolBytes, wideRowStepBytes } from "./modify-spool.js";
+import { sourceValueBytes } from "./input-size-plan.js";
 import type { Operator } from "./pipeline.js";
 /** One query's admissions, resources and the executed/delivered lifecycle. */
 import type { MaybePromise } from "../access/key-index.js";
@@ -69,6 +70,13 @@ interface Reservation {
 }
 
 type Mutable<T> = { -readonly [K in keyof T]: T[K] };
+/** A modification's input row, composed column by column (exec/plan.ts): the bytes of every
+ * column a rule sizes, and whether any column has none. `source` is a table column's bound. */
+export type ModifyRowBound = (
+  slots: readonly number[],
+  largest: number,
+  source: (id: number) => number | null,
+) => { readonly known: number; readonly unknown: boolean };
 export type MutableOperatorProfile = Mutable<OperatorProfile>;
 /** Identity for physical helper operators as well as lowered relational nodes. */
 export type OperatorIdentity = Pick<Rel, "id" | "op"> & {
@@ -232,9 +240,9 @@ export class QueryRuntime {
   #resultOwnedMinimum = false;
   #resultCopies = 1;
   #resultRowProgress: ((slots: readonly number[], largest: number) => number | null) | null = null;
-  #modifyResultRow: ((slots: readonly number[], largest: number) => number | null) | null = null;
+  #modifyResultRow: ModifyRowBound | null = null;
   /** A modification's input row bound, which its spool's progress loan must cover. */
-  modifyResultRow(bound: (slots: readonly number[], largest: number) => number | null): void {
+  modifyResultRow(bound: ModifyRowBound): void {
     this.#modifyResultRow = bound;
   }
   /** Complete emitted row, already including logical aliases; unrelated input is not output. */
@@ -833,17 +841,29 @@ export class QueryRuntime {
           )
         : 0;
     // A modification's spool borrows each row's step from this lane, beyond whatever the
-    // result window already holds: the lane covers one whole row on its own. Without a spool
-    // (RETURNING, an upsert, rules) nothing borrows that step.
+    // result window already holds: the lane covers one whole row on its own. RETURNING, an upsert,
+    // rules and first-match UPDATE … FROM / DELETE … USING spool on the modification operator's
+    // own admitted grant and lanes (`modify#N`, exec/plan.ts), not on this lane.
     const root = this.plan.root;
-    const modifyRowBytes =
-      root.op === "modify" && this.#spools()
-        ? (this.#modifyResultRow?.(binding.slotBytes ?? [], binding.largestSlot) ?? null)
-        : null;
-    const modifyRowStep =
-      modifyRowBytes === null || root.op !== "modify"
-        ? 0
-        : wideRowStepBytes(modifyRowBytes, root.input.output.length);
+    let modifyRowStep = 0;
+    if (root.op === "modify" && this.#spools()) {
+      const resultStep = this.#resultStep(
+        binding.logicalBytes ?? binding.bytes,
+        binding.largestSlot,
+        binding.slotBytes,
+      );
+      // A table column is bounded by its source read's value bound (every decoded cell); a
+      // source without one, or a column no rule sizes, adds the source/parameter envelope the
+      // lane had before. The bound is never dropped for the whole row.
+      const row = this.#modifyResultRow?.(binding.slotBytes ?? [], binding.largestSlot, (id) => {
+        const bound = this.#readBounds.get(id);
+        return bound === undefined ? null : sourceValueBytes(bound);
+      }) ?? { known: 0, unknown: true };
+      modifyRowStep = wideRowStepBytes(
+        row.known + (row.unknown ? resultStep : 0),
+        root.input.output.length,
+      );
+    }
     const resultProgress =
       atomic && (entries.length > 0 || this.plan.root.op === "modify")
         ? Math.max(
