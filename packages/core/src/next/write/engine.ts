@@ -92,6 +92,17 @@ export type EngineInput = OpenWritePathInput & {
     readonly logRecycleBytes?: number;
     /** Tests: called after each R25 prepare, before the root is encoded; a throw fails there. */
     readonly afterDeltaPrepared?: (kind: PublicationKind, sequence: number) => void;
+    /**
+     * Tests: a publication began ("started"), its root switch became durable ("switched"), and
+     * it left its post-switch section ("settled"); nothing between the last two may be refused.
+     */
+    readonly publicationSwitch?: (
+      phase: "started" | "switched" | "settled",
+      kind: PublicationKind,
+    ) => void;
+    /** Tests: called as a publication funds its post-switch pins, before it charges them; a
+     * throw is a refusal of that funding. */
+    readonly beforeFundPins?: (kind: PublicationKind) => void;
     /** The garbage floor of the idle publish (ruling R10; default `IDLE_GARBAGE_BYTES`). */
     readonly idleGarbageBytes?: number;
     /**
@@ -156,6 +167,7 @@ import { CommandMaintenance, waitCommandMaintenance } from "./command-wait.js";
 import { WriteCredits, WRITE_ROW_STEP_BYTES, type PreparedWriteCredit } from "./credits.js";
 import { NATIVE_WRITE_STEP_BYTES, NativeWriteSteps } from "./native-step.js";
 import { FIXED_CACHE_BYTES } from "../storage/page-cache.js";
+import { pinBytes } from "../storage/root-pins.js";
 import type {
   NativeWriteStepBoundary,
   NativeWriteStepOptions,
@@ -608,6 +620,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
   /** Ruling R25: the committed extent list every root this write path publishes carries. */
   readonly #lists: ExtentListKeeper;
   readonly #afterDeltaPrepared: ((kind: PublicationKind, sequence: number) => void) | null;
+  readonly #publicationSwitch:
+    ((phase: "started" | "switched" | "settled", kind: PublicationKind) => void) | null;
+  readonly #beforeFundPins: ((kind: PublicationKind) => void) | null;
   readonly #stageFault: NonNullable<EngineInput["tuning"]>["stageFault"] | null;
   /** R25 attempts so far (the initial root of a new store was attempt 1). */
   #attempts = 1;
@@ -793,6 +808,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#idleGarbageBytes = input.tuning?.idleGarbageBytes ?? IDLE_GARBAGE_BYTES;
     this.#extentDeltas = input.extentDeltas ?? null;
     this.#afterDeltaPrepared = input.tuning?.afterDeltaPrepared ?? null;
+    this.#publicationSwitch = input.tuning?.publicationSwitch ?? null;
+    this.#beforeFundPins = input.tuning?.beforeFundPins ?? null;
     this.#stageFault = input.tuning?.stageFault ?? null;
     this.#now = input.options.now ?? Date.now;
     this.#signal = input.options.signal;
@@ -826,7 +843,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       pinState: (state, label) => this.#pinState(state, label),
       runReader: (ref) => this.#runReader(ref),
       groupRoot: (ref, budget) => this.#metadata.groupRoot(ref, budget),
-      bitmap: (ref, rowCount) => this.#bitmap(ref, rowCount),
+      bitmap: (ref, rowCount, budget) => this.#bitmap(ref, rowCount, budget),
     };
     this.#unbindMetadataCaches = bindMetadataCaches(input.space, caches);
   }
@@ -1834,14 +1851,16 @@ export class WritePathImpl implements WritePath, EngineHooks {
   /** The engine's own reference on the current state's pin (views of it reuse that pin). */
   #currentPin: SpacePin | null = null;
 
-  #publishState(): void {
+  /** `budget`: a publication's pre-switch funding (`#fundPins`); otherwise the pin is charged
+   * now, which callers outside a publication's switch may retry. */
+  #publishState(budget: ByteBudget = this.#pinBudget): void {
     const tables = new Map<number, TableView>();
     for (const [id, state] of this.#tables) tables.set(id, state.view);
     const next: WriteState = { root: this.#root, tables };
     // Funded before it is exposed (review 10): the pin's charge may be refused (the caller's
     // metadata retry then grows and publishes again); until it succeeds the previous state, already
     // pinned, stays current, so a concurrent begin() or snapshot never pins an unfunded state.
-    const pin = this.#pinState(next, "current state");
+    const pin = this.#pinState(next, STATE_PIN, budget);
     if (this.#root.fts.staged === null) {
       this.#ftsPending = null;
       this.#ftsUnclaimed = false;
@@ -1852,9 +1871,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
     previous?.release();
   }
 
-  #setView(state: TableState, view: TableView): void {
+  #setView(state: TableState, view: TableView, budget?: ByteBudget): void {
     state.view = view;
-    this.#publishState();
+    this.#publishState(budget);
   }
 
   state(): WriteState {
@@ -2052,6 +2071,41 @@ export class WritePathImpl implements WritePath, EngineHooks {
     // No checkpoint can split the effects of one logged transaction.
     if (pending.lsn === lsn) this.#forgetIndex(indexId);
     else pending.droppedAt = lsn;
+  }
+
+  /**
+   * Funds the pins a publication makes after its point of no return (the durable switch to its
+   * new root), before that point. Once the root is durable the state that names it must publish,
+   * so nothing after the switch may be refused: a refused charge there cannot be retried, and it
+   * failed the write path (a recycle's state pin under metadata pressure). The budget hands out
+   * only these bytes; a pin it cannot cover is an invariant error, not a refusal. `release`
+   * returns what the publication did not use (a failure before the switch uses none).
+   */
+  #fundPins(kind: PublicationKind, labels: readonly string[]): PinFunding {
+    this.#beforeFundPins?.(kind);
+    const funded = labels.reduce((sum, label) => sum + pinBytes(label), 0);
+    this.#chargeMetadata(funded);
+    let remaining = funded;
+    return {
+      budget: {
+        ordinarySource: () => this.#metadataGrant,
+        allocate: (bytes: number) => {
+          if (bytes > remaining)
+            throw new Error(
+              `A pin after a publication's switch needs ${String(bytes)} bytes it was not funded`,
+            );
+          remaining -= bytes;
+          return true;
+        },
+        free: (bytes: number) => {
+          this.#chargeMetadata(-bytes);
+        },
+      },
+      release: () => {
+        if (remaining > 0) this.#chargeMetadata(-remaining);
+        remaining = 0;
+      },
+    };
   }
 
   /** Pins use the metadata owner's admission policy. */
@@ -3102,6 +3156,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
   }
 
   async #stageFts(tx: TransactionImpl, allowPreparation = true): Promise<FtsClaimSeal> {
+    this.#publicationSwitch?.("started", "fts");
+    let funding: PinFunding | null = null;
+    let switchedRoot = false;
     this.#check();
     if (this.#ftsMetadataBytes === 0) {
       this.#chargeMetadata(512);
@@ -3215,14 +3272,17 @@ export class WritePathImpl implements WritePath, EngineHooks {
         rootSequence: root.sequence,
         invalidated: false,
       };
+      funding = this.#fundPins("fts", [STATE_PIN]);
       await delta.publish(this.#space, encoded, writer, retired);
+      switchedRoot = true;
+      this.#publicationSwitch?.("switched", "fts");
       published = true;
       this.#root = root;
       this.#pruneCatalogs(root.globalLsn);
       this.#adoptTableRoots(root);
       this.#ftsPending = pending;
       this.#ftsUnclaimed = false;
-      this.#publishState();
+      this.#publishState(funding.budget);
       // This is the claim-preparation seal: no await may separate this capability check
       // from making the protected effect available to the row WAL encoder.
       if (
@@ -3245,6 +3305,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     } finally {
       const hadWriter = writer !== null;
       try {
+        funding?.release();
         await delta.settle();
         if (madeRoot) this.#releaseRoot(madeRoot);
         unlock?.();
@@ -3257,6 +3318,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
           this.#reclaimable();
           this.#credits.retireMetadataHeadroom(0);
         }
+        // The post-switch section ends with the whole cleanup (tests: nothing in it is refused).
+        if (switchedRoot) this.#publicationSwitch?.("settled", "fts");
       }
     }
     if (retryCompact) return this.#stageFts(tx, false);
@@ -3923,10 +3986,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
 
   readonly #statePins = new Map<WriteState, { pin: SpacePin; count: number }>();
 
-  #pinState(state: WriteState, label: string): SpacePin {
+  #pinState(state: WriteState, label: string, budget: ByteBudget = this.#pinBudget): SpacePin {
     let held = this.#statePins.get(state);
     if (held === undefined) {
-      held = { pin: this.#space.pin(label, this.#pinBudget), count: 0 };
+      held = { pin: this.#space.pin(label, budget), count: 0 };
       this.#statePins.set(state, held);
       this.#retainState(state);
     }
@@ -3936,7 +3999,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
     });
   }
 
-  #runReader(ref: RunRef): RunReader | Promise<RunReader> {
+  /** `site` names the opener's reads (`READ_SITES`; diagnostics and tests). */
+  #runReader(ref: RunRef, site?: string): RunReader | Promise<RunReader> {
     const known = this.#runsByRef.get(ref);
     if (known !== undefined) return known;
     const key = blobKey(ref.entries);
@@ -3945,9 +4009,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (!(cached instanceof Promise)) this.#rememberReader(ref, cached);
       return cached;
     }
-    // Its resident parts are charged to the metadata grant before they are built (runs.ts).
+    // Its resident parts are charged to the metadata grant before they are built (runs.ts), and
+    // its reads too: a refusal is metadata pressure, which this retry waits out, never a
+    // ReadDeniedError failing the merge (or flush) that opened it.
     const opened = this.#metadataRetry(() =>
-      RunReader.open(this.#space, ref, this.#grant, this.#metadataBudget),
+      RunReader.open(this.#space, ref, this.#metadataBudget, this.#metadataBudget, site),
     );
     if (opened instanceof Promise) {
       this.#runReadersPending++;
@@ -3982,11 +4048,18 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#nativeProgress(true);
   }
 
-  #bitmap(ref: BlobRef, rowCount: number): Uint32Array | Promise<Uint32Array> {
-    const peeked = this.#space.peek(ref);
+  /** `budget` pays for the read (default: the write path's rows grant). A flush passes the
+   * metadata budget, so a refusal is metadata pressure its retry unwinds and waits out. */
+  #bitmap(
+    ref: BlobRef,
+    rowCount: number,
+    budget: ByteBudget = this.#grant,
+    site?: string,
+  ): Uint32Array | Promise<Uint32Array> {
+    const peeked = this.#space.peek(ref, site === undefined ? undefined : { site });
     const decode = (bytes: Uint8Array) => decodeDeletionBitmap(bytes, rowCount);
     if (peeked !== null) return decode(peeked);
-    return readBlob(this.#space, ref, this.#grant).then(decode);
+    return readBlob(this.#space, ref, budget, site).then(decode);
   }
 
   // ── Flush and publish ────────────────────────────────────────────────────────────────────
@@ -4173,6 +4246,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
   }
 
   async #writeFlush(state: TableState, set: readonly Memtable[], through: number): Promise<void> {
+    this.#publicationSwitch?.("started", "flush");
+    let funding: PinFunding | null = null;
+    let switchedRoot = false;
     const current = this.#catalog.table(state.tableId);
     const historical = this.#catalogAt(
       this.#rootLsn(new Map([[state.tableId, { flushedThroughLsn: through }]])),
@@ -4265,7 +4341,13 @@ export class WritePathImpl implements WritePath, EngineHooks {
           const base =
             part.group.deletions === null
               ? null
-              : await this.#bitmap(part.group.deletions, part.group.rowCount);
+              : // As below: through the metadata budget, so pressure is retried.
+                await this.#bitmap(
+                  part.group.deletions,
+                  part.group.rowCount,
+                  this.#metadataBudget,
+                  READ_SITES.flushBitmap,
+                );
           const isSet = (position: number) =>
             base !== null && ((base[position >>> 5] ?? 0) & (1 << (position & 31))) !== 0;
           const deleted = memtable
@@ -4355,7 +4437,16 @@ export class WritePathImpl implements WritePath, EngineHooks {
         if (folded.length === 0) continue;
         const group = before.get(at);
         const old =
-          group.deletions === null ? null : await this.#bitmap(group.deletions, group.rowCount);
+          group.deletions === null
+            ? null
+            : // Charged to the metadata budget before it is read: under pressure the flush
+              // unwinds and retries (#metadataAsync), never failing the write path.
+              await this.#bitmap(
+                group.deletions,
+                group.rowCount,
+                this.#metadataBudget,
+                READ_SITES.flushBitmap,
+              );
         const deletions = await this.#writeBitmap(writer, group.rowCount, old, folded);
         if (group.deletions !== null) retired.push(group.deletions.extent);
         changes.set(at, { ...group, deletions, liveRowCount: group.liveRowCount - folded.length });
@@ -4508,6 +4599,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
       const growth = metadataBytes - state.metadataBytes;
       const rootCharge = parseCharge(rootBytes.length);
       const positiveGrowth = Math.max(0, growth);
+      // Funded first: a refusal here leaves nothing else charged (the finally releases funding).
+      const repoint = repointPin(state.tableId);
+      funding = this.#fundPins("flush", [repoint, STATE_PIN]);
       this.#chargeMetadata(positiveGrowth);
       try {
         this.#chargeMetadata(rootCharge);
@@ -4519,6 +4613,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
       madeRoot = root;
       try {
         await delta.publish(this.#space, rootBytes, writer, retired);
+        switchedRoot = true;
+        this.#publicationSwitch?.("switched", "flush");
       } catch (error) {
         this.#chargeMetadata(-positiveGrowth);
         throw error;
@@ -4542,7 +4638,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         this.#summaries.set(state.tableId, totals);
       } else this.#chargeMetadata(-positiveGrowth);
       // Re-point readers in the same step the publish resolves (ruling R16.3).
-      const pin: SpacePin = this.#space.pin(`re-point t${String(state.tableId)}`, this.#pinBudget);
+      const pin: SpacePin = this.#space.pin(repoint, funding.budget);
       const flushed = [...set];
       // Older readers keep the published group (pin) and the memtables' key deltas (ruling 2).
       for (const memtable of flushed) this.#published.add(memtable);
@@ -4597,10 +4693,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
         memtables: current.memtables.filter((memtable) => !set.includes(memtable)),
       };
       // The new state retains the root and (for a live table) the directory's chunks.
-      if (live) this.#setView(state, nextView);
+      if (live) this.#setView(state, nextView, funding.budget);
       else {
         state.view = nextView;
-        this.#publishState();
+        this.#publishState(funding.budget);
       }
       this.publications += 1;
     } catch (error) {
@@ -4610,6 +4706,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       try {
         for (const output of outputs) output.release();
         if (definitionCharge > 0) this.#chargeMetadata(-definitionCharge);
+        funding?.release();
         await delta.settle();
         created?.releaseCreation();
         pinned?.release();
@@ -4620,6 +4717,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
         this.#metadataWriters--;
         this.#reclaimable();
         this.#credits.retireMetadataHeadroom(0);
+        // The post-switch section ends with the whole cleanup (tests: nothing in it is refused).
+        if (switchedRoot) this.#publicationSwitch?.("settled", "flush");
       }
     }
     this.#scheduleMerge();
@@ -5414,6 +5513,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
   /** Publishes one root with no table changes (its FTS checkpoint and index settlements still
    * apply), if `wanted` still holds once the publication lock is held. */
   async #publishUnchanged(label: string, wanted: () => boolean): Promise<boolean> {
+    this.#publicationSwitch?.("started", "idle");
+    let funding: PinFunding | null = null;
+    let switchedRoot = false;
     const unlock = await this.#lock();
     let madeRoot: ManifestRoot | null = null;
     const delta = new DeltaPublication(
@@ -5446,17 +5548,21 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#chargeMetadata(charge);
       this.#roots.set(root, { refs: 1, bytes: charge });
       madeRoot = root;
+      funding = this.#fundPins("idle", [STATE_PIN]);
       await delta.publish(this.#space, bytes, writer, released);
+      switchedRoot = true;
+      this.#publicationSwitch?.("switched", "idle");
       this.#root = root;
       this.#pruneCatalogs(root.globalLsn);
       this.#adoptTableRoots(root);
-      this.#publishState();
+      this.#publishState(funding.budget);
       return true;
     } catch (error) {
       if (writer.state === "open") await writer.abort().catch(() => undefined);
       throw error;
     } finally {
       try {
+        funding?.release();
         await delta.settle();
         if (madeRoot !== null) this.#releaseRoot(madeRoot);
         unlock();
@@ -5464,6 +5570,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
         this.#metadataWriters--;
         this.#reclaimable();
         this.#credits.retireMetadataHeadroom(0);
+        // The post-switch section ends with the whole cleanup (tests: nothing in it is refused).
+        if (switchedRoot) this.#publicationSwitch?.("settled", "idle");
       }
     }
   }
@@ -5517,6 +5625,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
    * checkpoint below it; then the recycle gives up and the deferred frames go to the old log.
    */
   async #recycleLog(): Promise<void> {
+    this.#publicationSwitch?.("started", "recycle");
+    let funding: PinFunding | null = null;
     await this.#takeSlot("maintenance");
     if (this.#closed) {
       this.#maintenanceHolds = false;
@@ -5647,12 +5757,14 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#chargeMetadata(rootCharge);
       this.#roots.set(root, { refs: 1, bytes: rootCharge });
       madeRoot = root;
+      funding = this.#fundPins("recycle", [STATE_PIN]);
       await delta.publish(this.#space, rootBytes, writer, retired);
       switched = true;
+      this.#publicationSwitch?.("switched", "recycle");
       this.#root = root;
       this.#pruneCatalogs(root.globalLsn);
       this.#adoptTableRoots(root);
-      this.#publishState();
+      this.#publishState(funding.budget);
       // The root covering the old log is durable: only now may the log go.
       await this.#session.resetLog();
       this.maintenance.deferredFrames += this.#appender.deferredCount;
@@ -5669,6 +5781,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         if (!switched) this.#appender.abandonRecycle();
         else if (this.#appender.recycling)
           this.#appender.failRecycle(new Error("The log reset after a recycle's publish failed"));
+        funding?.release();
         await delta.settle();
         if (madeRoot !== null) this.#releaseRoot(madeRoot);
         unlock?.();
@@ -5681,6 +5794,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
           this.#reclaimable();
           this.#credits.retireMetadataHeadroom(0);
         }
+        // The post-switch section ends with the whole cleanup (tests: nothing in it is refused).
+        if (switched) this.#publicationSwitch?.("settled", "recycle");
       }
     }
   }
@@ -5827,6 +5942,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
     inputs: readonly RunRef[],
     divisor: number,
   ): Promise<void> {
+    this.#publicationSwitch?.("started", "merge");
+    let funding: PinFunding | null = null;
+    let switchedRoot = false;
     const started = performance.now();
     // This actual phase, rather than a previous flush's unused high-water credit,
     // funds run metadata and publication before any private merge state exists.
@@ -5834,7 +5952,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     // Opening run metadata may need admission. Do it before the private merge
     // grant and provisional writer exist; its retry cannot retain either one.
     const readers: RunReader[] = [];
-    for (const ref of inputs) readers.push(await this.#runReader(ref));
+    for (const ref of inputs) readers.push(await this.#runReader(ref, READ_SITES.mergeRun));
     const grant = await this.#credits.acquireMerge(
       `merge t${String(state.tableId)} i${String(indexId)}`,
       mergeWorkingBytes(inputs),
@@ -5931,13 +6049,16 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#chargeMetadata(rootCharge);
       this.#roots.set(next, { refs: 1, bytes: rootCharge });
       madeRoot = next;
+      funding = this.#fundPins("merge", [STATE_PIN]);
       await delta.publish(this.#space, rootBytes, writer, retired);
+      switchedRoot = true;
+      this.#publicationSwitch?.("switched", "merge");
       this.#root = next;
       this.#pruneCatalogs(next.globalLsn);
       this.#adoptTableRoots(next);
       const viewRuns = new Map(state.view.runs);
       viewRuns.set(indexId, runs);
-      this.#setView(state, { ...state.view, runs: viewRuns });
+      this.#setView(state, { ...state.view, runs: viewRuns }, funding.budget);
       // Readers older than this publication may still read the inputs (their pins keep the
       // extents); the inputs' resident parts go once they close.
       this.shared.readers.holdUntilOlderClose(() => {
@@ -5967,6 +6088,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       try {
         this.#merging = false;
         this.#reclaimable();
+        funding?.release();
         await delta.settle();
         if (madeRoot !== null) this.#releaseRoot(madeRoot);
         unlock?.();
@@ -5977,6 +6099,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
         this.#reclaimable();
         this.#credits.retireMetadataHeadroom(0);
         this.#nativeProgress();
+        // The post-switch section ends with the whole cleanup (tests: nothing in it is refused).
+        if (switchedRoot) this.#publicationSwitch?.("settled", "merge");
       }
     }
   }
@@ -6691,8 +6815,13 @@ function concat(parts: readonly Uint8Array[]): Uint8Array {
   return out;
 }
 
-async function readBlob(space: Space, ref: BlobRef, budget: Grant): Promise<Uint8Array> {
-  const lease = await space.read([ref], { budget });
+async function readBlob(
+  space: Space,
+  ref: BlobRef,
+  budget: ByteBudget,
+  site?: string,
+): Promise<Uint8Array> {
+  const lease = await space.read([ref], { budget, ...(site === undefined ? {} : { site }) });
   try {
     return (lease.bytes[0] ?? new Uint8Array(0)).slice();
   } finally {
@@ -6733,6 +6862,28 @@ export class ExtentSinkError extends Error {
  * a sink that throws from `commit` or `abort` fails the write path (`fail`, with
  * `ExtentSinkError`) without undoing the install, retrying, or skipping the publisher's cleanup.
  */
+/**
+ * Labels of the pins a publication both funds before its switch and makes after it: one spelling
+ * each, since a pin's charge depends on its label (`pinBytes`) and a mismatch would leave a
+ * post-switch pin over its funding.
+ */
+const STATE_PIN = "current state";
+
+/** Read sites named on `ReadOptions.site` / `PeekOptions.site` (diagnostics and tests). */
+export const READ_SITES = {
+  /** A merge opening its input runs. */
+  mergeRun: "merge run",
+  /** A flush reading an older group's deletion bitmap. */
+  flushBitmap: "flush bitmap",
+} as const;
+const repointPin = (tableId: number): string => `re-point t${String(tableId)}`;
+
+/** Pre-switch funding for a publication's post-switch pins (`WritePathImpl.#fundPins`). */
+interface PinFunding {
+  readonly budget: ByteBudget;
+  release(): void;
+}
+
 class DeltaPublication {
   #stagedSources: StagedExtents[] = [];
   #stagedCommitted: (() => void) | undefined;

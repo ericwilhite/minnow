@@ -22,6 +22,40 @@ export const NEXT_PARITY_GAPS: readonly ParityGap[] = [
     reason:
       "a rekey whose native trigger bodies need an indexed-domain preflight (writes stop the plan)",
   },
+  {
+    // 0.20 runs these. Cause: expressions with variable-size output (text and array
+    // concatenation, casts to text, JSON constructors and casts) compile only inside the
+    // pipeline's resumable projection/filter, and these sites evaluate outside it. Closing it:
+    // a row host (design note P1-phase-expression-design.md, mechanism A); each step removes
+    // its sites from the reason, and the last removes this entry.
+    id: "row-site-variable-expression",
+    message:
+      /^The executor does not support variable expression outside a resumable projection\/filter$/u,
+    reason:
+      "such an expression in INSERT ... VALUES, a CHECK constraint, a generated column, ON CONFLICT DO UPDATE SET/WHERE, or RETURNING",
+  },
+  {
+    // 0.20 runs these. Cause: a pipeline JSON expression needs a bounded source envelope, and
+    // jsonInputsBounded (exec/json-plan.ts) accepts table columns, literals and their
+    // projections but not a parameter, although its bytes are known once bound. Closing it:
+    // accept bound parameters as a bounded source (their bound size is the envelope).
+    id: "json-parameter-document",
+    message: /^The executor does not support JSON document without a bounded source envelope$/u,
+    reason:
+      "a JSON value built from a parameter in a query, such as INSERT ... SELECT ($1::text)::jsonb",
+  },
+  {
+    // 0.20 runs these. Cause: a producer-phase cut restarts the graph from the root, and the
+    // UNION ALL concat recipe keeps no continuation, so it would replay arms already delivered.
+    // Closing it: record completed arms across a cut (skip them on restart), allow UNION ALL in
+    // phaseRetainingParents, drop the refusal; then the differential's concatenating arms
+    // compare with PostgreSQL. Estimate: about a day (~100 engine lines, ~200 test lines).
+    id: "union-all-phase-arm",
+    message:
+      /^The executor does not support an expression evaluated in producer phases \(text concatenation, JSON expansion or a JSON aggregate\) inside a UNION ALL arm/u,
+    reason:
+      "text concatenation or JSON work inside a UNION ALL arm, or in the input of ROLLUP, CUBE or GROUPING SETS",
+  },
 ];
 
 /** The listed gap `error` (or an error in its cause chain) is, or null. */

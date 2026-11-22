@@ -39,7 +39,8 @@ export function readTable(
         },
         group: source.group,
         staged: source.staged,
-        deletions: () => source.deletions(),
+        // The scan's budget pays for a bitmap read; its read bound includes those bytes.
+        deletions: () => source.deletions(budget),
         root: () => {
           check();
           return root.root();

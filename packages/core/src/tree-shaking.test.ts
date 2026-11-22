@@ -112,7 +112,9 @@ const ENGINE_WITH_OPFS_GZIP_BUDGET = 451 * 1024;
 // Exact native FK provenance / schema-action comparison: 1,588,242 raw / 458,212 gzip.
 // Raise raw once by 768 and gzip by 128; standalone client and isolation caps stay.
 // Copy-meter hooks and linear typing: 1,590,462 raw bytes. Raise raw once by 2 KiB.
-const INDEXEDDB_WORKER_RAW_BUDGET = 1553.25 * 1024;
+// Set-operation ordinals resolve against the first leaf query (shared front end): 1,590,599 raw
+// bytes. Raise raw once by 512; gzip, standalone client and isolation caps stay.
+const INDEXEDDB_WORKER_RAW_BUDGET = 1553.75 * 1024;
 // Native trigger-name folding: 1,587,617 raw / 457,994 gzip bytes (+100 / +28).
 // The old gzip cap is exceeded by 10 bytes. Raise once by 128; raw and isolation caps stay.
 // Bounded boolean regex (3dc95943): 1,588,261 raw / 458,253 gzip bytes with the

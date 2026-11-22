@@ -614,6 +614,19 @@ function wildcardShapeCases(): Case[] {
       sql: `SELECT d.* FROM data d WHERE id <= 80 EXCEPT SELECT e.* FROM data e WHERE id <= 20 ORDER BY 1`,
       ordered: true,
     },
+    // Ordinals name the compound's output columns, which are its first leaf query's, also when
+    // the first member is a nested compound. SQLite gives INTERSECT no precedence and has no
+    // parenthesized compounds, so PGlite is the oracle here.
+    {
+      sql: `SELECT d.id, d.region FROM data d WHERE id <= 80 INTERSECT SELECT e.id, e.region FROM data e WHERE id >= 60 UNION SELECT f.id, f.region FROM data f WHERE id >= 150 ORDER BY 2 DESC, 1`,
+      ordered: true,
+      skip: ["sqlite"],
+    },
+    {
+      sql: `(SELECT id, region FROM data WHERE id <= 40 UNION SELECT id, region FROM data WHERE id >= 150) EXCEPT SELECT id, region FROM data WHERE id % 3 = 0 ORDER BY 1 DESC LIMIT 25`,
+      ordered: true,
+      skip: ["sqlite"],
+    },
     {
       sql: `WITH copied(ident, place, total, enabled, joined_at, title, noted_at) AS (SELECT * FROM data) SELECT ident, title FROM copied ORDER BY ident LIMIT 19`,
       ordered: true,
@@ -2765,7 +2778,7 @@ describe("SQL conformance against SQLite and PGlite", () => {
       expect(corpus.length).toBeGreaterThan(1_000);
       expect(combinationCases().length).toBeGreaterThan(80);
       expect(wildcardOrderCases()).toHaveLength(10);
-      expect(wildcardShapeCases()).toHaveLength(12);
+      expect(wildcardShapeCases()).toHaveLength(14);
       // The unoptimized comparison is only worth something while it actually runs. Every case that
       // got this far reached it, so pin both the total and the share that ran rather than lowered:
       // a change that routes cases into the lowering branch -- or one that makes the corpus

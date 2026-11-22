@@ -264,7 +264,12 @@ layer with no funded bounds is never skipped. `write/range-pressure.test.ts` gen
 histories through a held flush and durable reopen over memory and simulated IndexedDB.
 Each traversal charges its order and chain buffers and refunds them on success, cancellation
 or failure. Published-run encoding uses the metadata budget for that temporary workspace, so
-pressure unwinds the publication and waits through its retry path. Dropping a delta while a
+pressure unwinds the publication and waits through its retry path. A publication's point of no
+return is its durable root switch: the pins it makes after it (the state pin, a flush's re-point
+pin) are funded before it (`#fundPins`), since nothing after the switch may be refused
+(`testing/publication-funding.test.ts`). A flush reads an older group's deletion bitmap through the
+metadata budget, so pressure there is retried too; a scan reads a bitmap through its own budget,
+whose read bound includes the bitmap's bytes. Dropping a delta while a
 traversal is suspended keeps its source arrays charged until the last traversal settles.
 `write/key-hash-accounting.test.ts` intercepts native constructors independently of the
 charge callbacks and checks capacities, overlap, refusal, constructor failures and release.

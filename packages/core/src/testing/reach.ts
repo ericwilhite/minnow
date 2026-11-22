@@ -10745,6 +10745,16 @@ export const FOLLOW_NESTED_AFTER_REACH = [
 ] as const;
 
 /** Computed INSERT ... SELECT, UPDATE and DELETE against PostgreSQL (dml-computed-differential). */
+/** Publications under metadata pressure (next/write/publication-funding.test.ts). */
+export const PUBLICATION_PRESSURE_REACH = [
+  "refused after switch",
+  "small cap only",
+  "wide row",
+  "flush",
+  "recycle",
+  "merge",
+] as const;
+
 export const DML_COMPUTED_REACH = [
   "series source",
   "table source",
@@ -10781,9 +10791,12 @@ export const SET_OPERATION_REACH = [
   "three or more arms",
   "coerced arm",
   "empty arm",
+  "renamed arm",
   "duplicates kept",
   "bag",
   "ordered",
+  "ordinal",
+  "ordinal over a nested first member",
   "aggregated",
   "grouped",
   "joined",
