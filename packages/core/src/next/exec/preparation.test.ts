@@ -1,8 +1,9 @@
 /**
  * The preparation credit (exec/preparation.ts). Laws (memory governor contract,
  * memory/governor.ts): no hold-and-wait under FIFO admission, and a typed 53200 only above the cap.
- * A would-wait releases everything, waits holding nothing for a credit that grows geometrically,
- * so a query restarts at most ceil(log2(capacity / first request)) + 1 times. An attempt that
+ * A would-wait releases everything, waits holding nothing for a credit that doubles when the
+ * doubled credit is admissible at once (then a query restarts at most
+ * ceil(log2(capacity / first request)) + 1 times), else covers its measured peak. An attempt that
  * holds nothing waits in place (already a wait holding nothing).
  */
 import { afterEach, expect, it, vi } from "vitest";
@@ -426,5 +427,72 @@ it("keeps only open grants in an attempt's live total (sizing passes take and cl
   expect(facade.heldBytes).toBe(recipe.held);
   facade.close();
   recipe.close();
+  expect(governor.usedBytes).toBe(0);
+});
+
+it("waits for its measured need, not a doubled credit that does not fit now", async () => {
+  const MiB = 1 << 20;
+  const governor = new Governor(16 * MiB);
+  const usable = governor.capBytes - governor.reserveBytes;
+  const facade = new PreparationGovernor(governor);
+  const wait = (needed: number) =>
+    new PreparationWouldWait("probe", MiB, false, needed - MiB, [
+      { label: "probe", minimumBytes: MiB, spillable: false },
+    ]);
+  const signal = new AbortController().signal;
+  await facade.regrow(wait(3 * MiB), signal);
+  expect(facade.needBytes).toBe(3 * MiB);
+  // Another statement holds all but 5 MiB: the doubled 6 MiB cannot be admitted now, and the
+  // attempt needs only 4. Waiting for 6 would wait on that statement for memory not needed.
+  const other = await governor.admit({
+    label: "other",
+    minimumBytes: usable - 5 * MiB,
+    spillable: false,
+  });
+  const next = facade.regrow(wait(4 * MiB), signal);
+  const outcome = await Promise.race([
+    next.then(() => "admitted"),
+    new Promise((resolve) => setTimeout(() => resolve("still waiting"), 300)),
+  ]);
+  other.close();
+  await next;
+  expect(outcome).toBe("admitted");
+  expect(facade.needBytes).toBe(4 * MiB);
+  facade.close();
+  expect(governor.usedBytes).toBe(0);
+});
+
+it("refuses a need that could never be served beside its statement's holdings before waiting", async () => {
+  const MiB = 1 << 20;
+  const governor = new Governor(16 * MiB);
+  const usable = governor.capBytes - governor.reserveBytes;
+  const facade = new PreparationGovernor(governor);
+  // The statement keeps its result grant through the restart; another statement holds 2 MiB and
+  // will release it, but the need does not fit beside the result grant whatever it releases.
+  const result = await governor.admit({ label: "result", minimumBytes: 6 * MiB, spillable: false });
+  const other = await governor.admit({ label: "other", minimumBytes: 2 * MiB, spillable: false });
+  const needed = usable - 6 * MiB + 1;
+  const cancel = new AbortController();
+  const regrown = facade.regrow(
+    new PreparationWouldWait("probe", MiB, false, needed - MiB, [
+      { label: "probe", minimumBytes: MiB, spillable: false },
+    ]),
+    cancel.signal,
+    () => ({ grants: [result] }),
+  );
+  const outcome = await Promise.race([
+    regrown.then(
+      () => "admitted",
+      (error: unknown) => error,
+    ),
+    new Promise((resolve) => setTimeout(() => resolve("still waiting"), 300)),
+  ]);
+  // A wait left behind (a wrong outcome) ends here, so the assertion below reports it.
+  cancel.abort(new Error("still waiting"));
+  await regrown.catch(() => undefined);
+  other.close();
+  expect(outcome).toMatchObject({ name: "MemoryAdmissionError", sqlState: "53200" });
+  result.close();
+  facade.close();
   expect(governor.usedBytes).toBe(0);
 });

@@ -74,6 +74,8 @@ export class BlobCache<T> implements EvictableCacheLike {
   constructor(
     register: (cache: EvictableCacheLike) => CacheMemory,
     readonly key: (ref: BlobRef) => string = blobKey,
+    /** Names the cache in a governor stall report. */
+    readonly label = "blob cache",
   ) {
     this.#memory = register(this);
   }

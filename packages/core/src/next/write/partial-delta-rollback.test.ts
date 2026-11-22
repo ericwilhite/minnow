@@ -132,7 +132,17 @@ for (const seed of seedsFor("next-write-partial-delta-rollback", [0xb3d0]))
                 ? st.table(table).delete(batch(locators(targets, table)), null)
                 : st.table(table).insert(batch(ints(ids), ints(values)), null);
             try {
-              await expect(autocommit(p, attempt)).rejects.toBe(error);
+              const refusal = autocommit(p, attempt);
+              if (s.native) await expect(refusal).rejects.toBe(error);
+              // A statement reports the write path's memtable refusal as the public memory
+              // refusal (memory/README.md): 53200, naming the bytes it refused.
+              else
+                await expect(refusal).rejects.toMatchObject({
+                  name: "MemoryAdmissionError",
+                  sqlState: "53200",
+                  label: "write path memtable",
+                  bytes: 256,
+                });
             } finally {
               spy.mockRestore();
               batchSpy.mockRestore();

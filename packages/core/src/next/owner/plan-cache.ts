@@ -59,7 +59,11 @@ export class PlanCache<T> {
 
   #registered(): Handle {
     if (this.#handle !== null) return this.#handle;
-    const source: EvictableCache = { evictableBytes: 0, evict: (bytes) => this.#evict(bytes) };
+    const source: EvictableCache = {
+      label: "plan cache",
+      evictableBytes: 0,
+      evict: (bytes) => this.#evict(bytes),
+    };
     Object.defineProperty(source, "evictableBytes", { get: () => this.#bytes });
     Object.defineProperty(source, "oldestUnusedAt", {
       get: () => this.#entries.values().next().value?.usedAt,

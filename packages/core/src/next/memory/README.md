@@ -113,6 +113,46 @@ query-size error. A complete execution minimum greater than the whole cap is the
 `MemoryAdmissionError` at admission. Oversized parameter inputs fail initial admission. Only already-admitted owned copies may
 checkpoint during a pressure handoff (see below).
 
+A statement's wait is also bounded by what it keeps while it waits (GOVERNOR-WAIT-POLICY
+point 5, `MemoryGovernor.servableNow`): the usable capacity less its own grants and, while it
+holds the writer turn, what the writer keeps until the statement ends
+(`WriteCredits.retainedWhileOpen`). This is accounting, not a guess about who might release.
+
+- When the writer runs no work of its own, its holdings are exact: everything it holds beyond
+  its registered lifetime holding stays while the turn is held, except what reclaim returns
+  (row credit above the row floor, metadata credit above the prepaid step). That is the row
+  floor or every memtable's rows if more (no idle spill runs with the turn held, and no flush
+  starts on its own: a flush must cover a whole commit, so frozen memtables whose commit reaches
+  the live memtable wait for it), the prepaid metadata step, and all commit and merge credit
+  (their forecasts return only once the turn is free).
+- While the writer runs a flush, merge, commit or log append, that work may move idle credit
+  between its accounts and release it, and retire the metadata step it prepaid. Only the
+  memtable rows that work will not publish count then, so the value is too large, never too
+  small: nothing that could fit is refused.
+- Left out always: an older snapshot's metadata and run readers, a dropped table's state, other
+  statements' grants, evictable cache entries. Each is released by its own holder.
+
+An execution's fixed buffers and a preparation restart's credit carry that value
+(`NativeGrantGroupOptions.servable`). The governor evaluates it whenever the group is the head
+of its queue and does not fit, first on the drain that queues it (before any wait), and only
+after the reclaim requests that drain made have completed, so the statement's and the writer's
+idle credit is returned first. A group above it is refused with 53200. The writer wakes the
+queue when its own work ends; its holdings are then exact, and a group above them is refused
+instead of waiting forever. Anything at or below it waits and is served once the
+finite holders release (`testing/servable-beside-writer.test.ts` checks both sides: the value is
+served, one byte more is refused). A preparation restart doubles its credit only when the doubled
+credit is admissible at once; otherwise it waits for its measured need alone.
+
+The write path's memtable refusal (`MemtableMemoryError`) is internal: a statement's write call
+reports it as this same `MemoryAdmissionError` (label `write path memtable`). It is raised before
+the memtable allocation it refused, so the failed statement rolls back with nothing written.
+
+In test builds, `Governor.stallAfterMs` turns a wait with no progress into a
+`GovernorStallError`. Its report names every byte `usedBytes` counts: each grant holder, each
+registered cache with the bytes it holds (caches name themselves with `EvictableCache.label`),
+the registered lifetime holdings (which lie inside those grants and caches), and any
+unattributed remainder, which is zero unless the accounting is broken.
+
 Memory refusals carry `code: "MINNOW_MEMORY_ADMISSION"`, SQLSTATE `53200`, and a
 `cause` with `requestedBytes` and `admittedBytes`. A private progress step larger
 than its admitted lane raises the same error before allocating or waiting; it

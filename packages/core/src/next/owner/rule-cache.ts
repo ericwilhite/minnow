@@ -126,6 +126,7 @@ export class RuleCache {
   #registered(): CacheHandle | null {
     if (this.#handle !== null || this.#governor === null || this.#closed) return this.#handle;
     const source: EvictableCache = {
+      label: "rule cache",
       evictableBytes: 0,
       evict: (bytes: number) => this.#evict(bytes),
     };

@@ -271,6 +271,8 @@ export interface CacheMemory {
 /** What the governor calls on the cache (`EvictableCache`). */
 export interface EvictableCacheLike {
   readonly evictableBytes: number;
+  /** Names the cache in a governor stall report (test builds). */
+  readonly label?: string;
   evict(bytes: number): number;
   /**
    * When the entry `evict` takes next was last used (`performance.now()` ms): the governor evicts

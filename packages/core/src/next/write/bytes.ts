@@ -8,6 +8,7 @@ import { encodeUtf8Into, utf8Length } from "../utf8.js";
 export { utf8Length } from "../utf8.js";
 import { DURABLE_CODECS, requireTag } from "../durable-format.js";
 import { StoreCorruptionError } from "../storage/contract.js";
+import { MemoryAdmissionError } from "../memory-values.js";
 import { SMALL_COMMIT_BYTES, StreamCommit, type BufferAllocator } from "./commit-buffers.js";
 
 /** `value`, which the caller knows is present (a broken invariant is a `TypeError`, not data). */
@@ -36,13 +37,33 @@ export interface Charge {
 /** For scratch structures nobody accounts (tests, a statement's transient row copies). */
 export const UNCHARGED: Charge = { allocate: () => true, free: () => undefined };
 
-/** The write path's grant refused memory a memtable needs (after backpressure). */
+/**
+ * The write path's grant refused memory a memtable needs (after backpressure). Internal: the
+ * write path retries or declines on it; a statement's write call reports it to its caller as
+ * the public `MemoryAdmissionError` (53200, `memoryRefusal`), never as this type.
+ */
 export class MemtableMemoryError extends Error {
   readonly code = "MINNOW_MEMTABLE_MEMORY";
-  constructor(readonly bytes: number) {
+  constructor(
+    readonly bytes: number,
+    /** Bytes the write path could still charge when it refused, where known. */
+    readonly available = 0,
+  ) {
     super(`The write path could not charge ${String(bytes)} bytes of memtable memory`);
     this.name = "MemtableMemoryError";
   }
+}
+
+/**
+ * The statement boundary's view of a write-path error: a memtable refusal becomes the public
+ * memory refusal every other admission reports (`MemoryAdmissionError`: code
+ * `MINNOW_MEMORY_ADMISSION`, SQLSTATE 53200, PostgreSQL's out_of_memory). It is raised before
+ * the memtable allocation it refused, so the failed statement rolls back with nothing written.
+ */
+export function memoryRefusal(error: unknown): unknown {
+  return error instanceof MemtableMemoryError
+    ? new MemoryAdmissionError("write path memtable", error.bytes, error.available)
+    : error;
 }
 
 /** Charges `bytes` to `charge` before an allocation, or throws `MemtableMemoryError`. */

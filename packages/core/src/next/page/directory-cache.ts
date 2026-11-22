@@ -8,7 +8,11 @@ import type { ExtentReader } from "../storage/extents.js";
 import type { ChunkDirectory } from "./directory.js";
 
 export function createDirectoryCache(governor: MemoryGovernor): BlobCache<ChunkDirectory> {
-  return new BlobCache<ChunkDirectory>((cache) => governor.registerCache(cache), fullBlobKey);
+  return new BlobCache<ChunkDirectory>(
+    (cache) => governor.registerCache(cache),
+    fullBlobKey,
+    "directory cache",
+  );
 }
 
 /** Resolve before a read-step wraps the pin's reader. Queries borrow the owner's

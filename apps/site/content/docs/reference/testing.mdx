@@ -53,8 +53,9 @@ after generated declarations or asynchronous signatures change.
 `MINNOW_GOVERNOR_STALL_MS` turns on the governor's stall guard in a Vitest run. A memory request
 that waits that many milliseconds while nothing in the governor changes (no credit taken or
 returned, no request queued, served or withdrawn) fails with a `GovernorStallError`. It names the
-waiting request, every holder and where the request was queued, instead of hanging until the test
-timeout. It is a no-progress window, not a proof of deadlock: a holder that computes for longer
+waiting request, every holder, every cache with the bytes it holds, the lifetime holdings owners
+registered, any bytes none of them account for, and where the request was queued, instead of
+hanging until the test timeout. It is a no-progress window, not a proof of deadlock: a holder that computes for longer
 than the window without touching the governor is reported too. The trigger and write suites pass
 with it set to 10 seconds:
 

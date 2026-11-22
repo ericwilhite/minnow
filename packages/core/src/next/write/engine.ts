@@ -161,6 +161,7 @@ import {
   OBJECT_OVERHEAD_BYTES,
   MemoryAdmissionError,
   type Grant,
+  type LentHoldings,
   type Loan,
 } from "../memory/governor.js";
 import { CommandMaintenance, waitCommandMaintenance } from "./command-wait.js";
@@ -783,12 +784,17 @@ export class WritePathImpl implements WritePath, EngineHooks {
       groupRoots: new BlobCache<GroupRoot>(
         (cache) => input.governor.registerCache(cache),
         fullBlobKey,
+        "group root cache",
       ),
-      groupPages: new BlobCache<readonly GroupRef[]>((cache) =>
-        input.governor.registerCache(cache),
+      groupPages: new BlobCache<readonly GroupRef[]>(
+        (cache) => input.governor.registerCache(cache),
+        undefined,
+        "group page cache",
       ),
-      groupIndexes: new BlobCache<readonly GroupPageEntry[]>((cache) =>
-        input.governor.registerCache(cache),
+      groupIndexes: new BlobCache<readonly GroupPageEntry[]>(
+        (cache) => input.governor.registerCache(cache),
+        undefined,
+        "group index cache",
       ),
     };
     this.#metadataCaches = [
@@ -1133,7 +1139,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
       // holdings (scratch control) are registered by the owner, never counted twice here.
       const ready = engine;
       engine.#unregisterLifetime =
-        input.governor.registerPermanent?.(() => ready.#lifetimeBytes()) ?? null;
+        input.governor.registerPermanent?.(() => ready.#lifetimeBytes(), "write path lifetime") ??
+        null;
       if (input.deferInitialMaintenance !== true) engine.startInitialMaintenance();
       return engine;
     } catch (error) {
@@ -2139,7 +2146,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#reclaimWake = true;
     queueMicrotask(() => {
       this.#reclaimWake = false;
-      if (!this.#closed && this.#canRetireIdleForecasts()) this.#credits.notifyReclaimable();
+      // Idle forecasts may retire; and the writer's holdings are now exactly known, so a
+      // request waiting beside its turn can be decided (`NativeGrantGroupOptions.servable`).
+      if (!this.#closed && this.#ownWorkIdle()) this.#credits.notifyReclaimable();
     });
   }
 
@@ -2362,10 +2371,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       // it keeps for live queries. Listener cells are their subscribers' (finite) holdings.
       (this.#changes === null ? 0 : CHANGE_FEED_BYTES + this.#changes.historyBytes) +
       (this.#currentPin === null ? 0 : (this.#statePins.get(this.#state)?.pin.bytes ?? 0)) +
-      OBJECT_OVERHEAD_BYTES +
-      NATIVE_WRITE_STEP_BYTES +
-      ArenaPool.overhead +
-      this.keys.residentBytes +
+      this.#rowsLifetimeBytes() +
       writer(this.#columns) +
       writer(this.#body) +
       writer(this.#sequenceBody) +
@@ -2765,7 +2771,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#check();
       if (this.#headroom(bytes + (growth?.() ?? 0))) return;
     }
-    throw new MemtableMemoryError(bytes);
+    throw new MemtableMemoryError(bytes, Math.max(0, this.#grant.held - this.#grant.allocated));
   }
 
   // ── Public API ───────────────────────────────────────────────────────────────────────────
@@ -3054,6 +3060,68 @@ export class WritePathImpl implements WritePath, EngineHooks {
    * Check/source views have retired; no borrowed vector or second loan crosses this wait. */
   statementEnded(): void {
     this.#reclaimable();
+  }
+
+  writerHoldings(): LentHoldings {
+    const credits = this.#credits;
+    return {
+      grants: credits.grants(),
+      retained: () =>
+        credits.retainedWhileOpen(
+          this.#rowsLifetimeBytes(),
+          this.#stayingRowBytes(),
+          this.#ownWorkIdle(),
+        ),
+    };
+  }
+
+  /** The lifetime controls charged to the row account (part of `#lifetimeBytes`). */
+  #rowsLifetimeBytes(): number {
+    return (
+      OBJECT_OVERHEAD_BYTES + NATIVE_WRITE_STEP_BYTES + ArenaPool.overhead + this.keys.residentBytes
+    );
+  }
+
+  /**
+   * Memtable rows of the current tables, which stay while a statement holds the writer turn and
+   * the writer runs no work of its own: only a flush frees them, none is running then, and none
+   * starts on its own (the idle spill needs the turn free; a flush must cover a whole commit, so
+   * frozen memtables whose commit reaches the live memtable wait for it to freeze). A dropped
+   * table's memtables are not the current tables': its snapshots release them.
+   */
+  #stayingRowBytes(): number {
+    let total = 0;
+    for (const state of this.#tables.values())
+      for (const memtable of state.view.memtables) total += memtable.bytes;
+    return total;
+  }
+
+  /**
+   * The writer runs no work of its own: no flush, merge, commit encoding, log append, recycle,
+   * metadata step or recovery. While it does, that work may move idle credit between the
+   * writer's accounts and release it, or retire the metadata step it prepaid.
+   */
+  #ownWorkIdle(): boolean {
+    return (
+      !this.#recovering &&
+      !this.#claimed &&
+      !this.#maintenanceHolds &&
+      this.#metadataWriters === 0 &&
+      !this.#credits.hasMergeStep &&
+      this.#commitEncoding === 0 &&
+      !this.#appender.hasPendingWork &&
+      this.#commitRuns.size === 0 &&
+      this.#minimumRuns.size === 0 &&
+      this.#flushing.size === 0 &&
+      !this.#flushScheduled &&
+      !this.#flushLoop &&
+      !this.#mergeScheduled &&
+      !this.#merging &&
+      !this.#spilling &&
+      this.#recycling === null &&
+      this.#idleRun === null &&
+      this.#runReadersPending === 0
+    );
   }
 
   prepareFtsMutation(signal?: AbortSignal): MaybePromise<void> {
@@ -4079,11 +4147,15 @@ export class WritePathImpl implements WritePath, EngineHooks {
 
   // ── Flush and publish ────────────────────────────────────────────────────────────────────
 
+  /** The flush loop is running (between `#scheduleFlush`'s start and its end). */
+  #flushLoop = false;
+
   #scheduleFlush(): void {
     if (this.#flushScheduled || this.#closed) return;
     this.#flushScheduled = true;
     this.#flushes = this.#flushes.then(async () => {
       this.#flushScheduled = false;
+      this.#flushLoop = true;
       try {
         for (;;) {
           if (this.failure !== null || this.#closed) return;
@@ -4106,6 +4178,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
           if (this.#flushProgress() === before) return;
         }
       } finally {
+        this.#flushLoop = false;
         // The flushed memtables' arenas are now idle credit a queued admission may reclaim.
         this.#reclaimable();
       }

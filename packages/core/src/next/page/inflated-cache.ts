@@ -14,7 +14,7 @@ export class InflatedPageCache implements EvictableCacheLike {
 
   /** `register` is the governor's `registerCache` (memory/governor.ts). */
   constructor(register: (cache: EvictableCacheLike) => CacheMemory) {
-    this.#cache = new BlobCache<Uint8Array>(register);
+    this.#cache = new BlobCache<Uint8Array>(register, undefined, "inflated page cache");
   }
 
   get evictableBytes(): number {

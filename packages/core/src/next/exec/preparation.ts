@@ -16,11 +16,16 @@
  * plus one `…/preparation-credit` part; once admitted, all of it is the next attempt's credit.
  *
  * The request covers the attempt's peak simultaneous need (live grants at their peak, or live
- * grants plus the request that would have waited), at least twice the previous request but no more
- * than the usable capacity (usableCapacity: the cap less the reserve unless private progress,
- * less lifetime holdings). A credit of the usable capacity serves every preparation whose peak
- * fits, so a query restarts at most ceil(log2(usable / first request)) + 1 times; a peak need above
- * the usable capacity is the typed MemoryAdmissionError (53200), never a refusal below it.
+ * grants plus the request that would have waited), at most the usable capacity; a peak need
+ * above it is the typed MemoryAdmissionError (53200). It is twice the previous request when that
+ * is admissible at once, else the measured peak alone: a restart never waits for more than it
+ * needs. The wait carries what the statement keeps through it (its result grant, its writer's
+ * holdings: `NativeGrantGroupOptions.servable`), so a credit that could never be served beside
+ * them is refused with 53200 rather than left waiting. Each credit is larger than the last and
+ * covers the stopped attempt's peak, so an attempt that repeats its admissions gets past the one
+ * that stopped the last. Restarts are therefore at most ceil(log2(usable / first request)) + 1
+ * that doubled, plus at most one per admission of an attempt for those that took the measured
+ * peak.
  *
  * Once the reservation is installed the facade passes every admission to the real governor.
  */
@@ -32,6 +37,7 @@ import {
   type Grant,
   type MemoryGovernor,
   type NativeGrantGroupOptions,
+  type WaitingHoldings,
 } from "../memory/governor.js";
 
 type Part = NativeGrantGroupOptions["grants"][number];
@@ -77,6 +83,9 @@ export class PreparationGovernor implements MemoryGovernor {
   }
   get reserveBytes(): number {
     return this.governor.reserveBytes;
+  }
+  servableNow(own: WaitingHoldings, includesProgress?: boolean): number {
+    return this.governor.servableNow(own, includesProgress);
   }
   get usedBytes(): number {
     return this.governor.usedBytes;
@@ -279,6 +288,7 @@ export class PreparationGovernor implements MemoryGovernor {
         grants: options.grants,
         includesProgress: progress,
         ...(options.signal === undefined ? {} : { signal: options.signal }),
+        ...(options.servable === undefined ? {} : { servable: options.servable }),
       };
       if (this.governor.canAdmitNow(total, progress) || this.#holdsNothing())
         return this.governor
@@ -308,10 +318,18 @@ export class PreparationGovernor implements MemoryGovernor {
 
   /**
    * After the attempt released everything it held: waits, holding nothing, for the next credit.
-   * The request is the attempt's peak need, at least twice the previous request, at most the
-   * usable capacity.
+   * The credit is twice the previous one when that is admissible at once (at most the usable
+   * capacity), else the attempt's peak need: it never waits for more than it needs. `beside` is
+   * what the statement still keeps while it waits (its result grant, and its writer's holdings
+   * while it holds the turn): the wait carries it (`NativeGrantGroupOptions.servable`), so a
+   * credit that could never be served beside it is refused with 53200, at once or when the
+   * writer's own work ends, never left waiting.
    */
-  async regrow(wait: PreparationWouldWait, signal: AbortSignal): Promise<void> {
+  async regrow(
+    wait: PreparationWouldWait,
+    signal: AbortSignal,
+    beside?: () => WaitingHoldings,
+  ): Promise<void> {
     if (!this.#preparing) throw new TypeError("Preparation already reserved");
     this.#credit?.close();
     this.#credit = null;
@@ -320,7 +338,10 @@ export class PreparationGovernor implements MemoryGovernor {
     const progress = wait.includesProgress || this.#progress;
     const usable = this.usableCapacity(progress);
     if (wait.needed > usable) throw new MemoryAdmissionError(wait.label, wait.needed, usable);
-    this.#need = Math.max(wait.needed, Math.min(2 * this.#need, usable));
+    // Double the credit only when that fits now. Waiting for more than the attempt needs could
+    // wait for memory only this statement's own holdings keep: wait for the need itself.
+    const doubled = Math.max(wait.needed, Math.min(2 * this.#need, usable));
+    this.#need = this.governor.canAdmitNow(doubled, progress) ? doubled : wait.needed;
     this.#attempts++;
     // The admission that would have waited, with its own label and parts, plus the rest of the
     // credit. All of it becomes the next attempt's credit.
@@ -328,6 +349,9 @@ export class PreparationGovernor implements MemoryGovernor {
       label: wait.label,
       includesProgress: progress,
       signal,
+      ...(beside === undefined
+        ? {}
+        : { servable: () => this.governor.servableNow(beside(), progress) }),
       grants: [
         ...wait.parts,
         {

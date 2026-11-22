@@ -13744,3 +13744,28 @@ export const FLAT_BYTE_PG_REACH = [
   "UUID36 width",
   "zero state and spill",
 ] as const;
+
+/** Sequences of wide inserts at a 32 MiB cap (next/testing/wide-insert-admission.test.ts). */
+export const WIDE_INSERT_ADMISSION_REACH = [
+  "written",
+  "row over a MiB written",
+  "wide row read back",
+  "wide table read back",
+  "wide table read refused",
+  "refused before waiting",
+  "memtable refusal",
+  "written after a refusal",
+  "three or more statements",
+] as const;
+
+/** servableBeside beside a writer holding the turn (next/testing/servable-beside-writer.test.ts). */
+export const SERVABLE_BESIDE_WRITER_REACH = [
+  "live memtable rows",
+  "wide live rows",
+  "frozen rows under a held flush",
+  "table dropped",
+  "table dropped under a snapshot",
+  "served exactly",
+  "one more byte refused",
+  "refused once the writer settled",
+] as const;
