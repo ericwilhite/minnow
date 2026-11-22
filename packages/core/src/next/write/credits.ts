@@ -263,6 +263,7 @@ export class WriteCredits {
     /** The governor's one writer holder chain: every growth of this owner is holder growth from
      * it (GOVERNOR-WAIT-POLICY point 6, checked by the governor). Closed with these accounts. */
     readonly holderChain: HolderChain,
+    readonly ownsHolderChain = true,
   ) {
     const [rows, metadata, commits, merge] = grants;
     if (!rows || !metadata || !commits || !merge)
@@ -277,20 +278,29 @@ export class WriteCredits {
     if (signal?.aborted) this.#abort();
   }
 
+  /**
+   * Admits the owner minimum. The accounts open the governor's writer holder chain and close it
+   * with themselves, unless the caller passes `chain`, which it keeps owning (credits-level
+   * tests that model several owners on one governor register one owner chain each; the engine's
+   * owner claim allows one writer).
+   */
   static async open(
     governor: MemoryGovernor,
     minimum: WriteMinimum,
     signal?: AbortSignal,
     holdings?: () => number,
+    chain?: HolderChain,
   ): Promise<WriteCredits> {
     minimum = { ...minimum };
+    if (chain !== undefined)
+      return WriteCredits.#open(governor, minimum, chain, false, signal, holdings);
     if (governor.openHolderChain === undefined)
       throw new TypeError("Write credits need a governor that checks holder chains");
-    const chain = governor.openHolderChain("write engine", "writer");
+    const own = governor.openHolderChain("write engine", "writer");
     try {
-      return await WriteCredits.#open(governor, minimum, chain, signal, holdings);
+      return await WriteCredits.#open(governor, minimum, own, true, signal, holdings);
     } catch (error) {
-      chain.close();
+      own.close();
       throw error;
     }
   }
@@ -299,6 +309,7 @@ export class WriteCredits {
     governor: MemoryGovernor,
     minimum: WriteMinimum,
     chain: HolderChain,
+    ownsChain: boolean,
     signal?: AbortSignal,
     holdings?: () => number,
   ): Promise<WriteCredits> {
@@ -324,7 +335,7 @@ export class WriteCredits {
     });
     try {
       signal?.throwIfAborted();
-      const credits = new WriteCredits(governor, minimum, signal, grants, chain);
+      const credits = new WriteCredits(governor, minimum, signal, grants, chain, ownsChain);
       if (holdings !== undefined) credits.bindOwnerHoldings(holdings);
       return credits;
     } catch (error) {
@@ -818,6 +829,6 @@ export class WriteCredits {
     this.signal?.removeEventListener("abort", this.#abort);
     for (const grant of [this.metadata, this.commits, this.merge]) grant.close();
     if (!keepRowsForReaders) this.rows.close();
-    this.holderChain.close();
+    if (this.ownsHolderChain) this.holderChain.close();
   }
 }

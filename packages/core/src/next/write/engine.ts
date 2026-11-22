@@ -1110,7 +1110,14 @@ export class WritePathImpl implements WritePath, EngineHooks {
         rootCharge,
         lists,
       });
-      engine.#ownerClaim = claim;
+      // The writer holder chain belongs to the owner claim: a close that fails before its accounts
+      // are returned still frees both, so recovery can reopen a writer on this governor.
+      engine.#ownerClaim = {
+        release: () => {
+          claim.release();
+          credits.holderChain.close();
+        },
+      };
       if (input.ownerHoldings !== undefined) engine.#ownerHoldings.add(input.ownerHoldings);
       await engine.#load();
       await engine.#prepareMinimum();
