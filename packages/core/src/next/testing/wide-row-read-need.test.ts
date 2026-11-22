@@ -21,10 +21,12 @@
  * - one wide value per row, inserted at either cap;
  * - a second wide column copied from the first (`SET b = a`) only where it completes.
  *
- * Limits (#51, P1, fixes both):
- * - at 32 MiB, `UPDATE t SET b = a` over a 2 or 3 MiB value waits forever: the statement's query
- *   waits on its own writer's idle forecasts;
- * - at 64 MiB, copying a 6 MiB value is refused with MemtableMemoryError (25,178,288 bytes).
+ * Limits:
+ * - at 32 MiB, `UPDATE t SET b = a` over a 2 or 3 MiB value is refused with a typed 53200: its
+ *   query cannot fit beside its own statement's holdings (15,117,092 and 21,413,668 bytes, 13.8 MB
+ *   available; #51 turned the former endless wait into this refusal);
+ * - at 64 MiB, copying a 6 MiB value is refused with a typed 53200 (the write path's memtable,
+ *   25,178,288 bytes).
  * - named remaining terms of a one-row read's admission:
  *   - a memtable read that fits without the over-cap retry funds the metadata of a publication
  *     that may happen before it opens: the format's worst case, `MEMORY_READ_RESIDENT_BYTES`
@@ -35,12 +37,10 @@
  *   - a stored read bound counts a selected large value four times (`4 * values`), while its fetch
  *     allocates two: `2 x` the value (38,203,972 admitted, 18,975,756 real peak, for 6 MiB). The
  *     stored selected-value factor is a follow-up.
- * - pinned divergence until #51: at 64 MiB, `ORDER BY` over a 3 MiB value and its 3 MiB copy asks
- *   64,041,638 bytes. That fits the usable cap (64,046,142), but the writer's idle live allocations
- *   (about 286 KB) can leave only 64,037,596 grantable, so it may wait; the stall guard reports it.
- *   Which it does depends on the writer's live allocations at that moment: across runs it was
- *   served, refused with a typed 53200, and stalled. On main it was refused with 53200
- *   (66,252,108). #51 closes that usable-vs-grantable gap; then the stall branch is dropped.
+ * - at 64 MiB, `ORDER BY` over a 3 MiB value and its 3 MiB copy asks 64,041,638 bytes: within the
+ *   usable cap (64,046,142), but the writer's idle live allocations (about 286 KB) can leave only
+ *   64,037,596 grantable. Before #51 it could wait there; #51 closed that gap, so it is served or
+ *   refused with a typed 53200, and a stall fails the test.
  * - at 32 MiB, inserting a small row and a 3 MiB row in one statement is refused at run time
  *   (`result/progress` needs 5,077,416 bytes, 1,815,232 funded: P1's write-side lane work), so the
  *   shared-group stored case runs at 64 MiB only.
@@ -218,22 +218,14 @@ it.each(cases)(
         );
         holdings.on = false;
         if (cap === 64 && width === 3 * MiB && copy && read.sql.endsWith("ORDER BY id")) {
-          // Pinned known divergence (Limits): the request lands at the edge of the
-          // usable-vs-grantable gap, so before #51 it may wait there (the stall report), be refused
-          // with a typed 53200, or be served, depending on the writer's live allocations then.
-          // When #51 lands, drop the stall branch: served or typed 53200 only.
+          // At the edge of the usable-vs-grantable gap (Limits). #51 closed it: the query is
+          // served, or refused with a typed 53200, and never waits there.
+          expect(
+            (outcome as { code?: string }).code,
+            "#51 closes the usable-vs-grantable gap: it never stalls",
+          ).not.toBe("MINNOW_GOVERNOR_STALL");
           if (Array.isArray(outcome)) expect(outcome).toEqual(read.expected);
-          else if ((outcome as { code?: string }).code === "MINNOW_GOVERNOR_STALL") {
-            // The stall's cause: this query's own working set waiting beside the writer's live
-            // allocations, nothing else.
-            const message = (outcome as Error).message;
-            expect(message, "#51 closes the usable-vs-grantable gap: the waiter").toMatch(
-              /"query#\d+\/fixed-buffers" waited/u,
-            );
-            expect(message, "#51 closes the usable-vs-grantable gap: the holder").toContain(
-              "write path",
-            );
-          } else {
+          else {
             expect(outcome, "#51 closes the usable-vs-grantable gap").toMatchObject(REFUSED);
             const refused = outcome as { bytes: number; capacity: number };
             expect(refused.bytes, "a refusal only above the cap").toBeGreaterThan(refused.capacity);
