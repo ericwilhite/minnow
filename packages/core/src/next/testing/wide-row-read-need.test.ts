@@ -10,9 +10,11 @@
  * (`MAX_READ_BYTES`) and an 8 MiB allowance for the result window, the key probe, frame metadata
  * and fixed arrays. A read whose need fits the usable cap must complete with the exact values.
  * Any other outcome may only be a typed 53200 whose need exceeds that cap. A one-row read (by key)
- * also admits no more than that need: a step funds what it can use (as in #48). Sizing by the
- * table's widest row, or funding the same row's copies twice, over-admits by several times the
- * row and refuses reads below the cap.
+ * also admits no more than that need plus the remaining terms named below: a step funds what it
+ * can use (as in #48). The admission is measured through every entry point that admits a query's
+ * working set (a synchronous `tryAdmit`, else `admitGroup`), and must be measured (non-zero).
+ * Sizing by the table's widest row, or funding the same row's copies twice, over-admits by several
+ * times the row and refuses reads below the cap.
  *
  * Rows are built only in ways that work today:
  * - one wide value per row, inserted at either cap;
@@ -22,10 +24,16 @@
  * - at 32 MiB, `UPDATE t SET b = a` over a 2 or 3 MiB value waits forever: the statement's query
  *   waits on its own writer's idle forecasts;
  * - at 64 MiB, copying a 6 MiB value is refused with MemtableMemoryError (25,178,288 bytes).
- * - a one-row read of a resident, unretained memtable chunk also funds the metadata of a publication
- *   that may happen before it opens: the format's worst case, `MEMORY_READ_RESIDENT_BYTES`
- *   (19,279,872 bytes). Its real peak beside a 6 MiB value is about 2.8 MB. Fix 4, a follow-up,
- *   retains the chunk instead. Until then a small row's admission check allows that envelope.
+ * - named remaining terms of a one-row read's admission:
+ *   - a memtable read that fits without the over-cap retry funds the metadata of a publication
+ *     that may happen before it opens: the format's worst case, `MEMORY_READ_RESIDENT_BYTES`
+ *     (19,279,872 bytes); its real peak beside a 6 MiB value is about 2.8 MB. Fix 4 retains the
+ *     chunk instead;
+ *   - such a fitting read also keeps its result step's source envelope (four copies of the row's
+ *     values, less the window), because fix 2 applies over the cap only;
+ *   - a stored read bound counts a selected large value four times (`4 * values`), while its fetch
+ *     allocates two: `2 x` the value (38,203,972 admitted, 18,975,756 real peak, for 6 MiB). The
+ *     stored selected-value factor is a follow-up.
  * - pinned divergence until #51: at 64 MiB, `ORDER BY` over a 3 MiB value and its 3 MiB copy asks
  *   64,041,638 bytes. That fits the usable cap (64,046,142), but the writer's idle live allocations
  *   (about 286 KB) can leave only 64,037,596 grantable, so it may wait; the stall guard reports it.
@@ -130,16 +138,30 @@ it.each(cases)(
       const b = copy ? wide : null;
       const tiny = 2 + 8,
         row = (copy ? 2 : 1) * (width + 1) + 8;
-      // The query's admitted parts: its complete working set, as admitted.
+      // The query's complete working set, as admitted, through every entry point that admits it
+      // (memory/working-set.ts: a synchronous `tryAdmit` of the whole, else `admitGroup`).
       let admitted = 0;
+      const workingSet = (label: string) => /^query#\d+\/fixed-buffers$/u.test(label);
       const admitGroup = governor.admitGroup.bind(governor);
       governor.admitGroup = (options) => {
-        if (/^query#\d+\/fixed-buffers$/u.test(options.label))
+        if (workingSet(options.label))
           admitted = Math.max(
             admitted,
             options.grants.reduce((sum, part) => sum + part.minimumBytes, 0),
           );
         return admitGroup(options);
+      };
+      const tryAdmit = governor.tryAdmit.bind(governor);
+      governor.tryAdmit = (options) => {
+        const grant = tryAdmit(options);
+        if (grant !== null && workingSet(options.label))
+          admitted = Math.max(admitted, options.minimumBytes);
+        return grant;
+      };
+      const admit = governor.admit.bind(governor);
+      governor.admit = (options) => {
+        if (workingSet(options.label)) admitted = Math.max(admitted, options.minimumBytes);
+        return admit(options);
       };
       const reads: Array<{
         sql: string;
@@ -205,7 +227,17 @@ it.each(cases)(
           // with a typed 53200, or be served, depending on the writer's live allocations then.
           // When #51 lands, drop the stall branch: served or typed 53200 only.
           if (Array.isArray(outcome)) expect(outcome).toEqual(read.expected);
-          else if ((outcome as { code?: string }).code !== "MINNOW_GOVERNOR_STALL") {
+          else if ((outcome as { code?: string }).code === "MINNOW_GOVERNOR_STALL") {
+            // The stall's cause: this query's own working set waiting beside the writer's live
+            // allocations, nothing else.
+            const message = (outcome as Error).message;
+            expect(message, "#51 closes the usable-vs-grantable gap: the waiter").toMatch(
+              /"query#\d+\/fixed-buffers" waited/u,
+            );
+            expect(message, "#51 closes the usable-vs-grantable gap: the holder").toContain(
+              "write path",
+            );
+          } else {
             expect(outcome, "#51 closes the usable-vs-grantable gap").toMatchObject(REFUSED);
             const refused = outcome as { bytes: number; capacity: number };
             expect(refused.bytes, "a refusal only above the cap").toBeGreaterThan(refused.capacity);
@@ -233,14 +265,27 @@ it.each(cases)(
           const refused = outcome as { bytes: number; capacity: number };
           expect(refused.bytes, "a refusal only above the cap").toBeGreaterThan(refused.capacity);
         } else expect(outcome).toEqual(read.expected);
-        // A small row's read also funds the resident envelope (Limits above, fix 4).
-        // Only a memtable read has that envelope: a stored group's is measured (fix 3).
+        // Named remaining terms (Limits), not a blanket allowance:
+        // - a memtable read that fit without the over-cap retry funds the resident envelope of a
+        //   publication that may happen first (`MEMORY_READ_RESIDENT_BYTES`; fix 4 retains the
+        //   chunk instead);
+        // - a query that fits keeps its result step's source envelope, four copies of the row's
+        //   values (fix 2 applies over the cap only, so fitting queries size as before);
+        // - a stored read bound counts a selected large value four times, its fetch allocates two
+        //   (`2 x` that value; the stored selected-value factor, a follow-up).
         const allowed =
-          derived + (read.rowBytes === tiny && stored !== true ? MEMORY_READ_RESIDENT_BYTES : 0);
-        if (read.byKey === true && Array.isArray(outcome))
+          derived +
+          (stored === true
+            ? read.rowBytes === row
+              ? 2 * width
+              : 0
+            : MEMORY_READ_RESIDENT_BYTES + 4 * read.rowBytes);
+        if (read.byKey === true && Array.isArray(outcome)) {
+          expect(admitted, `${read.sql}: its admission was measured`).toBeGreaterThan(0);
           expect(admitted, `${read.sql}: admits no more than its need`).toBeLessThanOrEqual(
             allowed,
           );
+        }
       }
     } finally {
       await db.close();

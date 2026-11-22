@@ -536,6 +536,11 @@ export function boundSource(
           const stored = root.value.columns
             .filter((column) => source.columns.includes(column.columnId))
             .reduce((sum, column) => sum + column.data.length, 0);
+          // Named selected rows (a lookup's locators): only their pages and their values are read.
+          const picked =
+            source.selectedRow === true && source.locators !== undefined
+              ? positionsIn(source.locators, index)
+              : null;
           const span = source.selectedRow
             ? Math.max(1, rows)
             : windowBytes === 0
@@ -629,6 +634,14 @@ export function boundSource(
                 selectedValues = 0;
               for (const [index, page] of reader.directory.pages.entries()) {
                 if (page.firstRow >= rows) break;
+                if (
+                  picked !== null &&
+                  !picked.some(
+                    (position) =>
+                      position >= page.firstRow && position < page.firstRow + page.rowCount,
+                  )
+                )
+                  continue;
                 const encoded = page.length;
                 let raw = encoded;
                 const lane =
@@ -688,6 +701,7 @@ export function boundSource(
                     let large = 0;
                     if (source.batchRows === 1) {
                       for (let row = from; row < to; row++) {
+                        if (picked !== null && !picked.includes(row)) continue;
                         large = Math.max(large, reader.largeValueBytes(row, row + 1));
                         if ((row & 1023) === 0) {
                           const pause = pauseIfDue(task);
