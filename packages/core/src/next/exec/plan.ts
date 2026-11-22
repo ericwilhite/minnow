@@ -3552,6 +3552,24 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           : { row: input.reduce((a, b) => a + b, 0) + output + 65536, repeated: 0 };
       });
     }
+    if (modification.op === "modify")
+      // The modification's spool holds each input row on the result progress lane. Size that
+      // lane from the row itself (concatenation sums its arguments), not from the bound
+      // parameters' bytes, which a computed row can exceed. A column read from a table is not
+      // bounded here (null): its row keeps the source-progress envelope.
+      runtime.modifyResultRow((slots, largest) => {
+        const sizes = {
+          parameter: (slot: number) => slots[slot] ?? largest,
+          source: () => null,
+        };
+        let row = 0;
+        for (let c = 0; c < modification.input.output.length; c++) {
+          const bytes = columnInputBytes(modification.input, c, sizes);
+          if (bytes === null) return null;
+          row += bytes;
+        }
+        return row;
+      });
     const jsonGroupSources = new Map<number, Set<number>>();
     const jsonGroupColumnBytes = new Map<number, Map<number, number>>();
     const resultSources = new Map<number, Set<number>>();

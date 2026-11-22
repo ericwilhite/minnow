@@ -1,6 +1,6 @@
 import type { NativeInputTargets } from "./native-target-guard.js";
 import type { NativeParameterBinding } from "./native-parameters.js";
-import { ModifySpool, modifySpoolBytes } from "./modify-spool.js";
+import { ModifySpool, modifySpoolBytes, wideRowStepBytes } from "./modify-spool.js";
 import type { Operator } from "./pipeline.js";
 /** One query's admissions, resources and the executed/delivered lifecycle. */
 import type { MaybePromise } from "../access/key-index.js";
@@ -232,6 +232,11 @@ export class QueryRuntime {
   #resultOwnedMinimum = false;
   #resultCopies = 1;
   #resultRowProgress: ((slots: readonly number[], largest: number) => number | null) | null = null;
+  #modifyResultRow: ((slots: readonly number[], largest: number) => number | null) | null = null;
+  /** A modification's input row bound, which its spool's progress loan must cover. */
+  modifyResultRow(bound: (slots: readonly number[], largest: number) => number | null): void {
+    this.#modifyResultRow = bound;
+  }
   /** Complete emitted row, already including logical aliases; unrelated input is not output. */
   resultRowProgress(bound: (slots: readonly number[], largest: number) => number | null): void {
     this.#resultRowProgress = bound;
@@ -273,16 +278,23 @@ export class QueryRuntime {
       throw new TypeError("Positive result multiplicity required");
     this.#resultCopies = copies;
   }
-  #resultWindow(): number {
-    // A buffered producer cannot offer a frame before its delivery handoff. Keep only
-    // bounded empty-sink metadata, rather than an unused full consumer byte window.
-    const spool =
+  /** Whether the modification's input is spooled (`ModifySpool`) before it is written. */
+  #spools(): boolean {
+    return (
       this.modifyOutput !== null &&
       this.plan.root.op === "modify" &&
       this.plan.root.returning === null &&
       this.plan.root.kind !== "upsert" &&
       !this.plan.root.usesRules &&
       this.plan.root.onRepeat !== "first"
+    );
+  }
+
+  #resultWindow(): number {
+    // A buffered producer cannot offer a frame before its delivery handoff. Keep only
+    // bounded empty-sink metadata, rather than an unused full consumer byte window.
+    const spool =
+      this.#spools() && this.plan.root.op === "modify"
         ? modifySpoolBytes(this.plan.root.input.output.length)
         : 0;
     return (
@@ -820,6 +832,18 @@ export class QueryRuntime {
                 : Math.max(MAX_BLOB_BYTES, emittedRow),
           )
         : 0;
+    // A modification's spool borrows each row's step from this lane, beyond whatever the
+    // result window already holds: the lane covers one whole row on its own. Without a spool
+    // (RETURNING, an upsert, rules) nothing borrows that step.
+    const root = this.plan.root;
+    const modifyRowBytes =
+      root.op === "modify" && this.#spools()
+        ? (this.#modifyResultRow?.(binding.slotBytes ?? [], binding.largestSlot) ?? null)
+        : null;
+    const modifyRowStep =
+      modifyRowBytes === null || root.op !== "modify"
+        ? 0
+        : wideRowStepBytes(modifyRowBytes, root.input.output.length);
     const resultProgress =
       atomic && (entries.length > 0 || this.plan.root.op === "modify")
         ? Math.max(
@@ -829,6 +853,7 @@ export class QueryRuntime {
               binding.largestSlot,
               binding.slotBytes,
             ) - window,
+            modifyRowStep,
           )
         : 0;
     const prefix = `query#${String(this.request.queryId)}`;

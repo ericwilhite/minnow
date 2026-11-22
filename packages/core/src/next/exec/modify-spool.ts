@@ -11,6 +11,12 @@ import { sortRowView, SORT_ROW_VIEW_BYTES } from "./sort-row.js";
 import { pushAndWait, type Operator, type Transfer } from "./pipeline.js";
 
 export const modifySpoolBytes = (columns: number): number => 262144 + columns * 8192;
+/** The pool step one wide row takes in `#append`: its encoded page twice (the page and its
+ * copy) and a working page. The statement's result progress lane is sized from it (run.ts). */
+export function wideRowStepBytes(valueBytes: number, columns: number): number {
+  return 2 * PageWriter.oneRowBound(valueBytes, columns) + 65536;
+}
+
 export class ModifySpool implements Operator {
   readonly #pool: Pool;
   readonly #files: SpillFiles;
