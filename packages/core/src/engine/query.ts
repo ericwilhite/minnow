@@ -15020,8 +15020,10 @@ export function bindPendingSelectShapes(
     }
 
     if (lowered.pendingSetOrder === true) {
-      const first = lowered.base.union?.blocks[0];
-      lowered.orderBy = resolveOrderByOrdinals(lowered.orderBy, first?.select ?? []);
+      lowered.orderBy = resolveOrderByOrdinals(
+        lowered.orderBy,
+        setOutputSelect(lowered.base.union?.blocks[0]),
+      );
       delete lowered.pendingSetOrder;
     }
     const aliases = block.pendingOutputAliases;
@@ -15257,6 +15259,23 @@ function mergedWildcardSelect(
   return items;
 }
 
+/**
+ * The select list naming a set-operation member's output columns. A member that is itself a
+ * compound (a leading INTERSECT chain, or a parenthesized set operation) selects `*` over its
+ * own members, and its columns are its first member's, recursively (PostgreSQL: a compound's
+ * output columns are its first leaf query's).
+ */
+function setOutputSelect(block: CompiledQuery | undefined): readonly SelectItem[] {
+  let member = block;
+  while (
+    member?.base.union !== undefined &&
+    member.select.length === 1 &&
+    member.select[0]?.expression.kind === "wildcard"
+  )
+    member = member.base.union.blocks[0];
+  return member?.select ?? [];
+}
+
 /** Wraps compound members into the set-operation source the executor folds left to right. */
 export function compoundSelectBlock(
   sql: string,
@@ -15268,7 +15287,7 @@ export function compoundSelectBlock(
   // Set-operation output columns are the first member's, so ordinals resolve against them.
   const pendingSetOrder = blocks.some(planHasPendingSelectShapes);
   if (!pendingSetOrder) {
-    tail = { ...tail, orderBy: resolveOrderByOrdinals(tail.orderBy, blocks[0]?.select ?? []) };
+    tail = { ...tail, orderBy: resolveOrderByOrdinals(tail.orderBy, setOutputSelect(blocks[0])) };
   }
   return {
     sql,
