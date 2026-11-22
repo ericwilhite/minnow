@@ -1735,9 +1735,11 @@ and the owner import it directly.
   emitted row's own copy once its minimum is over the cap (the aggregate result recipe),
   instead of the source's read envelope a second time; modifications keep their envelope.
   `testing/wide-row-read-need.test.ts` holds key reads beside and of wide rows to an
-  independently derived need. A one-row read of a resident, unretained memtable chunk still
-  funds the format's worst-case metadata of a publication that may happen first
-  (`MEMORY_READ_RESIDENT_BYTES`).
+  independently derived need. When a key read's selected rows lie in one memtable chunk, sizing
+  retains that chunk up front (`QueryRuntime.retainSourceRow`, `prepareRead({ locator })`): the
+  read sizes and executes over the retained chunk, and funds no publication it would not read
+  (`MEMORY_READ_RESIDENT_BYTES`). A publication meanwhile lends the chunk's columns, charged to
+  the write owner, until the query ends (`testing/retained-key-read.test.ts`).
 - Caches are evicted before anything spills. Several may register (the space's page cache, the
   decoded directory and metadata caches, the inflated-page cache); eviction takes the entry unused
   longest across all of them (`oldestUnusedAt`).

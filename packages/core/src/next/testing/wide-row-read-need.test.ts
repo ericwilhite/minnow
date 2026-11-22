@@ -28,11 +28,7 @@
  * - at 64 MiB, copying a 6 MiB value is refused with a typed 53200 (the write path's memtable,
  *   25,178,288 bytes).
  * - named remaining terms of a one-row read's admission:
- *   - a memtable read that fits without the over-cap retry funds the metadata of a publication
- *     that may happen before it opens: the format's worst case, `MEMORY_READ_RESIDENT_BYTES`
- *     (19,279,872 bytes); its real peak beside a 6 MiB value is about 2.8 MB. Fix 4 retains the
- *     chunk instead;
- *   - such a fitting read also keeps its result step's source envelope (four copies of the row's
+ *   - a memtable read that fits without the over-cap retry keeps its result step's source envelope (four copies of the row's
  *     values, less the window), because fix 2 applies over the cap only;
  *   - a stored read bound counts a selected large value four times (`4 * values`), while its fetch
  *     allocates two: `2 x` the value (38,203,972 admitted, 18,975,756 real peak, for 6 MiB). The
@@ -52,7 +48,6 @@ import { afterAll, beforeAll, expect, it } from "vitest";
 import { Governor } from "../memory/governor.js";
 import { MinnowDatabaseClient } from "../owner/database-client.js";
 import { MAX_READ_BYTES } from "../storage/extents.js";
-import { MEMORY_READ_RESIDENT_BYTES } from "../write/memory-read.js";
 import { publicOwner } from "./public-owner.test.fixture.js";
 
 const KiB = 1 << 10,
@@ -254,20 +249,12 @@ it.each(cases)(
           expect(refused.bytes, "a refusal only above the cap").toBeGreaterThan(refused.capacity);
         } else expect(outcome).toEqual(read.expected);
         // Named remaining terms (Limits), not a blanket allowance:
-        // - a memtable read that fit without the over-cap retry funds the resident envelope of a
-        //   publication that may happen first (`MEMORY_READ_RESIDENT_BYTES`; fix 4 retains the
-        //   chunk instead);
         // - a query that fits keeps its result step's source envelope, four copies of the row's
         //   values (fix 2 applies over the cap only, so fitting queries size as before);
         // - a stored read bound counts a selected large value four times, its fetch allocates two
         //   (`2 x` that value; the stored selected-value factor, a follow-up).
         const allowed =
-          derived +
-          (stored === true
-            ? read.rowBytes === row
-              ? 2 * width
-              : 0
-            : MEMORY_READ_RESIDENT_BYTES + 4 * read.rowBytes);
+          derived + (stored === true ? (read.rowBytes === row ? 2 * width : 0) : 4 * read.rowBytes);
         if (read.byKey === true && Array.isArray(outcome)) {
           expect(holdings.peak, `${read.sql}: its holdings were measured`).toBeGreaterThan(0);
           expect(holdings.peak, `${read.sql}: holds no more than its need`).toBeLessThanOrEqual(

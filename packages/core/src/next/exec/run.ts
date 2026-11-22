@@ -486,6 +486,61 @@ export class QueryRuntime {
     return next();
   }
 
+  /**
+   * Retains, up front, the memtable chunk holding a key read's selected row (`locator`), so the
+   * read reads that resident data even if the memtable publishes before it opens, and its sizing
+   * funds no publication it will never read (write/memory-read.ts: a retained chunk has no resident
+   * envelope). The same retained source serves sizing and execution (`sourceView`) and is released
+   * at query end. Only the recipe's control is charged here (the chunk stays charged to the write
+   * owner). False when the row is not in an unpublished memtable chunk.
+   */
+  retainSourceRow(tableId: number, locator: number): MaybePromise<boolean> {
+    if (this.#sourceRecipes.has(tableId)) return false;
+    const install = (table: TableSnapshot): MaybePromise<boolean> => {
+      this.signal.throwIfAborted();
+      if (this.#closed) throw new QueryCancelledError();
+      if (!table.prepareRead) return false;
+      const options = {
+        label: `query#${String(this.request.queryId)}/source-recipe`,
+        minimumBytes: 8192 + 1024 + table.columns.length * 16,
+        spillable: false,
+      };
+      const bind = (grant: Grant): boolean => {
+        try {
+          this.signal.throwIfAborted();
+          const recipe = table.prepareRead?.({ budget: grant, locator });
+          if (!recipe) {
+            grant.close();
+            return false;
+          }
+          this.#meter(grant, undefined);
+          this.#sourceRecipes.set(tableId, {
+            table: recipe.table,
+            close: () => {
+              try {
+                recipe.close();
+              } finally {
+                grant.close();
+              }
+            },
+          });
+          return true;
+        } catch (error) {
+          grant.close();
+          throw error;
+        }
+      };
+      const grant = this.governor.tryAdmit(options);
+      return grant === null
+        ? this.governor.admit({ ...options, signal: this.signal }).then(bind)
+        : bind(grant);
+    };
+    const table = this.view.table(tableId, {
+      budget: { allocate: () => false, free: () => undefined },
+    });
+    return table instanceof Promise ? table.then(install) : install(table);
+  }
+
   table(id: number, budget: ByteBudget): MaybePromise<TableSnapshot> {
     const wrap = (table: TableSnapshot) =>
       readTable(
@@ -1060,13 +1115,25 @@ export class QueryRuntime {
       };
       return bound instanceof Promise ? bound.then(installed) : installed(bound);
     };
-    return admitted instanceof Promise
-      ? admitted.then((grants) => {
-          this.#wait += performance.now() - started;
-          return install(grants);
-        })
-      : install(admitted);
+    const reserved =
+      admitted instanceof Promise
+        ? admitted.then((grants) => {
+            this.#wait += performance.now() - started;
+            return install(grants);
+          })
+        : install(admitted);
+    const after = QueryRuntime.afterReservation;
+    if (after === null) return reserved;
+    const queryId = this.request.queryId;
+    return reserved instanceof Promise ? reserved.then(() => after(queryId)) : after(queryId);
   }
+
+  /**
+   * Test-only: awaited after a query's reservation is installed and before it executes, with its
+   * query id. Lets a test change the database between a query's sizing and its reads (a memtable
+   * publication beside a retained source). Null in production.
+   */
+  static afterReservation: ((queryId: number) => Promise<void>) | null = null;
 
   constructor(
     readonly plan: PhysicalPlan,

@@ -94,6 +94,7 @@ import {
 import type { ByteCharge } from "../vector/varlen.js";
 import { samePhysicalType, type PhysicalType } from "../types.js";
 import { BATCH_ROWS, type Batch, type Selection, type Vector } from "../vector/vector.js";
+import { locatorPosition, locatorSegment } from "../vector/locator.js";
 import { int64At } from "../vector/int64.js";
 import { HybridAggregateOperator, closeHybridPhase, type HybridPhase } from "./agg/hybrid.js";
 import { RestoredAggregateOperator, restoredMinimum, restoredLoans } from "./agg/restored.js";
@@ -4522,6 +4523,17 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
             if (found !== null) {
               held.push(found);
               named.set(source.id, found);
+              // A read's selected rows in one memtable chunk: retain that chunk up front, so the
+              // read never funds the metadata of a publication it would not read (run.ts
+              // `retainSourceRow`). Modifications keep the writer's own memtables unborrowed.
+              const first = found.locators?.[0];
+              if (
+                plan.root.op !== "modify" &&
+                first !== undefined &&
+                found.locators !== undefined &&
+                oneChunk(found.locators)
+              )
+                yield* readValue(runtime.retainSourceRow(source.tableId, first));
             }
             const segments = selection(found ?? undefined);
             const bound: ReadBound = yield* readValue(sizeMain(found ?? undefined));
@@ -4954,4 +4966,16 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
     });
   };
   return fts.wrap(program, () => nextPhysicalId++);
+}
+
+/** Whether ascending `locators` all lie in one segment's one memory chunk (`BATCH_ROWS` rows). */
+function oneChunk(locators: Float64Array): boolean {
+  const first = locators[0],
+    last = locators[locators.length - 1];
+  if (first === undefined || last === undefined) return false;
+  return (
+    locatorSegment(first) === locatorSegment(last) &&
+    Math.floor(locatorPosition(first) / BATCH_ROWS) ===
+      Math.floor(locatorPosition(last) / BATCH_ROWS)
+  );
 }
