@@ -8,7 +8,12 @@ import { freshDatabaseIdentity, nextDatabaseIdentity } from "../format/database-
 import { indexKeyKind } from "../keys/key-encoding.js";
 import { MemtableMemoryError } from "./bytes.js";
 import { SnapshotIndexes } from "./snapshot-index.js";
-import { MemoryAdmissionError, type MemoryGovernor } from "../memory/governor.js";
+import {
+  holderChain,
+  MemoryAdmissionError,
+  type Grant,
+  type MemoryGovernor,
+} from "../memory/governor.js";
 import {
   SnapshotReplay,
   SnapshotSourcePrefix,
@@ -258,14 +263,22 @@ export async function loadSnapshot(
         minimum + retained,
         governor.capBytes,
       );
-    const [grant] = await governor.admitGroup({
-      label: "portable snapshot load",
-      // Retained input (counted in `retained`) stays held through this wait.
-      ...(retained > 0 ? { holdsCredit: true } : {}),
-      includesProgress: true,
-      grants: [{ label: "snapshot complete step", minimumBytes: minimum, spillable: false }],
-      ...(options.signal === undefined ? {} : { signal: options.signal }),
-    });
+    // Retained input (counted in `retained`) stays held through this wait. A load replaces the
+    // database while no writing transaction is open: an owner holder chain.
+    const chain = retained > 0 ? holderChain(governor, "portable snapshot load") : undefined;
+    let grants: readonly Grant[];
+    try {
+      grants = await governor.admitGroup({
+        label: "portable snapshot load",
+        ...(chain === undefined ? {} : { holdsCredit: chain }),
+        includesProgress: true,
+        grants: [{ label: "snapshot complete step", minimumBytes: minimum, spillable: false }],
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+      });
+    } finally {
+      chain?.close();
+    }
+    const [grant] = grants;
     if (grant === undefined) throw new TypeError("Missing snapshot load grant");
     let shortfall: { bytes: number; required: number } | undefined;
     const budget: ByteBudget = {

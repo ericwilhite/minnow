@@ -5,6 +5,7 @@ import {
   Governor,
   GovernorStallError,
   GrowthObserverReentryError,
+  holderChain,
   MemoryAdmissionError,
   type Grant,
 } from "../memory/governor.js";
@@ -67,7 +68,12 @@ it("re-checks priority after a reclaim callout: a holder queued during it is ser
   base.onReclaimRequest(() => {
     if (holder) return;
     holder = governor
-      .admit({ label: "holder", minimumBytes: 1, spillable: false, holdsCredit: true })
+      .admit({
+        label: "holder",
+        minimumBytes: 1,
+        spillable: false,
+        holdsCredit: holderChain(governor, "holder"),
+      })
       .then((grant) => {
         order.push("holder");
         return grant;
@@ -163,12 +169,13 @@ it("serves an admission within the usable cap once the holder chain ahead of it 
       served = true;
       return grant;
     });
+  const chain = holderChain(governor, "1,000-step holder chain");
   for (let i = 0; i < 1_000; i++) {
     const growth = await governor.admit({
       label: "growth",
       minimumBytes: 1,
       spillable: false,
-      holdsCredit: true,
+      holdsCredit: chain,
     });
     growth.close();
   }
@@ -198,7 +205,7 @@ describe("preparation credit interactions", () => {
       label: "holder growth",
       minimumBytes: 2 << 20,
       spillable: false,
-      holdsCredit: true,
+      holdsCredit: holderChain(governor, "holder growth"),
     });
     // 1 MiB is free, but a holder is queued: a preparation step must not be told "at once".
     expect(governor.canAdmitNow(64 << 10, false)).toBe(false);
@@ -336,7 +343,7 @@ it("reports a waiter past its hard deadline despite unrelated activity", async (
     governor
       .admitGroup({
         label: `growth ${String(i)}`,
-        holdsCredit: true,
+        holdsCredit: holderChain(governor, `growth ${String(i)}`),
         grants: [{ label: "growth", minimumBytes: 2048, spillable: false }],
       })
       .then(

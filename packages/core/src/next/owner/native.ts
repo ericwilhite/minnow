@@ -2,7 +2,7 @@
  * Replacement runs only under OwnerServer's exclusive snapshot barrier. */
 import type { StorageBackend, OwnerLease, StoreSession } from "../storage/contract.js";
 import { DATA_ALIGN } from "../storage/contract.js";
-import type { MemoryGovernor, Grant } from "../memory/governor.js";
+import { holderChain, type MemoryGovernor, type Grant } from "../memory/governor.js";
 import type { ExtentSpace } from "../storage/extents.js";
 import { openExtentSpace } from "../storage/space.js";
 import { listedRootExtents, reachableExtents } from "../format/reachable.js";
@@ -65,13 +65,19 @@ export async function openNativeOwnerEngine(
   const reopen = async () => {
     await closeStorage();
     session = await backend.open(lease);
-    startup = await governor.admit({
-      label: "native owner startup",
-      minimumBytes: 8 << 20,
-      spillable: true,
-      // The owner's scratch control grant stays held through this wait.
-      holdsCredit: true,
-    });
+    // The owner's scratch control grant stays held through this wait. Reopen is exclusive owner
+    // work (the old write path is closed): an owner holder chain.
+    const reopening = holderChain(governor, "native owner startup");
+    try {
+      startup = await governor.admit({
+        label: "native owner startup",
+        minimumBytes: 8 << 20,
+        spillable: true,
+        holdsCredit: reopening,
+      });
+    } finally {
+      reopening.close();
+    }
     space = await openExtentSpace(session, {
       reachable: listedRootExtents(),
       walk: reachableExtents(),

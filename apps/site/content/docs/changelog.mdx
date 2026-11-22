@@ -97,9 +97,18 @@ a full-text index or pending full-text state exists. A trigger body's query size
 from what its root can afford beside the writer. These changes keep the qualified SQL histories
 within 32 MiB. A native step no longer holds the writer's background-merge minimum (a native
 step never merges; a merge admits its own credit when it runs), so at 32 MiB the generated
-preparation bodies that used to be refused with 53200 now run. A body is still refused with 53200
-when its preparation together with the writer's mandatory workspace (its row and commit minimums,
-any running merge, its metadata headroom and the page cache's fixed slabs) exceeds the cap.
+preparation bodies that used to be refused with 53200 now run. A native step also no longer
+holds the writer's row minimum: it keeps the rows it is writing, its commit window, its live
+commit buffers and its metadata step. A body is still refused with 53200 when its preparation
+together with the writer's mandatory workspace (its funded row step, its commit window, any
+running merge, its metadata headroom and the page cache's fixed slabs) exceeds the cap. The
+memory governor now checks the rule that keeps this order free of deadlocks: growth from an owner
+that holds memory it cannot release names a registered holder chain. The write engine is the only
+writer chain. Exclusive owner work (startup, reopen, snapshot import) uses owner chains, and those
+may not grow while a writing transaction is open. Anything else is an internal error (XX000),
+raised before it waits. A query's ordered index scan now funds its cursor as part of the query's
+own memory admission, so the cursor never waits for memory while the query holds its other
+buffers; inside a write statement a cursor still waits as the writer's own growth.
 Unqualified native roots retain typed 0A000
 refusals. Public 0.x behavior, package entry points and stored formats are unchanged; no
 migration is required.

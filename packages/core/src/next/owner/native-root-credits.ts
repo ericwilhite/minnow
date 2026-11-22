@@ -272,8 +272,9 @@ export class NativeRootCredits {
           }));
           provisional = await this.scope.governor.admitGroup({
             label: "native root step",
-            // The root holds its retained base (bindings, rules, parameters) through this wait.
-            holdsCredit: true,
+            // The root holds its retained base (bindings, rules, parameters) through this wait,
+            // inside the writer's chain: its boundary is the writer's funding witness.
+            holdsCredit: boundary.holderChain,
             grants: delta,
             includesProgress: this.scope.includesProgress === true,
             signal: AbortSignal.any([stop, boundary.invalidated]),

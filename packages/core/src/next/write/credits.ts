@@ -2,7 +2,7 @@
  * The write owner's native accounts. A step receives already admitted credit, not a wrapper
  * allocation counter: storage may transfer a real buffer out through native takeFrom.
  */
-import type { Grant, MemoryGovernor } from "../memory/governor.js";
+import type { Grant, HolderChain, MemoryGovernor } from "../memory/governor.js";
 import { GrantClosedError, MemoryAdmissionError } from "../memory/governor.js";
 import type { MaybePromise } from "../access/key-index.js";
 import { releaseIdle } from "./budget.js";
@@ -82,13 +82,60 @@ export class WriteCredits {
     );
   }
 
-  /** A native step's own workspace is funded. It holds no merge minimum: native steps never
-   * merge, and a background merge admits its own credit when it runs. */
-  #nativeReady(): boolean {
+  /**
+   * What a native step protects (writer floors, steps 1-3): live allocations and loans; the
+   * funded row step (`protectRows`), not the writer's row minimum; the metadata step and its
+   * headroom; the commit window (`nativeCommitBytes`); an active merge's own floor. No merge
+   * minimum: a native step never merges, and a merge admits its own credit when it runs.
+   */
+  nativeProtectedBytes(metadataHeadroom = this.#metadataHeadroom): number {
     return (
-      this.rows.held >= Math.max(this.#rowMinimum, this.#rowFloor) &&
-      this.commits.held >= this.minimum.commits
+      Math.max(this.rows.allocated + this.rows.loaned, this.nativeRowFloorBytes) +
+      this.metadata.allocated +
+      Math.max(
+        this.metadata.loaned,
+        metadataHeadroom,
+        this.#commitMetadataFunding - this.metadata.allocated,
+        this.#mergeMetadataFunding - this.metadata.allocated,
+      ) +
+      this.nativeCommitBytes +
+      this.activeMergeBytes
     );
+  }
+
+  /** The funded row step a native step keeps (and recovery's scan, while recovering). */
+  get nativeRowFloorBytes(): number {
+    return Math.max(this.#rowFloor, this.#workingMinimum().rows ?? 0);
+  }
+
+  /**
+   * Commit credit a native step keeps: the commit window (`minimum.commits`) and anything more it
+   * holds, never reclaimed between native steps (as before writer floors). A native statement's
+   * commit and log frames then never grow while a competitor retains the rest of the cap
+   * (testing/referential-pressure.test.ts). Steps 2-3 first dropped it and funded the window at
+   * commit time; that regressed three referential laws, and holding it per transaction instead
+   * (the "pin") broke write-query-reclaim and writer-holder-growth. Idle reclaim between
+   * statements still returns it (`reclaimIdleForecasts`).
+   */
+  get nativeCommitBytes(): number {
+    return Math.max(
+      this.minimum.commits,
+      this.commits.held,
+      this.commits.allocated + this.commits.loaned,
+      this.#commitFunding,
+      this.#workingMinimum().commits ?? 0,
+    );
+  }
+
+  /** Commit credit no reclaim may return: an active step's window and a funded commit's. */
+  #commitFloor(): number {
+    return Math.max(this.#workingMinimum().commits ?? 0, this.#commitFunding);
+  }
+
+  /** A native step's own workspace is funded: its row step and the commit window (no row or
+   * merge minimum). */
+  #nativeReady(): boolean {
+    return this.rows.held >= this.nativeRowFloorBytes && this.commits.held >= this.minimum.commits;
   }
 
   /** Merge credit a native step must keep: an active merge's holdings and prepaid floor only. */
@@ -131,15 +178,14 @@ export class WriteCredits {
     return this.#mergeActive !== null;
   }
 
-  /** Return high-water estimates without using a live primary or merge's progress. Native
-   * steps pass 0: they hold no merge minimum (an active merge keeps its own floor). */
-  reclaimNativeStep(mergeMinimum = this.minimum.merge): void {
-    this.reclaimRows();
+  /** Return high-water estimates between native steps without using a live primary or a
+   * merge's progress: down to what a native step protects (`nativeProtectedBytes`). Commit
+   * credit is never returned here (`nativeCommitBytes`). */
+  reclaimNativeStep(): void {
+    const released =
+      releaseIdle(this.rows, this.nativeRowFloorBytes) + releaseIdle(this.merge, this.#mergeFloor);
     this.reclaimMetadata();
-    releaseIdle(
-      this.merge,
-      Math.max(this.#mergeFloor, Math.max(0, mergeMinimum - (this.#mergeActive?.held ?? 0))),
-    );
+    if (released) this.#changed?.();
   }
 
   #workingMinimum: () => Partial<WriteMinimum> = () => ({});
@@ -214,6 +260,10 @@ export class WriteCredits {
     readonly minimum: WriteMinimum,
     readonly signal: AbortSignal | undefined,
     grants: readonly Grant[],
+    /** The governor's one writer holder chain: every growth of this owner is holder growth from
+     * it (GOVERNOR-WAIT-POLICY point 6, checked by the governor). Closed with these accounts. */
+    readonly holderChain: HolderChain,
+    readonly ownsHolderChain = true,
   ) {
     const [rows, metadata, commits, merge] = grants;
     if (!rows || !metadata || !commits || !merge)
@@ -228,13 +278,41 @@ export class WriteCredits {
     if (signal?.aborted) this.#abort();
   }
 
+  /**
+   * Admits the owner minimum. The accounts open the governor's writer holder chain and close it
+   * with themselves, unless the caller passes `chain`, which it keeps owning (credits-level
+   * tests that model several owners on one governor register one owner chain each; the engine's
+   * owner claim allows one writer).
+   */
   static async open(
     governor: MemoryGovernor,
     minimum: WriteMinimum,
     signal?: AbortSignal,
     holdings?: () => number,
+    chain?: HolderChain,
   ): Promise<WriteCredits> {
     minimum = { ...minimum };
+    if (chain !== undefined)
+      return WriteCredits.#open(governor, minimum, chain, false, signal, holdings);
+    if (governor.openHolderChain === undefined)
+      throw new TypeError("Write credits need a governor that checks holder chains");
+    const own = governor.openHolderChain("write engine", "writer");
+    try {
+      return await WriteCredits.#open(governor, minimum, own, true, signal, holdings);
+    } catch (error) {
+      own.close();
+      throw error;
+    }
+  }
+
+  static async #open(
+    governor: MemoryGovernor,
+    minimum: WriteMinimum,
+    chain: HolderChain,
+    ownsChain: boolean,
+    signal?: AbortSignal,
+    holdings?: () => number,
+  ): Promise<WriteCredits> {
     // The owner's permanent holdings stay beside this minimum: above capacity together,
     // the admission could never be served.
     if (holdings !== undefined) {
@@ -246,7 +324,7 @@ export class WriteCredits {
     const grants = await governor.admitGroup({
       label: "write owner minimum",
       // The owner keeps its permanent holdings (scratch control) through this wait: holder growth.
-      ...(holdings !== undefined && holdings() > 0 ? { holdsCredit: true } : {}),
+      ...(holdings !== undefined && holdings() > 0 ? { holdsCredit: chain } : {}),
       grants: [
         { label: "write path", minimumBytes: minimum.rows, spillable: true },
         { label: "write path metadata", minimumBytes: minimum.metadata, spillable: true },
@@ -257,7 +335,7 @@ export class WriteCredits {
     });
     try {
       signal?.throwIfAborted();
-      const credits = new WriteCredits(governor, minimum, signal, grants);
+      const credits = new WriteCredits(governor, minimum, signal, grants, chain, ownsChain);
       if (holdings !== undefined) credits.bindOwnerHoldings(holdings);
       return credits;
     } catch (error) {
@@ -298,7 +376,7 @@ export class WriteCredits {
         this.metadata,
         Math.max(working.metadata ?? 0, this.#commitMetadataFunding, this.#mergeMetadataFunding),
       ) +
-      releaseIdle(this.commits, Math.max(working.commits ?? 0, this.#commitFunding)) +
+      releaseIdle(this.commits, this.#commitFloor()) +
       releaseIdle(this.merge, Math.max(this.#mergeFloor, working.merge ?? 0));
     if (released) this.#changed?.();
     return released;
@@ -446,11 +524,7 @@ export class WriteCredits {
     for (;;) {
       this.#check();
       stop.throwIfAborted();
-      if (
-        grant.held >= wanted &&
-        this.metadata.held >= metadata &&
-        (!nativeMinimum || this.#nativeReady())
-      ) {
+      if (this.#grown(grant, wanted, metadata, nativeMinimum)) {
         this.#rememberFundedMetadata(grant, wanted, metadata, funding);
         return;
       }
@@ -459,16 +533,14 @@ export class WriteCredits {
       const floors = [
         Math.max(this.#rowFloor, working.rows ?? 0),
         Math.max(working.metadata ?? 0, this.#commitMetadataFunding, this.#mergeMetadataFunding),
-        Math.max(working.commits ?? 0, this.#commitFunding),
+        this.#commitFloor(),
         Math.max(this.#mergeFloor, working.merge ?? 0),
       ];
       const desired = accounts.map((account, i) =>
         Math.max(account.allocated + account.loaned, floors[i] ?? 0),
       );
-      if (nativeMinimum) {
-        desired[0] = Math.max(desired[0] ?? 0, this.#rowMinimum);
-        desired[2] = Math.max(desired[2] ?? 0, this.minimum.commits);
-      }
+      // A native step's commit window (`#nativeReady`); its row step is already `#rowFloor`.
+      if (nativeMinimum) desired[2] = Math.max(desired[2] ?? 0, this.minimum.commits);
       desired[target] = Math.max(desired[target] ?? 0, wanted);
       desired[1] = Math.max(desired[1] ?? 0, metadata);
       // First preserve warm WAL/merge windows when immediate credit can fund
@@ -494,11 +566,7 @@ export class WriteCredits {
             if (moved > 0 && source === this.metadata) this.#trimMetadataHeadroom();
           }
         }
-        if (
-          grant.held >= wanted &&
-          this.metadata.held >= metadata &&
-          (!nativeMinimum || this.#nativeReady())
-        ) {
+        if (this.#grown(grant, wanted, metadata, nativeMinimum)) {
           this.#rememberFundedMetadata(grant, wanted, metadata, funding);
           return;
         }
@@ -566,7 +634,7 @@ export class WriteCredits {
         ...(includesProgress ? { includesProgress: true } : {}),
         // The writer holds its floors (and, inside a native step, the root its retained base)
         // through this wait and cannot release them: holder growth (GOVERNOR-WAIT-POLICY).
-        holdsCredit: true,
+        holdsCredit: this.holderChain,
         grants: accounts.map((account, i) => ({
           label: `write growth ${account.label}`,
           minimumBytes: Math.max(0, (desired[i] ?? 0) - account.held),
@@ -590,6 +658,19 @@ export class WriteCredits {
         for (const credit of credits) credit.close();
       }
     }
+  }
+
+  /**
+   * Growth is complete: the grant reached `wanted`, the metadata step is funded, and a native
+   * step's own workspace is ready. The exits of `#growTo` share this one check: callers
+   * re-prepare until a request is immediate, so an exit that resolved short would spin them.
+   */
+  #grown(grant: Grant, wanted: number, metadata: number, nativeMinimum: boolean): boolean {
+    return (
+      grant.held >= wanted &&
+      this.metadata.held >= metadata &&
+      (!nativeMinimum || this.#nativeReady())
+    );
   }
 
   #rememberFundedMetadata(
@@ -748,5 +829,6 @@ export class WriteCredits {
     this.signal?.removeEventListener("abort", this.#abort);
     for (const grant of [this.metadata, this.commits, this.merge]) grant.close();
     if (!keepRowsForReaders) this.rows.close();
+    if (this.ownsHolderChain) this.holderChain.close();
   }
 }

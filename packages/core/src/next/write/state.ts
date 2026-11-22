@@ -152,6 +152,8 @@ export class ReaderRegistry {
 /** What snapshots and readers share: the space, caches of decoded metadata, the write path's budget. */
 export interface Shared {
   readonly governor: import("../memory/governor.js").MemoryGovernor;
+  /** The write engine's holder chain: growth inside a write statement is holder growth from it. */
+  readonly holderChain: import("../memory/governor.js").HolderChain;
   readonly space: Space;
   /** The write path's own budget for resident metadata and short leases. */
   readonly budget: ByteBudget;

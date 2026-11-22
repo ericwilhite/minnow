@@ -12030,6 +12030,15 @@ export const LIFETIME_HOLDINGS_REACH = [
   "exact after publication",
 ] as const;
 
+/** A commit window funded inside a native step under pressure (writer floors steps 2-3). */
+export const NATIVE_COMMIT_FUNDING_REACH = [
+  "forecasts retired before the step",
+  "commit funded as holder growth",
+  "served ahead of an earlier admission",
+  "refused above the cap",
+  "earlier admission served afterwards",
+] as const;
+
 /** Memtable sizing summaries against one-row hints (write/memtable.ts valueSummary). */
 export const MEMORY_SIZING_SUMMARY_REACH = [
   "several chunks",

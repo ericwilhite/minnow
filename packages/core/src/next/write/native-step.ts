@@ -5,7 +5,7 @@ import type {
 } from "../access/native-write-step.js";
 import { NativeWriteStepChangedError } from "../access/native-write-step.js";
 import { TransactionStateError, WritePathClosedError } from "../access/write-path.js";
-import { MemoryAdmissionError, type MemoryGovernor } from "../memory/governor.js";
+import { MemoryAdmissionError, type HolderChain, type MemoryGovernor } from "../memory/governor.js";
 import type { ByteCharge } from "../vector/varlen.js";
 
 /** Controller, one preparing request, one witness and one cancellable wakeup. */
@@ -14,6 +14,8 @@ export const NATIVE_WRITE_STEP_BYTES = 4096;
 export interface NativeWriteStepScope {
   readonly charge: ByteCharge;
   readonly governor: MemoryGovernor;
+  /** The writer's holder chain, handed to every boundary. */
+  readonly holderChain: HolderChain;
   check(owner: object): void;
   protectedBytes(): number;
   stabilize(owner: object, rootBytes: number, capacity: number, signal: AbortSignal): Promise<void>;
@@ -28,6 +30,7 @@ class Boundary implements NativeWriteStepBoundary {
     readonly protectedWriteBytes: number,
     readonly ordinaryCapacity: number,
     readonly capacityBytes: number,
+    readonly holderChain: HolderChain,
   ) {
     this.#parent = parent;
   }
@@ -139,7 +142,7 @@ export class NativeWriteSteps {
         const bytes = scope.protectedBytes();
         if (bytes + rootBytes > capacity)
           throw new MemoryAdmissionError("native root and writer", bytes + rootBytes, capacity);
-        const boundary = new Boundary(this, bytes, ordinary, capacity);
+        const boundary = new Boundary(this, bytes, ordinary, capacity, scope.holderChain);
         this.#live = boundary;
         return boundary;
       }

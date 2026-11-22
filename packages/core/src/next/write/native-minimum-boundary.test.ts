@@ -1,10 +1,10 @@
 /**
- * A native step's minimum at the capacity boundary (writer floors step 1, review of #34). A native
- * step never merges, so its complete need is rows, commits and metadata: never the merge minimum.
- * Law: prepareNativeMinimum is served exactly when that need fits the ordinary capacity
- * (cap - reserve), whatever forecasts were retired before, and is refused with 53200 at once
- * otherwise. A merge target in the native growth (the surviving mutant the review found) over-asks
- * by the merge minimum and refuses a need that fits.
+ * A native step's minimum at the capacity boundary (writer floors, review of #34). A native step
+ * protects its live rows, the commit window and its metadata step: never the writer's row or merge
+ * minimum (it never merges; a merge admits its own credit). Law: prepareNativeMinimum is served
+ * exactly when that need fits the ordinary capacity (cap - reserve), whatever forecasts were
+ * retired before, and is refused with 53200 at once otherwise. A row or merge minimum in the
+ * native growth over-asks and refuses a need that fits.
  */
 import fc from "fast-check";
 import { expect, it } from "vitest";
@@ -17,17 +17,18 @@ const KiB = 1024;
 
 it("serves a native minimum that fits exactly after idle forecasts were retired", async () => {
   // The reviewer's history: 4 MiB, every minimum 64 KiB, forecasts retired, then a native minimum
-  // whose metadata headroom fills the ordinary capacity beside the row and commit minimums.
+  // whose metadata headroom fills the ordinary capacity beside the commit window (no row or merge
+  // minimum beside it).
   const governor = new Governor(4 << 20);
   const minimum = { rows: 64 * KiB, metadata: 64 * KiB, commits: 64 * KiB, merge: 64 * KiB };
   const credits = await WriteCredits.open(governor, minimum);
   try {
     credits.reclaimIdleForecasts();
-    const headroom = governor.capBytes - governor.reserveBytes - minimum.rows - minimum.commits;
+    const headroom = governor.capBytes - governor.reserveBytes - minimum.commits;
     await credits.prepareNativeMinimum(headroom);
     expect(credits.merge.held).toBe(0);
     expect(credits.metadata.held).toBe(headroom);
-    expect(credits.rows.held).toBeGreaterThanOrEqual(minimum.rows);
+    expect(credits.rows.held).toBe(0);
     expect(credits.commits.held).toBeGreaterThanOrEqual(minimum.commits);
   } finally {
     credits.close();
@@ -84,8 +85,9 @@ for (const seed of seedsFor("next-native-minimum-boundary", [50961, 50962]))
               credits.reclaimIdleForecasts();
               reach.reach("depleted forecasts");
             }
-            // The native need: rows, commits and metadata. Never the merge minimum.
-            const rows = Math.max(minimum.rows, liveRows),
+            // The native need: live rows, the commit window and the metadata step. No row or
+            // merge minimum.
+            const rows = liveRows,
               commits = Math.max(minimum.commits, liveCommits),
               ordinary = governor.capBytes - governor.reserveBytes;
             const headroom = ordinary - rows - commits + delta;

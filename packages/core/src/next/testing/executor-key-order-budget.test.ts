@@ -15,6 +15,7 @@ import type { PreparedPlan, ParameterValue } from "../exec/executor.js";
 import type { Snapshot } from "../access/snapshot.js";
 import { oracleRows } from "./differential-adapter.js";
 import { StorageCore } from "./storage-core.js";
+import { useDiagnosticOrderedScan } from "./key-order-diagnostic.test-support.js";
 
 it.each(seedsFor("next-key-order-parameter-admission", [0xe109, 0xe10a]))(
   "retains a fitting generic recipe when index buffers plus inputs exceed the cap (seed %i)",
@@ -226,3 +227,69 @@ it.each(seedsFor("next-key-order-parameter-admission", [0xe109, 0xe10a]))(
     }
   },
 );
+
+it("sizes an ordered scan's cursor by what it reads: a resident index fits small caps", async () => {
+  // Review of #41 (Astra): the diagnostic ordered scan funds its cursor with the query. A wholly
+  // resident index is read with the resident recipe (a small envelope); reserving the
+  // publication-wide plan instead refused 2,305 int rows at 9 and 10 MiB, which complete with a
+  // self-admitted cursor (query holdings 9,022,025 bytes, cursor 5,632). Only the query's governor
+  // is small: the write path needs more than 9 MiB to open, so it keeps its own.
+  const core = await new StorageCore().open();
+  const original = core.harness.governor;
+  await core.execute("CREATE TABLE t(id INT PRIMARY KEY, n INT)");
+  await core.execute("INSERT INTO t SELECT g, g FROM generate_series(1, 2305) g");
+  await core.harness.path.quiesce();
+  useDiagnosticOrderedScan(core);
+  const expected = Array.from({ length: 2305 }, (_, k) => ({ id: k + 1, n: k + 1 }));
+  // The publication-wide recipe's minimum for this index (planning holds nothing).
+  const pinned = core.harness.path.pin();
+  const table = core.harness.path.catalog.tableByName("t");
+  const wide = pinned
+    .index(table?.id ?? 0, table?.primaryKey ?? 0)
+    .planRange({ lower: null, upper: null }, "asc").minimumBytes;
+  pinned.release();
+  expect(wide, "the publication-wide envelope is larger").toBeGreaterThan(16 << 10);
+  try {
+    for (const mib of [8, 9, 10, 11, 12]) {
+      const governor = new Governor(mib << 20);
+      Object.defineProperty(core.harness, "governor", { value: governor, configurable: true });
+      const cursors: number[] = [];
+      const admitGroup = governor.admitGroup.bind(governor);
+      governor.admitGroup = (options) => {
+        for (const part of options.grants)
+          if (/\/indexRange#\d+\/minimum$/u.test(part.label)) cursors.push(part.minimumBytes);
+        return admitGroup(options);
+      };
+      const tryAdmit = governor.tryAdmit.bind(governor);
+      governor.tryAdmit = (options) => {
+        if (/\/indexRange#\d+\/minimum$/u.test(options.label)) cursors.push(options.minimumBytes);
+        return tryAdmit(options);
+      };
+      const outcome = await core.execute("SELECT id, n FROM t ORDER BY id").then(
+        (result) => result,
+        (error: unknown) => error,
+      );
+      if (mib >= 9) {
+        // The parent's boundary: every cap of 9 MiB and above completes.
+        expect(outcome, `${String(mib)} MiB completes`).not.toBeInstanceOf(Error);
+        expect(oracleRows(outcome as Parameters<typeof oracleRows>[0])).toEqual(expected);
+      } else if (outcome instanceof Error) {
+        // Below it only a typed refusal whose need exceeds the cap: never below the cap.
+        expect(outcome).toBeInstanceOf(MemoryAdmissionError);
+        const refused = outcome as MemoryAdmissionError;
+        expect(refused.bytes).toBeGreaterThan(refused.capacity);
+      }
+      // The resident recipe, not the publication-wide envelope, wherever the query ran.
+      if (mib >= 9) {
+        expect(cursors, "no publication-wide cursor envelope").not.toContain(wide);
+        expect(
+          cursors.some((bytes) => bytes < 16 << 10),
+          "the cursor's resident envelope",
+        ).toBe(true);
+      }
+    }
+  } finally {
+    Object.defineProperty(core.harness, "governor", { value: original, configurable: true });
+    await core.close();
+  }
+});

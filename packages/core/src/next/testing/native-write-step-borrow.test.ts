@@ -132,8 +132,49 @@ for (const seed of seedsFor("next-native-write-owner-borrow", [0xb711, 0xb712]))
             });
             if (order === "self") {
               expect(borrowed).toBe(0);
-              const rootBytes = before.capacityBytes - before.protectedWriteBytes + 512;
+              // Law (GOVERNOR-WAIT-POLICY, intrinsic refusal): a request is refused at once exactly
+              // when it exceeds what can be granted beside the step, never below it. What the step
+              // keeps depends on the request (writer floors keep no row or commit minimum, and a
+              // funded step settles its own headroom), so the boundary is found, not assumed: the
+              // largest request the step serves, by bisection over the capacity. It is never below
+              // what a stabilized boundary showed free; one byte above it is the refusal checked.
+              const capacity = before.capacityBytes;
+              let floor = before.protectedWriteBytes;
               before.release();
+              for (;;) {
+                const probe = await s.prepareNativeStep(0, stop.signal, { includesProgress: true });
+                const protectedBytes = probe.protectedWriteBytes;
+                probe.release();
+                if (protectedBytes >= floor) break;
+                floor = protectedBytes;
+              }
+              let served = 0,
+                refused = capacity + 1;
+              while (refused - served > 1) {
+                const mid = Math.floor((served + refused) / 2);
+                const fits = await s
+                  .prepareNativeStep(mid, stop.signal, { includesProgress: true })
+                  .then(
+                    (boundary) => {
+                      boundary.release();
+                      return true;
+                    },
+                    (error: unknown) => {
+                      expect(error).toMatchObject({
+                        code: "MINNOW_MEMORY_ADMISSION",
+                        sqlState: "53200",
+                      });
+                      return false;
+                    },
+                  );
+                if (fits) served = mid;
+                else refused = mid;
+              }
+              expect(
+                served,
+                "never refused below what the step showed free",
+              ).toBeGreaterThanOrEqual(capacity - floor);
+              const rootBytes = refused;
               let attempts = 0;
               const reclaim = Reflect.get(WriteCredits.prototype, "reclaimNativeStep");
               reclaimSpy = vi

@@ -66,7 +66,7 @@ import {
   type WireFlat,
 } from "../exec/result.js";
 import { RequestLedger } from "../format/ledger.js";
-import type { Grant } from "../memory/governor.js";
+import type { Grant, HolderChain } from "../memory/governor.js";
 import type { OutputColumn, PhysicalPlan, Rel, ScalarExpr } from "../ir/ir.js";
 import { MemoryCatalog } from "../lower/memory-catalog.js";
 import type {
@@ -245,6 +245,11 @@ class StandinTransaction {
 
   get catalog(): CatalogView {
     return catalogOf(this.working);
+  }
+
+  /** The stand-in has no governor, so nothing grows as a holder inside it. */
+  get holderChain(): HolderChain {
+    throw new TypeError("The stand-in write path has no holder chain");
   }
 
   statement(options: StatementOptions): Statement {

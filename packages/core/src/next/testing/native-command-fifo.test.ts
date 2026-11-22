@@ -31,9 +31,7 @@ it("serves a native root's step before an earlier foreign request only its relea
       await core.execute(sql);
     const lowered = core.lowerer.lower("UPDATE p SET n = 7 WHERE id <= 2", core.context());
     if (lowered.kind !== "modify") throw new Error("modify plan required");
-    // What the idle engine keeps between statements; the foreign request fits beside it only.
-    const baseline = governor.usedBytes;
-    const want = governor.capBytes - governor.reserveBytes - baseline - (64 << 10);
+    let want = 0;
     // eslint-disable-next-line @typescript-eslint/unbound-method -- Called with this below.
     const source = NativeRootCredits.prototype.prepareSource;
     vi.spyOn(NativeRootCredits.prototype, "prepareSource").mockImplementation(function (
@@ -42,10 +40,13 @@ it("serves a native root's step before an earlier foreign request only its relea
       signal,
     ) {
       if (foreign === null) {
-        // The root holds its retained base now; queue a request only its release can serve.
-        expect(governor.usedBytes + want).toBeGreaterThan(
-          governor.capBytes - governor.reserveBytes,
-        );
+        // The root holds its retained base now; queue a request only its release can serve: one
+        // KiB more than is free at this moment (a native step keeps no idle forecasts since writer
+        // floors steps 2-3, so the request is sized from what is held now, not from the idle
+        // baseline), and servable once the root releases (within the usable capacity: the idle
+        // writer's forecasts are reclaimable then).
+        want = governor.capBytes - governor.reserveBytes - governor.usedBytes + 1024;
+        expect(want).toBeLessThanOrEqual(governor.usableCapacity());
         foreign = governor
           .admitGroup({
             label: "foreign whole",

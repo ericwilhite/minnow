@@ -189,7 +189,7 @@ import type { ChangeFeed } from "./changes.js";
 import type { MaybePromise } from "./key-index.js";
 import type { CommitFrameBody } from "../format/log-frame.js";
 import type { RequestLedger } from "../format/ledger.js";
-import type { MemoryGovernor } from "../memory/governor.js";
+import type { HolderChain, MemoryGovernor } from "../memory/governor.js";
 import type { StoreSession } from "../storage/contract.js";
 import type { StatValue } from "../types.js";
 import type { Int64Values } from "../vector/vector.js";
@@ -271,6 +271,9 @@ export interface WritePath {
 export interface WriteTransaction {
   /** The LSN this transaction's statements read from (`appliedLsn` at begin). */
   readonly baseLsn: number;
+  /** The writer's holder chain: growth inside this transaction while it holds credit it cannot
+   * release is holder growth from it (GOVERNOR-WAIT-POLICY point 6, checked by the governor). */
+  readonly holderChain: HolderChain;
   /** Committed catalog plus this transaction's DDL. */
   readonly catalog: CatalogView;
   readonly state: "open" | "committing" | "committed" | "rolledBack" | "failed";

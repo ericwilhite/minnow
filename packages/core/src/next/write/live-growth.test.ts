@@ -17,7 +17,7 @@ import {
   WRITE_RELEASABLE_HOLDER_REACH,
   WRITE_RETAINED_MERGE_REACH,
 } from "../../testing/reach.js";
-import { Governor, MemoryAdmissionError, type Grant } from "../memory/governor.js";
+import { Governor, holderChain, MemoryAdmissionError, type Grant } from "../memory/governor.js";
 import { yieldTask } from "../task.js";
 import { WriteCredits } from "./credits.js";
 
@@ -67,7 +67,15 @@ for (const seed of seedsFor("next-write-live-growth", [47301, 47302]))
           onTestFinished(close);
           try {
             for (let i = 0; i < count; i++) {
-              const owner = await WriteCredits.open(governor, minimum);
+              // Several write owners on one governor (the engine's claim allows one writer): each
+              // registers an owner holder chain, so its growth is checked holder growth.
+              const owner = await WriteCredits.open(
+                governor,
+                minimum,
+                undefined,
+                undefined,
+                holderChain(governor, `owner ${String(i)}`),
+              );
               owner.rows.onReclaimRequest(() => owner.reclaimRows());
               owner.metadata.onReclaimRequest(() => owner.reclaimMetadata());
               // Spill: the rows leave memory (here a checksum stands for the written run).

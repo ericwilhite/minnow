@@ -1638,7 +1638,26 @@ and the owner import it directly.
   queued admissions. `Governor.observeGrants` reports each grant synchronously with the queues at
   that moment, so suites check the serving order itself. The writer and a native root
   cannot wait on each other (one writer per governor; a native root queues its own step only after
-  the writer's step has settled). Readers are not holders: query preparation waits only while holding
+  the writer's step has settled). Holder chains never wait on each other, and the governor checks
+  it (policy point 6, the holder-chain invariant). `holdsCredit` names a registered
+  `HolderChain`, never a bare flag. The write engine is the governor's one `"writer"` chain. A
+  native root, the write index range cursor and an identity migration grow inside it (a root
+  through its step boundary, the others through their transaction or statement view). Exclusive
+  owner work (boot, reopen, snapshot import) uses short-lived `"owner"` chains. Holder growth that
+  names no open chain of the governor, or that comes from an owner chain while the writer chain
+  has a writing transaction open, raises `HolderChainInvariantError` (XX000) before it queues.
+  A read snapshot's index range cursor never queues: a cursor cannot see its caller's grants, so
+  its caller funds it atomically with its own admission. The ordered scan, admitted or not,
+  opens its cursor on a grant of the query's complete admission, sized by what the cursor will
+  read: `prepareResidentRange` for a wholly resident index (a small envelope), `planRange` when
+  it can reach published runs. A bare `range()` cursor takes only credit granted at once and
+  otherwise raises the same error before anything queues. Holder priority has no aging: a new
+  admission waiting behind the writer's holder growth is served once the writer's holdings
+  become reclaimable (its rows freed, its transaction ended), not merely when a statement ends
+  (`testing/read-cursor-admission.test.ts`).
+  The case this rules out: a foreign
+  holder whose growth fits only once the writer's rows are released, queued ahead of the writer's
+  commit, with neither able to move. Test: `testing/holder-chain-invariant.test.ts`. Readers are not holders: query preparation waits only while holding
   nothing (the preparation credit, below), since readers each retaining a source recipe while
   waiting could otherwise wait on each other. Policy: `holdsCredit` and `registerPermanent` in
   `memory/governor.ts`; tests: `memory/holder-priority.test.ts`,

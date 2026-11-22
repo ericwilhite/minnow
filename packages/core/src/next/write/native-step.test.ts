@@ -43,12 +43,14 @@ for (const seed of seedsFor("next-native-write-owner-credit", [0xb715, 0xb716]))
               },
               scope = {
                 governor,
+                holderChain: credits.holderChain,
                 check: (s: object) => {
                   expect(s).toBe(owner);
                 },
-                // The engine's native protocol (write/engine.ts): a native step never merges, so it
-                // protects and keeps no merge minimum; an active merge keeps its own floor.
-                protectedBytes: () => credits.protectedBytes(0),
+                // The engine's native protocol (write/engine.ts, writer floors): a native step
+                // protects its row step and the commit window, no row or merge minimum; an active
+                // merge keeps its own floor.
+                protectedBytes: () => credits.nativeProtectedBytes(),
                 stabilize: async () => {
                   if (pressure.buffer) {
                     credits.metadata.free(pressure.buffer.byteLength);
@@ -56,7 +58,7 @@ for (const seed of seedsFor("next-native-write-owner-credit", [0xb715, 0xb716]))
                     steps?.changed();
                   }
                   await credits.prepareNativeMinimum(nextHeadroom, stop.signal, privateProgress);
-                  credits.reclaimNativeStep(0);
+                  credits.reclaimNativeStep();
                   if (!pressure.injected) {
                     pressure.injected = true;
                     // Change lands between native preparation and witness publication.
@@ -127,6 +129,8 @@ for (const seed of seedsFor("next-native-write-owner-credit", [0xb715, 0xb716]))
             expect(credits.metadata.held).toBe(metadata + headroom);
             // Active: the merge's credit moved to its own grant. Idle: the forecast is reclaimed.
             expect(credits.merge.held).toBe(0);
+            // The commit window stays with the native step.
+            expect(credits.commits.held).toBe(minimum.commits);
             primary.check();
             expect(rows[0]).toBe(61);
             expect(meta[0]).toBe(73);

@@ -181,6 +181,7 @@ import {
   indexReadTarget,
   admittedIndexMinimums,
   planIndexRange,
+  legacyCursorMinimum,
   runIndexOrder,
   windowSegments,
   type IndexShape,
@@ -1365,6 +1366,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
             fetch: rel,
             restore: { id: nextPhysicalId++, op: "sort", profileAs: rel },
             descending: rel.descending,
+            cursor: { id: nextPhysicalId++, op: "indexRange", profileAs: rel },
           };
           const placeholders = indexMinimums(shape, 1);
           for (let i = 0; i < placeholders.length; i++) {
@@ -1372,6 +1374,14 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
             if (!entry) throw new Error("index minimum");
             fixed(entry.rel, (cap) => indexMinimums(shape, cap)[i]?.minimum ?? 0, rel.id);
           }
+          // Its cursor joins the query's complete admission (key-order.ts `IndexShape.cursor`).
+          const cursor = shape.cursor;
+          if (cursor)
+            fixed(
+              cursor,
+              (_cap, runtime) => legacyCursorMinimum(runtime, shape, rel.indexId),
+              rel.id,
+            );
           return (runtime, sink, stops, demand) =>
             runIndexOrder(runtime, sink, shape, rel.indexId, null, 0, demand, () =>
               stops.some((stop) => stop()),

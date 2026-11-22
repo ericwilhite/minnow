@@ -468,6 +468,8 @@ it.each(
   },
 );
 
+// A statement view's cursor (writer-chain holder growth) waits at admission; a read snapshot's
+// never queues (reviews of #41; testing/read-cursor-admission.test.ts).
 it.each([false, true])("waits at admission and can close the wait (%s)", async (cancel) => {
   const h = new Harness("strict", "memory"),
     p = await h.open();
@@ -486,8 +488,10 @@ it.each([false, true])("waits at admission and can close the wait (%s)", async (
     // Finish asynchronous publication/reclamation before filling ordinary credit.
     // Otherwise its legitimate release can admit the cursor during the next task.
     await p.quiesce();
-    const view = p.pin(),
-      reader = view.index(t, p.catalog.table(t)?.primaryKey ?? 0);
+    const tx = await p.begin(),
+      statement = tx.statement({ rules }),
+      view = { release: () => tx.rollback() },
+      reader = statement.view.index(t, p.catalog.table(t)?.primaryKey ?? 0);
     // Drain cooperative reclaim/cache eviction first. Filling a snapshot of free
     // credit alone is not pressure: the cursor may legitimately reclaim more. The largest
     // servable request (GOVERNOR-WAIT-POLICY: `cap - reserve` less the writer's registered

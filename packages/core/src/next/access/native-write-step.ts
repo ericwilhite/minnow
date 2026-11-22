@@ -1,5 +1,8 @@
 /** A native owner funding boundary, never a row/image borrow or a commit. */
 export interface NativeWriteStepBoundary {
+  /** The writer's holder chain: a root funded under this boundary grows inside it
+   * (GOVERNOR-WAIT-POLICY point 6, checked by the governor). */
+  readonly holderChain: import("../memory/governor.js").HolderChain;
   /** Native writer accounts plus non-evictable extent-storage slabs/metadata,
    * counted once after representation relief. Excludes temporary foreign cache/read pressure. */
   readonly protectedWriteBytes: number;

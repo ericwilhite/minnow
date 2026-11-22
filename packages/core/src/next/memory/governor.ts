@@ -59,9 +59,49 @@ export interface AdmitOptions {
   readonly spillable: boolean;
   /** Cancels a pending admission (rejects with the signal's reason; nothing is held). */
   readonly signal?: AbortSignal;
-  /** The caller holds credit it cannot release until this is served: holder growth
-   * (see NativeGrantGroupOptions.holdsCredit). */
-  readonly holdsCredit?: boolean;
+  /** The caller holds credit it cannot release until this is served: holder growth from this
+   * chain (see NativeGrantGroupOptions.holdsCredit). */
+  readonly holdsCredit?: HolderChain;
+}
+
+/**
+ * A registered holder chain (GOVERNOR-WAIT-POLICY point 6, checked): the only source of holder
+ * growth. Holder priority is deadlock-free because holder chains never wait on each other: the
+ * write engine is the one `"writer"` chain per governor (a native root, the write index range
+ * cursor and an identity migration grow inside it), and an `"owner"` chain is exclusive owner
+ * work (startup, reopen, snapshot import) that runs while no writing transaction is open. The
+ * governor enforces both: holder growth names an open chain of this governor, and an owner
+ * chain's growth while the writer chain has a writing transaction open is an invariant error
+ * (`HolderChainInvariantError`), never a queued wait.
+ */
+export interface HolderChain {
+  readonly label: string;
+  readonly kind: "writer" | "owner";
+  /** Writer chain only: a writing transaction is open (set by the write engine). */
+  transactionOpen: boolean;
+  /** Ends the chain; its later holder growth is an invariant error. Idempotent. */
+  close(): void;
+}
+
+/** Opens an owner holder chain on `governor`, which must check holder chains (a `Governor`). */
+export function holderChain(governor: MemoryGovernor, label: string): HolderChain {
+  if (governor.openHolderChain === undefined)
+    throw new TypeError(`Holder growth "${label}" needs a governor that checks holder chains`);
+  return governor.openHolderChain(label, "owner");
+}
+
+/** Holder growth outside the checked holder-chain invariant (GOVERNOR-WAIT-POLICY point 6): a
+ * programming error in the caller, raised before anything queues. */
+export class HolderChainInvariantError extends Error {
+  readonly code = "MINNOW_HOLDER_CHAIN_INVARIANT";
+  readonly sqlState = "XX000";
+  constructor(
+    readonly label: string,
+    reason: string,
+  ) {
+    super(`Holder growth "${label}" ${reason} (GOVERNOR-WAIT-POLICY point 6)`);
+    this.name = "HolderChainInvariantError";
+  }
 }
 
 /**
@@ -147,6 +187,11 @@ export interface MemoryGovernor {
    * registrations change. Returns the unregistration. Optional for wrapping governors.
    */
   registerPermanent?(bytes: () => number): () => void;
+  /**
+   * Registers a holder chain (`HolderChain`): at most one `"writer"` chain is open per governor.
+   * Optional for wrapping governors, which forward holder growth to the governor that checks it.
+   */
+  openHolderChain?(label: string, kind: HolderChain["kind"]): HolderChain;
   /** Moves idle ordinary credit within this owner. No allocation or global admission occurs. */
   transferCredit(source: Grant, target: Grant, bytes: number): boolean;
   /**
@@ -183,11 +228,12 @@ export interface NativeGrantGroupOptions {
   readonly includesProgress?: boolean;
   /**
    * The caller holds credit it cannot release until this is served (a native root's retained
-   * base; the writer's floors inside a native step). Such holder growth is served before every
-   * queued new admission, as soon as it fits (FIFO among holders), so a holder never waits behind
-   * a request that only its own release could serve. Set explicitly; never inferred.
+   * base; the writer's floors inside a native step): holder growth from this registered chain.
+   * It is served before every queued new admission, as soon as it fits (FIFO among holders), so a
+   * holder never waits behind a request that only its own release could serve. Set explicitly;
+   * never inferred. The chain is checked (`HolderChain`).
    */
-  readonly holdsCredit?: boolean;
+  readonly holdsCredit?: HolderChain;
 }
 
 export class ValueTooLargeError extends Error {
@@ -522,6 +568,40 @@ export class Governor implements MemoryGovernor {
    * progress: a waiter has stalled only if no grant anywhere changed during the window. */
   activity = 0;
   readonly #permanent = new Set<() => number>();
+  readonly #chains = new Set<HolderChain>();
+  #writerChain: HolderChain | null = null;
+
+  openHolderChain(label: string, kind: HolderChain["kind"]): HolderChain {
+    this.assertMutable();
+    if (kind === "writer" && this.#writerChain !== null)
+      throw new HolderChainInvariantError(label, "opens a second writer chain on this governor");
+    const chains = this.#chains;
+    const chain: HolderChain = {
+      label,
+      kind,
+      transactionOpen: false,
+      close: () => {
+        chains.delete(chain);
+        chain.transactionOpen = false;
+        if (this.#writerChain === chain) this.#writerChain = null;
+      },
+    };
+    chains.add(chain);
+    if (kind === "writer") this.#writerChain = chain;
+    return chain;
+  }
+
+  /** The checked holder-chain invariant (GOVERNOR-WAIT-POLICY point 6). */
+  #checkHolder(label: string, chain: HolderChain): void {
+    if (!this.#chains.has(chain))
+      throw new HolderChainInvariantError(label, "names no open holder chain of this governor");
+    if (chain.kind !== "writer" && this.#writerChain?.transactionOpen === true)
+      throw new HolderChainInvariantError(
+        label,
+        `grows in ${chain.kind} chain "${chain.label}" while the writer chain ` +
+          `"${this.#writerChain.label}" has a writing transaction open`,
+      );
+  }
 
   registerPermanent(bytes: () => number): () => void {
     this.assertMutable();
@@ -1073,6 +1153,7 @@ export class Governor implements MemoryGovernor {
 
   async admit(options: AdmitOptions): Promise<Grant> {
     this.assertMutable();
+    if (options.holdsCredit !== undefined) this.#checkHolder(options.label, options.holdsCredit);
     if (options.minimumBytes > this.usableCapacity(false))
       throw new MemoryAdmissionError(
         options.label,
@@ -1080,7 +1161,7 @@ export class Governor implements MemoryGovernor {
         this.usableCapacity(false),
       );
     return this.#enqueue(
-      options.holdsCredit === true ? this.#holders : this.#admissions,
+      options.holdsCredit !== undefined ? this.#holders : this.#admissions,
       {
         bytes: options.minimumBytes,
         loan: false,
@@ -1094,6 +1175,7 @@ export class Governor implements MemoryGovernor {
 
   async admitGroup(options: NativeGrantGroupOptions): Promise<readonly Grant[]> {
     this.assertMutable();
+    if (options.holdsCredit !== undefined) this.#checkHolder(options.label, options.holdsCredit);
     const { label, signal, includesProgress } = options;
     // Copy before waiting: the caller cannot change the named minima after admission queues.
     const parts = options.grants.map(({ label, minimumBytes, spillable }) => ({
@@ -1136,7 +1218,7 @@ export class Governor implements MemoryGovernor {
       return grants;
     }
     const admitted = await this.#enqueue(
-      options.holdsCredit === true ? this.#holders : this.#admissions,
+      options.holdsCredit !== undefined ? this.#holders : this.#admissions,
       {
         bytes: total,
         loan: false,

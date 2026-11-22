@@ -3,7 +3,7 @@ import fc from "fast-check";
 import { expect, it, onTestFinished } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach, WRITE_STEP_CONCURRENCY_REACH } from "../../testing/reach.js";
-import { Governor, type Grant } from "../memory/governor.js";
+import { Governor, holderChain, type Grant } from "../memory/governor.js";
 import { yieldTask } from "../task.js";
 import { WriteCredits } from "./credits.js";
 
@@ -65,7 +65,15 @@ for (const seed of seedsFor("next-write-step-concurrency", [47201, 47202]))
           onTestFinished(close);
           try {
             for (let i = 0; i < count; i++) {
-              const owner = await WriteCredits.open(governor, minimum);
+              // Several write owners on one governor (the engine's claim allows one writer): each
+              // registers an owner holder chain, so its growth is checked holder growth.
+              const owner = await WriteCredits.open(
+                governor,
+                minimum,
+                undefined,
+                undefined,
+                holderChain(governor, `owner ${String(i)}`),
+              );
               owner.rows.onReclaimRequest(() => owner.reclaimRows());
               owner.metadata.onReclaimRequest(() => owner.reclaimMetadata());
               await owner.prepareMetadata(minimum.metadata);

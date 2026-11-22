@@ -886,7 +886,10 @@ it.each(seedsFor("next-native-primary-admission", [0xb5f0]))(
     const reach = createReach("native primary admission", NATIVE_PRIMARY_ADMISSION_REACH);
     await fc.assert(
       fc.asyncProperty(
-        fc.integer({ min: 4 * 1024 * 1024, max: 6 * 1024 * 1024 }),
+        // Wider than the writer's idle forecasts (rows, commits, metadata headroom: about 10 MiB),
+        // which a native step may now use before asking the governor (writer floors steps 2-3):
+        // the row's growth must reach governor admission and wait there.
+        fc.integer({ min: 12 * 1024 * 1024, max: 14 * 1024 * 1024 }),
         async (width) => {
           reach.beginHistory();
           const f = await fixture(2, false, false),

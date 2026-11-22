@@ -7,7 +7,8 @@ import {
 } from "../access/key-index.js";
 import { taskClock, yieldTask } from "../exec/pipeline.js";
 import type { RunRef } from "../format/manifest.js";
-import type { Grant } from "../memory/governor.js";
+import { HolderChainInvariantError, type Grant } from "../memory/governor.js";
+import { MAX_LSN } from "../access/snapshot.js";
 import { MinimumBudget } from "../memory/working-set.js";
 import type { PlannedRange } from "./range-plan.js";
 import type { ByteBudget } from "../access/space.js";
@@ -147,10 +148,22 @@ export class StreamingRangeCursor implements IndexCursor {
         grant = this.#account;
       } else {
         let owned = shared.governor.tryAdmit(options);
+        // A read snapshot's cursor never queues (GOVERNOR-WAIT-POLICY: readers are not holders,
+        // and a cursor cannot see its caller's grants, so no check inside it could rule out
+        // hold-and-wait). A caller funds it atomically with its own admission (`planRange` or
+        // `prepareResidentRange`, then `open`), as the ordered scan does; unfunded, it takes only
+        // credit granted at once and otherwise raises before anything queues. A statement view
+        // (bound above every LSN) waits as holder growth in the writer chain: inside a write
+        // statement the writer holds its floors and the statement its rows.
+        const reader = this.index.table.snapshot.bound <= MAX_LSN;
+        if (owned === null && reader)
+          throw new HolderChainInvariantError(
+            options.label,
+            "would wait from a read snapshot; fund the cursor with the caller's admission",
+          );
         owned ??= (yield shared.governor.admit({
           ...options,
-          // Inside a write statement: the writer holds its floors and the statement its rows.
-          holdsCredit: true,
+          holdsCredit: shared.holderChain,
           signal: this.#abort.signal,
         })) as Grant;
         this.#ownedGrant = owned;

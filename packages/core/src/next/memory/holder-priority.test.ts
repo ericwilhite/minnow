@@ -12,7 +12,7 @@ import fc from "fast-check";
 import { expect, it } from "vitest";
 import { seedsFor } from "../../testing/seeds.js";
 import { createReach, GOVERNOR_HOLDER_PRIORITY_REACH } from "../../testing/reach.js";
-import { Governor, type Grant, type GrantEvent } from "./governor.js";
+import { Governor, holderChain, type Grant, type GrantEvent } from "./governor.js";
 
 const KIB = 1024;
 const pause = (turns: number) =>
@@ -89,11 +89,21 @@ for (const seed of seedsFor("next-governor-holder-priority", [50101, 50102]))
             ): Promise<readonly Grant[]> => {
               const event: Event = { kind, queued: tick(), served: null };
               events.push(event);
-              const grants = await governor.admitGroup({
-                label,
-                grants: [{ label, minimumBytes: bytes, spillable: false }],
-                ...options,
-              });
+              // A holder request names a registered chain (GOVERNOR-WAIT-POLICY point 6): an owner
+              // chain here, as no writing transaction is open on this governor.
+              const { holdsCredit, ...rest } = options;
+              const chain = holdsCredit === true ? holderChain(governor, label) : undefined;
+              let grants: readonly Grant[];
+              try {
+                grants = await governor.admitGroup({
+                  label,
+                  grants: [{ label, minimumBytes: bytes, spillable: false }],
+                  ...rest,
+                  ...(chain === undefined ? {} : { holdsCredit: chain }),
+                });
+              } finally {
+                chain?.close();
+              }
               event.served = tick();
               observe();
               return grants;
