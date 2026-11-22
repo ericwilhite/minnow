@@ -1646,13 +1646,15 @@ and the owner import it directly.
   owner work (boot, reopen, snapshot import) uses short-lived `"owner"` chains. Holder growth that
   names no open chain of the governor, or that comes from an owner chain while the writer chain
   has a writing transaction open, raises `HolderChainInvariantError` (XX000) before it queues.
-  A caller that holds credit funds its index range cursor with its own admission: the ordered
-  scan, admitted or not, opens its cursor on a grant of the query's complete admission
-  (`planRange`, `open`), so the cursor never waits mid-query. A bare read-snapshot cursor
-  (`range()`) waits as a new admission only while neither it nor another cursor of its view
-  holds governor credit, and raises the same error otherwise. Holder priority has no aging: a
-  waiting reader is served once the writer's holdings become reclaimable (its rows freed, its
-  transaction ended), not merely when a statement ends (`testing/read-cursor-admission.test.ts`).
+  A read snapshot's index range cursor never queues: a cursor cannot see its caller's grants, so
+  its caller funds it atomically with its own admission. The ordered scan, admitted or not,
+  opens its cursor on a grant of the query's complete admission, sized by what the cursor will
+  read: `prepareResidentRange` for a wholly resident index (a small envelope), `planRange` when
+  it can reach published runs. A bare `range()` cursor takes only credit granted at once and
+  otherwise raises the same error before anything queues. Holder priority has no aging: a new
+  admission waiting behind the writer's holder growth is served once the writer's holdings
+  become reclaimable (its rows freed, its transaction ended), not merely when a statement ends
+  (`testing/read-cursor-admission.test.ts`).
   The case this rules out: a foreign
   holder whose growth fits only once the writer's rows are released, queued ahead of the writer's
   commit, with neither able to move. Test: `testing/holder-chain-invariant.test.ts`. Readers are not holders: query preparation waits only while holding

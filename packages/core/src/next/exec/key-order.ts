@@ -248,11 +248,41 @@ export interface IndexShape {
   readonly cursor?: OperatorIdentity;
 }
 
-/** The planned minimum of an unadmitted ordered scan's cursor, or 0 without a range plan. */
+/**
+ * The range plan an unadmitted ordered scan's cursor reads with, once per query: sizing and
+ * execution use the same plan. A wholly resident index gets the resident recipe (its one delta
+ * retained, a small envelope); one that can reach published runs gets the publication-wide plan.
+ * Null without a range plan (a reader that is not native).
+ */
+const legacyPlans = new WeakMap<QueryRuntime, Map<number, IndexRangePlan | null>>();
+function legacyCursorPlan(
+  runtime: QueryRuntime,
+  shape: IndexShape,
+  indexId: number,
+): IndexRangePlan | null {
+  const cursor = shape.cursor;
+  if (cursor === undefined) return null;
+  let plans = legacyPlans.get(runtime);
+  if (plans === undefined) {
+    plans = new Map<number, IndexRangePlan | null>();
+    legacyPlans.set(runtime, plans);
+  }
+  if (plans.has(cursor.id)) return plans.get(cursor.id) ?? null;
+  const reader = runtime.view.index(shape.tableId, indexId);
+  const resident =
+    reader.prepareResidentRange?.(
+      { lower: null, upper: null },
+      shape.descending ? "desc" : "asc",
+    ) ?? null;
+  if (resident) runtime.dispose(() => resident.close());
+  const plan = resident ?? planIndexRange(reader, shape.descending);
+  plans.set(cursor.id, plan);
+  return plan;
+}
+
+/** The minimum of an unadmitted ordered scan's cursor (`legacyCursorPlan`), or 0 without one. */
 export function legacyCursorMinimum(runtime: QueryRuntime, shape: IndexShape, indexId: number) {
-  return (
-    planIndexRange(runtime.view.index(shape.tableId, indexId), shape.descending)?.minimumBytes ?? 0
-  );
+  return legacyCursorPlan(runtime, shape, indexId)?.minimumBytes ?? 0;
 }
 /** A byte target chooses real read batches; it is never a certificate about a value.
  * Unknown/underestimated widths still pass through ordinary bounded source sizing,
@@ -331,10 +361,7 @@ export async function runIndexOrder(
   admitted?: AdmittedIndexRead,
 ): Promise<void> {
   // An unadmitted scan's cursor, funded with the query (`IndexShape.cursor`).
-  const legacy =
-    admitted === undefined && shape.cursor !== undefined
-      ? planIndexRange(runtime.view.index(shape.tableId, indexId), shape.descending)
-      : null;
+  const legacy = admitted === undefined ? legacyCursorPlan(runtime, shape, indexId) : null;
   const entries = admitted
     ? admittedIndexMinimums(shape, runtime.governor.capBytes, admitted)
     : [

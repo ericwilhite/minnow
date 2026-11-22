@@ -1124,16 +1124,6 @@ export class SnapshotImpl implements Snapshot {
 
   // Allocated only for bounded reads or range cursors; ordinary snapshots keep their existing fast path.
   #cursors: Set<Pick<IndexCursor, "close">> | null = null;
-  #rangeCredit = 0;
-  /** Range cursors of this view that own a governor grant now (write/range-cursor.ts). */
-  get rangeCreditHolders(): number {
-    return this.#rangeCredit;
-  }
-  rangeCredit(delta: 1 | -1): void {
-    this.#rangeCredit += delta;
-    if (this.#rangeCredit < 0) throw new Error("Range cursor credit released twice");
-  }
-
   watchCursor(cursor: Pick<IndexCursor, "close">): () => void {
     this.check();
     const cursors = (this.#cursors ??= new Set());

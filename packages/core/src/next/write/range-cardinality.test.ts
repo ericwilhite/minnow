@@ -29,9 +29,6 @@ function reader(h: Harness, ref: RunRef): ViewIndex {
         check: () => undefined,
         checkRead: () => undefined,
         watchCursor: () => () => undefined,
-        // The view's count of range cursors owning a grant (write/view.ts).
-        rangeCreditHolders: 0,
-        rangeCredit: () => undefined,
         bound: 1,
         shared: { space: h.space, governor: h.governor },
       },

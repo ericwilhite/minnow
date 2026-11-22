@@ -137,15 +137,6 @@ export class StreamingRangeCursor implements IndexCursor {
       keyBytes,
     };
   }
-  /** Governor credit this cursor holds now: its grant, its inputs' buffers or a prepared lease. */
-  #holdsCredit(): boolean {
-    return (
-      this.#ownedGrant !== null ||
-      this.#grant !== null ||
-      this.#inputs.length > 0 ||
-      this.#prepared !== null
-    );
-  }
   *#open(): Generator<Promise<unknown>, void, unknown> {
     const shared = this.index.table.snapshot.shared;
     for (;;) {
@@ -157,28 +148,25 @@ export class StreamingRangeCursor implements IndexCursor {
         grant = this.#account;
       } else {
         let owned = shared.governor.tryAdmit(options);
-        // A statement view (bound above every LSN) waits as holder growth in the writer chain:
-        // inside a write statement the writer holds its floors and the statement its rows. A read
-        // snapshot is outside the writer chain and waits as a new admission, holding nothing
-        // (GOVERNOR-WAIT-POLICY point 6: readers are not holders). Checked, not assumed: a reader
-        // that would wait holding governor credit is the hold-and-wait the policy rules out.
-        const snapshot = this.index.table.snapshot;
-        const reader = snapshot.bound <= MAX_LSN;
-        // Its caller must hold nothing either: another cursor of this view that owns a grant is
-        // the caller's credit. A caller that holds credit funds its cursor with its own admission
-        // (`planRange` and `open`, as the ordered scan does), so it never waits here.
-        if (owned === null && reader && (this.#holdsCredit() || snapshot.rangeCreditHolders > 0))
+        // A read snapshot's cursor never queues (GOVERNOR-WAIT-POLICY: readers are not holders,
+        // and a cursor cannot see its caller's grants, so no check inside it could rule out
+        // hold-and-wait). A caller funds it atomically with its own admission (`planRange` or
+        // `prepareResidentRange`, then `open`), as the ordered scan does; unfunded, it takes only
+        // credit granted at once and otherwise raises before anything queues. A statement view
+        // (bound above every LSN) waits as holder growth in the writer chain: inside a write
+        // statement the writer holds its floors and the statement its rows.
+        const reader = this.index.table.snapshot.bound <= MAX_LSN;
+        if (owned === null && reader)
           throw new HolderChainInvariantError(
             options.label,
-            "would wait from a read snapshot while it or its caller holds governor credit",
+            "would wait from a read snapshot; fund the cursor with the caller's admission",
           );
         owned ??= (yield shared.governor.admit({
           ...options,
-          ...(reader ? {} : { holdsCredit: shared.holderChain }),
+          holdsCredit: shared.holderChain,
           signal: this.#abort.signal,
         })) as Grant;
         this.#ownedGrant = owned;
-        snapshot.rangeCredit(1);
         grant = owned;
       }
       this.#grant = grant;
@@ -188,7 +176,6 @@ export class StreamingRangeCursor implements IndexCursor {
       if (this.#ownedGrant !== null && current.minimum > this.#ownedGrant.held) {
         this.#ownedGrant.close();
         this.#ownedGrant = null;
-        this.index.table.snapshot.rangeCredit(-1);
         this.#grant = null;
         continue;
       }
@@ -491,11 +478,8 @@ export class StreamingRangeCursor implements IndexCursor {
       this.#account.free(this.#account.allocated);
       this.#account = null;
     }
-    if (this.#ownedGrant !== null) {
-      this.#ownedGrant.close();
-      this.#ownedGrant = null;
-      this.index.table.snapshot.rangeCredit(-1);
-    }
+    this.#ownedGrant?.close();
+    this.#ownedGrant = null;
     this.#unlink?.();
     this.#unlink = null;
     this.#grant = null;
