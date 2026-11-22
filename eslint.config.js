@@ -131,6 +131,9 @@ export default tseslint.config(
       // Node-only lifecycle fault observers associate native callbacks with their producer.
       // No production module imports this test or node:async_hooks.
       "packages/core/src/next/testing/retaining-parent-lifecycle.test.ts",
+      // Attributes metadata charges to the publication past its switch through
+      // node:async_hooks (no stack strings). Node-only; no production module imports it.
+      "packages/core/src/next/testing/publication-funding.test.ts",
       // Node-only generated-test watchdog; owns/reaps its child and temporary config.
       // No browser entry point imports this fixture.
       "packages/core/src/next/testing/inactive-envelope-deadline.test.fixture.ts",

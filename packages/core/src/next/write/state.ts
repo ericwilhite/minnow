@@ -170,5 +170,6 @@ export interface Shared {
    */
   groupRoot(ref: BlobRef, budget: ByteBudget): MaybePromise<Held<GroupRoot>>;
   /** A group's canonical deletion words (bit set = deleted), checked against its stored row count. */
-  bitmap(ref: BlobRef, rowCount: number): Uint32Array | Promise<Uint32Array>;
+  /** `budget` pays for the read: a query's snapshot budget, sized into its read bound. */
+  bitmap(ref: BlobRef, rowCount: number, budget?: ByteBudget): Uint32Array | Promise<Uint32Array>;
 }
