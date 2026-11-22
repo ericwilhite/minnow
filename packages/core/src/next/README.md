@@ -1726,7 +1726,9 @@ and the owner import it directly.
 - Reads by key size the rows they fetch. A key lookup's sizing probe names its selected locators,
   and a memtable source sizes those rows from their own widths (`ReadSource.locators`), not from
   its chunks' maxima; a stored group reads only those rows' pages and values. A small row beside
-  a wide one is not sized as the wide one. Its read bound
+  a wide one is not sized as the wide one. Execution matches that: the memory scan reads a chunk only from
+  its first live row to its last (`exec/memory-scan.ts`), so a selected row is decoded alone, not
+  after its chunk's earlier rows. Its read bound
   then covers the complete read step of any row it fetches (`ReadBound.stepCovered`), so that
   source's own progress lane funds nothing again; the four-copy envelope keeps its meaning for
   every other operator. Plain delivery whose columns have bounded input widths funds the
