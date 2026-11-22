@@ -41,6 +41,13 @@ it("retries a flush whose deletion-bitmap read is refused, never failing the wri
   let refused = 0,
     metadataPressure = 0;
   core.harness.onSpace = (space) => {
+    // The read must happen: a cache hit (`peek`) would skip it, and whether the open left the
+    // bitmap resident varies by machine. The targeted read always goes to storage.
+    const peek = space.peek.bind(space);
+    space.peek = (ref, options) => {
+      const stack = new Error().stack ?? "";
+      return stack.includes("#bitmap") && stack.includes("#writeFlush") ? null : peek(ref, options);
+    };
     const read = space.read.bind(space);
     space.read = (refs, options) => {
       const stack = new Error().stack ?? "";
@@ -174,6 +181,15 @@ it("completes a merge whose run-reader read is refused: it waits out the pressur
     metadataPressure = 0,
     armed = false;
   core.harness.onSpace = (space) => {
+    // The reads must happen: a cache hit (`peek`) would skip them, and whether the open left
+    // the runs resident varies by machine. The targeted reads always go to storage.
+    const peek = space.peek.bind(space);
+    space.peek = (ref, options) => {
+      const stack = new Error().stack ?? "";
+      return armed && stack.includes("RunReader") && stack.includes("#mergePinned")
+        ? null
+        : peek(ref, options);
+    };
     const read = space.read.bind(space);
     space.read = (refs, options) => {
       const stack = new Error().stack ?? "";

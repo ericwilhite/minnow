@@ -207,7 +207,10 @@ it("funds the idle publication's state pin before its switch", async () => {
     await insert([6, 7, 8]);
     await insert([9]);
     await step(path.quiesce());
-    await step(new Promise((resolve) => setTimeout(resolve, 3 * IDLE_FLUSH_MS)));
+    // The idle publish runs on a timer once the path has been idle for IDLE_FLUSH_MS: wait for
+    // it (bounded), not for a fixed time a slow runner may not meet.
+    for (let waited = 0; path.maintenance.idlePublishes === 0 && waited < 100; waited++)
+      await step(new Promise((resolve) => setTimeout(resolve, IDLE_FLUSH_MS)));
     await step(path.quiesce());
     expect(path.maintenance.idlePublishes).toBeGreaterThan(0);
     expect(refused).toEqual([]);
