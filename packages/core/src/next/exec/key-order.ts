@@ -32,6 +32,9 @@ export const WINDOW_SEGMENTS_LABEL = "key-order/window-segments";
 /** A window's distinct segment indexes, ascending, and the charge that holds them. */
 export interface WindowSegments {
   readonly segments: Uint32Array;
+  /** A lookup's selected locators (ascending, distinct), charged with the list: a selected-row
+   * source sizes these rows by their own widths (page/read-bounds.ts `ReadSource.locators`). */
+  readonly locators?: Float64Array;
   /** Frees the list's charge once sizing no longer reads it. Idempotent. */
   release(): void;
 }

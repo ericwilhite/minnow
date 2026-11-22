@@ -922,16 +922,21 @@ export class QueryRuntime {
     }
     this.#sharedAggregateSteps = new Set(sharedParts.keys());
     const operators = entries.map((entry) => {
-      const capacity = canBorrow(entry.rel)
-        ? this.#laneBytes(
-            entry.rel,
-            entry.loanSlot,
-            this.#operatorProgress.get(entry.rel.id) ?? 0,
-            binding.slotBytes,
-            binding.largestSlot,
-            entry.minimum,
-          )
-        : 0;
+      // A selected-row source's minimum already funds its complete read step
+      // (page/read-bounds.ts `stepCovered`): its own lane funds nothing again. The shared
+      // envelope (`#operatorProgress`, `#progressBytes`) is unchanged for every other operator.
+      const covered = this.#readBounds.get(entry.rel.id)?.stepCovered === true;
+      const capacity =
+        !covered && canBorrow(entry.rel)
+          ? this.#laneBytes(
+              entry.rel,
+              entry.loanSlot,
+              this.#operatorProgress.get(entry.rel.id) ?? 0,
+              binding.slotBytes,
+              binding.largestSlot,
+              entry.minimum,
+            )
+          : 0;
       return {
         entry,
         capacity,
