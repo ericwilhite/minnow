@@ -1723,6 +1723,18 @@ and the owner import it directly.
   Spill staging reserves the complete row/page overlap even when an unsuccessful append has
   already grown some column buffers. The generated no-pressure campaign compares fitting plans'
   peaks with the pre-change admission policy, including caps just above the parent's peak.
+- Reads by key size the rows they fetch. A key lookup's sizing probe names its selected locators,
+  and a memtable source sizes those rows from their own widths (`ReadSource.locators`), not from
+  its chunks' maxima: a small row beside a wide one is not sized as the wide one. Its read bound
+  then covers the complete read step of any row it fetches (`ReadBound.stepCovered`), so that
+  source's own progress lane funds nothing again; the four-copy envelope keeps its meaning for
+  every other operator. Plain delivery whose columns have bounded input widths funds the
+  emitted row's own copy once its minimum is over the cap (the aggregate result recipe),
+  instead of the source's read envelope a second time; modifications keep their envelope.
+  `testing/wide-row-read-need.test.ts` holds key reads beside and of wide rows to an
+  independently derived need. A one-row read of a resident, unretained memtable chunk still
+  funds the format's worst-case metadata of a publication that may happen first
+  (`MEMORY_READ_RESIDENT_BYTES`).
 - Caches are evicted before anything spills. Several may register (the space's page cache, the
   decoded directory and metadata caches, the inflated-page cache); eviction takes the entry unused
   longest across all of them (`oldestUnusedAt`).
