@@ -143,9 +143,10 @@ engine compares before it invalidates, so neither hook sees a new snapshot.
 A commit that changes several queries updates them in the same turn, so a component reading a list
 and a detail view renders once with both up to date. That holds for queries whose adapter decodes
 the engine's result, such as the Kysely wrapper given its `db`; a query that re-executes itself
-updates when its own run finishes. After a rekey, a detail view can keep
-querying by the key it holds: `WHERE order_id = ?` with the old key still returns the row, and the
-row's `order_id` is the new key. See [Offline sync and rekeying](/docs/engine/rekeying).
+updates when its own run finishes. After a rekey, switch a detail view to the new key: in the
+current 0.x engine `WHERE order_id = ?` with the old key still returns the row for a while, but the
+planned 1.0 frees the old key at once, as PostgreSQL does. See
+[Offline sync and rekeying](/docs/engine/rekeying).
 
 See [Live queries](/docs/extensions/live-queries) for query construction, errors, keyed changes,
 windows, and teardown.

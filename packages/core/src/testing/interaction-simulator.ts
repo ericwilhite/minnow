@@ -462,6 +462,12 @@ export interface SimulationDriver {
    */
   listedGap?(error: unknown): string | null;
   readonly faults?: SimulatedFaults;
+  /**
+   * Whether a rekey leaves a forward from each key it retires (the 0.x engine: engine/rekeying,
+   * `keyForwardRetentionMs`). False is PostgreSQL's behaviour and the 1.0 rebuild's (decision
+   * D14): the old key names nothing at once and may be inserted again. Default true.
+   */
+  readonly keyForwarding?: boolean;
   /** Whether errors the driver reports carry `name`; a driver over a text channel may not. */
   close?(): Promise<void>;
 }
@@ -2309,9 +2315,11 @@ interface ModelChild {
 class ShadowModel {
   readonly tables = new Map<string, ModelTable>();
   readonly indexes = new Map<string, ModelIndex>();
+  /** Whether a rekey forwards each key it retires (`SimulationDriver.keyForwarding`). */
+  constructor(readonly keyForwarding = true) {}
 
   clone(): ShadowModel {
-    const copy = new ShadowModel();
+    const copy = new ShadowModel(this.keyForwarding);
     for (const [name, table] of this.tables) {
       copy.tables.set(name, {
         definition: table.definition,
@@ -2587,7 +2595,8 @@ class ShadowModel {
     const retired: Array<readonly [number, number]> = [];
     for (const [from, to] of renamed) {
       if (targets.has(from)) continue;
-      table.forwards.set(from, to);
+      // Without forwarding (PostgreSQL, 1.0) the retired key names nothing and is free again.
+      if (this.keyForwarding) table.forwards.set(from, to);
       retired.push([from, to]);
     }
     return { accepted: true, refusal: undefined, matched: matched.length, retired };
@@ -3194,7 +3203,7 @@ class PlanRunner {
   readonly #traceLength: number;
   readonly #trace: string[] = [];
   readonly #connections: SimulatedConnection[] = [];
-  #model = new ShadowModel();
+  #model: ShadowModel;
   #index = 0;
   #statements = 0;
   #queries = 0;
@@ -3215,6 +3224,7 @@ class PlanRunner {
     this.#plan = plan;
     this.#driver = driver;
     this.#traceLength = traceLength;
+    this.#model = new ShadowModel(driver.keyForwarding ?? true);
   }
 
   async run(): Promise<InteractionRunResult> {

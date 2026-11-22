@@ -820,7 +820,8 @@ each compaction and collection, the IndexedDB and OPFS stores must also pass a f
 With `rekeying: true` (`--rekeying true` on the command line) a plan also changes primary keys:
 `UPDATE … SET id = …` to a constant, shifted by a step, negated, or swapped between two rows,
 alone or inside a transaction, and some tables get a self-referencing
-`REFERENCES … NOT ENFORCED` column. The model keeps every retired key's forward, so it checks the
+`REFERENCES … NOT ENFORCED` column. Over the 0.x engine the model keeps every retired key's
+forward (the driver's `keyForwarding`, true by default), so it checks the
 [rekeying](/docs/engine/rekeying) rules too: a rekey onto a live, repeated, or retired key fails
 as a duplicate and writes nothing; references follow the moved rows; a retired key reads, updates,
 upserts, and is compared through its forward on every connection; and inserting a retired key is
@@ -901,7 +902,10 @@ is skipped and counted, and a write refused that way stops its plan at that step
 continuing on a model the engine no longer matches. A plan whose first failure is a listed open
 finding (a reduced divergence with an owner) is counted against it, every listed finding must
 still block some plan, and every other plan must run to the end. A fixed finding leaves the list
-and its seeds join the regression seeds.
+and its seeds join the regression seeds. Rekeying plans run there too, judged by PostgreSQL's behaviour: the
+1.0 rebuild keeps no key forwards (decision D14), so the driver declares `keyForwarding: false`
+and the model frees a retired key at once: it reads nothing on another connection and may be
+inserted again.
 
 The browser driver recovers a crash by reloading the document. A new worker in the same document
 is enough on Chromium and Firefox, but WebKit can keep a transaction the dead worker still had

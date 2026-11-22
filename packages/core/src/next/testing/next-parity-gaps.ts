@@ -90,17 +90,7 @@ export interface OpenFinding {
   readonly owner: string;
 }
 
-export const NEXT_OPEN_FINDINGS: readonly OpenFinding[] = [
-  {
-    id: "rekey-forwards",
-    failure:
-      /^rekey-forward: reading retired key \d+: |^duplicate insert (inside a transaction )?was accepted, but the model refuses it \(unique\)/u,
-    reason:
-      "a key retired by a rekey neither forwards to its row nor counts as taken " +
-      "(sql/dml.mdx, engine/rekeying.mdx)",
-    owner: "C1",
-  },
-];
+export const NEXT_OPEN_FINDINGS: readonly OpenFinding[] = [];
 
 /** The open finding a simulator failure is, or null. */
 export function openFinding(error: unknown): OpenFinding | null {

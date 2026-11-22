@@ -8945,7 +8945,7 @@
               "name": "SimulationDriver",
               "kind": "type",
               "declarations": [
-                "export interface SimulationDriver {\n    open(connection: number): Promise<SimulatedConnection>;\n    listedGap?(error: unknown): string | null;\n    readonly faults?: SimulatedFaults;\n    close?(): Promise<void>;\n}"
+                "export interface SimulationDriver {\n    open(connection: number): Promise<SimulatedConnection>;\n    listedGap?(error: unknown): string | null;\n    readonly faults?: SimulatedFaults;\n    readonly keyForwarding?: boolean;\n    close?(): Promise<void>;\n}"
               ]
             },
             {

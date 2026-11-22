@@ -75,6 +75,7 @@ code also makes the worker's lifecycle yours (you decide when it starts and stop
   deliveries; re-register after `reopen()`. Use `resolveKeys(table, keys)` for an ordered batch of
   held keys in one request. `mergeKey(table, from, to)` is available on the client and its write
   sessions, with the same atomic behavior as the engine. See [rekeying](/docs/engine/rekeying).
+  These are 0.x APIs: the 1.0 rebuild has no key forwarding and does not offer them ([the 1.0 cutover](/docs/engine/rekeying#10-cutover-no-key-forwarding)).
 - **`migrate()` takes the same schema DSL** — it's serialized over the wire automatically.
 - **Typed errors survive the trip.** `instanceof UniqueConstraintError` and
   `instanceof UnknownTableError` work on the client, with their fields; stack traces point into
