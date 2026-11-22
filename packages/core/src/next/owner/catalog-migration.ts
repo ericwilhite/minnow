@@ -67,7 +67,7 @@ export async function migrateCatalog(
           const grant = await governor.admit({
             label: "migration/identity",
             // Inside a write transaction: the writer holds its floors and the statement its rows.
-            holdsCredit: true,
+            holdsCredit: transaction.holderChain,
             minimumBytes: 4 * 1024 * 1024,
             spillable: false,
             ...(options.signal ? { signal: options.signal } : {}),

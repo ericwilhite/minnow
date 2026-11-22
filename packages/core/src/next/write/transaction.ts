@@ -90,6 +90,7 @@ import {
 import { need, MemtableMemoryError, byteString } from "./bytes.js";
 import type { PreparedWriteCredit } from "./credits.js";
 import { NativePrimaryAdapter, type NativePrimaryScope } from "./primary-command.js";
+import type { HolderChain } from "../memory/governor.js";
 import type {
   NativeWriteStepBoundary,
   NativeWriteStepOptions,
@@ -310,6 +311,9 @@ export class TransactionImpl implements WriteTransaction {
   }
   /** Requested on the transaction by the engine at commit. */
   readonly hooks: EngineHooks;
+  get holderChain(): HolderChain {
+    return this.hooks.shared.holderChain;
+  }
 
   constructor(hooks: EngineHooks, baseLsn: number) {
     this.hooks = hooks;

@@ -7,7 +7,7 @@ import {
   type StoreSession,
 } from "../storage/contract.js";
 import type { Grant } from "../memory/governor.js";
-import { Governor } from "../memory/governor.js";
+import { Governor, holderChain } from "../memory/governor.js";
 import type { CacheMemory, ExtentSpace } from "../storage/extents.js";
 import { openExtentSpace } from "../storage/space.js";
 import { listedRootExtents, reachableExtents } from "../format/reachable.js";
@@ -141,14 +141,20 @@ async function openResources(
       // The native spill contract explicitly permits this for an in-memory backend only.
       spill = new MemorySpillService();
     } else {
-      scratchControl = await governor.admit({
-        label: "shared scratch control",
-        // The write path is open: its owner minimum stays held through this wait.
-        holdsCredit: true,
-        minimumBytes: SCRATCH_CONTROL_BYTES,
-        spillable: false,
-        ...(options.signal === undefined ? {} : { signal: options.signal }),
-      });
+      // The write path is open: its owner minimum stays held through this wait. Boot is exclusive
+      // owner work (no writing transaction can be open yet): an owner holder chain.
+      const boot = holderChain(governor, "native boot");
+      try {
+        scratchControl = await governor.admit({
+          label: "shared scratch control",
+          holdsCredit: boot,
+          minimumBytes: SCRATCH_CONTROL_BYTES,
+          spillable: false,
+          ...(options.signal === undefined ? {} : { signal: options.signal }),
+        });
+      } finally {
+        boot.close();
+      }
       scratchMemory = governor.registerCache({ evictableBytes: 0, evict: () => 0 });
       spill = new ScratchSpillService(scratch, { budget: scratchControl, memory: scratchMemory });
       // Permanent beside the write engine: part of every write growth step's complete minimum.

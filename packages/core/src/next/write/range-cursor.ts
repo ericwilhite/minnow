@@ -7,7 +7,8 @@ import {
 } from "../access/key-index.js";
 import { taskClock, yieldTask } from "../exec/pipeline.js";
 import type { RunRef } from "../format/manifest.js";
-import type { Grant } from "../memory/governor.js";
+import { HolderChainInvariantError, type Grant } from "../memory/governor.js";
+import { MAX_LSN } from "../access/snapshot.js";
 import { MinimumBudget } from "../memory/working-set.js";
 import type { PlannedRange } from "./range-plan.js";
 import type { ByteBudget } from "../access/space.js";
@@ -147,10 +148,17 @@ export class StreamingRangeCursor implements IndexCursor {
         grant = this.#account;
       } else {
         let owned = shared.governor.tryAdmit(options);
+        // Only a statement view (bound above every LSN) grows here as a holder: inside a write
+        // statement the writer holds its floors and the statement its rows. A read snapshot is
+        // outside the writer chain (GOVERNOR-WAIT-POLICY point 6).
+        if (owned === null && this.index.table.snapshot.bound <= MAX_LSN)
+          throw new HolderChainInvariantError(
+            options.label,
+            "would wait as a holder from a read snapshot, outside the writer chain",
+          );
         owned ??= (yield shared.governor.admit({
           ...options,
-          // Inside a write statement: the writer holds its floors and the statement its rows.
-          holdsCredit: true,
+          holdsCredit: shared.holderChain,
           signal: this.#abort.signal,
         })) as Grant;
         this.#ownedGrant = owned;

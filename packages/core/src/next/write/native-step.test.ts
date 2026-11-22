@@ -43,6 +43,7 @@ for (const seed of seedsFor("next-native-write-owner-credit", [0xb715, 0xb716]))
               },
               scope = {
                 governor,
+                holderChain: credits.holderChain,
                 check: (s: object) => {
                   expect(s).toBe(owner);
                 },

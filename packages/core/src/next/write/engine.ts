@@ -747,6 +747,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#nativeSteps = new NativeWriteSteps({
       charge: grant,
       governor: input.governor,
+      holderChain: credits.holderChain,
       check: (owner) => this.#checkNativeStep(owner),
       protectedBytes: () => this.#protectedNativeBytes(),
       stabilize: (owner, bytes, capacity, signal) =>
@@ -815,6 +816,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const space = input.space;
     this.shared = {
       governor: input.governor,
+      holderChain: credits.holderChain,
       space,
       budget: grant,
       // A reader closing can release what only older readers kept (a dropped table's memtables,
@@ -869,6 +871,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
    * dies with its governor; a new engine may then claim the same governor. */
   static abandonForCrash(path: WritePathImpl): void {
     path.#ownerClaim?.release();
+    path.#credits.holderChain.close();
   }
 
   #ownerClaim: { release(): void } | null = null;
@@ -2867,9 +2870,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#reclaimable();
     const tx = new TransactionImpl(this, this.appliedLsn);
     this.#holder = tx;
-    // Its first write funds the commit window, which it then keeps until it ends: the commit
-    // never waits while its rows are counted (credits.ts holdCommitWindow).
-    this.#credits.holdCommitWindow(true);
+    // GOVERNOR-WAIT-POLICY point 6, checked: no other holder chain grows while this is open.
+    this.#credits.holderChain.transactionOpen = true;
     return tx;
   }
 
@@ -2930,7 +2932,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     )
       this.#ftsUnclaimed = true;
     this.#holder = null;
-    this.#credits.holdCommitWindow(false);
+    this.#credits.holderChain.transactionOpen = false;
     this.#reclaimable();
     this.#passSlot();
     // A frozen memtable may have waited for this writer's pending rows.

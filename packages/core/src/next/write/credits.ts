@@ -2,7 +2,7 @@
  * The write owner's native accounts. A step receives already admitted credit, not a wrapper
  * allocation counter: storage may transfer a real buffer out through native takeFrom.
  */
-import type { Grant, MemoryGovernor } from "../memory/governor.js";
+import type { Grant, HolderChain, MemoryGovernor } from "../memory/governor.js";
 import { GrantClosedError, MemoryAdmissionError } from "../memory/governor.js";
 import type { MaybePromise } from "../access/key-index.js";
 import { releaseIdle } from "./budget.js";
@@ -44,14 +44,6 @@ export class WriteCredits {
   #mergeActive: Grant | null = null;
   #mergeFloor = 0;
   #commitFunding = 0;
-  /**
-   * The open writing transaction's commit window (GOVERNOR-WAIT-POLICY, no hold-and-wait): set
-   * while a transaction holds the writer turn. Its first write funds the window beside its first
-   * step, while it holds nothing yet; every later step and reclaim keeps it, so the commit (and a
-   * sequence frame) never waits while the transaction's rows are counted. Cleared when the
-   * transaction ends.
-   */
-  #transactionCommit = false;
   #commitMetadataFunding = 0;
   #mergeMetadataFunding = 0;
   #metadataHeadroom = 0;
@@ -118,39 +110,19 @@ export class WriteCredits {
     return Math.max(this.#rowFloor, this.#workingMinimum().rows ?? 0);
   }
 
-  /** Commit credit a native step keeps: live buffers and loans, the commit window while a
-   * commit or log append runs or was funded, and the writing transaction's commit window. */
+  /** Commit credit a native step keeps: live buffers and loans, and the commit window only
+   * while a commit or log append runs or was funded. */
   get nativeCommitBytes(): number {
     return Math.max(
       this.commits.allocated + this.commits.loaned,
       this.#commitFunding,
       this.#workingMinimum().commits ?? 0,
-      this.transactionCommitBytes,
     );
   }
 
-  /** The writing transaction's commit window (`holdCommitWindow`), or 0 without one. */
-  get transactionCommitBytes(): number {
-    return this.#transactionCommit ? this.minimum.commits : 0;
-  }
-
-  /**
-   * Starts (`true`) or ends (`false`) a writing transaction's commit window. Starting funds
-   * nothing: the transaction's first write step grows to it. Ending returns it if idle.
-   */
-  holdCommitWindow(hold: boolean): void {
-    if (this.#transactionCommit === hold) return;
-    this.#transactionCommit = hold;
-    if (!hold && releaseIdle(this.commits, this.#commitFloor())) this.#changed?.();
-  }
-
-  /** Commit credit no reclaim may return: an active step's and the transaction's window. */
+  /** Commit credit no reclaim may return: an active step's window and a funded commit's. */
   #commitFloor(): number {
-    return Math.max(
-      this.#workingMinimum().commits ?? 0,
-      this.#commitFunding,
-      this.transactionCommitBytes,
-    );
+    return Math.max(this.#workingMinimum().commits ?? 0, this.#commitFunding);
   }
 
   /** A native step's own workspace is funded (no row, commit or merge minimum). */
@@ -283,6 +255,9 @@ export class WriteCredits {
     readonly minimum: WriteMinimum,
     readonly signal: AbortSignal | undefined,
     grants: readonly Grant[],
+    /** The governor's one writer holder chain: every growth of this owner is holder growth from
+     * it (GOVERNOR-WAIT-POLICY point 6, checked by the governor). Closed with these accounts. */
+    readonly holderChain: HolderChain,
   ) {
     const [rows, metadata, commits, merge] = grants;
     if (!rows || !metadata || !commits || !merge)
@@ -304,6 +279,24 @@ export class WriteCredits {
     holdings?: () => number,
   ): Promise<WriteCredits> {
     minimum = { ...minimum };
+    if (governor.openHolderChain === undefined)
+      throw new TypeError("Write credits need a governor that checks holder chains");
+    const chain = governor.openHolderChain("write engine", "writer");
+    try {
+      return await WriteCredits.#open(governor, minimum, chain, signal, holdings);
+    } catch (error) {
+      chain.close();
+      throw error;
+    }
+  }
+
+  static async #open(
+    governor: MemoryGovernor,
+    minimum: WriteMinimum,
+    chain: HolderChain,
+    signal?: AbortSignal,
+    holdings?: () => number,
+  ): Promise<WriteCredits> {
     // The owner's permanent holdings stay beside this minimum: above capacity together,
     // the admission could never be served.
     if (holdings !== undefined) {
@@ -315,7 +308,7 @@ export class WriteCredits {
     const grants = await governor.admitGroup({
       label: "write owner minimum",
       // The owner keeps its permanent holdings (scratch control) through this wait: holder growth.
-      ...(holdings !== undefined && holdings() > 0 ? { holdsCredit: true } : {}),
+      ...(holdings !== undefined && holdings() > 0 ? { holdsCredit: chain } : {}),
       grants: [
         { label: "write path", minimumBytes: minimum.rows, spillable: true },
         { label: "write path metadata", minimumBytes: minimum.metadata, spillable: true },
@@ -326,7 +319,7 @@ export class WriteCredits {
     });
     try {
       signal?.throwIfAborted();
-      const credits = new WriteCredits(governor, minimum, signal, grants);
+      const credits = new WriteCredits(governor, minimum, signal, grants, chain);
       if (holdings !== undefined) credits.bindOwnerHoldings(holdings);
       return credits;
     } catch (error) {
@@ -436,7 +429,7 @@ export class WriteCredits {
     if (bytes > this.governor.capBytes)
       throw new MemoryAdmissionError("write metadata step", bytes, this.governor.capBytes);
     const wanted = this.metadata.allocated + bytes;
-    if (this.metadata.held >= wanted && this.commits.held >= this.transactionCommitBytes) {
+    if (this.metadata.held >= wanted) {
       this.#metadataHeadroom = bytes;
       if (before !== bytes) this.#changed?.();
       return undefined;
@@ -559,11 +552,9 @@ export class WriteCredits {
           this.#rememberFundedMetadata(grant, wanted, metadata, funding);
           return;
         }
-        // An immediate grow funds only `grant`: every other part of the step must be in place.
         if (
           (!nativeMinimum || this.#nativeReady()) &&
           this.metadata.held >= metadata &&
-          this.commits.held >= this.transactionCommitBytes &&
           (pass === 1 ||
             wanted - grant.held <=
               this.governor.capBytes - this.governor.reserveBytes - this.governor.usedBytes) &&
@@ -625,7 +616,7 @@ export class WriteCredits {
         ...(includesProgress ? { includesProgress: true } : {}),
         // The writer holds its floors (and, inside a native step, the root its retained base)
         // through this wait and cannot release them: holder growth (GOVERNOR-WAIT-POLICY).
-        holdsCredit: true,
+        holdsCredit: this.holderChain,
         grants: accounts.map((account, i) => ({
           label: `write growth ${account.label}`,
           minimumBytes: Math.max(0, (desired[i] ?? 0) - account.held),
@@ -652,16 +643,14 @@ export class WriteCredits {
   }
 
   /**
-   * Growth is complete: the grant reached `wanted`, the metadata step is funded, the writing
-   * transaction's commit window is held, and a native step's own workspace is ready. Every exit
-   * of `#growTo` uses this, so no growth resolves without the commit window: callers re-prepare
-   * until a request is immediate, and an exit that skipped the window would spin them.
+   * Growth is complete: the grant reached `wanted`, the metadata step is funded, and a native
+   * step's own workspace is ready. The exits of `#growTo` share this one check: callers
+   * re-prepare until a request is immediate, so an exit that resolved short would spin them.
    */
   #grown(grant: Grant, wanted: number, metadata: number, nativeMinimum: boolean): boolean {
     return (
       grant.held >= wanted &&
       this.metadata.held >= metadata &&
-      this.commits.held >= this.transactionCommitBytes &&
       (!nativeMinimum || this.#nativeReady())
     );
   }
@@ -822,5 +811,6 @@ export class WriteCredits {
     this.signal?.removeEventListener("abort", this.#abort);
     for (const grant of [this.metadata, this.commits, this.merge]) grant.close();
     if (!keepRowsForReaders) this.rows.close();
+    this.holderChain.close();
   }
 }
