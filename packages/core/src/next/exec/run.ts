@@ -11,7 +11,7 @@ import { readTable } from "./read-table.js";
 import type { ByteBudget } from "../access/space.js";
 import type { Snapshot, TableSnapshot, TableReadRecipe } from "../access/snapshot.js";
 import type { Bound, PhysicalPlan, Rel } from "../ir/ir.js";
-import type { Grant, MemoryGovernor } from "../memory/governor.js";
+import type { Grant, MemoryGovernor, WaitingHoldings } from "../memory/governor.js";
 import { PreparationGovernor, PreparationWouldWait, preparationGovernor } from "./preparation.js";
 import {
   ExecutionError,
@@ -912,6 +912,7 @@ export class QueryRuntime {
       grants: parts,
       includesProgress: atomic,
       signal: this.signal,
+      holdings: () => this.waitingHoldings(),
     });
     const install = (grants: readonly Grant[]): MaybePromise<void> => {
       if (this.#closed || this.signal.aborted) {
@@ -1153,6 +1154,16 @@ export class QueryRuntime {
       this.#wait += performance.now() - start;
       return this.#adopt(grant, rel);
     });
+  }
+
+  /**
+   * What this statement keeps held while one of its requests waits: its accounted grants
+   * (reserved shares are inside them) and, while it holds the writer turn, the writer's
+   * (`MemoryGovernor.servableNow`).
+   */
+  waitingHoldings(): WaitingHoldings {
+    const writer = this.request.statement?.writerHoldings?.() ?? null;
+    return writer === null ? { grants: this.#grants } : { grants: this.#grants, lent: writer };
   }
 
   /** The result grant is tracked but survives pipeline disposal until result delivery. */
@@ -1718,7 +1729,12 @@ export class QueryExecution implements Execution {
     runtime.abort(RESTART);
     await runtime.close();
     await sizingSettled(this.#controller.signal);
-    await preparation.regrow(error, this.#controller.signal);
+    // Holding nothing but its result grant and, while it holds the writer turn, the writer's.
+    await preparation.regrow(error, this.#controller.signal, () => {
+      const writer = this.request.statement?.writerHoldings?.() ?? null;
+      const grants = this.#result === null ? [] : [this.#result];
+      return writer === null ? { grants } : { grants, lent: writer };
+    });
     const fresh = this.#newRuntime();
     this.#runtime = fresh;
     if (this.#atomic !== null) fresh.atomicResult(this.#atomic.result, this.#atomic.window);

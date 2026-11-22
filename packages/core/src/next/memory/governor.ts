@@ -155,6 +155,8 @@ export interface Grant {
 /** A cache's side of the governor (rule 6). */
 export interface EvictableCache {
   readonly evictableBytes: number;
+  /** Names the cache in a stall report (test builds). */
+  readonly label?: string;
   /** Evicts at least `bytes` if possible, releasing them through its handle (possibly at once). */
   evict(bytes: number): number;
   /**
@@ -184,14 +186,26 @@ export interface MemoryGovernor {
    * reclaim request: the native owner's scratch control). An admission whose need exceeds the
    * capacity less every registered permanent holding can never be served while they persist,
    * so it is refused at once with 53200, never left waiting; queued requests are re-checked when
-   * registrations change. Returns the unregistration. Optional for wrapping governors.
+   * registrations change. `label` names the holding in a stall report. Returns the
+   * unregistration. Optional for wrapping governors.
    */
-  registerPermanent?(bytes: () => number): () => void;
+  registerPermanent?(bytes: () => number, label?: string): () => void;
   /**
    * Registers a holder chain (`HolderChain`): at most one `"writer"` chain is open per governor.
    * Optional for wrapping governors, which forward holder growth to the governor that checks it.
    */
   openHolderChain?(label: string, kind: HolderChain["kind"]): HolderChain;
+  /**
+   * GOVERNOR-WAIT-POLICY point 5: the most a request could ever be served while its statement
+   * waits: the usable capacity (`usableCapacity(includesProgress)`: the cap, less the reserve for
+   * an ordinary request, less every registered lifetime holding) less what that statement keeps
+   * held while it waits (`WaitingHoldings`). A waiting group carries it as
+   * `NativeGrantGroupOptions.holdings`. With `unasked`, the statement's own spillable grants
+   * count nothing: their reclaim, not yet asked, may return all they hold. Optional for wrapping
+   * governors that never wait (a
+   * prepaid native body's).
+   */
+  servableNow?(own: WaitingHoldings, includesProgress?: boolean, unasked?: boolean): number;
   /** Moves idle ordinary credit within this owner. No allocation or global admission occurs. */
   transferCredit(source: Grant, target: Grant, bytes: number): boolean;
   /**
@@ -213,6 +227,26 @@ export interface MemoryGovernor {
   };
 }
 
+/** What a statement keeps held while one of its requests waits (`servableNow`). */
+export interface WaitingHoldings {
+  /** The statement's own grants: they stay held while it waits. */
+  readonly grants: readonly Grant[];
+  /** Another owner's holdings kept for the statement: its writer's, while it holds the turn. */
+  readonly lent?: LentHoldings;
+}
+
+/** An owner's holdings kept for the statement that holds its turn (the writer's). */
+export interface LentHoldings {
+  readonly grants: readonly Grant[];
+  /**
+   * The bytes of `grants`, beyond the owner's registered lifetime holding, that stay held
+   * however long the statement waits. The rest is finite: a flush, a snapshot's close or the
+   * owner's reclaim frees it. Never more than stays: while the owner runs work of its own its
+   * holdings are not yet known, and it counts none.
+   */
+  retained(): number;
+}
+
 /** Named parts of one complete minimum. Each part remains a normal native grant. */
 export interface NativeGrantGroupOptions {
   /** Shared idle native credit, usable by every earlier FIFO admission head. */
@@ -226,6 +260,18 @@ export interface NativeGrantGroupOptions {
   readonly signal?: AbortSignal;
   /** The total includes private progress credit; its consumers never need the shared reserve. */
   readonly includesProgress?: boolean;
+  /**
+   * What the requesting statement keeps held while this group waits: its bound is
+   * `servableNow(holdings)` (GOVERNOR-WAIT-POLICY point 5). A group above its bound is refused
+   * with 53200 wherever it sits in its queue, never left waiting. Every queued group is checked on
+   * every drain, the one that queues it included (before it waits), with its own spillable grants
+   * counting nothing (their reclaim is not asked yet); at the head, after that drain's reclaim
+   * requests have completed, it is checked against all its holdings. The bound grows as finite
+   * holders release and shrinks when an owner's own work ends and its holdings become exactly
+   * known (a writer's flush or merge: `LentHoldings.retained`); the owner wakes the queue then.
+   * Groups within their bound keep their FIFO order.
+   */
+  readonly holdings?: () => WaitingHoldings;
   /**
    * The caller holds credit it cannot release until this is served (a native root's retained
    * base; the writer's floors inside a native step): holder growth from this registered chain.
@@ -286,6 +332,8 @@ interface Request {
   readonly pending: Set<Promise<void>>;
   readonly includesProgress: boolean;
   readonly parts: NativeGrantGroupOptions["grants"] | null;
+  /** `NativeGrantGroupOptions.holdings`: its bound is checked while it waits. */
+  readonly holdings: (() => WaitingHoldings) | null;
 }
 
 /** A growth observer (Governor.observeGrowth) tried to change grant or governor state. */
@@ -473,6 +521,17 @@ export interface StallHolder {
   readonly spillable: boolean;
 }
 
+/** The rest of a stall report: every byte `usedBytes` counts outside the grant holders. */
+export interface StallAccounts {
+  /** Registered caches and the bytes each holds, evictable or not. */
+  readonly caches: ReadonlyArray<{ readonly label: string; held: number; evictable: number }>;
+  /** Registered lifetime holdings (`registerPermanent`). They are held inside the grants and
+   * caches above (or outside the governor), so they are listed, not added to the total. */
+  readonly permanent: ReadonlyArray<{ readonly label: string; readonly bytes: number }>;
+  /** Used bytes no grant or cache holds. Zero unless the governor's accounting is broken. */
+  readonly unattributed: number;
+}
+
 /**
  * Thrown (test builds only, `Governor.stallAfterMs`) at a waiter that saw no governor progress
  * for that long: no credit taken or returned, no request queued, served or withdrawn, and no
@@ -497,6 +556,7 @@ export class GovernorStallError extends Error {
     /** Which rule fired: no governor progress for `afterMs`, or queued past the hard deadline
      * (`Governor.stallDeadlineWindows` windows) whatever unrelated activity continued. */
     readonly rule: "no progress" | "deadline" = "no progress",
+    readonly accounts: StallAccounts = { caches: [], permanent: [], unattributed: 0 },
   ) {
     super(
       `Governor stall (${rule}): "${waiter.label}" waited ` +
@@ -509,6 +569,17 @@ export class GovernorStallError extends Error {
               `${holder.label} ${String(holder.held)}B held/${String(holder.allocated)}B allocated`,
           )
           .join(", ") +
+        `; caches: ` +
+        (accounts.caches
+          .map(
+            (cache) =>
+              `${cache.label} ${String(cache.held)}B held/${String(cache.evictable)}B evictable`,
+          )
+          .join(", ") || "none") +
+        `; unattributed ${String(accounts.unattributed)}B; lifetime holdings: ` +
+        (accounts.permanent
+          .map((holding) => `${holding.label} ${String(holding.bytes)}B`)
+          .join(", ") || "none") +
         `; queued at:\n${waiterStack}`,
     );
     this.name = "GovernorStallError";
@@ -567,7 +638,9 @@ export class Governor implements MemoryGovernor {
    * moved between grants or into a cache. A holder working inside memory it was granted is
    * progress: a waiter has stalled only if no grant anywhere changed during the window. */
   activity = 0;
-  readonly #permanent = new Set<() => number>();
+  readonly #permanent = new Map<() => number, string>();
+  /** Bytes each registered cache holds (charged or taken from a grant, less released). */
+  readonly #cacheHeld = new Map<EvictableCache, number>();
   readonly #chains = new Set<HolderChain>();
   #writerChain: HolderChain | null = null;
 
@@ -603,9 +676,22 @@ export class Governor implements MemoryGovernor {
       );
   }
 
-  registerPermanent(bytes: () => number): () => void {
+  servableNow(own: WaitingHoldings, includesProgress = false, unasked = false): number {
+    let held = 0;
+    for (const grant of new Set(own.grants))
+      if (
+        grant instanceof GrantImpl &&
+        grant.governor === this &&
+        !grant.closed &&
+        !(unasked && grant.spillable)
+      )
+        held += grant.held;
+    return this.usableCapacity(includesProgress) - held - (own.lent?.retained() ?? 0);
+  }
+
+  registerPermanent(bytes: () => number, label = "owner lifetime holdings"): () => void {
     this.assertMutable();
-    this.#permanent.add(bytes);
+    this.#permanent.set(bytes, label);
     this.#drain();
     return () => {
       this.assertMutable();
@@ -617,7 +703,7 @@ export class Governor implements MemoryGovernor {
   /** Lifetime holdings registered by owners (`registerPermanent`). */
   get permanentBytes(): number {
     let total = 0;
-    for (const bytes of this.#permanent) total += bytes();
+    for (const bytes of this.#permanent.keys()) total += bytes();
     return total;
   }
 
@@ -629,6 +715,28 @@ export class Governor implements MemoryGovernor {
     return (
       (includesProgress ? this.capBytes : this.capBytes - this.reserveBytes) - this.permanentBytes
     );
+  }
+
+  /**
+   * Every queued group above its bound (`NativeGrantGroupOptions.holdings`), wherever it sits:
+   * 53200 now, never a wait. Its own spillable grants count nothing here (their reclaim is not
+   * asked yet), so this refuses no more than the head check after reclaim would.
+   */
+  #refuseAboveBound(): boolean {
+    let refused = false;
+    for (const queue of [this.#holders, this.#admissions])
+      for (const request of [...queue]) {
+        if (request.holdings === null || request.pending.size > 0) continue;
+        const most = this.servableNow(request.holdings(), request.includesProgress, true);
+        if (request.bytes <= most) continue;
+        this.#reject(
+          queue,
+          request,
+          new MemoryAdmissionError(request.label, request.bytes, Math.max(0, most)),
+        );
+        refused = true;
+      }
+    return refused;
   }
 
   /** A queued request that can never be served while the permanent holdings persist: 53200. */
@@ -840,6 +948,12 @@ export class Governor implements MemoryGovernor {
   give(bytes: number): void {
     this.#progress++;
     this.usedBytes -= bytes;
+    // A zero release is an owner's wake (`release(0)`, the writer's `notifyReclaimable`): its
+    // reclaimers may return more now (a publication covered what they keep), so a queued
+    // admission asks each of them once more. A read still asks one holder at a time.
+    if (bytes === 0)
+      for (const queue of [this.#holders, this.#admissions])
+        for (const request of queue) if (request.readRoom === null) request.asked.clear();
     this.#drain();
   }
 
@@ -882,7 +996,9 @@ export class Governor implements MemoryGovernor {
             if (this.#holders.length === 0) this.#serve(this.#admissions, false);
           }
         }
-      } while (this.#releasedDuringDrain());
+        // After serving: only a group still waiting is checked, so none that fits now is refused.
+        // A refused group may have blocked the ones behind it: serve again then.
+      } while (this.#refuseAboveBound() || this.#releasedDuringDrain());
     } finally {
       this.#draining = false;
     }
@@ -971,6 +1087,21 @@ export class Governor implements MemoryGovernor {
             this.#reject(queue, request, new ReadStepBoundaryError());
             continue;
           }
+          // GOVERNOR-WAIT-POLICY point 5, again as holdings settle: never served while it waits.
+          // Not while a reclaim it asked for is pending: its own holdings may still shrink.
+          const holdings = request.pending.size === 0 ? request.holdings?.() : undefined;
+          const most =
+            holdings === undefined
+              ? undefined
+              : this.servableNow(holdings, request.includesProgress);
+          if (most !== undefined && demand() > most) {
+            this.#reject(
+              queue,
+              request,
+              new MemoryAdmissionError(request.label, demand(), Math.max(0, most)),
+            );
+            continue;
+          }
           return;
         }
       }
@@ -1047,7 +1178,8 @@ export class Governor implements MemoryGovernor {
       | "pending"
       | "includesProgress"
       | "parts"
-    > & { includesProgress?: boolean },
+      | "holdings"
+    > & { includesProgress?: boolean; holdings?: (() => WaitingHoldings) | null },
     signal?: AbortSignal,
     readRoom: number | null = null,
     parts: NativeGrantGroupOptions["grants"] | null = null,
@@ -1065,6 +1197,7 @@ export class Governor implements MemoryGovernor {
       const entry: Request = {
         ...request,
         includesProgress: request.includesProgress ?? false,
+        holdings: request.holdings ?? null,
         asked: new Set(),
         pending: new Set(),
         readRoom,
@@ -1133,12 +1266,36 @@ export class Governor implements MemoryGovernor {
             afterMs,
             queuedAt,
             rule,
+            this.#accounts(),
           ),
         );
       },
       Math.max(10, afterMs / 4),
     );
     (timer as { unref?: () => void }).unref?.();
+  }
+
+  /** Every byte `usedBytes` counts outside the grants, for a stall report. */
+  #accounts(): StallAccounts {
+    let grants = 0;
+    for (const grant of this.#grants) grants += grant.held;
+    let unnamed = 0;
+    const caches = [...this.#cacheHeld]
+      .filter(([, held]) => held !== 0)
+      .map(([cache, held]) => ({
+        label:
+          cache.label ??
+          (cache.constructor === Object ? `cache ${String(++unnamed)}` : cache.constructor.name),
+        held,
+        evictable: cache.evictableBytes,
+      }));
+    return {
+      caches,
+      permanent: [...this.#permanent]
+        .map(([bytes, label]) => ({ label, bytes: bytes() }))
+        .filter((holding) => holding.bytes !== 0),
+      unattributed: this.usedBytes - grants - caches.reduce((sum, cache) => sum + cache.held, 0),
+    };
   }
 
   #reject(queue: Request[], request: Request, error: unknown): void {
@@ -1226,6 +1383,7 @@ export class Governor implements MemoryGovernor {
         label,
         spillable: false,
         includesProgress: includesProgress === true,
+        holdings: options.holdings ?? null,
       },
       signal,
       null,
@@ -1415,6 +1573,9 @@ export class Governor implements MemoryGovernor {
   registerCache(cache: EvictableCache) {
     this.assertMutable();
     if (!this.#caches.includes(cache)) this.#caches.push(cache);
+    if (!this.#cacheHeld.has(cache)) this.#cacheHeld.set(cache, 0);
+    const held = (bytes: number) =>
+      this.#cacheHeld.set(cache, (this.#cacheHeld.get(cache) ?? 0) + bytes);
     let active = true;
     return {
       takeFrom: (source: unknown, bytes: number): boolean => {
@@ -1433,6 +1594,7 @@ export class Governor implements MemoryGovernor {
         // ordinary capacity changes owner; it cannot serve a queued admission in between.
         source.allocated -= bytes;
         source.held -= bytes;
+        held(bytes);
         this.activity++;
         return true;
       },
@@ -1447,11 +1609,13 @@ export class Governor implements MemoryGovernor {
           return false;
         if (this.#missing(bytes, false) > 0) return false;
         this.#take(bytes);
+        held(bytes);
         this.#observeGrant("cache", "charge", bytes);
         return true;
       },
       release: (bytes: number): void => {
         this.assertMutable();
+        held(-bytes);
         this.give(bytes);
       },
       unregister: (): void => {

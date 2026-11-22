@@ -434,8 +434,9 @@ class Space implements ExtentSpace {
     this.#rootFrame = currentFrame;
     this.#previousFrame = previousFrame;
     this.#fileLength = dataLength;
-    this.#ledger = new RootPins(options.registerCache({ evictableBytes: 0, evict: () => 0 }), () =>
-      this.#scheduleReclaim(),
+    this.#ledger = new RootPins(
+      options.registerCache({ label: "root pins", evictableBytes: 0, evict: () => 0 }),
+      () => this.#scheduleReclaim(),
     );
     this.#tickets = new RetirementTickets(journal);
     this.#currentSnapshot = currentSnapshot;

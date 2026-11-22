@@ -344,6 +344,64 @@ export class WriteCredits {
     }
   }
 
+  /** Every grant the owner holds now: its four accounts and an active merge step. */
+  grants(): readonly Grant[] {
+    const grants = [this.rows, this.metadata, this.commits, this.merge];
+    if (this.#mergeActive !== null) grants.push(this.#mergeActive);
+    return grants;
+  }
+
+  /**
+   * The bytes this owner keeps, beyond its registered lifetime holding, however long a writable
+   * statement holding the writer turn waits (`MemoryGovernor.servableNow`). Nothing returns
+   * them before the statement ends: reclaim leaves the row and metadata accounts at their floors
+   * while the turn is held (`reclaimRows`, `reclaimMetadata`; idle forecasts retire only once it
+   * is free, `reclaimIdleForecasts`), and no reclaim returns the commit and merge accounts.
+   *
+   * - Rows: the row floor (the row minimum or a prepared row step) beyond the lifetime controls
+   *   charged there (`rowsLifetime`), or the memtable rows (`stayingRows`) if more: while the
+   *   turn is held no idle spill runs, and with no work of the owner's own no flush runs.
+   * - Metadata: the prepaid metadata step and any commit or merge funding beyond allocations.
+   *   Allocations are left out: the current state's are the lifetime holding, an older
+   *   snapshot's go when it closes, a flush's when it ends.
+   * - Commits and merge: all they hold, less allocations (the resident commit writers are
+   *   lifetime; merge buffers end with their merge). Their forecasts, minimum or grown, return
+   *   only through `reclaimIdleForecasts`, which needs the turn free. Returning the idle merge
+   *   forecast to a statement's own query was measured (review #51): it admits queries while
+   *   another holder still holds memory, whose progress lanes are then sized from what is left
+   *   and whose step loans refuse (the result lane's sizing, statement-sizing PR 2), turning
+   *   writes that waited and succeeded into 53200. Revisit with those lanes.
+   *
+   * Each account counts at most what it holds now: the owner never grows while it waits.
+   *
+   * While the owner runs work of its own (`ownWorkIdle` false: a flush, merge, commit or log
+   * append), that work may take idle credit from any account (`growTo` moves unused forecasts
+   * before it waits), free memtable rows, retire the prepaid metadata step and release all of it
+   * when it ends: what stays is not known until then, and none counts. Never more than stays:
+   * nothing that could fit is refused on the owner's account; the owner wakes the queue when its
+   * work ends, and a waiting request is decided then.
+   */
+  retainedWhileOpen(rowsLifetime = 0, stayingRows = 0, ownWorkIdle = true): number {
+    if (!ownWorkIdle) return 0;
+    const rows = Math.max(0, Math.min(stayingRows, this.rows.held - rowsLifetime));
+    const idle = (grant: Grant, floor: number) =>
+      Math.max(0, Math.min(grant.held, floor) - grant.allocated - grant.loaned);
+    const rowFloor = Math.min(this.rows.held, Math.max(this.#rowMinimum, this.#rowFloor));
+    return (
+      Math.max(rowFloor - rowsLifetime, rows) +
+      idle(
+        this.metadata,
+        Math.max(
+          this.metadata.allocated + this.#metadataHeadroom,
+          this.#commitMetadataFunding,
+          this.#mergeMetadataFunding,
+        ),
+      ) +
+      idle(this.commits, this.commits.held) +
+      idle(this.merge, this.merge.held)
+    );
+  }
+
   #check(): void {
     this.#stop.signal.throwIfAborted();
     if (this.#closed) throw new GrantClosedError("write owner minimum");

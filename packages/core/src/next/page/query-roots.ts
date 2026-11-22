@@ -70,6 +70,7 @@ export class QueryRoots {
       },
       (ref) =>
         `${String((ref as RootKey)[TABLE])}:${String(ref.extent.offset)}:${String(ref.extent.length)}:${String(ref.offset)}:${String(ref.length)}:${String(ref.checksum)}`,
+      "scan root cache",
     );
     this.#unregister = unregister;
   }

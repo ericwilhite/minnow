@@ -133,6 +133,7 @@ export class LiveRuntime {
     this.#limit = Math.floor((governor.capBytes - governor.reserveBytes) / 4);
     const entries = this.#entries;
     this.#cache = governor.registerCache({
+      label: "live query results",
       get evictableBytes() {
         let bytes = 0;
         for (const entry of entries)
@@ -158,8 +159,10 @@ export class LiveRuntime {
       // Lifetime holdings until close (database replacement or engine close): its 512 B base and
       // its feed listener cell. A request only their release could serve is refused at once.
       this.#unregisterLifetime =
-        governor.registerPermanent?.(() => (this.#closed ? 0 : 512 + CHANGE_LISTENER_BYTES)) ??
-        null;
+        governor.registerPermanent?.(
+          () => (this.#closed ? 0 : 512 + CHANGE_LISTENER_BYTES),
+          "live runtime",
+        ) ?? null;
     } catch (error) {
       if (this.#used > 0) this.#free(this.#used);
       this.#cache.unregister?.();

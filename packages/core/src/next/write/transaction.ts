@@ -87,8 +87,9 @@ import {
   otherIndexLayersEndBefore,
   type TableSnapshotImpl,
 } from "./view.js";
-import { need, MemtableMemoryError, byteString } from "./bytes.js";
+import { need, MemtableMemoryError, byteString, memoryRefusal } from "./bytes.js";
 import type { PreparedWriteCredit } from "./credits.js";
+import type { LentHoldings } from "../memory/governor.js";
 import { NativePrimaryAdapter, type NativePrimaryScope } from "./primary-command.js";
 import type { HolderChain } from "../memory/governor.js";
 import type {
@@ -113,6 +114,8 @@ export interface EngineHooks {
   checkNativeStepReady?(statement: StatementImpl): void;
   /** A statement closed (ended or rolled back): its forecasts may now be reclaimable. */
   statementEnded?(): void;
+  /** The write owner's holdings, kept for whichever statement holds the writer turn. */
+  writerHoldings?(): LentHoldings;
   closeNativeStep?(statement: StatementImpl): Promise<void>;
   readonly shared: Shared;
   /** The one key batch writers encode into (one writer at a time; consumed before reuse). */
@@ -812,6 +815,10 @@ export class StatementImpl implements Statement {
   get touched(): Map<number, Set<number>> {
     return (this.#touchedMap ??= new Map());
   }
+  /** A writable statement holds the writer turn, and with it the write owner's holdings. */
+  writerHoldings(): LentHoldings | null {
+    return this.readOnly ? null : (this.tx.hooks.writerHoldings?.() ?? null);
+  }
   /** Whether this statement inserted row `rowId` of `tableId` (ON CONFLICT `statement`). */
   inserted(tableId: number, rowId: number): boolean {
     // Native IDs only advance. A row below the statement-visible high-water mark
@@ -980,12 +987,12 @@ export class StatementImpl implements Statement {
       if (result instanceof Promise)
         return result.catch((error: unknown) => {
           this.#state = "failed";
-          throw error;
+          throw memoryRefusal(error);
         });
       return result;
     } catch (error) {
       this.#state = "failed";
-      throw error;
+      throw memoryRefusal(error);
     }
   }
 

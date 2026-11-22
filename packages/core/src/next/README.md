@@ -1659,12 +1659,20 @@ and the owner import it directly.
   holder whose growth fits only once the writer's rows are released, queued ahead of the writer's
   commit, with neither able to move. Test: `testing/holder-chain-invariant.test.ts`. Readers are not holders: query preparation waits only while holding
   nothing (the preparation credit, below), since readers each retaining a source recipe while
-  waiting could otherwise wait on each other. Policy: `holdsCredit` and `registerPermanent` in
+  waiting could otherwise wait on each other. A statement never waits for what it could never get
+  beside its own holdings and what its writer keeps while it holds the turn: its fixed buffers
+  and a preparation restart carry that bound (`servableNow`, `NativeGrantGroupOptions.holdings`)
+  and are refused with 53200 above it, before they wait or when the writer's own work ends and
+  its holdings are exact, and a restart waits for its measured need, never a doubled credit
+  that is not admissible at once (memory/README.md). Policy: `holdsCredit`,
+  `registerPermanent`, `servableNow` and `servable` in
   `memory/governor.ts`; tests: `memory/holder-priority.test.ts`,
   `memory/wait-policy-regressions.test.ts`, `memory/wait-wake-regressions.test.ts`,
-  `testing/native-command-fifo.test.ts`. In test runs,
+  `memory/servable-beside.test.ts`, `testing/native-command-fifo.test.ts`,
+  `testing/wide-insert-admission.test.ts`, `testing/servable-beside-writer.test.ts`,
+  `testing/statement-wait-release.test.ts`. In test runs,
   `MINNOW_GOVERNOR_STALL_MS` turns any wait without governor progress into a `GovernorStallError`
-  naming every holder. Progress includes any allocation, free or credit move on any grant, so a
+  naming every holder, cache and lifetime holding. Progress includes any allocation, free or credit move on any grant, so a
   holder working inside memory it was already granted is not reported while it touches its
   grants; one computing longer than the window without touching any grant still is (a CPU-only
   false positive). Unrelated activity can hide a stalled waiter only until its hard deadline
@@ -1678,11 +1686,14 @@ and the owner import it directly.
   from scratch on a fresh runtime. That wait is the admission that would have waited, with its
   own label and named parts, plus a `query#N/preparation-credit` part; all of it becomes the
   next attempt's credit, a single pool: every grant the attempt obtains returns the bytes it
-  releases there, so freed scratch serves the next phase. The request is the attempt's peak
-  simultaneous need, at least twice the previous request, and at most the usable capacity
-  (the cap less the reserve unless private progress, less lifetime
-  holdings), so a query restarts at most `ceil(log2(usable / first request)) + 1` times. A peak
-  need above the usable capacity is `MemoryAdmissionError` (53200).
+  releases there, so freed scratch serves the next phase. The request is twice the previous one
+  when that is admissible at once, else the attempt's measured peak alone, at most the usable
+  capacity (a peak need above it is `MemoryAdmissionError`, 53200). The wait carries what the
+  statement keeps through it (its result grant, its writer's holdings:
+  `NativeGrantGroupOptions.holdings`), so a credit that could never be served beside them is
+  refused with 53200 rather than left waiting. Each credit is larger than the last and covers
+  the stopped attempt's peak, so restarts are at most `ceil(log2(usable / first request)) + 1`
+  that doubled plus at most one per admission of an attempt that took its measured peak.
 - A grant _holds_ bytes, and its operator _allocates_ buffers out of them, so a non-spillable
   operator works inside its admitted minimum.
 - Growth is charged before it happens, including the overlap while a buffer is copied.

@@ -155,13 +155,17 @@ async function openResources(
       } finally {
         boot.close();
       }
-      scratchMemory = governor.registerCache({ evictableBytes: 0, evict: () => 0 });
+      scratchMemory = governor.registerCache({
+        label: "native scratch",
+        evictableBytes: 0,
+        evict: () => 0,
+      });
       spill = new ScratchSpillService(scratch, { budget: scratchControl, memory: scratchMemory });
       // Permanent beside the write engine: part of every write growth step's complete minimum.
       const control = scratchControl;
       openedPath.retainOwnerHoldings(() => control.held);
       // Held for the owner's lifetime, never released on a reclaim request: permanent.
-      unregisterScratch = governor.registerPermanent(() => control.held);
+      unregisterScratch = governor.registerPermanent(() => control.held, "native scratch control");
     }
     // Native recovery must finish before old temporary ownership is swept.
     await spill.sweep();
