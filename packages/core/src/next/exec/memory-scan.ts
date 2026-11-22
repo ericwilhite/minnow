@@ -66,6 +66,8 @@ export class MemorySegmentScan implements BatchSource {
   #chunk = 0;
   /** Chunk-relative row the next read of `#chunk` starts at; 0 at a chunk's start. */
   #start = 0;
+  /** Chunk-relative end of `#chunk`'s live rows: no read decodes the dead rows after it. */
+  #liveEnd = MEMORY_CHUNK_ROWS;
   /** The current segment's deletions; undefined until read. */
   #deletions: DeletionVector | null | undefined = undefined;
   #aborted = false;
@@ -118,6 +120,7 @@ export class MemorySegmentScan implements BatchSource {
         this.#segment += 1;
         this.#chunk = 0;
         this.#start = 0;
+        this.#liveEnd = MEMORY_CHUNK_ROWS;
         this.#deletions = undefined;
         continue;
       }
@@ -141,6 +144,11 @@ export class MemorySegmentScan implements BatchSource {
           this.#chunk += 1;
           continue;
         }
+        // Read only the span of live rows: a selected row (an index fetch, a late fetch) is
+        // decoded alone, not after every row before it in its chunk. Sizing counts the selected
+        // rows' own widths (page/read-bounds.ts `ReadSource.locators`).
+        this.#start = this.#selection.rows[0] ?? 0;
+        this.#liveEnd = (this.#selection.rows[this.#selection.count - 1] ?? length - 1) + 1;
       }
       // The previous batch's borrow has ended: its varlen bytes may be reused.
       for (const out of this.#out) out.varlen?.reset();
@@ -156,7 +164,7 @@ export class MemorySegmentScan implements BatchSource {
             // selection. Keep those reads vectorized inside the admitted byte prefix.
             maxRows: Math.min(
               MEMORY_CHUNK_ROWS,
-              length - this.#start,
+              Math.min(length, this.#liveEnd) - this.#start,
               this.selectRows !== undefined || this.#deletions !== null
                 ? MEMORY_CHUNK_ROWS
                 : maxRows,
@@ -244,9 +252,10 @@ export class MemorySegmentScan implements BatchSource {
     }
     this.#lastSegment = this.#segments[this.#segment]?.index ?? -1;
     this.#lastStart = this.#chunk * MEMORY_CHUNK_ROWS + firstRow;
-    if (end === length) {
+    if (end >= Math.min(length, this.#liveEnd)) {
       this.#chunk += 1;
       this.#start = 0;
+      this.#liveEnd = MEMORY_CHUNK_ROWS;
     } else this.#start = end;
     return { batch: { length: end - firstRow, columns: this.#vectors, selection } };
   }

@@ -299,10 +299,11 @@ describe("MemorySegmentScan", () => {
       .filter(([column]) => column === 2)
       .map(([, chunk, start]) => [chunk, start]);
     expect(starts).toHaveLength(Math.ceil(2048 / 8) + Math.ceil(952 / 8));
+    // Position 0 is deleted: the first part starts at the first live row.
     expect(starts.slice(0, 3)).toEqual([
-      [0, 0],
-      [0, 8],
-      [0, 16],
+      [0, 1],
+      [0, 9],
+      [0, 17],
     ]);
     expect(starts.at(256)).toEqual([1, 0]);
     expect(
@@ -310,6 +311,44 @@ describe("MemorySegmentScan", () => {
     ).toEqual(starts);
     const chunks = segment.calls.map(([, chunk]) => chunk);
     expect(chunks).toEqual([...chunks].sort((a, b) => a - b));
+  });
+
+  it("decodes only the span of a chunk's live rows, never the dead rows around it", async () => {
+    // An index fetch selects one row: the rows before and after it in its chunk are not read.
+    // Live: positions 700, 701 and 900 of chunk 0; no live row in chunk 1.
+    const live = new Set([700, 701, 900]);
+    const selected: DeletionVector = {
+      deletedCount: 3000 - live.size,
+      isDeleted: (position) => !live.has(position),
+      liveRows(from, length, input, out: Selection) {
+        out.count = 0;
+        for (let k = 0; k < length; k++)
+          if ((input === null || input.rows.includes(k)) && live.has(from + k))
+            out.rows[out.count++] = k;
+      },
+    };
+    const segment = new PartialTextSegment(0, 3000, selected);
+    const allowance: ByteCharge = { allocate: () => true, free: () => undefined };
+    const out: ChunkOutput[] = [
+      {
+        flat: allocateFlat(INT, MEMORY_CHUNK_ROWS),
+        codes: new Int32Array(MEMORY_CHUNK_ROWS),
+        varlen: null,
+      },
+      {
+        flat: allocateFlat(TEXT, MEMORY_CHUNK_ROWS),
+        codes: new Int32Array(MEMORY_CHUNK_ROWS),
+        varlen: new VarlenBuilder(MEMORY_CHUNK_ROWS, allowance, 64, 64),
+      },
+    ];
+    const sink = new Copying();
+    await drive(new MemorySegmentScan([segment], [1, 2], out), sink);
+    expect(sink.rows).toEqual([...live].map((position) => [position, text(position)]));
+    // 8-row parts from row 700; the part holding row 900 is the last read of the scan.
+    const starts = segment.calls.filter(([column]) => column === 2).map(([, , start]) => start);
+    expect(starts[0]).toBe(700);
+    expect(starts.at(-1)).toBe(900 - ((900 - 700) % 8));
+    expect(segment.calls.every(([, chunk]) => chunk === 0)).toBe(true);
   });
 
   it("refuses a denied part with no row (no progress loan to borrow)", async () => {
