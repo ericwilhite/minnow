@@ -91,6 +91,15 @@ export interface RowBindingLease {
   readonly tableId: number;
   readonly old: ReadonlyArray<Vector | typeof ROW_IMAGE_UNREAD> | null;
   readonly new: ReadonlyArray<Vector | typeof ROW_IMAGE_UNREAD> | null;
+  /**
+   * The funded bytes of one binding copy of each read column, by position (0 where unread): the
+   * read funded these with the image, and a binding copy charges exactly them
+   * (owner/registry-scalar.ts `bindingCopyBytes`).
+   */
+  readonly copyBytes?: {
+    readonly old: readonly number[] | null;
+    readonly new: readonly number[] | null;
+  };
   release(): void;
 }
 export interface NativeCommandBoundary {

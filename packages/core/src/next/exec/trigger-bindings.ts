@@ -110,7 +110,12 @@ export class TriggerBindingProgram {
             data.layout === "varlen"
               ? (data.offsets[1] ?? 0) - (data.offsets[0] ?? 0) + 8
               : flatBytes(row) - (row.validity?.byteLength ?? 0);
-          result.take(bytes + (row.validity?.byteLength ?? 0));
+          const copyBytes = bytes + (row.validity?.byteLength ?? 0);
+          // The read funded this copy with the image (owner/registry-scalar.ts
+          // bindingCopyBytes): charge exactly that, which is never less than the copy.
+          const funded = lease.copyBytes?.[ref.source]?.[ref.position];
+          if (funded !== undefined && funded < copyBytes) invalid("binding copy above its funding");
+          result.take(funded ?? copyBytes);
           result.push({
             ...row,
             validity: row.validity?.slice() ?? null,
