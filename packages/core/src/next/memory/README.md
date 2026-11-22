@@ -140,7 +140,13 @@ idle credit is returned first. A group above it is refused with 53200. The write
 queue when its own work ends; its holdings are then exact, and a group above them is refused
 instead of waiting forever. Anything at or below it waits and is served once the
 finite holders release (`testing/servable-beside-writer.test.ts` checks both sides: the value is
-served, one byte more is refused). A preparation restart doubles its credit only when the doubled
+served, one byte more is refused). A queued admission asks a holder whose reclaim is asynchronous
+once, so asks that free nothing do not loop; an owner's wake (`release(0)`, the writer's
+`notifyReclaimable` after a publication) makes every queued admission ask its reclaimers once
+more, since what they keep may now be covered and droppable. An idle writer then holds exactly
+its registered lifetime holding, so `usableCapacity` needs no other subtraction: its other
+allocations (covered FTS mutation entries, row arenas) are finite and reclaim returns them.
+A preparation restart doubles its credit only when the doubled
 credit is admissible at once; otherwise it waits for its measured need alone.
 
 The write path's memtable refusal (`MemtableMemoryError`) is internal: a statement's write call

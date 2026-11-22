@@ -366,7 +366,11 @@ export class WriteCredits {
    *   snapshot's go when it closes, a flush's when it ends.
    * - Commits and merge: all they hold, less allocations (the resident commit writers are
    *   lifetime; merge buffers end with their merge). Their forecasts, minimum or grown, return
-   *   only through `reclaimIdleForecasts`, which needs the turn free.
+   *   only through `reclaimIdleForecasts`, which needs the turn free. Returning the idle merge
+   *   forecast to a statement's own query was measured (review #51): it admits queries while
+   *   another holder still holds memory, whose progress lanes are then sized from what is left
+   *   and whose step loans refuse (the result lane's sizing, statement-sizing PR 2), turning
+   *   writes that waited and succeeded into 53200. Revisit with those lanes.
    *
    * Each account counts at most what it holds now: the owner never grows while it waits.
    *

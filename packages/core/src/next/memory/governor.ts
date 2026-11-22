@@ -917,6 +917,12 @@ export class Governor implements MemoryGovernor {
   give(bytes: number): void {
     this.#progress++;
     this.usedBytes -= bytes;
+    // A zero release is an owner's wake (`release(0)`, the writer's `notifyReclaimable`): its
+    // reclaimers may return more now (a publication covered what they keep), so a queued
+    // admission asks each of them once more. A read still asks one holder at a time.
+    if (bytes === 0)
+      for (const queue of [this.#holders, this.#admissions])
+        for (const request of queue) if (request.readRoom === null) request.asked.clear();
     this.#drain();
   }
 

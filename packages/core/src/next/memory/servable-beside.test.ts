@@ -160,3 +160,37 @@ it("names caches and lifetime holdings in a stall report, leaving nothing unattr
   scratch.close();
   expect(governor.usedBytes).toBe(0);
 });
+
+it("asks a reclaimer again after its owner's wake, so a covered release is not missed", async () => {
+  const governor = new Governor(CAP);
+  const writer = await governor.admit({ label: "writer", minimumBytes: 4 * MiB, spillable: true });
+  expect(writer.allocate(4 * MiB)).toBe(true);
+  // The reclaimer frees nothing until its state allows (a publication covers its entries).
+  let covered = false,
+    asked = 0;
+  writer.onReclaimRequest(async () => {
+    asked++;
+    await Promise.resolve();
+    if (!covered) return;
+    writer.free(4 * MiB);
+    writer.release(4 * MiB);
+  });
+  const waiting = governor
+    .admitGroup({
+      label: "read",
+      grants: [{ label: "read", minimumBytes: USABLE - MiB, spillable: false }],
+    })
+    .then((grants) => {
+      for (const grant of grants) grant.close();
+      return "served" as const;
+    });
+  expect(await within(waiting)).toBe(PENDING);
+  expect(asked).toBe(1);
+  covered = true;
+  // The owner's wake (`notifyReclaimable`): queued admissions ask its reclaimer once more.
+  writer.release(0);
+  expect(await within(waiting)).toBe("served");
+  expect(asked).toBe(2);
+  writer.close();
+  expect(governor.usedBytes).toBe(0);
+});
