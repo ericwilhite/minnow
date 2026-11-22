@@ -5,6 +5,10 @@
 import { ReadDeniedError, type ByteBudget, type CacheMemory } from "./extents.js";
 import type { RootPin } from "./reclaim.js";
 export const PIN_HEADER_BYTES = 320;
+/** What a pin with this label charges (`RootPins.pin`). */
+export function pinBytes(label: string): number {
+  return PIN_HEADER_BYTES + 2 * label.length;
+}
 interface Credit {
   free(bytes: number): void;
 }
@@ -76,7 +80,7 @@ export class RootPins {
   }
   pin(label = "pin", budget?: ByteBudget): RootPin {
     if (this.#closed) throw new TypeError("Root pins closed");
-    const bytes = PIN_HEADER_BYTES + 2 * label.length;
+    const bytes = pinBytes(label);
     let credit: Credit;
     if (budget === undefined) {
       if (!this.memory.charge(bytes)) throw new ReadDeniedError(bytes);

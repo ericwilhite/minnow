@@ -240,7 +240,7 @@ interface SegmentBase {
    * and for groups whose bitmap is cached; otherwise reads the group's bitmap once. Immutable,
    * shared, charged to the cache (bitmaps) or the write path (memory deletions).
    */
-  deletions(): MaybePromise<DeletionVector | null>;
+  deletions(budget?: ByteBudget): MaybePromise<DeletionVector | null>;
   /**
    * Sound bounds of a column over the whole segment ("Scanning"), or null when unknown.
    * Groups: from the group root (`root()` must have resolved).

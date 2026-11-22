@@ -364,6 +364,8 @@ export interface ReadOptions {
 
   /** Charged for every byte the lease holds, cached or not, until `release` (ruling R5). */
   readonly budget: ByteBudget;
+  /** A label naming the call site (diagnostics and tests): no effect on the read. */
+  readonly site?: string;
   readonly signal?: AbortSignal;
   /**
    * A one-pass scan (a full export): blobs it misses stay private to its lease and are never
@@ -392,6 +394,8 @@ export interface ReadLease {
 
 /** Options of `ExtentReader.peek`. */
 export interface PeekOptions {
+  /** A label naming the call site (diagnostics and tests): no effect on the read. */
+  readonly site?: string;
   /**
    * A one-pass scan's hit (`ReadOptions.once`): not a use. The entry is not marked as reused, not
    * moved in its segment and its last use is not updated, so a scan never promotes what it
