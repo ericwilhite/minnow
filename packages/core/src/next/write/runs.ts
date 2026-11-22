@@ -1113,6 +1113,7 @@ async function readAll(
   space: SpaceReader,
   refs: readonly BlobRef[],
   budget: ByteBudget,
+  site?: string,
 ): Promise<Uint8Array[]> {
   const out: Uint8Array[] = [];
   for (let from = 0; from < refs.length;) {
@@ -1122,7 +1123,10 @@ async function readAll(
       bytes += need(refs[to]).length;
       to += 1;
     }
-    const lease = await space.read(refs.slice(from, to), { budget });
+    const lease = await space.read(refs.slice(from, to), {
+      budget,
+      ...(site === undefined ? {} : { site }),
+    });
     try {
       for (const part of lease.bytes) out.push(part.slice());
     } finally {
@@ -1240,18 +1244,21 @@ export class RunReader {
     ref: RunRef,
     budget: ByteBudget,
     charge: ByteBudget,
+    /** Names the opener's read site on every peek and read (diagnostics and tests). */
+    site?: string,
   ): MaybePromise<RunReader> {
     requireEncoding("run reader", ref.encoding ?? 1, [1, 2]);
     if ((ref.encoding ?? 1) === 2) {
       overflowKeyBytes(ref);
-      return RunReader.#openOverflow(space, ref, budget, charge);
+      return RunReader.#openOverflow(space, ref, budget, charge, site);
     }
-    const fences = space.peek(ref.fences);
-    const index = space.peek(ref.entries);
-    const directory = space.peek(ref.bloom);
+    const peekOptions = site === undefined ? undefined : { site };
+    const fences = space.peek(ref.fences, peekOptions);
+    const index = space.peek(ref.entries, peekOptions);
+    const directory = space.peek(ref.bloom, peekOptions);
     if (fences !== null && index !== null && directory !== null) {
       const { partitionBlocks, refs } = RunReader.#directory(ref, directory);
-      const blooms = refs.map((blob) => space.peek(blob));
+      const blooms = refs.map((blob) => space.peek(blob, peekOptions));
       if (blooms.every((bytes): bytes is Uint8Array => bytes !== null))
         return RunReader.#build(ref, fences, index, partitionBlocks, blooms, charge);
     }
@@ -1260,9 +1267,10 @@ export class RunReader {
         space,
         [ref.fences, ref.entries, ref.bloom],
         budget,
+        site,
       );
       const { partitionBlocks, refs } = RunReader.#directory(ref, need(directoryBytes));
-      const blooms = await readAll(space, refs, budget);
+      const blooms = await readAll(space, refs, budget, site);
       return RunReader.#build(
         ref,
         need(fenceBytes),
@@ -1280,6 +1288,7 @@ export class RunReader {
     ref: RunRef,
     budget: ByteBudget,
     charge: ByteBudget,
+    site?: string,
   ): Promise<RunReader> {
     const bound = RunReader.residentBound(ref);
     if (!charge.allocate(bound)) throw new ParseBudgetError(bound);
@@ -1289,6 +1298,7 @@ export class RunReader {
         space,
         [ref.fences, ref.entries, ref.bloom],
         budget,
+        site,
       );
       const blockCount = new ByteReader(need(index)).varuint();
       if (
@@ -1307,7 +1317,7 @@ export class RunReader {
           13 * Math.ceil(blocks / PARTITION_BLOCKS)
       )
         throw new StoreCorruptionError("Run Bloom bytes exceed its entry bound");
-      const blooms = await readAll(space, refs, budget);
+      const blooms = await readAll(space, refs, budget, site);
       const bytes = RunReader.residentCharge(need(fences), blooms);
       const reader = new RunReader(ref, need(fences), need(index), partitionBlocks, blooms, bytes);
       await reader.#verifyBoundaries(space, need(fences), budget);

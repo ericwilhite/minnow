@@ -12,6 +12,7 @@
  * the path must stay usable.
  */
 import fc from "fast-check";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { afterEach, expect, it } from "vitest";
 import { Governor } from "../memory/governor.js";
 import { createReach, PUBLICATION_PRESSURE_REACH } from "../../testing/reach.js";
@@ -28,7 +29,7 @@ import {
   ints,
   tableInput,
 } from "../write/test-support.js";
-import type { WritePathImpl } from "../write/engine.js";
+import type { PublicationKind, WritePathImpl } from "../write/engine.js";
 import { IDLE_FLUSH_MS } from "../write/log.js";
 import { StorageCore } from "./storage-core.js";
 import { oracleRows } from "./differential-adapter.js";
@@ -41,28 +42,20 @@ const allocate = Object.getOwnPropertyDescriptor(MetadataBudget.prototype, "allo
 afterEach(() => {
   MetadataBudget.prototype.allocate = allocate;
 });
-// The refusals below match publications by name in the stack: keep every frame.
-Error.stackTraceLimit = 100;
-
-/** The write path's publications (engine.ts): each switches to a new root, then publishes. */
-const PUBLICATIONS = [
-  "#recycleLog",
-  "#writeFlush",
-  "#mergePinned",
-  "#publishUnchanged",
-  "#stageFts",
-] as const;
-
 /**
  * Refuses every metadata charge a publication makes between its durable switch and the end of
- * its post-switch section (engine tuning `publicationSwitch`). Publications take one lock to
- * switch, so at most one is past its switch at a time; its own allocations are refused, while
- * other work running meanwhile (another publication's preparation) meets ordinary pressure. The
- * first refusal rejects `firstRefusal`, naming the publication: a refused post-switch step can
- * otherwise leave its publication retrying forever.
+ * its post-switch section. The engine names both ends and the publication (tuning
+ * `publicationSwitch`); the "switched" call enters that publication's async context here, so only
+ * charges made in its own continuation are refused, while other work running meanwhile (another
+ * publication's preparation, a statement) meets ordinary pressure. Each publication's "started"
+ * call clears the context it inherited from whatever scheduled it. The first refusal rejects
+ * `firstRefusal`, naming the publication: a refused post-switch step can otherwise leave its
+ * publication retrying forever. Each publication's first pin funding is also refused once
+ * (tuning `beforeFundPins`): it must unwind and retry, leaving no charge behind.
  */
 function refuseAfterSwitch() {
-  const switchedNow: string[] = [];
+  const inside = new AsyncLocalStorage<PublicationKind | undefined>();
+  const switchedNow = new Set<PublicationKind>();
   const refused: string[] = [];
   let refuse: (error: Error) => void = () => undefined;
   const firstRefusal = new Promise<never>((_, reject) => {
@@ -70,58 +63,64 @@ function refuseAfterSwitch() {
   });
   firstRefusal.catch(() => undefined);
   const counts = { switches: 0 };
-  // Each publication's first pin funding is also refused once, before its switch: it must
-  // unwind and retry, leaving no charge behind (`metadata.balanced()`).
-  const fundingRefused = new Set<string>();
+  const fundingRefused = new Set<PublicationKind>();
   const metadata = {
     budget: null as MetadataBudget | null,
     /** At rest the grant holds the resident metadata plus the current state's pin, exactly. */
-    offset: null as number | null,
     measure(path: { readonly residentMetadataBytes: number }): number {
       if (this.budget === null) throw new Error("no metadata budget seen");
       return this.budget.grant.allocated - path.residentMetadataBytes;
     },
   };
   MetadataBudget.prototype.allocate = function (bytes: number) {
-    const stack = new Error().stack ?? "";
-    if (stack.includes("#fundPins")) {
-      metadata.budget ??= this;
-      const publication = PUBLICATIONS.find((name) => stack.includes(name));
-      if (publication !== undefined && !fundingRefused.has(publication)) {
-        fundingRefused.add(publication);
-        throw new MetadataPressure(bytes, bytes);
-      }
-    }
-    const current = switchedNow[switchedNow.length - 1];
-    if (current !== undefined && bytes > 0 && stack.includes(current)) {
-      refused.push(current);
-      refuse(new Error(`${current} allocated ${String(bytes)} bytes after its switch`));
+    // The write path's one metadata budget.
+    metadata.budget ??= this;
+    const kind = inside.getStore();
+    if (kind !== undefined && switchedNow.has(kind) && bytes > 0) {
+      refused.push(kind);
+      refuse(
+        new Error(`the ${kind} publication allocated ${String(bytes)} bytes after its switch`),
+      );
       throw new MetadataPressure(bytes, bytes);
     }
     return allocate.call(this, bytes);
   };
-  const publicationSwitch = (phase: "switched" | "settled"): void => {
-    if (phase === "settled") {
-      switchedNow.pop();
+  const publicationSwitch = (
+    phase: "started" | "switched" | "settled",
+    kind: PublicationKind,
+  ): void => {
+    // A publication's own work is not the one that spawned it: a flush scheduled from inside
+    // another publication's post-switch section starts here with no inherited attribution.
+    if (phase === "started") {
+      inside.enterWith(undefined);
       return;
     }
-    const stack = new Error().stack ?? "";
-    const publication = PUBLICATIONS.find((name) => stack.includes(name));
-    if (publication === undefined) throw new Error(`An unknown publication switched: ${stack}`);
+    if (phase === "settled") {
+      switchedNow.delete(kind);
+      inside.enterWith(undefined);
+      return;
+    }
     counts.switches++;
-    switchedNow.push(publication);
+    switchedNow.add(kind);
+    inside.enterWith(kind);
+  };
+  const beforeFundPins = (kind: PublicationKind): void => {
+    if (fundingRefused.has(kind)) return;
+    fundingRefused.add(kind);
+    throw new MetadataPressure(1, 1);
   };
   const step = <T>(work: Promise<T>): Promise<T> => Promise.race([work, firstRefusal]);
-  return { refused, counts, publicationSwitch, step, fundingRefused, metadata };
+  return { refused, counts, publicationSwitch, beforeFundPins, step, fundingRefused, metadata };
 }
 
 it("funds every post-switch pin before the switch: no publication fails after its root is durable", async () => {
-  const { refused, counts, publicationSwitch, step, fundingRefused, metadata } =
+  const { refused, counts, publicationSwitch, beforeFundPins, step, fundingRefused, metadata } =
     refuseAfterSwitch();
   const core = new StorageCore(8, {
     logRecycleBytes: 32 * 1024,
     merges: { mode: "auto" },
     publicationSwitch,
+    beforeFundPins,
   });
   await core.open();
   const sql = (text: string) => step(core.execute(text));
@@ -157,9 +156,7 @@ it("funds every post-switch pin before the switch: no publication fails after it
     expect(refused).toEqual([]);
     // Each refused funding unwound completely: at rest the metadata grant holds exactly the
     // resident metadata plus the current state's pin, as before any publication.
-    expect([...fundingRefused].sort()).toEqual(
-      ["#mergePinned", "#recycleLog", "#stageFts", "#writeFlush"].sort(),
-    );
+    expect([...fundingRefused].sort()).toEqual(["flush", "fts", "merge", "recycle"]);
     await step(core.harness.path.quiesce());
     expect(metadata.measure(core.harness.path)).toBe(pinBytes("current state"));
     // The path is healthy and every acknowledged write is there.
@@ -189,12 +186,14 @@ async function oneTable(path: WritePathImpl): Promise<number> {
 }
 
 it("funds the idle publication's state pin before its switch", async () => {
-  const { refused, publicationSwitch, step, fundingRefused, metadata } = refuseAfterSwitch();
+  const { refused, publicationSwitch, beforeFundPins, step, fundingRefused, metadata } =
+    refuseAfterSwitch();
   // As write/extent-deltas.test.ts drives an idle publish: any retired space is over the bound.
   const harness = new Harness("strict", "memory", 4, undefined, {
     merges: { mode: "manual", fanIn: 2 },
     idleGarbageBytes: 1,
     publicationSwitch,
+    beforeFundPins,
   });
   const path = await harness.open();
   try {
@@ -215,7 +214,7 @@ it("funds the idle publication's state pin before its switch", async () => {
     expect(path.maintenance.idlePublishes).toBeGreaterThan(0);
     expect(refused).toEqual([]);
     expect(path.failure).toBeNull();
-    expect(fundingRefused.has("#publishUnchanged")).toBe(true);
+    expect(fundingRefused.has("idle")).toBe(true);
     await step(path.quiesce());
     expect(metadata.measure(path)).toBe(pinBytes("current state"));
   } finally {
@@ -260,6 +259,7 @@ for (const seed of seedsFor("next-publication-pressure", [0x9b11, 0x9b12]))
               logRecycleBytes: 64 * 1024,
               merges: { mode: "manual", fanIn: 2 },
               publicationSwitch: pressure.publicationSwitch,
+              ...(refuse ? { beforeFundPins: pressure.beforeFundPins } : {}),
             });
             // A small cap: large rows leave the metadata budget little room to grow.
             Object.defineProperty(core.harness, "governor", { value: new Governor(32 << 20) });
@@ -370,22 +370,24 @@ it("refunds a flush's page-index charge when its pin funding is refused", async 
     const seen: { budget: MetadataBudget | null } = { budget: null };
     let refused = 0;
     MetadataBudget.prototype.allocate = function (bytes: number) {
-      const stack = new Error().stack ?? "";
-      if (stack.includes("#fundPins") && stack.includes("#writeFlush")) {
-        seen.budget = this;
-        if (refuse && refused++ === 0)
-          throw new MetadataPressure(bytes, this.grant.allocated + bytes);
-      }
+      // The write path's one metadata budget.
+      seen.budget ??= this;
       return allocate.call(this, bytes);
     };
-    const core = new StorageCore(8, { merges: { mode: "manual" } });
+    const core = new StorageCore(8, {
+      merges: { mode: "manual" },
+      // The first flush's pin funding is refused, as metadata pressure refuses it.
+      beforeFundPins: (kind) => {
+        if (refuse && kind === "flush" && refused++ === 0) throw new MetadataPressure(1, 1);
+      },
+    });
     try {
       await core.open();
       await core.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)");
       for (let i = 0; i < 40; i++)
         await core.execute(`INSERT INTO t VALUES (${String(i)}, ${String(i)})`);
       await core.harness.path.quiesce();
-      if (seen.budget === null) throw new Error("no flush funded its pins");
+      if (seen.budget === null) throw new Error("no metadata was charged");
       return { allocated: seen.budget.grant.allocated, refused };
     } finally {
       MetadataBudget.prototype.allocate = allocate;

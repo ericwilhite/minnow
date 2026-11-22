@@ -13,6 +13,7 @@ import { expect, it } from "vitest";
 import { Governor } from "../memory/governor.js";
 import { boundSource } from "../page/read-bounds.js";
 import { MetadataBudget, MetadataPressure } from "../write/budget.js";
+import { READ_SITES } from "../write/engine.js";
 import { StorageCore } from "./storage-core.js";
 import { oracleRows } from "./differential-adapter.js";
 
@@ -42,16 +43,15 @@ it("retries a flush whose deletion-bitmap read is refused, never failing the wri
     metadataPressure = 0;
   core.harness.onSpace = (space) => {
     // The read must happen: a cache hit (`peek`) would skip it, and whether the open left the
-    // bitmap resident varies by machine. The targeted read always goes to storage.
+    // bitmap resident varies by machine. The targeted read (by its named site, READ_SITES)
+    // always goes to storage.
     const peek = space.peek.bind(space);
     space.peek = (ref, options) => {
-      const stack = new Error().stack ?? "";
-      return stack.includes("#bitmap") && stack.includes("#writeFlush") ? null : peek(ref, options);
+      return options?.site === READ_SITES.flushBitmap ? null : peek(ref, options);
     };
     const read = space.read.bind(space);
     space.read = (refs, options) => {
-      const stack = new Error().stack ?? "";
-      if (!stack.includes("#bitmap") || !stack.includes("#writeFlush")) return read(refs, options);
+      if (options.site !== READ_SITES.flushBitmap) return read(refs, options);
       const budget = options.budget;
       const metadata = budget instanceof MetadataBudget;
       if (metadata && metadataPressure > 0) return read(refs, options);
@@ -185,16 +185,11 @@ it("completes a merge whose run-reader read is refused: it waits out the pressur
     // the runs resident varies by machine. The targeted reads always go to storage.
     const peek = space.peek.bind(space);
     space.peek = (ref, options) => {
-      const stack = new Error().stack ?? "";
-      return armed && stack.includes("RunReader") && stack.includes("#mergePinned")
-        ? null
-        : peek(ref, options);
+      return armed && options?.site === READ_SITES.mergeRun ? null : peek(ref, options);
     };
     const read = space.read.bind(space);
     space.read = (refs, options) => {
-      const stack = new Error().stack ?? "";
-      if (!armed || !stack.includes("RunReader") || !stack.includes("#mergePinned"))
-        return read(refs, options);
+      if (!armed || options.site !== READ_SITES.mergeRun) return read(refs, options);
       const budget = options.budget;
       const metadata = budget instanceof MetadataBudget;
       if (metadata && metadataPressure > 0) return read(refs, options);
