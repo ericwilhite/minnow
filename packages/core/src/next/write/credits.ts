@@ -515,12 +515,7 @@ export class WriteCredits {
     for (;;) {
       this.#check();
       stop.throwIfAborted();
-      if (
-        grant.held >= wanted &&
-        this.metadata.held >= metadata &&
-        this.commits.held >= this.transactionCommitBytes &&
-        (!nativeMinimum || this.#nativeReady())
-      ) {
+      if (this.#grown(grant, wanted, metadata, nativeMinimum)) {
         this.#rememberFundedMetadata(grant, wanted, metadata, funding);
         return;
       }
@@ -560,17 +555,15 @@ export class WriteCredits {
             if (moved > 0 && source === this.metadata) this.#trimMetadataHeadroom();
           }
         }
-        if (
-          grant.held >= wanted &&
-          this.metadata.held >= metadata &&
-          (!nativeMinimum || this.#nativeReady())
-        ) {
+        if (this.#grown(grant, wanted, metadata, nativeMinimum)) {
           this.#rememberFundedMetadata(grant, wanted, metadata, funding);
           return;
         }
+        // An immediate grow funds only `grant`: every other part of the step must be in place.
         if (
           (!nativeMinimum || this.#nativeReady()) &&
           this.metadata.held >= metadata &&
+          this.commits.held >= this.transactionCommitBytes &&
           (pass === 1 ||
             wanted - grant.held <=
               this.governor.capBytes - this.governor.reserveBytes - this.governor.usedBytes) &&
@@ -656,6 +649,21 @@ export class WriteCredits {
         for (const credit of credits) credit.close();
       }
     }
+  }
+
+  /**
+   * Growth is complete: the grant reached `wanted`, the metadata step is funded, the writing
+   * transaction's commit window is held, and a native step's own workspace is ready. Every exit
+   * of `#growTo` uses this, so no growth resolves without the commit window: callers re-prepare
+   * until a request is immediate, and an exit that skipped the window would spin them.
+   */
+  #grown(grant: Grant, wanted: number, metadata: number, nativeMinimum: boolean): boolean {
+    return (
+      grant.held >= wanted &&
+      this.metadata.held >= metadata &&
+      this.commits.held >= this.transactionCommitBytes &&
+      (!nativeMinimum || this.#nativeReady())
+    );
   }
 
   #rememberFundedMetadata(

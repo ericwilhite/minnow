@@ -13719,3 +13719,18 @@ export const FLAT_BYTE_PG_REACH = [
   "UUID36 width",
   "zero state and spill",
 ] as const;
+
+/** A writing transaction's commit window is funded whenever its growth resolves
+ * (write/transaction-commit-window.test.ts). */
+export const TRANSACTION_COMMIT_WINDOW_REACH = [
+  "window unfunded at first write",
+  "metadata step",
+  "row growth",
+  "native minimum",
+  "funded by idle transfer",
+  "funded by fresh admission",
+  "idle covers the step only",
+  "repeat request is immediate",
+  "window returned at transaction end",
+  "zero final charge",
+] as const;
