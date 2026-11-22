@@ -59,8 +59,9 @@ and benchmarks that run in your browser.
   keyed-change, bounded-window, and Suspense/SWR-friendly React adapters. A commit updates every
   affected query in the same turn, so a screen renders it once.
 - **Keys that can change.** A record created offline under a temporary key moves to its server key
-  with one `UPDATE`. References follow in the same commit. In 0.x the old key also keeps reading and
-  writing the row for 10 days; the planned 1.0 frees it at once, as PostgreSQL does. See
+  with one `UPDATE`. References follow in the same commit, and in 0.x the old key keeps reading and
+  writing the row for 10 days, so nothing that held it loses the record. The planned 1.0 frees the
+  old key at once, as PostgreSQL does. See
   [Offline sync and rekeying](https://minnowdb.com/docs/engine/rekeying/).
 - **Portable and extensible.** Snapshots move a committed database between stores. The public
   storage interface includes a shared test kit for custom adapters.
