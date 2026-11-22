@@ -366,9 +366,27 @@ class GrantImpl implements Grant {
   grown: (() => void) | null = null;
   /** Holdings grew during the current operation; the observer runs once it completes. */
   pendingGrowth = false;
-  held = 0;
+  #held = 0;
+  #loan = 0;
+  /** Credit this grant holds. Every change is reported to `Governor.observeHoldings`. */
+  get held(): number {
+    return this.#held;
+  }
+  set held(bytes: number) {
+    const delta = bytes - this.#held;
+    this.#held = bytes;
+    if (delta !== 0) Governor.observeHoldings?.(this, delta);
+  }
   allocated = 0;
-  loan = 0;
+  /** Bytes lent from the reserve. Every change is reported to `Governor.observeHoldings`. */
+  get loan(): number {
+    return this.#loan;
+  }
+  set loan(bytes: number) {
+    const delta = bytes - this.#loan;
+    this.#loan = bytes;
+    if (delta !== 0) Governor.observeHoldings?.(this, delta);
+  }
   loanPending = false;
   closed = false;
   reclaim: ((bytes: number) => unknown) | null = null;
@@ -610,6 +628,12 @@ export class Governor implements MemoryGovernor {
    * longer than the window would also be reported.
    */
   static stallAfterMs: number | null = null;
+  /**
+   * Test builds only: called after every change to a grant's holdings (its `held` credit or its
+   * reserve `loaned` bytes), by `delta` bytes: growth, transfers, carving, releases, loans and
+   * close all pass here. Suites sum it per owner for exact peak holdings.
+   */
+  static observeHoldings: ((grant: Grant, delta: number) => void) | null = null;
   /** Test builds: a waiter queued for this many windows is reported whatever other activity
    * continues (review 10): unrelated grant activity cannot mask a stalled waiter indefinitely. */
   static stallDeadlineWindows = 6;
