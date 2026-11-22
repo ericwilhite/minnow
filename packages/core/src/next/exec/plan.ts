@@ -3552,6 +3552,26 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           : { row: input.reduce((a, b) => a + b, 0) + output + 65536, repeated: 0 };
       });
     }
+    if (modification.op === "modify")
+      // The modification's spool holds each input row on the result progress lane. Its bound is
+      // composed column by column, never dropped: parameters, literals and concatenation keep
+      // their exact sizes (concatenation sums its arguments), a table column takes its source
+      // read's value bound, and a column no rule sizes is marked unknown (run.ts adds the
+      // source/parameter envelope for it).
+      runtime.modifyResultRow((slots, largest, source) => {
+        const sizes = {
+          parameter: (slot: number) => slots[slot] ?? largest,
+          source: (id: number) => source(id),
+        };
+        let known = 0,
+          unknown = false;
+        for (let c = 0; c < modification.input.output.length; c++) {
+          const bytes = columnInputBytes(modification.input, c, sizes);
+          if (bytes === null) unknown = true;
+          else known += bytes;
+        }
+        return { known, unknown };
+      });
     const jsonGroupSources = new Map<number, Set<number>>();
     const jsonGroupColumnBytes = new Map<number, Map<number, number>>();
     const resultSources = new Map<number, Set<number>>();

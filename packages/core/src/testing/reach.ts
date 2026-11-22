@@ -10744,7 +10744,6 @@ export const FOLLOW_NESTED_AFTER_REACH = [
   "body expression reads immediate RI",
 ] as const;
 
-/** Computed INSERT ... SELECT, UPDATE and DELETE against PostgreSQL (dml-computed-differential). */
 /** Publications under metadata pressure (next/write/publication-funding.test.ts). */
 export const PUBLICATION_PRESSURE_REACH = [
   "refused after switch",
@@ -10755,6 +10754,19 @@ export const PUBLICATION_PRESSURE_REACH = [
   "merge",
 ] as const;
 
+/** Modification rows larger than their parameters (next/testing/modify-row-progress.test.ts). */
+export const MODIFY_ROW_PROGRESS_REACH = [
+  "insert",
+  "update",
+  "row larger than its parameter",
+  "row over a MiB",
+  "table column in the row",
+  "wide table column in the row",
+  "beside another connection's read",
+  "written",
+] as const;
+
+/** Computed INSERT ... SELECT, UPDATE and DELETE against PostgreSQL (dml-computed-differential). */
 export const DML_COMPUTED_REACH = [
   "series source",
   "table source",

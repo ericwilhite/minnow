@@ -207,6 +207,13 @@ export class PageWriter {
     return this.#bytes.byteLength;
   }
 
+  /** At least `encodedBytes` of one row whose values total `valueBytes` over `columns`: each
+   * column adds its header and at most three buffers (validity, offsets, data), each framed by
+   * 8 bytes and padded to 8, and one row's validity and offsets are 16 bytes at most. */
+  static oneRowBound(valueBytes: number, columns: number): number {
+    return HEADER_BYTES + columns * (COLUMN_BYTES + 3 * (8 + 7) + 16) + valueBytes;
+  }
+
   static encodedBytes(columns: readonly FlatVector[], rows: number): number {
     let total = HEADER_BYTES;
     for (const column of columns) {
