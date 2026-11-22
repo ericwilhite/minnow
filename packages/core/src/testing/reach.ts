@@ -10820,6 +10820,18 @@ export const FOLLOW_NESTED_PRESSURE_REACH = [
   "zero native charge",
 ] as const;
 
+/** Native trigger writes over values from bytes to several MiB, beside an optional competitor. */
+export const NATIVE_TRIGGER_VALUE_WIDTH_REACH = [
+  "small value",
+  "value of a MiB or two",
+  "value of several MiB",
+  "competitor holds all but 1 MiB",
+  "completed beside the competitor",
+  "waited and was cancelled",
+  "completed without pressure",
+  "OLD and NEW bound",
+] as const;
+
 /** Native trigger bodies' input queries: point and range lookups on prepaid shares. */
 export const NATIVE_BODY_SIZING_REACH = [
   "published",
