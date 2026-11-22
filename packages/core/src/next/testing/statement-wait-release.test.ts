@@ -83,7 +83,10 @@ for (const reader of READERS)
         );
         // Never refused: written beside the read if it fits, else it waits for the read.
         const early = await within(statement, 500);
-        if (early !== PENDING) expect(early).toBe("written");
+        expect(
+          early === PENDING ? "waited for the read" : early,
+          "it waits for the read or is written at once; it is never refused",
+        ).toBeOneOf(["waited for the read", "written"]);
         for (let frame = await other.execution.results.next(); frame !== null;) {
           frame.release();
           frame = await other.execution.results.next();
