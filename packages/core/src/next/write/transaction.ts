@@ -165,9 +165,11 @@ export interface EngineHooks {
   addIndexDelta(tableId: number, indexId: number): Memtable;
   /** Ensures memtable memory for about `bytes` more before an insert (backpressure). */
   admit(bytes: number, growth?: () => number, wait?: RowsWait): MaybePromise<void>;
-  /** Reserves the state pin a rollback's republication needs, before an undo that needs one is
-   * recorded (a memtable freeze, a table created): its rollback never waits for memory. */
+  /** Reserves a state pin for a rollback's republication before an undo that needs one may be
+   * recorded (a memtable freeze, a table created): its rollback never needs memory. */
   reserveRollback?(): void;
+  /** The reserved pin now belongs to the undo just recorded (`reserveRollback`). */
+  assignRollback?(): void;
   /** End-of-statement admission after producer borrows and check views retire. */
   prepareFtsMutation?(signal?: AbortSignal): MaybePromise<void>;
   /** Command primary prepayment, before the root borrows a decoded image. */
@@ -1171,6 +1173,7 @@ export class StatementImpl implements Statement {
     return settle(this.tx.hooks.prepareCatalog(catalog), () => {
       this.tx.hooks.reserveRollback?.();
       this.tx.undo.push({ kind: "catalog", statement: this.ordinal, before, logged });
+      if (logged.some((change) => change.op === "createTable")) this.tx.hooks.assignRollback?.();
       this.tx.catalog = catalog;
     });
   }
@@ -1195,6 +1198,8 @@ export class StatementImpl implements Statement {
           this.guard(() => {
             this.tx.hooks.reserveRollback?.();
             this.tx.undo.push({ kind: "catalog", statement: this.ordinal, before, logged });
+            if (logged.some((change) => change.op === "createTable"))
+              this.tx.hooks.assignRollback?.();
             this.tx.catalog = catalog;
             const work: Array<MaybePromise<void>> = [];
             for (const entry of logged) {
@@ -2226,7 +2231,7 @@ export class TableWriterImpl implements TableWriter {
           this.tableId,
           plan.count - done,
         );
-        if (created)
+        if (created) {
           tx.undo.push({
             kind: "freeze",
             statement: this.statement.ordinal,
@@ -2234,6 +2239,8 @@ export class TableWriterImpl implements TableWriter {
             created: memtable,
             frozen,
           });
+          tx.hooks.assignRollback?.();
+        }
         const take = Math.min(memtable.capacity, plan.count - done),
           before = memtable.rowCount;
         const previous = tx.undo[this.#lastRowsUndo];
