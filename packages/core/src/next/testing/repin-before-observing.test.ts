@@ -24,7 +24,7 @@ import fc from "fast-check";
 import { afterEach, expect, it } from "vitest";
 import type { Snapshot } from "../access/snapshot.js";
 import type { Execution, PreparedPlan } from "../exec/executor.js";
-import { Governor } from "../memory/governor.js";
+import { Governor, type Grant } from "../memory/governor.js";
 import { ChunkReader } from "../page/reader.js";
 import { rowsOf } from "../write/test-support.js";
 import { createReach, REPIN_BEFORE_OBSERVING_REACH } from "../../testing/reach.js";
@@ -39,7 +39,12 @@ afterEach(() => {
   Governor.stallAfterMs = null;
 });
 
-type Offer = "none" | "fresh" | "declined";
+/**
+ * `republished`: as if another publication landed while the fresh attempt waited (a stand-in:
+ * this history publishes once). A grant holds 8 MiB, about what the first refusal's snapshot
+ * kept alone, and the fresh snapshot reports keeping them alone.
+ */
+type Offer = "none" | "fresh" | "declined" | "republished";
 
 /** C1's history at `capMiB`, then the point read, with the owner's offer as given. */
 async function read(capMiB: number, offer: Offer) {
@@ -65,15 +70,39 @@ async function read(capMiB: number, offer: Offer) {
     let pin: Snapshot = path.pin();
     const first = pin;
     let offers = 0;
+    const retained: Grant[] = [];
     const repin = (catalogVersion: number): Snapshot | null => {
       offers++;
       if (offer === "declined") return null;
-      const fresh = path.pin();
+      // What the first refusal's snapshot kept alone (8.4 MB, measured): a second publication's
+      // rows, held by a grant and reported by the fresh snapshot as its own.
+      const kept = 8 * MiB;
+      let fresh = path.pin();
       if (fresh.catalog.version !== catalogVersion) {
         fresh.release();
         return null;
       }
+      // Once: a later move (only without the one-move rule) gets a plain fresh snapshot.
+      if (offer === "republished" && offers === 1) {
+        const target = fresh;
+        fresh = new Proxy(target, {
+          get(object, key) {
+            if (key === "exclusiveBytes") return () => kept;
+            const value: unknown = Reflect.get(object, key, object);
+            return typeof value === "function" ? (value as () => unknown).bind(object) : value;
+          },
+        });
+      }
       pin.release();
+      if (offer === "republished" && offers === 1) {
+        const held = governor.tryAdmit({
+          label: "a second publication's rows",
+          minimumBytes: kept,
+          spillable: false,
+        });
+        if (held === null) throw new Error("the stand-in could not hold the kept rows");
+        retained.push(held);
+      }
       pin = fresh;
       return fresh;
     };
@@ -114,6 +143,7 @@ async function read(capMiB: number, offer: Offer) {
     view.release();
     const result = { outcome, offers, moved: pin !== first, served, committed };
     pin.release();
+    for (const held of retained) held.close();
     expect(path.failure).toBeNull();
     return result;
   } finally {
@@ -131,6 +161,13 @@ for (const cap of [36.5, 36.75])
     expect(moved.moved, "the execution read the fresh snapshot").toBe(true);
     expect(moved.served === moved.committed, "it shows what is committed").toBe(true);
   }, 120_000);
+
+it("moves at most once per execution, whatever publications follow", async () => {
+  const result = await read(36.5, "republished");
+  expect(result.outcome, "the second refusal stands, typed").toMatchObject(TYPED);
+  expect(result.offers, "one move").toBe(1);
+  expect(result.moved).toBe(true);
+}, 60_000);
 
 it("keeps the refusal when the owner declines (a later statement, a moved catalog)", async () => {
   const declined = await read(36.5, "declined");

@@ -136,8 +136,8 @@ release.
   autocommit query, to the statement that took a read-only transaction's snapshot (later
   statements keep it), and to a query in a writable transaction (a fresh view of the same rows);
   never to a query that locks rows or calls a sequence function. PostgreSQL takes a statement's
-  snapshot when it begins to run, and such a query has not begun in any visible sense. A fresh
-  snapshot keeps nothing alone, so each move follows a publication. A refusal at a preparation
+  snapshot when it begins to run, and such a query has not begun in any visible sense. It moves
+  once per execution: a second refusal, after more publications, is the 53200. A refusal at a preparation
   restart keeps the 53200: no read reaches one with its snapshot deciding.
 
 - When the writer runs no work of its own, its holdings are exact: everything it holds beyond

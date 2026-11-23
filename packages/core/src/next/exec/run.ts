@@ -1551,6 +1551,9 @@ export class QueryExecution implements Execution {
   #restartEpoch = -1;
   /** The view the next attempt reads: the request's, or a fresher one it re-pinned (`#repin`). */
   #view: Snapshot;
+  /** Whether this execution re-pinned: at most once, so a second refusal is the typed 53200
+   * whatever publications follow (design note: one move per statement execution). */
+  #repinned = false;
   #atomic: { readonly result: DeferredGrant; readonly window: number } | null = null;
   #committed = false;
   #draining = false;
@@ -1808,12 +1811,13 @@ export class QueryExecution implements Execution {
   /**
    * A refusal the statement can leave behind by moving to a newer snapshot: refused for memory
    * while it prepares (it has delivered no row and written nothing), with memory only its own
-   * snapshot keeps alive, and the owner offers a re-pin (`ExecuteRequest.repin`). A fresh snapshot
-   * of the current state keeps nothing alone, so each re-pin follows a publication.
+   * snapshot keeps alive, the owner offers a re-pin (`ExecuteRequest.repin`), and it has not
+   * re-pinned before: one move per execution, however many publications follow it.
    */
   #repinnable(error: unknown, holdings: WaitingHoldings): error is MemoryAdmissionError {
     if (
       !(error instanceof MemoryAdmissionError) ||
+      this.#repinned ||
       this.#offer() === undefined ||
       this.#controller.signal.aborted ||
       this.#preparation === null ||
@@ -1836,6 +1840,7 @@ export class QueryExecution implements Execution {
 
   /** Moves the next attempt to a fresh snapshot; the refusal stands when the owner has none. */
   #repin(refusal: MemoryAdmissionError): void {
+    this.#repinned = true;
     const fresh = this.#offer()?.(this.plan.catalogVersion) ?? null;
     if (fresh === null) throw refusal;
     this.#view = fresh;
