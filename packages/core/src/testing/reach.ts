@@ -10763,6 +10763,7 @@ export const MODIFY_ROW_PROGRESS_REACH = [
   "table column in the row",
   "wide table column in the row",
   "beside another connection's read",
+  "must fit",
   "written",
 ] as const;
 

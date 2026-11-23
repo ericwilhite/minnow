@@ -114,9 +114,17 @@ query-size error. A complete execution minimum greater than the whole cap is the
 checkpoint during a pressure handoff (see below).
 
 A statement's wait is also bounded by what it keeps while it waits (GOVERNOR-WAIT-POLICY
-point 5, `MemoryGovernor.servableNow`): the usable capacity less its own grants and, while it
-holds the writer turn, what the writer keeps until the statement ends
-(`WriteCredits.retainedWhileOpen`). This is accounting, not a guess about who might release.
+point 5, `MemoryGovernor.servableNow`): the usable capacity less its own grants, what only its
+own snapshot keeps alive (`WaitingHoldings.pinned`), and, while it holds the writer turn, what
+the writer keeps until the statement ends (`WriteCredits.retainedWhileOpen`). This is
+accounting, not a guess about who might release.
+
+- What only the statement's snapshot keeps: a publication or drop leaves memory (a flushed
+  memtable's borrowed chunks and key deltas, a dropped table's rows, retired run readers) for
+  the readers older than it (`ReaderRegistry.holdUntilOlderClose`). When the statement's
+  snapshot is the only live reader older than such a hold, the hold is its own
+  (`Snapshot.exclusiveBytes`): it returns only when the statement ends. A hold another live,
+  older reader also keeps is that reader's, and is waited for.
 
 - When the writer runs no work of its own, its holdings are exact: everything it holds beyond
   its registered lifetime holding stays while the turn is held, except what reclaim returns
@@ -124,13 +132,21 @@ holds the writer turn, what the writer keeps until the statement ends
   floor or every memtable's rows if more (no idle spill runs with the turn held, and no flush
   starts on its own: a flush must cover a whole commit, so frozen memtables whose commit reaches
   the live memtable wait for it), the prepaid metadata step, and all commit and merge credit
-  (their forecasts return only once the turn is free).
+  (their forecasts return only once the turn is free; the writer's own memtable rows may take
+  them, `WriteCredits.fundFromIdle`).
 - While the writer runs a flush, merge, commit or log append, that work may move idle credit
   between its accounts and release it, and retire the metadata step it prepaid. Only the
   memtable rows that work will not publish count then, so the value is too large, never too
   small: nothing that could fit is refused.
-- Left out always: an older snapshot's metadata and run readers, a dropped table's state, other
-  statements' grants, evictable cache entries. Each is released by its own holder.
+- While the writer's growth waits in the governor (a merge's credit, a flush's or merge's
+  metadata), that work frees nothing until it is served, so the writer's holdings count as
+  when it is idle. That growth is holder growth, served before every admission: when it cannot
+  fit beside what the statement keeps, in its own capacity class (ordinary growth may not use
+  the progress reserve), nothing the statement asks can be served either, and its value is 0
+  (`LentHoldings.queued`).
+- Left out always: what another live snapshot also keeps, a dropped table's state another
+  reader keeps, other statements' grants, evictable cache entries. Each is released by its own
+  holder.
 
 An execution's fixed buffers and a preparation restart's credit carry their statement's
 holdings (`NativeGrantGroupOptions.holdings`), and the governor checks every queued group
@@ -153,9 +169,19 @@ allocations (covered FTS mutation entries, row arenas) are finite and reclaim re
 A preparation restart doubles its credit only when the doubled
 credit is admissible at once; otherwise it waits for its measured need alone.
 
+An insert step charges the memtable what it allocates, before it allocates it
+(write/transaction.ts `#stepCharge`, checked by `testing/memtable-charge-census.test.ts`):
+per-row metadata, and for rows into chunks the live memtable already has, their arenas' growth
+(with the resize overlap when a step resizes an arena twice) and the chunk's lazy arrays;
+otherwise what the step opens plus the larger of twice its input and the live arenas' growth.
+It is recomputed after relief, since a freeze changes the memtable the rows reach. When the
+governor has no free memory left, the write path funds it from its own idle commit and merge
+credit before relief.
+
 The write path's memtable refusal (`MemtableMemoryError`) is internal: a statement's write call
-reports it as this same `MemoryAdmissionError` (label `write path memtable`). It is raised before
-the memtable allocation it refused, so the failed statement rolls back with nothing written.
+reports it as this same `MemoryAdmissionError` (label `write path memtable`, naming the whole
+charge). It is raised before the memtable allocation it refused, so the failed statement rolls
+back with nothing written.
 
 In test builds, `Governor.stallAfterMs` turns a wait with no progress into a
 `GovernorStallError`. Its report names every byte `usedBytes` counts: each grant holder, each
