@@ -2108,6 +2108,14 @@ export const WRITABLE_TRANSACTION_READ_REACH = [
 /** A write step waiting for rows, decided without spinning (row-wait-reclaim). */
 export const ROW_WAIT_RECLAIM_REACH = ["waited for rows", "written", "refused typed"] as const;
 
+/** A refused read moves to a fresh snapshot, or not (repin-before-observing). */
+export const REPIN_BEFORE_OBSERVING_REACH = [
+  "moved and served",
+  "moved and refused",
+  "served in place",
+  "refused in place",
+] as const;
+
 /** A read-only transaction's snapshot is taken by its first statement (read-only-snapshot-timing). */
 export const READ_ONLY_SNAPSHOT_TIMING_REACH = [
   "commit before the snapshot seen",

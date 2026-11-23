@@ -129,6 +129,16 @@ release.
   pin of a state a newer one superseded (its space pin, its root, the group directories and
   chunks no other state shares), when no other pin shares that state. A hold another live,
   older reader also keeps is that reader's, and is waited for.
+- A query refused because of what only its snapshot keeps moves to a fresh snapshot instead,
+  when the snapshot is its to choose and it has observed nothing (exec/run.ts `#repinnable`,
+  `ExecuteRequest.repin`): while it prepares, before any row, when its admission waited holding
+  nothing and would be servable beside the rest of what it keeps. The owner offers this to an
+  autocommit query, to the statement that took a read-only transaction's snapshot (later
+  statements keep it), and to a query in a writable transaction (a fresh view of the same rows);
+  never to a query that locks rows or calls a sequence function. PostgreSQL takes a statement's
+  snapshot when it begins to run, and such a query has not begun in any visible sense. A fresh
+  snapshot keeps nothing alone, so each move follows a publication. A refusal at a preparation
+  restart keeps the 53200: no read reaches one with its snapshot deciding.
 
 - When the writer runs no work of its own, its holdings are exact: everything it holds beyond
   its registered lifetime holding stays while the turn is held, except what reclaim returns

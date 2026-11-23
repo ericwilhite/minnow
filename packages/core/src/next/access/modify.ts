@@ -94,6 +94,12 @@ export interface Statement {
   readonly ordinal: number;
   /** What the statement reads: a statement view (snapshot.ts). Released by `end`/`rollback`. */
   readonly view: Snapshot;
+  /**
+   * Releases `view` and makes a fresh one on the current state, at the same bound and catalog: it
+   * shows the same rows (the writer turn keeps other commits out). Only for a read-only statement
+   * whose view nothing has read yet: its query's preparation restart (exec/run.ts `#repin`).
+   */
+  renewView?(): Snapshot;
   /** The catalog including this transaction's DDL so far. */
   readonly catalog: CatalogView;
   /**

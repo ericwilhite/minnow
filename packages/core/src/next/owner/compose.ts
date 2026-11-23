@@ -718,6 +718,10 @@ class ComposedSession implements EngineSession {
   #transaction = 0;
   #modes: AppliedTransactionModes = { ...DEFAULT_TRANSACTION_MODES };
   #snapshotTaken = false;
+  /** Query and data statements this session started (`#guard`). */
+  #statements = 0;
+  /** The statement (`#statements`) whose start pinned the read-only transaction's snapshot. */
+  #pinnedBy: number | null = null;
   #hasWrites = false;
   readonly #sequenceAccess: SequenceAccess;
   #tx: WriteTransaction | null = null;
@@ -823,6 +827,51 @@ class ComposedSession implements EngineSession {
     return this.#lastCommitLsn === null ? {} : { atLeastLsn: this.#lastCommitLsn };
   }
 
+  /**
+   * A read snapshot for one query, which the query may move to a newer one while it has observed
+   * nothing (`ExecuteRequest.repin`). Outside a transaction it is the query's own; in a read-only
+   * transaction it is the transaction's, movable only by the statement that took it, while that
+   * statement is the session's latest. Never for a query that locks rows.
+   */
+  #queryPin(inReadOnly: boolean, locks: boolean) {
+    if (inReadOnly) {
+      const pin = this.#transactionPin();
+      const statement = this.#statements;
+      const repin = (catalogVersion: number): Snapshot | null => {
+        const old = this.#readPin;
+        if (this.#pinnedBy !== statement || this.#statements !== statement || old === null)
+          return null;
+        const fresh = this.#writePath().pin(this.#pinOptions());
+        if (fresh.catalog.version !== catalogVersion) {
+          fresh.release();
+          return null;
+        }
+        old.release();
+        this.#readPin = fresh;
+        return fresh;
+      };
+      return { pin, release: () => undefined, ...(locks ? {} : { repin }) };
+    }
+    let pin = this.#writePath().pin(this.#pinOptions());
+    const repin = (catalogVersion: number): Snapshot | null => {
+      const fresh = this.#writePath().pin(this.#pinOptions());
+      if (fresh.catalog.version !== catalogVersion) {
+        fresh.release();
+        return null;
+      }
+      pin.release();
+      pin = fresh;
+      return fresh;
+    };
+    return {
+      pin,
+      release: () => {
+        pin.release();
+      },
+      ...(locks ? {} : { repin }),
+    };
+  }
+
   #rules(catalog: () => CatalogView) {
     return (tableId: number) => this.#engine.rules(catalog(), tableId, this.#privateRules());
   }
@@ -842,6 +891,7 @@ class ComposedSession implements EngineSession {
           readonly snapshot: Snapshot;
           readonly statement: null;
           readonly writerHoldings?: () => LentHoldings | null;
+          readonly repin?: (catalogVersion: number) => Snapshot | null;
         }
       | {
           readonly snapshot: null;
@@ -852,6 +902,12 @@ class ComposedSession implements EngineSession {
   ): Execution {
     const prepared = this.#engine.prepare(plan);
     const options = this.#engine.options;
+    // A sequence call is an observation (nextval, setval, currval): such a query keeps its snapshot.
+    if (target.statement === null && target.repin !== undefined && prepared.usesSequences) {
+      const { repin, ...kept } = target;
+      void repin;
+      target = kept;
+    }
     return prepared.execute({
       parameters: params,
       statementTime: this.#statementTime(),
@@ -875,6 +931,7 @@ class ComposedSession implements EngineSession {
     this.#tx = null;
     this.#readPin?.release();
     this.#readPin = null;
+    this.#pinnedBy = null;
     this.#modes = { ...DEFAULT_TRANSACTION_MODES };
     this.#snapshotTaken = false;
     this.#hasWrites = false;
@@ -904,7 +961,11 @@ class ComposedSession implements EngineSession {
       (lowered.kind === "query" || lowered.kind === "modify" || lowered.kind === "ddl")
     ) {
       this.#snapshotTaken = true;
-      if (this.#modes.readOnly && this.#tx === null) this.#transactionPin();
+      this.#statements++;
+      if (this.#modes.readOnly && this.#tx === null && this.#readPin === null) {
+        this.#transactionPin();
+        this.#pinnedBy = this.#statements;
+      }
     }
     const locking = lowered.rowLocking;
     if (this.#modes.readOnly && lowered.kind === "query" && locking !== "none")
@@ -957,17 +1018,18 @@ class ComposedSession implements EngineSession {
     if (this.#tx !== null) return null;
     const inReadOnly = this.#state === "open" && this.#modes.readOnly;
     if (this.#state !== "idle" && !inReadOnly) return null;
-    const pin = inReadOnly ? this.#transactionPin() : this.#writePath().pin(this.#pinOptions());
-    const releasePin = () => {
-      if (!inReadOnly) pin.release();
-    };
+    const {
+      pin,
+      release: releasePin,
+      repin,
+    } = this.#queryPin(inReadOnly, lowered.rowLocking !== "none");
     let execution: Execution;
     try {
       execution = this.#execute(
         lowered.plan,
         boundParameters(statement, params),
         context,
-        { snapshot: pin, statement: null },
+        { snapshot: pin, statement: null, ...(repin === undefined ? {} : { repin }) },
         "atExecuted",
       );
     } catch (error) {
@@ -1084,6 +1146,8 @@ class ComposedSession implements EngineSession {
       let execution: Execution;
       try {
         // It holds the writer turn: the writer's holdings stay while it waits.
+        // A fresh statement view shows the same rows: the writer turn keeps other commits out.
+        const renew = statement.renewView?.bind(statement);
         execution = this.#execute(
           lowered.plan,
           params,
@@ -1092,6 +1156,9 @@ class ComposedSession implements EngineSession {
             snapshot: statement.view,
             statement: null,
             writerHoldings: () => statement.writerHoldings?.() ?? null,
+            ...(renew === undefined || lowered.rowLocking !== "none"
+              ? {}
+              : { repin: () => renew() }),
           },
           "atExecuted",
         );
@@ -1121,17 +1188,18 @@ class ComposedSession implements EngineSession {
       };
     }
     const inReadOnly = this.#state === "open" && this.#modes.readOnly;
-    const pin = inReadOnly ? this.#transactionPin() : this.#writePath().pin(this.#pinOptions());
-    const releasePin = () => {
-      if (!inReadOnly) pin.release();
-    };
+    const {
+      pin,
+      release: releasePin,
+      repin,
+    } = this.#queryPin(inReadOnly, lowered.rowLocking !== "none");
     let execution: Execution;
     try {
       execution = this.#execute(
         lowered.plan,
         params,
         context,
-        { snapshot: pin, statement: null },
+        { snapshot: pin, statement: null, ...(repin === undefined ? {} : { repin }) },
         "atExecuted",
       );
     } catch (error) {
@@ -1556,6 +1624,7 @@ class ComposedSession implements EngineSession {
         this.#tx?.rollback();
         this.#tx = null;
         this.#readPin = pin;
+        this.#pinnedBy = null;
         this.#savepoints = this.#savepoints.map((entry) => ({ ...entry, savepoint: null }));
       } else if (!readOnly && this.#tx === null) {
         const tx = await this.#writePath().begin({ signal });

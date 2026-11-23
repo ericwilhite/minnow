@@ -8,6 +8,7 @@ import type { MaybePromise } from "../access/key-index.js";
 import { SnapshotReleasedError } from "../access/snapshot.js";
 import { sizingSettled } from "../page/read-bounds.js";
 import { checkRetries, macrotaskEpoch } from "../memory/retry-guard.js";
+import { MemoryAdmissionError } from "../memory-values.js";
 import { QueryRoots, type RootColumns } from "../page/query-roots.js";
 import { readTable } from "./read-table.js";
 import type { ByteBudget } from "../access/space.js";
@@ -1548,6 +1549,8 @@ export class QueryExecution implements Execution {
   #restarts = 0;
   #restartNeed = 0;
   #restartEpoch = -1;
+  /** The view the next attempt reads: the request's, or a fresher one it re-pinned (`#repin`). */
+  #view: Snapshot;
   #atomic: { readonly result: DeferredGrant; readonly window: number } | null = null;
   #committed = false;
   #draining = false;
@@ -1568,6 +1571,7 @@ export class QueryExecution implements Execution {
       );
     const view = request.statement?.view ?? request.snapshot;
     if (view === null) throw new TypeError("execution requires a view");
+    this.#view = view;
     const windowBytes = request.resultWindowBytes ?? RESULT_WINDOW_BYTES;
     if (!Number.isSafeInteger(windowBytes) || windowBytes <= 0)
       throw new TypeError("positive result window required");
@@ -1766,12 +1770,10 @@ export class QueryExecution implements Execution {
   }
 
   #newRuntime(): QueryRuntime {
-    const view = this.request.statement?.view ?? this.request.snapshot;
-    if (view === null) throw new TypeError("execution requires a view");
     return new QueryRuntime(
       this.plan,
       this.request,
-      view,
+      this.#view,
       this.#controller.signal,
       null,
       this.#preparation ?? this.request.governor,
@@ -1787,16 +1789,75 @@ export class QueryExecution implements Execution {
     try {
       work = program(runtime, sink);
     } catch (error) {
+      if (this.#repinnable(error, runtime.waitingHoldings()))
+        return this.#repinAfter(error, program);
       // Any other failure stays synchronous, exactly as without the facade.
       if (!this.#restartable(error)) throw error;
       return this.#restart(error, program);
     }
     return work instanceof Promise
       ? work.catch((error: unknown) => {
+          if (this.#repinnable(error, runtime.waitingHoldings()))
+            return this.#repinAfter(error, program);
           if (!this.#restartable(error)) throw error;
           return this.#restart(error, program);
         })
       : work;
+  }
+
+  /**
+   * A refusal the statement can leave behind by moving to a newer snapshot: refused for memory
+   * while it prepares (it has delivered no row and written nothing), with memory only its own
+   * snapshot keeps alive, and the owner offers a re-pin (`ExecuteRequest.repin`). A fresh snapshot
+   * of the current state keeps nothing alone, so each re-pin follows a publication.
+   */
+  #repinnable(error: unknown, holdings: WaitingHoldings): error is MemoryAdmissionError {
+    if (
+      !(error instanceof MemoryAdmissionError) ||
+      this.#offer() === undefined ||
+      this.#controller.signal.aborted ||
+      this.#preparation === null ||
+      !this.#preparation.preparing ||
+      this.#sink === null ||
+      this.#sink.rowCount !== 0 ||
+      this.#runtime?.modification
+    )
+      return false;
+    // Only when the snapshot's own bytes decided it: what was available beside them, plus them,
+    // covers the request, and it is servable beside the rest of what the statement keeps.
+    const pinned = holdings.pinned?.() ?? 0;
+    const rest = { grants: holdings.grants, ...(holdings.lent ? { lent: holdings.lent } : {}) };
+    return (
+      pinned > 0 &&
+      error.bytes <= error.capacity + pinned &&
+      error.bytes <= this.#preparation.servableNow(rest, true)
+    );
+  }
+
+  /** Moves the next attempt to a fresh snapshot; the refusal stands when the owner has none. */
+  #repin(refusal: MemoryAdmissionError): void {
+    const fresh = this.#offer()?.(this.plan.catalogVersion) ?? null;
+    if (fresh === null) throw refusal;
+    this.#view = fresh;
+  }
+
+  /** Re-pins after a refused attempt (`#repinnable`) and prepares again from scratch. */
+  async #repinAfter(refusal: MemoryAdmissionError, program: Program): Promise<void> {
+    const preparation = this.#preparation,
+      runtime = this.#runtime;
+    if (preparation === null || runtime === null) throw refusal;
+    runtime.abort(RESTART);
+    await runtime.close();
+    await sizingSettled(this.#controller.signal);
+    preparation.reset();
+    this.#repin(refusal);
+    return this.#again(program);
+  }
+
+  /** The owner's re-pin, offered for a query only (`ExecuteRequest.repin`). */
+  #offer(): ((catalogVersion: number) => Snapshot | null) | undefined {
+    const request = this.request;
+    return request.statement === null ? request.repin : undefined;
   }
 
   /** A would-wait before the reservation installed: the attempt can be prepared again. */
@@ -1839,11 +1900,18 @@ export class QueryExecution implements Execution {
     // holds the writer turn, the writer's.
     const view = runtime.view;
     const pinned = () => view.exclusiveBytes?.() ?? 0;
+    // A refusal here stays #56's 53200: no read reaches it with its snapshot deciding (only the
+    // admission it waits in holding nothing does: `#attempt`).
     await preparation.regrow(error, this.#controller.signal, () => {
       const writer = writerOf(this.request);
       const grants = this.#result === null ? [] : [this.#result];
       return writer === null ? { grants, pinned } : { grants, lent: writer, pinned };
     });
+    return this.#again(program);
+  }
+
+  /** A fresh runtime on the current view, bound to the execution's result, and a new attempt. */
+  #again(program: Program): MaybePromise<void> {
     const fresh = this.#newRuntime();
     this.#runtime = fresh;
     if (this.#atomic !== null) fresh.atomicResult(this.#atomic.result, this.#atomic.window);

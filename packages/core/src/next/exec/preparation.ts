@@ -372,6 +372,18 @@ export class PreparationGovernor implements MemoryGovernor {
     this.#credit = credit;
   }
 
+  /**
+   * After a refused attempt released everything it held, before it prepares again on another
+   * snapshot (exec/run.ts `#repinAfter`): no credit, nothing taken, no peak. The need stays.
+   */
+  reset(): void {
+    if (!this.#preparing) throw new TypeError("Preparation already reserved");
+    this.#credit?.close();
+    this.#credit = null;
+    this.#forget();
+    this.#peak = 0;
+  }
+
   /** The reservation is installed: release the unused credit and pass admissions through. */
   finish(): void {
     this.#preparing = false;
