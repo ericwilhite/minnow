@@ -2825,27 +2825,37 @@ export class WritePathImpl implements WritePath, EngineHooks {
   ) {
     const governor = this.#credits.governor;
     this.maintenance.rowWaits += 1;
-    for (;;) {
-      signal?.throwIfAborted();
-      this.#check();
-      if (this.#headroom(bytes + (growth?.() ?? 0))) return;
-      const deficit = bytes + (growth?.() ?? 0) - (this.#grant.held - this.#grant.allocated);
-      const [credit] = await governor.admitGroup({
-        label: "write path memtable",
-        grants: [{ label: "write path memtable", minimumBytes: deficit, spillable: false }],
-        holdings,
-        ...(signal === undefined ? {} : { signal }),
-      });
-      try {
+    let keep: (() => void) | null = null;
+    try {
+      for (;;) {
+        signal?.throwIfAborted();
         this.#check();
-        if (
-          credit === undefined ||
-          !governor.transferCredit(credit, this.#grant, credit.held - credit.allocated)
-        )
-          throw new Error("Admitted memtable credit was not transferred");
-      } finally {
-        credit?.close();
+        const need = bytes + (growth?.() ?? 0);
+        if (this.#headroom(need)) return;
+        // The rows it holds stay while it waits: reclaim for this very admission must not return
+        // them (it did, and the step asked again forever).
+        keep?.();
+        keep = this.#credits.holdRowsWhileWaiting(need);
+        const deficit = need - (this.#grant.held - this.#grant.allocated);
+        const [credit] = await governor.admitGroup({
+          label: "write path memtable",
+          grants: [{ label: "write path memtable", minimumBytes: deficit, spillable: false }],
+          holdings,
+          ...(signal === undefined ? {} : { signal }),
+        });
+        try {
+          this.#check();
+          if (
+            credit === undefined ||
+            !governor.transferCredit(credit, this.#grant, credit.held - credit.allocated)
+          )
+            throw new Error("Admitted memtable credit was not transferred");
+        } finally {
+          credit?.close();
+        }
       }
+    } finally {
+      keep?.();
     }
   }
 

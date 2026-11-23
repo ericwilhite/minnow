@@ -839,9 +839,10 @@ export class StatementImpl implements Statement {
   get touched(): Map<number, Set<number>> {
     return (this.#touchedMap ??= new Map());
   }
-  /** A writable statement holds the writer turn, and with it the write owner's holdings. */
+  /** Every statement of a write transaction holds the writer turn (its transaction took it at
+   * begin), and with it the write owner's holdings, a read-only one too. */
   writerHoldings(): LentHoldings | null {
-    return this.readOnly ? null : (this.tx.hooks.writerHoldings?.() ?? null);
+    return this.tx.hooks.writerHoldings?.() ?? null;
   }
 
   /** How a write step of this statement may wait for memory (`EngineHooks.admit`): what an

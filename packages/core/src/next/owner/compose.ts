@@ -77,7 +77,7 @@ import {
   type NotParameterizable,
 } from "../lower/parameterize.js";
 import { statisticsDrifted, type PlanningStatistics } from "../lower/statistics.js";
-import type { MemoryGovernor } from "../memory/governor.js";
+import type { LentHoldings, MemoryGovernor } from "../memory/governor.js";
 import { ReturnPool } from "../exec/return-pool.js";
 import type { SpillService } from "../spill/contract.js";
 import { PG_EPOCH_UNIX_MICROS } from "../temporal.js";
@@ -832,7 +832,11 @@ class ComposedSession implements EngineSession {
     params: readonly WireValue[],
     context: RunContext,
     target:
-      | { readonly snapshot: Snapshot; readonly statement: null }
+      | {
+          readonly snapshot: Snapshot;
+          readonly statement: null;
+          readonly writerHoldings?: () => LentHoldings | null;
+        }
       | {
           readonly snapshot: null;
           readonly statement: Statement;
@@ -1069,11 +1073,16 @@ class ComposedSession implements EngineSession {
       });
       let execution: Execution;
       try {
+        // It holds the writer turn: the writer's holdings stay while it waits.
         execution = this.#execute(
           lowered.plan,
           params,
           context,
-          { snapshot: statement.view, statement: null },
+          {
+            snapshot: statement.view,
+            statement: null,
+            writerHoldings: () => statement.writerHoldings?.() ?? null,
+          },
           "atExecuted",
         );
       } catch (error) {
