@@ -533,6 +533,20 @@ leaf supplies captured Date intrinsics to both engines; it cannot import either 
   path.
 - Collation belongs to expressions, never to stored types.
 
+### Step signals (`step-signal.ts`)
+
+- A short-lived step that must stop when a long-lived signal aborts (a native root's scope, a
+  statement's writer) takes `stepSignal(site, ...parents)`, never `AbortSignal.any`: a composite is
+  a dependant of every source until garbage collection, and a native trigger statement made 57 of
+  them per row.
+- A parent with open steps carries one `abort` listener, removed when its last step closes. A
+  step must be closed when it ends (`close()` in a `finally`, including when the work it guards
+  refuses to start). A parent's abort closes and aborts every open step with the parent's reason;
+  a step opened under an aborted parent is aborted at once.
+- Tests: `heldStepSignals()` counts registrations parents still hold, and
+  `observeStepSignals(site => …)` sees each step open (`testing/step-signal.test.ts`: under one
+  per row, no step left held after 2,000 rows, prompt cancellation at every site).
+
 ### Vectors (`vector/`)
 
 - A batch holds at most 2,048 rows and about 1 MiB in total, so wide rows get fewer rows. One huge
@@ -3395,6 +3409,12 @@ not require a home cache directory.
   (~100 µs at 1,000 rows); this protocol benchmark still explicitly injects stand-ins. It does
   not measure the real executor, whose index lookup plans remain unsupported, so real warm-PK
   latency is not established by those numbers.
+
+- A native command root's registry directory (`owner/registry-directory.ts`) keeps
+  `REGISTRY_DIRECTORY_LEAVES` (16) record blocks resident and spills the rest behind a 29-level
+  radix directory. Its charge, `REGISTRY_DIRECTORY_BYTES`, is derived from that count
+  (`exec/row-image-layout.ts`). Eight leaves thrashed under a trigger body's per-row working set;
+  `testing/registry-directory-work.test.ts` bounds the misses, page reads and appends per row.
 
 ### IR (`ir/`)
 

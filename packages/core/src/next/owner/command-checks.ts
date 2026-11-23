@@ -1,5 +1,6 @@
 /** Native, non-ending command checks over immutable accepted images and bounded index cursors.
  * Root funds the shared cursor step; image leases end before its progress callback. */
+import { stepSignal } from "../step-signal.js";
 import type { CatalogView, ColumnDef, IndexDef, TableDef } from "../access/catalog.js";
 import type { IndexCursor, IndexRangePlan } from "../access/key-index.js";
 import {
@@ -154,9 +155,16 @@ export class NativeCommandChecks {
   #work<T>(signal: AbortSignal, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
     this.#check(signal);
     if (this.#pending) invalid();
-    const combined = AbortSignal.any([signal, this.scope.signal, this.#stop.signal]);
-    const work = Promise.resolve(this.scope.statement.guard(() => run(combined)));
+    const step = stepSignal("command checks", signal, this.scope.signal, this.#stop.signal);
+    let work: Promise<T>;
+    try {
+      work = Promise.resolve(this.scope.statement.guard(() => run(step.signal)));
+    } catch (error) {
+      step.close();
+      throw error;
+    }
     const pending = work.finally(() => {
+      step.close();
       this.#columns.length = this.#vectors.length = this.#parts.length = 0;
       if (this.#pending === pending) this.#pending = null;
     });

@@ -1,5 +1,6 @@
 /** Command ownership and accepted/deferred work in the root's spilled directory. Three live
  * frames at most; successful checkpoints advance through newly accepted work, not undo.length. */
+import { stepSignal } from "../step-signal.js";
 import type {
   CommandToken,
   ReferentialEntry,
@@ -344,7 +345,8 @@ export class RegistryCommands {
             ? "referencesCount"
             : "followTargetsCount",
       remaining = frame.count - frame[countKey],
-      combined = AbortSignal.any([signal, this.scope.signal, this.#stop.signal]);
+      step = stepSignal("command checkpoint", signal, this.scope.signal, this.#stop.signal),
+      combined = step.signal;
     const run = async () => {
       let cursor = frame[kind]
         ? (await this.#work(() => this.#row(command, frame[kind]))).next
@@ -375,6 +377,7 @@ export class RegistryCommands {
         throw reason;
       })
       .finally(() => {
+        step.close();
         if (frame.checking === pending) frame.checking = null;
       });
     frame.checking = pending;

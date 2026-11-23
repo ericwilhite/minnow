@@ -6,6 +6,7 @@ import type {
 import { NativeWriteStepChangedError } from "../access/native-write-step.js";
 import { TransactionStateError, WritePathClosedError } from "../access/write-path.js";
 import { MemoryAdmissionError, type HolderChain, type MemoryGovernor } from "../memory/governor.js";
+import { stepSignal } from "../step-signal.js";
 import type { ByteCharge } from "../vector/varlen.js";
 
 /** Controller, one preparing request, one witness and one cancellable wakeup. */
@@ -126,25 +127,31 @@ export class NativeWriteSteps {
       capacity = options.includesProgress === true ? scope.governor.capBytes : ordinary;
     if (rootBytes > capacity) throw new MemoryAdmissionError("native root", rootBytes, capacity);
     const request = new AbortController(),
-      stop = AbortSignal.any([signal, request.signal]);
+      step = stepSignal("native write step", signal, request.signal),
+      stop = step.signal;
     this.#owner = owner;
     this.#request = request;
     const pending = Promise.resolve().then(async () => {
-      for (;;) {
-        const version = this.#version;
-        await scope.stabilize(owner, rootBytes, capacity, stop);
-        scope.check(owner);
-        stop.throwIfAborted();
-        // A native change can land after stabilize returns, before this continuation.
-        // Retry preparation, not SQL, rather than publish unfunded/stale headroom or
-        // classify a temporary change as an impossible compound minimum.
-        if (version !== this.#version) continue;
-        const bytes = scope.protectedBytes();
-        if (bytes + rootBytes > capacity)
-          throw new MemoryAdmissionError("native root and writer", bytes + rootBytes, capacity);
-        const boundary = new Boundary(this, bytes, ordinary, capacity, scope.holderChain);
-        this.#live = boundary;
-        return boundary;
+      // The step signal ends with this preparation, whatever its outcome.
+      try {
+        for (;;) {
+          const version = this.#version;
+          await scope.stabilize(owner, rootBytes, capacity, stop);
+          scope.check(owner);
+          stop.throwIfAborted();
+          // A native change can land after stabilize returns, before this continuation.
+          // Retry preparation, not SQL, rather than publish unfunded/stale headroom or
+          // classify a temporary change as an impossible compound minimum.
+          if (version !== this.#version) continue;
+          const bytes = scope.protectedBytes();
+          if (bytes + rootBytes > capacity)
+            throw new MemoryAdmissionError("native root and writer", bytes + rootBytes, capacity);
+          const boundary = new Boundary(this, bytes, ordinary, capacity, scope.holderChain);
+          this.#live = boundary;
+          return boundary;
+        }
+      } finally {
+        step.close();
       }
     });
     this.#pending = pending;

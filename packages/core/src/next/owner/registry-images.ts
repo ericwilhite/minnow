@@ -1,5 +1,6 @@
 /** Root-owned immutable OLD/NEW images. Directory records and fragmented scalar payloads
  * outlive queue packets; only one projected, charged image lease may be live at a time. */
+import { stepSignal } from "../step-signal.js";
 import type { ColumnDef } from "../access/catalog.js";
 import type { MaybePromise } from "../access/key-index.js";
 import {
@@ -549,135 +550,155 @@ export class RegistryImages {
     projection: RowBindingProjection | null,
     signal: AbortSignal,
   ): Promise<RowBindingLease> {
-    signal = AbortSignal.any([signal, this.scope.signal, this.#stop.signal]);
-    this.#check(signal);
-    this.#origin(ref);
-    return this.#work(async () => {
-      const { table, oldHead, nextHead, hasOld, hasNext } = await this.#info(ref, signal);
-      if (projection) this.#validateProjection(table, projection);
-      let scalarBytes = 0,
-        workspace = 0,
-        copyBytes = 0;
-      // A binding read (a projection) also funds one binding copy of each column it reads, sized
-      // from the same records before anything is decoded (registry-scalar.ts bindingCopyBytes).
-      const copies = projection
-        ? {
-            old: hasOld ? new Array<number>(table.columns.length).fill(0) : null,
-            new: hasNext ? new Array<number>(table.columns.length).fill(0) : null,
-          }
-        : null;
-      const measure = (side: number[] | null) => async (position: number, scalar: Uint8Array) => {
-        const column = table.columns[position];
-        if (!column) corrupt();
-        const retained = registryScalarBytes(scalar, column.type);
-        scalarBytes += retained;
-        workspace = Math.max(workspace, registryScalarWorkspaceBytes(scalar, column.type));
-        if (side) {
-          const copy = bindingCopyBytes(scalar, column.type);
-          side[position] = copy;
-          copyBytes += copy;
-        }
-        if (!Number.isSafeInteger(scalarBytes) || !Number.isSafeInteger(copyBytes)) corrupt();
-      };
-      if (hasOld)
-        await this.#walk(
-          table,
-          oldHead,
-          projection?.old ?? null,
-          measure(copies?.old ?? null),
-          signal,
-        );
-      else if (oldHead !== 0) corrupt();
-      if (hasNext)
-        await this.#walk(
-          table,
-          nextHead,
-          projection?.new ?? null,
-          measure(copies?.new ?? null),
-          signal,
-        );
-      else if (nextHead !== 0) corrupt();
-      const bytes = 2 * table.columns.length * 1024 + scalarBytes;
-      // No image lease or native input progress is held here. The host owns the shared
-      // progress step and may wait cancellably. It funds exactly what that step allocates: this
-      // lease (`bytes`, allocated next; funding the step releases idle credit above it, so no
-      // earlier slack can be relied on) and the decode workspace, and for a binding read one
-      // binding copy of each read column (bindingCopyBytes, what BindingScope charges). The lease
-      // already holds every decoded payload: counting the payload again would refuse a write
-      // whose need fits the cap.
-      await this.scope.prepare(bytes + workspace + (copies ? copyBytes : 0), signal);
+    const step = stepSignal("row image read", signal, this.scope.signal, this.#stop.signal);
+    signal = step.signal;
+    try {
       this.#check(signal);
-      if (!this.scope.charge.allocate(bytes)) throw new RangeError("Image lease must be admitted");
-      let old: Array<Vector | typeof ROW_IMAGE_UNREAD> | null = null,
-        next: Array<Vector | typeof ROW_IMAGE_UNREAD> | null = null;
-      let transferred = false;
-      try {
-        old = hasOld ? [] : null;
-        next = hasNext ? [] : null;
-        for (let remaining = table.columns.length; remaining > 0; remaining--) {
-          old?.push(ROW_IMAGE_UNREAD);
-          next?.push(ROW_IMAGE_UNREAD);
-        }
-        const load =
-          (target: Array<Vector | typeof ROW_IMAGE_UNREAD>) =>
-          async (position: number, scalar: Uint8Array) => {
-            const column = table.columns[position];
-            if (!column) corrupt();
-            target[position] = await loadRegistryScalar(
-              scalar,
-              column.type,
-              this.scope.fragments,
-              this.scope.charge,
-              async () => {
-                await this.scope.checkpoint();
-                this.#check(signal);
-              },
+      this.#origin(ref);
+    } catch (error) {
+      step.close();
+      throw error;
+    }
+    // The step signal ends when this read's work settles; the lease it returns does not use it.
+    try {
+      return this.#work(async () => {
+        try {
+          const { table, oldHead, nextHead, hasOld, hasNext } = await this.#info(ref, signal);
+          if (projection) this.#validateProjection(table, projection);
+          let scalarBytes = 0,
+            workspace = 0,
+            copyBytes = 0;
+          // A binding read (a projection) also funds one binding copy of each column it reads, sized
+          // from the same records before anything is decoded (registry-scalar.ts bindingCopyBytes).
+          const copies = projection
+            ? {
+                old: hasOld ? new Array<number>(table.columns.length).fill(0) : null,
+                new: hasNext ? new Array<number>(table.columns.length).fill(0) : null,
+              }
+            : null;
+          const measure =
+            (side: number[] | null) => async (position: number, scalar: Uint8Array) => {
+              const column = table.columns[position];
+              if (!column) corrupt();
+              const retained = registryScalarBytes(scalar, column.type);
+              scalarBytes += retained;
+              workspace = Math.max(workspace, registryScalarWorkspaceBytes(scalar, column.type));
+              if (side) {
+                const copy = bindingCopyBytes(scalar, column.type);
+                side[position] = copy;
+                copyBytes += copy;
+              }
+              if (!Number.isSafeInteger(scalarBytes) || !Number.isSafeInteger(copyBytes)) corrupt();
+            };
+          if (hasOld)
+            await this.#walk(
+              table,
+              oldHead,
+              projection?.old ?? null,
+              measure(copies?.old ?? null),
               signal,
             );
+          else if (oldHead !== 0) corrupt();
+          if (hasNext)
+            await this.#walk(
+              table,
+              nextHead,
+              projection?.new ?? null,
+              measure(copies?.new ?? null),
+              signal,
+            );
+          else if (nextHead !== 0) corrupt();
+          const bytes = 2 * table.columns.length * 1024 + scalarBytes;
+          // No image lease or native input progress is held here. The host owns the shared
+          // progress step and may wait cancellably. It funds exactly what that step allocates: this
+          // lease (`bytes`, allocated next; funding the step releases idle credit above it, so no
+          // earlier slack can be relied on) and the decode workspace, and for a binding read one
+          // binding copy of each read column (bindingCopyBytes, what BindingScope charges). The lease
+          // already holds every decoded payload: counting the payload again would refuse a write
+          // whose need fits the cap.
+          await this.scope.prepare(bytes + workspace + (copies ? copyBytes : 0), signal);
+          this.#check(signal);
+          if (!this.scope.charge.allocate(bytes))
+            throw new RangeError("Image lease must be admitted");
+          let old: Array<Vector | typeof ROW_IMAGE_UNREAD> | null = null,
+            next: Array<Vector | typeof ROW_IMAGE_UNREAD> | null = null;
+          let transferred = false;
+          try {
+            old = hasOld ? [] : null;
+            next = hasNext ? [] : null;
+            for (let remaining = table.columns.length; remaining > 0; remaining--) {
+              old?.push(ROW_IMAGE_UNREAD);
+              next?.push(ROW_IMAGE_UNREAD);
+            }
+            const load =
+              (target: Array<Vector | typeof ROW_IMAGE_UNREAD>) =>
+              async (position: number, scalar: Uint8Array) => {
+                const column = table.columns[position];
+                if (!column) corrupt();
+                target[position] = await loadRegistryScalar(
+                  scalar,
+                  column.type,
+                  this.scope.fragments,
+                  this.scope.charge,
+                  async () => {
+                    await this.scope.checkpoint();
+                    this.#check(signal);
+                  },
+                  signal,
+                );
+                this.#check(signal);
+              };
+            if (old) await this.#walk(table, oldHead, projection?.old ?? null, load(old), signal);
+            if (next)
+              await this.#walk(table, nextHead, projection?.new ?? null, load(next), signal);
             this.#check(signal);
-          };
-        if (old) await this.#walk(table, oldHead, projection?.old ?? null, load(old), signal);
-        if (next) await this.#walk(table, nextHead, projection?.new ?? null, load(next), signal);
-        this.#check(signal);
-        const charge = this.scope.charge;
-        let released = false,
-          retire!: () => void;
-        this.#lease = new Promise<void>((resolve) => {
-          retire = resolve;
-        });
-        const check = () => {
-          if (released) state();
-        };
-        transferred = true;
-        return {
-          tableId: table.id,
-          ...(copies ? { copyBytes: copies } : {}),
-          get old() {
-            check();
-            return old;
-          },
-          get new() {
-            check();
-            return next;
-          },
-          release: () => {
-            if (released) return;
-            released = true;
-            if (old) old.length = 0;
-            if (next) next.length = 0;
-            charge.free(bytes);
-            this.#lease = null;
-            retire();
-          },
-        };
-      } finally {
-        if (!transferred) {
-          if (old) old.length = 0;
-          if (next) next.length = 0;
-          this.scope.charge.free(bytes);
+            const charge = this.scope.charge;
+            let released = false,
+              retire!: () => void;
+            this.#lease = new Promise<void>((resolve) => {
+              retire = resolve;
+            });
+            const check = () => {
+              if (released) state();
+            };
+            transferred = true;
+            return {
+              tableId: table.id,
+              ...(copies ? { copyBytes: copies } : {}),
+              get old() {
+                check();
+                return old;
+              },
+              get new() {
+                check();
+                return next;
+              },
+              release: () => {
+                if (released) return;
+                released = true;
+                if (old) old.length = 0;
+                if (next) next.length = 0;
+                charge.free(bytes);
+                this.#lease = null;
+                retire();
+              },
+            };
+          } finally {
+            if (!transferred) {
+              if (old) old.length = 0;
+              if (next) next.length = 0;
+              this.scope.charge.free(bytes);
+            }
+          }
+        } finally {
+          step.close();
         }
-      }
-    });
+      });
+    } catch (error) {
+      // #work refused before running (closed, or another operation pending).
+      step.close();
+      throw error;
+    }
   }
   close(): Promise<void> {
     return (this.#closing ??= (async () => {

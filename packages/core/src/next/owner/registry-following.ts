@@ -1,5 +1,6 @@
 /** Original follow inputs bind by scalar RI ID. Queued entries never change, and every
  * range shares the root directory. Source capture is a checkpoint, not an AFTER drain. */
+import { stepSignal } from "../step-signal.js";
 import type { CatalogView, ForeignKeyDef, TableDef } from "../access/catalog.js";
 import type {
   CommandToken,
@@ -99,12 +100,19 @@ export class RegistryFollowing {
   #work<T>(signal: AbortSignal, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
     this.#check(signal);
     if (this.#pending) invalid();
-    const combined = AbortSignal.any([signal, this.scope.signal, this.#stop.signal]);
-    const work = run(combined).catch((reason: unknown) => {
-      this.#failure = { reason };
-      throw reason;
-    });
+    const step = stepSignal("following", signal, this.scope.signal, this.#stop.signal);
+    let work: Promise<T>;
+    try {
+      work = run(step.signal).catch((reason: unknown) => {
+        this.#failure = { reason };
+        throw reason;
+      });
+    } catch (error) {
+      step.close();
+      throw error;
+    }
     const pending = work.finally(() => {
+      step.close();
       if (this.#pending === pending) this.#pending = null;
     });
     this.#pending = pending;
