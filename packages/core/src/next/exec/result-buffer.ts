@@ -1,5 +1,5 @@
 /** Result-grant allocations whose tight buffers can change cleanup owner without another charge. */
-import type { Grant } from "../memory/governor.js";
+import { MemoryAdmissionError, type Grant } from "../memory/governor.js";
 import type { Transfer } from "./pipeline.js";
 const owners = new WeakMap<Transfer, ResultBuffers>();
 export type ResultAllocator = (bytes: number) => Promise<ResultBuffers>;
@@ -16,8 +16,14 @@ export class ResultBuffers {
   ) {
     if (!Number.isSafeInteger(bytes) || bytes < 0)
       throw new RangeError("Invalid result allocation");
+    // A result value larger than its admission (an aggregate's, such as `string_agg`'s, is not
+    // sized from its inputs yet): the typed memory refusal (53200), never an untyped error.
     if (!budget.allocate(bytes))
-      throw new Error("Result-owned buffers exceed their complete admission");
+      throw new MemoryAdmissionError(
+        `${budget.label} result-owned buffers`,
+        bytes,
+        Math.max(0, budget.held - budget.allocated),
+      );
     this.#unallocated = bytes;
     this.#owned = bytes;
     this.#transfer = {
