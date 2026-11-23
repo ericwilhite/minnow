@@ -13804,3 +13804,11 @@ export const KEYED_UPDATE_SIZING_REACH = [
   "key by parameter",
   "key by literal",
 ] as const;
+
+/** Multi-row writes beside another connection's read (next/testing/multi-row-beside-read.test.ts). */
+export const MULTI_ROW_BESIDE_READ_REACH = [
+  "beside a held read",
+  "waited for the read",
+  "written at once",
+  "two-row memtables",
+] as const;

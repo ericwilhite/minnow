@@ -260,6 +260,7 @@ import {
   jsonBound,
   type EngineHooks,
   type PublishedRows,
+  type RowsWait,
 } from "./transaction.js";
 import { SnapshotImpl } from "./view.js";
 import { charged, need } from "./bytes.js";
@@ -2694,11 +2695,54 @@ export class WritePathImpl implements WritePath, EngineHooks {
    * after relief so a small next batch never carries the old arena's resize estimate. Throws
    * `MemtableMemoryError` when nothing more can be freed.
    */
-  admit(bytes: number, growth?: () => number): MaybePromise<void> {
+  admit(bytes: number, growth?: () => number, wait?: RowsWait): MaybePromise<void> {
     const prepared = this.#prepareMinimum();
-    return prepared instanceof Promise
-      ? this.#admitAfterMinimum(prepared, bytes, growth)
-      : this.#admitRows(bytes, growth);
+    const admitted =
+      prepared instanceof Promise
+        ? this.#admitAfterMinimum(prepared, bytes, growth)
+        : this.#admitRows(bytes, growth);
+    // Relief could not free enough: with the statement's holdings, wait for the rest in the
+    // governor rather than refuse (a finite holder, another connection's read, may hold it).
+    if (wait === undefined || !(admitted instanceof Promise)) return admitted;
+    return admitted.catch((error: unknown) => {
+      if (!(error instanceof MemtableMemoryError)) throw error;
+      return this.#waitForRows(bytes, growth, wait);
+    });
+  }
+
+  /**
+   * Waits for the rows a step needs beyond what relief freed, as an ordinary admission carrying
+   * the statement's holdings: refused (53200, before the step's effect) when it could never be
+   * served beside them (GOVERNOR-WAIT-POLICY point 5), else served once finite holders release,
+   * and cancelled with the statement. Not holder growth: a reader's own growth (its read steps,
+   * the writer metadata it opens run readers with) is served before it, and a query waits for
+   * an admission holding nothing (rule 2), so no reader waits on it. Its credit then moves to
+   * the row account.
+   */
+  async #waitForRows(bytes: number, growth: (() => number) | undefined, wait: RowsWait) {
+    const governor = this.#credits.governor;
+    for (;;) {
+      wait.signal?.throwIfAborted();
+      this.#check();
+      if (this.#headroom(bytes + (growth?.() ?? 0))) return;
+      const deficit = bytes + (growth?.() ?? 0) - (this.#grant.held - this.#grant.allocated);
+      const [credit] = await governor.admitGroup({
+        label: "write path memtable",
+        grants: [{ label: "write path memtable", minimumBytes: deficit, spillable: false }],
+        holdings: wait.holdings,
+        ...(wait.signal === undefined ? {} : { signal: wait.signal }),
+      });
+      try {
+        this.#check();
+        if (
+          credit === undefined ||
+          !governor.transferCredit(credit, this.#grant, credit.held - credit.allocated)
+        )
+          throw new Error("Admitted memtable credit was not transferred");
+      } finally {
+        credit?.close();
+      }
+    }
   }
 
   /** Root has retired producer/image borrows before this cancellable native prepayment.

@@ -70,7 +70,7 @@ import type { Batch, Selection } from "../vector/vector.js";
 import type { CatalogChange, CatalogView } from "./catalog.js";
 import type { MaybePromise } from "./key-index.js";
 import type { Snapshot } from "./snapshot.js";
-import type { LentHoldings } from "../memory/governor.js";
+import type { LentHoldings, WaitingHoldings } from "../memory/governor.js";
 
 export interface StatementOptions {
   /** Owner-classified query: retains a read view but may not open row or DDL writers.
@@ -132,6 +132,16 @@ export interface Statement {
    * (`MemoryGovernor.servableNow`). Optional for statements without a native writer.
    */
   writerHoldings?(): LentHoldings | null;
+  /**
+   * While a query executes this statement, what the statement keeps held if one of its write
+   * steps waits for memory: its query's grants, its writer's holdings, what only its snapshot
+   * keeps (`WaitingHoldings`). Set by the executing query (exec/run.ts), restored when it
+   * closes. Without it, a write step refuses rather than wait.
+   */
+  waitHoldings?: (() => WaitingHoldings) | null;
+  /** The executing query's cancellation, set and restored with `waitHoldings`: a write step's
+   * memory wait ends with it. */
+  waitSignal?: AbortSignal | null;
 }
 
 export interface TableWriteOptions {

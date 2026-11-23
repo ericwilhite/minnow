@@ -96,7 +96,7 @@ import {
 } from "./view.js";
 import { need, MemtableMemoryError, byteString, memoryRefusal } from "./bytes.js";
 import type { PreparedWriteCredit } from "./credits.js";
-import type { LentHoldings } from "../memory/governor.js";
+import type { LentHoldings, WaitingHoldings } from "../memory/governor.js";
 import { NativePrimaryAdapter, type NativePrimaryScope } from "./primary-command.js";
 import type { HolderChain } from "../memory/governor.js";
 import type {
@@ -110,6 +110,13 @@ export const ALL = PENDING_BASE + MAX_STATEMENTS;
 const FTS_ROW_UNDO_BYTES = 32;
 
 /** What transactions need from the write path. */
+/** What a write step's memory wait carries: the statement's holdings while it waits (the
+ * governor refuses the wait typed when it could never be served beside them) and its signal. */
+export interface RowsWait {
+  readonly holdings: () => WaitingHoldings;
+  readonly signal?: AbortSignal;
+}
+
 export interface EngineHooks {
   readonly liveRekeys?: boolean;
   prepareNativeStep?(
@@ -156,7 +163,7 @@ export interface EngineHooks {
   /** Adds an index's delta to the table's live memtable (createIndex). */
   addIndexDelta(tableId: number, indexId: number): Memtable;
   /** Ensures memtable memory for about `bytes` more before an insert (backpressure). */
-  admit(bytes: number, growth?: () => number): MaybePromise<void>;
+  admit(bytes: number, growth?: () => number, wait?: RowsWait): MaybePromise<void>;
   /** End-of-statement admission after producer borrows and check views retire. */
   prepareFtsMutation?(signal?: AbortSignal): MaybePromise<void>;
   /** Command primary prepayment, before the root borrows a decoded image. */
@@ -810,6 +817,8 @@ export class StatementImpl implements Statement {
   readonly tx: TransactionImpl;
   readonly #rules: (tableId: number) => TableRules;
   #signal: AbortSignal | undefined;
+  waitHoldings: (() => WaitingHoldings) | null = null;
+  waitSignal: AbortSignal | null = null;
   readonly #start: number;
   #state: "open" | "failed" | "ended" = "open";
   #writers: Map<string, TableWriterImpl> | null = null;
@@ -827,6 +836,19 @@ export class StatementImpl implements Statement {
   /** A writable statement holds the writer turn, and with it the write owner's holdings. */
   writerHoldings(): LentHoldings | null {
     return this.readOnly ? null : (this.tx.hooks.writerHoldings?.() ?? null);
+  }
+
+  /** How a write step of this statement may wait for memory (`EngineHooks.admit`), when a
+   * query executing it has said what it keeps held meanwhile. */
+  memoryWait(): RowsWait | undefined {
+    const holdings = this.waitHoldings;
+    if (holdings === null) return undefined;
+    const signals = [this.#signal, this.waitSignal].filter(
+      (signal): signal is AbortSignal => signal !== undefined && signal !== null,
+    );
+    const [only] = signals;
+    if (only === undefined) return { holdings };
+    return { holdings, signal: signals.length === 1 ? only : AbortSignal.any(signals) };
   }
   /** Whether this statement inserted row `rowId` of `tableId` (ON CONFLICT `statement`). */
   inserted(tableId: number, rowId: number): boolean {
@@ -1921,8 +1943,10 @@ export class TableWriterImpl implements TableWriter {
         bytes = this.#estimate(columns, plan);
       if (bytes <= BATCH_TARGET_BYTES || count <= 1 || !this.#wideKeys(columns, plan))
         return settle(
-          this.statement.tx.hooks.admit(this.#rowMetadata(columns, plan), () =>
-            this.#stepCharge(columns, plan),
+          this.statement.tx.hooks.admit(
+            this.#rowMetadata(columns, plan),
+            () => this.#stepCharge(columns, plan),
+            this.statement.memoryWait(),
           ),
           () => this.#insertRows(columns, plan, false, inserted),
         );
@@ -1945,8 +1969,10 @@ export class TableWriterImpl implements TableWriter {
           }
           offset += plan.count;
           const pending = settle(
-            this.statement.tx.hooks.admit(this.#rowMetadata(columns, plan), () =>
-              this.#stepCharge(columns, plan),
+            this.statement.tx.hooks.admit(
+              this.#rowMetadata(columns, plan),
+              () => this.#stepCharge(columns, plan),
+              this.statement.memoryWait(),
             ),
             () => this.statement.guard(() => this.#insertRows(columns, plan, false, inserted)),
           );

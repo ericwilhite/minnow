@@ -1595,6 +1595,32 @@ export class QueryExecution implements Execution {
       },
     );
     this.delivered.catch(() => undefined);
+    // While this execution runs its statement, the statement's write steps wait for memory
+    // beside what it keeps: its runtime's holdings and its result grant (the modification's
+    // spool drains after the producing runtime closes). A nested execution's registration is
+    // restored to its outer's when it settles.
+    const statement = request.statement;
+    if (statement !== null) {
+      const outer = statement.waitHoldings ?? null;
+      const own = (): WaitingHoldings => {
+        const holdings = this.#runtime?.waitingHoldings() ?? {
+          grants: [],
+          pinned: () => view.exclusiveBytes?.() ?? 0,
+        };
+        return this.#result === null
+          ? holdings
+          : { ...holdings, grants: [...holdings.grants, this.#result] };
+      };
+      const outerSignal = statement.waitSignal ?? null;
+      statement.waitHoldings = own;
+      statement.waitSignal = this.#controller.signal;
+      const restore = () => {
+        if (statement.waitHoldings !== own) return;
+        statement.waitHoldings = outer;
+        statement.waitSignal = outerSignal;
+      };
+      void this.executed.then(restore, restore);
+    }
     request.signal?.addEventListener("abort", onAbort, { once: true });
     try {
       if (request.signal?.aborted === true) this.cancel(request.signal.reason);
