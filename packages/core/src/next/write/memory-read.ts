@@ -544,7 +544,15 @@ export class MemoryReads {
       Held<ColumnChunk | undefined>,
       unknown
     > {
-      const root = yield* wait(new MetadataReader(context.pages).groupRoot(ref, context.budget));
+      // A one-pass read leaves the page cache alone too: its root blob is read, not admitted.
+      const pages: SpaceReader =
+        context.once === true
+          ? {
+              peek: (blob, options) => context.pages.peek(blob, { ...options, once: true }),
+              read: (refs, options) => context.pages.read(refs, { ...options, once: true }),
+            }
+          : context.pages;
+      const root = yield* wait(new MetadataReader(pages).groupRoot(ref, context.budget));
       return {
         value: root.value.columns.find((c) => c.columnId === columnId),
         release: () => root.release(),
