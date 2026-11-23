@@ -13,7 +13,8 @@ import {
   type MemorySummaryRequest,
   type MemoryOutputNeed,
 } from "../access/snapshot.js";
-import type { SpaceReader } from "../access/space.js";
+import { MemoDeclinedError, type ReaderMemo, type ReaderMemoEntry } from "../access/reader-memo.js";
+import type { ByteBudget, SpaceReader } from "../access/space.js";
 import { taskClock, yieldTask } from "../exec/pipeline.js";
 import {
   MetadataReader,
@@ -26,7 +27,12 @@ import {
   parseCharge,
   selectGroupRootColumns,
 } from "../format/manifest-codec.js";
-import { PageEncoding, type BlobRef, type ColumnChunk } from "../format/manifest.js";
+import {
+  PageEncoding,
+  type BlobRef,
+  type ColumnChunk,
+  type GroupRoot,
+} from "../format/manifest.js";
 import type { Held } from "../format/reachable.js";
 import {
   ChunkReader,
@@ -35,6 +41,7 @@ import {
   MAX_READ_BYTES,
   PAGE_DESCRIPTOR_BYTES,
 } from "../page/reader.js";
+import type { CompiledPredicate } from "../page/predicate.js";
 import { scratchBytes as predicateScratchBytes } from "../page/select.js";
 import { GZIP_MAX_PAGE_BYTES } from "../page/gzip.js";
 import { allocateData, type FlatVector, type VectorData } from "../vector/vector.js";
@@ -61,6 +68,161 @@ import {
  */
 interface RoutedRead extends MemoryReadContext {
   readonly caches: MetadataCaches | undefined;
+}
+
+const sameBlob = (a: BlobRef, b: BlobRef): boolean =>
+  a === b ||
+  (a.offset === b.offset &&
+    a.length === b.length &&
+    a.checksum === b.checksum &&
+    a.extent.offset === b.extent.offset &&
+    a.extent.length === b.extent.length);
+
+/** The null predicate a reader's varlen decode uses, compiled once per reader: a memo keeps its
+ * readers open across reads, and a reader charges each compiled predicate's codes until close. */
+const nullPredicates = new WeakMap<ChunkReader, CompiledPredicate | null>();
+function nullsOf(reader: ChunkReader): CompiledPredicate | null {
+  let nulls = nullPredicates.get(reader);
+  if (nulls === undefined) {
+    nulls = reader.compilePredicate({ op: "isNull" });
+    nullPredicates.set(reader, nulls);
+  }
+  return nulls;
+}
+
+type OpenedReader = ChunkReader | { missing: FlatVector };
+
+/**
+ * One memo entry (access/reader-memo.ts): the published group root of one memory segment and the
+ * chunk readers opened on it, kept across that segment's reads while its root stays the same.
+ * Everything it holds is charged to the memo's budget through `budget`, which records a refusal so
+ * the read can decline the memo instead of failing. It reads through its own pages under the
+ * memo's signal, and watches the snapshot: a release closes it.
+ */
+class PublishedReaders implements ReaderMemoEntry {
+  readonly readers = new Map<number, OpenedReader>();
+  readonly pages: SpaceReader;
+  readonly signal: AbortSignal;
+  readonly budget: ByteBudget;
+  /** Bytes the memo's budget refused (0: none). */
+  refused = 0;
+  #root: Held<GroupRoot> | null = null;
+  readonly #stop = new AbortController();
+  #unwatch: (() => void) | null;
+  #closed = false;
+  constructor(
+    readonly owner: MemoryReads,
+    readonly ref: BlobRef,
+    readonly memo: ReaderMemo,
+    base: SpaceReader,
+    readonly caches: MetadataCaches | undefined,
+  ) {
+    const source = owner.source;
+    this.budget = {
+      allocate: (bytes) => {
+        if (memo.budget.allocate(bytes)) return true;
+        this.refused = Math.max(this.refused, bytes);
+        return false;
+      },
+      free: (bytes) => {
+        memo.budget.free(bytes);
+      },
+    };
+    this.signal = AbortSignal.any([memo.signal, this.#stop.signal]);
+    const check = (): void => {
+      source.check();
+      this.signal.throwIfAborted();
+    };
+    this.pages = {
+      peek: (blob, options) => {
+        check();
+        return base.peek(blob, options);
+      },
+      read: async (refs, options) => {
+        check();
+        const lease = await base.read(refs, {
+          ...options,
+          budget: this.budget,
+          signal: this.signal,
+        });
+        try {
+          check();
+          return lease;
+        } catch (error) {
+          lease.release();
+          throw error;
+        }
+      },
+    };
+    this.#unwatch = source.watch(() => {
+      this.#stop.abort();
+      if (memo.entry(owner) === this) memo.invalidate();
+      else this.close();
+    });
+  }
+
+  /** The same published root, still open: the entry's readers are current. */
+  current(ref: BlobRef): boolean {
+    return !this.#closed && !this.#stop.signal.aborted && sameBlob(this.ref, ref);
+  }
+
+  *reader(columnId: number, check: () => void): Generator<Promise<unknown>, OpenedReader, unknown> {
+    const opened = this.readers.get(columnId);
+    if (opened !== undefined) return opened;
+    if (this.#root === null) {
+      const root = yield* wait(
+        new MetadataReader(this.pages, this.caches).groupRoot(this.ref, this.budget),
+      );
+      if (this.#closed) {
+        root.release();
+        check();
+        throw new TypeError("A closed reader memo entry cannot open readers");
+      }
+      this.#root = root;
+    }
+    check();
+    // One column, never the owner-shared view's complete column list.
+    const stored = selectGroupRootColumns(this.#root.value, [columnId])[0];
+    let reader: OpenedReader;
+    if (stored === undefined) {
+      const missing = this.owner.source.publishedMissing?.(columnId);
+      if (missing === undefined)
+        throw new RangeError("The published memory group lacks this column");
+      reader = { missing };
+    } else {
+      reader = yield* wait(
+        ChunkReader.open(this.pages, stored, {
+          budget: this.budget,
+          signal: this.signal,
+          ...(this.caches?.directories === undefined
+            ? {}
+            : { directories: this.caches.directories }),
+        }),
+      );
+      if (this.#closed) {
+        reader.close();
+        check();
+        throw new TypeError("A closed reader memo entry cannot open readers");
+      }
+    }
+    this.readers.set(columnId, reader);
+    return reader;
+  }
+
+  close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    try {
+      for (const reader of this.readers.values()) if (!("missing" in reader)) reader.close();
+      this.readers.clear();
+      this.#root?.release();
+      this.#root = null;
+    } finally {
+      const unwatch = this.#unwatch;
+      this.#unwatch = null;
+      unwatch?.();
+    }
+  }
 }
 
 export interface MemoryReadSource {
@@ -199,6 +361,34 @@ export class MemoryReads {
   ): MaybePromise<T> {
     context.signal.throwIfAborted();
     if (!context.budget.allocate(1024)) throw new PageBudgetError(1024);
+    const memo = context.readers;
+    if (memo !== undefined) {
+      // A memo read reads its pages through the memo's entry, which watches the snapshot under
+      // the memo's signal (covering this read's). No per-read composite signal or watch: a
+      // composite per point read on one long-lived signal costs Node a cleanup pass over every
+      // earlier one (quadratic in the statement's rows).
+      const signal = context.signal;
+      const check = (): void => {
+        this.source.check();
+        signal.throwIfAborted();
+      };
+      const direct: RoutedRead = {
+        budget: context.budget,
+        pages: context.pages,
+        signal,
+        readers: memo,
+        caches: undefined,
+      };
+      const execute = function* (): Generator<Promise<unknown>, T, unknown> {
+        try {
+          check();
+          return yield* work(direct, check);
+        } finally {
+          context.budget.free(1024);
+        }
+      };
+      return run(execute());
+    }
     const stop = new AbortController();
     const signal = AbortSignal.any([context.signal, stop.signal]);
     const check = (): void => {
@@ -257,8 +447,10 @@ export class MemoryReads {
     columnId: number,
     context: RoutedRead,
     check: () => void,
-    use: (reader: ChunkReader | { missing: FlatVector }) => Generator<Promise<unknown>, T, unknown>,
+    use: (reader: OpenedReader) => Generator<Promise<unknown>, T, unknown>,
   ): Generator<Promise<unknown>, T, unknown> {
+    const memo = context.readers;
+    if (memo !== undefined) return yield* this.#withMemo(memo, columnId, context, check, use);
     // Do not call a cold LazyGroupRoot.get(): its callback uses the writer's pages and budget.
     const caches = context.caches;
     const root = yield* this.#storedColumn(columnId, context);
@@ -286,6 +478,50 @@ export class MemoryReads {
       }
     } finally {
       root.release();
+    }
+  }
+
+  /**
+   * `#withReader` through the memo's entry for this segment: reused while the segment's published
+   * root is the one it was opened on, else replaced. The readers stay open after `use`. Any failure
+   * closes the entry (a reader may hold a half-loaded page); a refusal by the memo's budget is
+   * reported as `MemoDeclinedError`, so the caller can read again without the memo.
+   */
+  *#withMemo<T>(
+    memo: ReaderMemo,
+    columnId: number,
+    context: RoutedRead,
+    check: () => void,
+    use: (reader: OpenedReader) => Generator<Promise<unknown>, T, unknown>,
+  ): Generator<Promise<unknown>, T, unknown> {
+    check();
+    if (memo.closed) throw new TypeError("A closed reader memo cannot be read through");
+    const ref = this.source.publishedRoot();
+    let entry = memo.entry(this);
+    if (entry instanceof PublishedReaders && entry.current(ref)) memo.reuses += 1;
+    else {
+      // Memo reads are not wrapped (`#during`): these are the caller's own pages.
+      entry = new PublishedReaders(
+        this,
+        ref,
+        memo,
+        context.pages,
+        metadataCachesFor(context.pages),
+      );
+      memo.install(entry);
+    }
+    if (!(entry instanceof PublishedReaders)) throw new TypeError("Foreign reader memo entry");
+    try {
+      const reader = yield* entry.reader(columnId, check);
+      check();
+      return yield* use(reader);
+    } catch (error) {
+      const refused = entry.refused;
+      if (memo.entry(this) === entry) memo.invalidate();
+      else entry.close();
+      if (refused > 0 && !(error instanceof MemoDeclinedError))
+        throw new MemoDeclinedError(refused);
+      throw error;
     }
   }
 
@@ -723,7 +959,7 @@ export class MemoryReads {
           const scalar = scalarOutput(type);
           const mask = new Uint8Array(1),
             selected = new Uint32Array(MEMORY_CHUNK_ROWS / 32);
-          const nulls = reader.compilePredicate({ op: "isNull" });
+          const nulls = nullsOf(reader);
           if (nulls === null)
             throw new TypeError("Null predicate is unavailable for a stored column");
           let page = -1;

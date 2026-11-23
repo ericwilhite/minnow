@@ -5,12 +5,9 @@ import type { TableSnapshot } from "../access/snapshot.js";
 import type { StatementRules } from "./statement-rules.js";
 import type { Grant } from "../memory/governor.js";
 import type { PhysicalType } from "../types.js";
-import { locatorPosition, locatorSegment } from "../vector/locator.js";
 import type { Batch, Vector } from "../vector/vector.js";
 import { ColumnStore } from "./column-store.js";
 import { ProjectOperator } from "./filter.js";
-import { selectedSegment } from "./late-fetch.js";
-import { PointMemorySegment } from "./point-segment.js";
 import { compileExpr, type CompileContext } from "./kernels/compile.js";
 import {
   ExpressionMemoryError,
@@ -24,7 +21,8 @@ import { pushAndWait, type Operator, type Transfer } from "./pipeline.js";
 import type { ChunkReads } from "./scan.js";
 import { sortRowView, SORT_ROW_VIEW_BYTES } from "./sort-row.js";
 import type { Pool } from "./spill-pool.js";
-import { TableScan, memoryScanBufferBytes } from "./table-scan.js";
+import { memoryScanBufferBytes } from "./table-scan.js";
+import { PointFetcher } from "./point-fetch.js";
 
 export function upsertTypes(rel: ModifyRel): readonly PhysicalType[] {
   const n = rel.input.output.length - (rel.passthrough ?? 0);
@@ -67,6 +65,8 @@ export class UpsertWriter implements Operator {
   readonly #assigned: ColumnStore;
   readonly #kernels: UpsertExpressions;
   #project: ProjectOperator | null;
+  /** One reusable fetch of the conflicting rows for the statement (its reader memo included). */
+  readonly #fetcher: PointFetcher;
   #table: TableSnapshot | null = null;
   #pending: Promise<void> = Promise.resolve();
   constructor(
@@ -107,6 +107,15 @@ export class UpsertWriter implements Operator {
       requireTrackedTargets: true,
     });
     requireReturningRules(rel, table, scope);
+    this.#fetcher = new PointFetcher({
+      columns: table.columns.map((c) => c.id),
+      types: table.columns.map((c) => c.type),
+      pool,
+      grant,
+      signal,
+      reads,
+      context,
+    });
     this.#kernels = new UpsertExpressions(rel, { ...context, input: upsertTypes(rel) });
     this.#project =
       rel.returning === null
@@ -126,59 +135,8 @@ export class UpsertWriter implements Operator {
   async #fetch(locator: number): Promise<void> {
     const snapshot = this.statement.view;
     const original = (this.#table ??= await snapshot.table(this.table.id, { budget: this.pool }));
-    const source = original.segments[locatorSegment(locator)];
-    if (!source || locatorPosition(locator) >= source.rowCount)
-      throw new RangeError("Conflict locator is outside statement snapshot");
     this.#old.reset(true);
-    const position = locatorPosition(locator);
-    const segment =
-      source.kind === "memory"
-        ? new PointMemorySegment(source, position)
-        : selectedSegment(source, 0, new Uint16Array([position]));
-    const scan = new TableScan({
-      table: {
-        tableId: original.tableId,
-        schemaVersion: original.schemaVersion,
-        columns: original.columns,
-        liveRowCount: 1,
-        segments: [segment],
-      },
-      columns: this.table.columns.map((c) => c.id),
-      filter: null,
-      emitLocator: false,
-      context: { ...this.context, input: this.table.columns.map((c) => c.type) },
-      budget: this.pool,
-      pages: snapshot.pages,
-      reads: this.reads,
-      boundedMemory: true,
-      targetBytes: 16384,
-      rowsNeeded: () => 1,
-      loans: {
-        borrow: async (bytes) => {
-          await this.pool.need(bytes, this.grant, this.signal);
-          return { bytes, repay: () => undefined };
-        },
-      },
-    });
-    try {
-      const item = await scan.next();
-      if (!item || (item.batch.selection?.count ?? item.batch.length) !== 1)
-        throw new RangeError("Conflict row disappeared");
-      try {
-        const row = item.batch.selection?.rows[0] ?? 0;
-        await this.pool.need(
-          2 * this.#old.appendNeed(item.batch.columns, row) + 65536,
-          this.grant,
-          this.signal,
-        );
-        if (this.#old.append(item.batch.columns, item.batch.selection?.rows ?? null, 0, 1) !== 1)
-          throw new RangeError("Conflict row copy was not funded");
-      } finally {
-        item.transfer?.release();
-      }
-    } finally {
-      scan.abort();
-    }
+    await this.#fetcher.fetch(original, snapshot.pages, locator, this.#old);
   }
   async #write(batch: Batch): Promise<void> {
     const conflict = this.rel.onConflict;
@@ -305,10 +263,13 @@ export class UpsertWriter implements Operator {
     return this.#project?.finish() ?? this.output.finish();
   }
   abort(reason: unknown): void {
+    // The memo's readers and charges go back now; a fetch in flight fails with the statement.
+    this.#fetcher.close();
     this.#project?.abort(reason);
   }
   async close(): Promise<void> {
     await this.#pending.catch(() => undefined);
+    this.#fetcher.close();
     this.#project = null;
     this.#assigned.close();
     this.#old.close();
