@@ -79,6 +79,8 @@ export default defineConfig({
               : []),
             // A governor wait with no progress for this long fails, naming every holder.
             ...(process.env.MINNOW_GOVERNOR_STALL_MS ? ["scripts/governor-stall.setup.ts"] : []),
+            // Engine code opens no step signal inside an abort dispatch of one of its sources.
+            "packages/core/src/next/testing/step-signal-checks.setup.ts",
           ],
           // Nonzero groups also preserve this order with Vitest's single-worker shortcut.
           sequence: { groupOrder: 1 },

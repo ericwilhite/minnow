@@ -7,20 +7,40 @@
  * composites per row and checked them constantly (C1's profile, 2026-11-22: a tenth of its time).
  * A step is a plain `AbortController`, so checking it costs nothing.
  *
- * It aborts exactly as `AbortSignal.any(parents)` would: the DOM's two-phase "signal abort". When
- * a source aborts, every dependent takes that source's reason at once (step 4), then the source's
- * own listeners run (step 5), and only then do the dependents' abort events fire (step 6). So:
+ * ## Contract
+ *
+ * `stepSignal(site, ...parents)` behaves as `AbortSignal.any(parents)`, and `abortableStep(site,
+ * ...parents)` as `AbortSignal.any([...parents, own.signal])` whose `abort(reason)` is
+ * `own.abort(reason)`. **A step's reason and final aborted state always match that composite's.**
+ * One difference, of event timing only: a step opened inside an abort listener, over a step whose
+ * abort two nested sources are dispatching at once, is not born aborted as the composite would be.
+ * It aborts, with the composite's reason, when the outer source's dispatch reaches it, so it may
+ * fire one abort event the composite never fires (`ambiguousStepOpens()` counts it; pinned in
+ * testing/step-signal.test.ts). Engine code opens no step inside an abort dispatch of one of its
+ * sources: test builds check that across the whole next/ suite (`checkStepOpensDuringAbort`).
+ * A closed step is over: it no longer follows its parents, unless its abort was already decided
+ * when it closed (then it ends aborted with that reason), and a direct abort after a close does
+ * nothing.
+ *
+ * ## How
+ *
+ * The DOM's two-phase "signal abort": when a source aborts, every dependent takes that source's
+ * reason at once (step 4), then the source's own listeners run (step 5), and only then do the
+ * dependents' abort events fire (step 6). So:
  * - Each parent with open steps gets one sentinel, `AbortSignal.any([parent])`, created once per
  *   parent and never read. Its abort event fires at step 6, where a composite's would, and the
  *   parent's fan-out listens there: steps abort after every listener of the parent, in the order
  *   they joined.
- * - The first source to abort decides a step's reason. A fan-out passes over a step that has
- *   another aborted parent whose own fan-out has not finished: that parent's abort encloses this
- *   one (a later abort would have been dispatched completely before returning here), so it aborted
- *   first and its fan-out aborts the step.
- * - A parent that is itself a step signal is replaced by that step's parents, as `AbortSignal.any`
- *   replaces a composite source by its sources.
- * A step under an already-aborted parent aborts at once with the first such parent's reason.
+ * - The first source to abort decides a step's reason. A fan-out passes over a step that another
+ *   aborted source has decided but not yet fanned out: that abort encloses this one (a later
+ *   abort would have been dispatched completely before returning here), so it came first and its
+ *   fan-out aborts the step.
+ * - A parent that is itself a step stands for its sources (an abortable step also for its own
+ *   signal), as `AbortSignal.any` replaces a composite source by its sources. An aborted parent
+ *   gives its own recorded reason; a parent step whose abort one pending source decides gives that
+ *   source's reason at once.
+ * - A close, or a direct abort, while the step's abort is decided but pending waits for that
+ *   fan-out.
  *
  * `close()` ends a step (in a `finally`, including when the work it guards refuses to start): its
  * parents stop holding it, and a parent's sentinel listener is removed with its last step.
@@ -72,8 +92,10 @@ const records = new WeakMap<
 >();
 /** Registrations parents hold: one per open step and parent. */
 let held = 0;
-/** Steps opened over a step with several pending aborts (the known divergence below). */
+/** Steps opened over a step with several pending aborts (the contract's timing difference). */
 let ambiguous = 0;
+/** Test builds only: the sites of steps opened while a source's abort was in dispatch. */
+let opensDuringAbort: string[] | null = null;
 /** Test builds only: told the site of every step as it opens (null in production). */
 let observer: ((site: string) => void) | null = null;
 
@@ -189,6 +211,8 @@ function open(
     for (const parent of joined) leave(parent, controller);
     joined.length = 0;
   };
+  if (opensDuringAbort !== null && parents.some((parent) => pending(parent)))
+    opensDuringAbort.push(site);
   const sources: AbortSignal[] = [];
   const step: Step = { parents: sources, release };
   const handle = {
@@ -267,6 +291,17 @@ export function observeStepSignals(observe: ((site: string) => void) | null): vo
  */
 export function ambiguousStepOpens(): number {
   return ambiguous;
+}
+
+/**
+ * Test builds only: records (when `on`) every step opened while an abort of one of its sources is
+ * in dispatch, and returns the sites recorded since the last call. Engine code opens none
+ * (step-signal-checks.setup.ts asserts it after every test file).
+ */
+export function checkStepOpensDuringAbort(on: boolean): readonly string[] {
+  const seen = opensDuringAbort ?? [];
+  opensDuringAbort = on ? [] : null;
+  return seen;
 }
 
 /** Step registrations parents still hold (tests: a step never closed stays held). */

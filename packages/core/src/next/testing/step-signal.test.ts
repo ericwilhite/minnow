@@ -26,6 +26,7 @@ import { MinnowDatabaseClient } from "../owner/database-client.js";
 import {
   abortableStep,
   ambiguousStepOpens,
+  checkStepOpensDuringAbort,
   heldStepSignals,
   observeStepSignals,
   stepSignal,
@@ -34,6 +35,9 @@ import { publicOwner } from "./public-owner.test.fixture.js";
 
 afterEach(() => {
   observeStepSignals(null);
+  // This file opens steps inside abort dispatches on purpose: clear them from the suite-wide
+  // check (step-signal-checks.setup.ts), and keep checking for the next test.
+  checkStepOpensDuringAbort(true);
 });
 
 describe("stepSignal", () => {
@@ -127,6 +131,24 @@ describe("stepSignal", () => {
     expect(b.signal.reason).toBe(first);
     a.close();
     b.close();
+  });
+
+  it("records a step opened inside an abort dispatch of one of its sources (the suite check)", () => {
+    checkStepOpensDuringAbort(true);
+    const p = new AbortController(),
+      q = new AbortController();
+    const a = stepSignal("outside", p.signal);
+    p.signal.addEventListener("abort", () => {
+      stepSignal("inside a source's abort", p.signal, q.signal).close();
+      stepSignal("inside, over a decided step", a.signal).close();
+      stepSignal("inside, unrelated", q.signal).close();
+    });
+    p.abort("stop");
+    a.close();
+    expect(checkStepOpensDuringAbort(true)).toEqual([
+      "inside a source's abort",
+      "inside, over a decided step",
+    ]);
   });
 
   // Astra's re-check of #55 (probes.mjs): each compared with AbortSignal.any.
