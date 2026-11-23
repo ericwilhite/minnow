@@ -183,7 +183,10 @@ its own idle commit and merge credit before relief. When relief cannot free enou
 waits for the rest as an ordinary admission carrying its statement's holdings
 (`Statement.waitHoldings`, registered by the executing query, and its cancellation): refused with
 53200 only when it could never be served beside them, otherwise served once another
-connection's finite holdings release, never refused part way. A transaction reserves one state
+connection's finite holdings release, never refused part way. While it waits, the row credit it
+already holds stays (`WriteCredits.holdRowsWhileWaiting`, a floor like a prepared step's): the
+governor's reclaim for that very admission would otherwise return it, and the step would ask
+again forever. A transaction reserves one state
 pin for each undo it records that republishes the writer's state (a memtable freeze, a table it
 created, a table it staged), funded before the step that records it, so a rollback never needs
 memory, whatever snapshots keep the states it replaces. A step that would wait for a running

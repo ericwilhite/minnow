@@ -2098,6 +2098,9 @@ export const OWNER_PRIVATE_PLAN_CACHE_STATES = [
   "private close",
 ] as const;
 
+/** A write step waiting for rows, decided without spinning (row-wait-reclaim). */
+export const ROW_WAIT_RECLAIM_REACH = ["waited for rows", "written", "refused typed"] as const;
+
 /** PG per-attribute mode transitions, statement attempts, savepoints and transaction cleanup. */
 export const OWNER_TRANSACTION_MODE_STATES = [
   "read-only begin",

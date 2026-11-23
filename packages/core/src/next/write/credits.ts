@@ -49,6 +49,13 @@ export class WriteCredits {
   #metadataHeadroom = 0;
   #rowMinimum: number;
   #rowFloor = 0;
+  /** Rows a waiting write step keeps from reclaim (`holdRowsWhileWaiting`); 0 when none waits. */
+  #rowWait = 0;
+  /** What reclaim, idle funding and merge exchange leave of the row account beyond the minimum:
+   * a prepared step's floor, or a waiting step's. */
+  get #rowsKept(): number {
+    return Math.max(this.#rowFloor, this.#rowWait);
+  }
   #rowStep = 0;
   #nextRowStep = 0;
   #changed: ((growth?: boolean) => void) | null = null;
@@ -67,7 +74,7 @@ export class WriteCredits {
   ): number {
     const active = this.#mergeActive?.held ?? 0;
     return (
-      Math.max(this.#rowMinimum, this.rows.allocated + this.rows.loaned, this.#rowFloor) +
+      Math.max(this.#rowMinimum, this.rows.allocated + this.rows.loaned, this.#rowsKept) +
       this.metadata.allocated +
       Math.max(
         this.metadata.loaned,
@@ -105,7 +112,7 @@ export class WriteCredits {
 
   /** The funded row step a native step keeps (and recovery's scan, while recovering). */
   get nativeRowFloorBytes(): number {
-    return Math.max(this.#rowFloor, this.#workingMinimum().rows ?? 0);
+    return Math.max(this.#rowsKept, this.#workingMinimum().rows ?? 0);
   }
 
   /**
@@ -406,7 +413,7 @@ export class WriteCredits {
     const rows = Math.max(0, Math.min(stayingRows, this.rows.held - rowsLifetime));
     const idle = (grant: Grant, floor: number) =>
       Math.max(0, Math.min(grant.held, floor) - grant.allocated - grant.loaned);
-    const rowFloor = Math.min(this.rows.held, Math.max(this.#rowMinimum, this.#rowFloor));
+    const rowFloor = Math.min(this.rows.held, Math.max(this.#rowMinimum, this.#rowsKept));
     return (
       Math.max(rowFloor - rowsLifetime, rows) +
       idle(
@@ -429,7 +436,7 @@ export class WriteCredits {
 
   /** Return idle estimates only; live buffers, public loans and the row working minimum stay. */
   reclaimRows(): number {
-    const released = releaseIdle(this.rows, Math.max(this.#rowMinimum, this.#rowFloor));
+    const released = releaseIdle(this.rows, Math.max(this.#rowMinimum, this.#rowsKept));
     if (released) this.#changed?.();
     return released;
   }
@@ -449,7 +456,7 @@ export class WriteCredits {
     const working = this.#workingMinimum();
     this.#metadataHeadroom = 0;
     const released =
-      releaseIdle(this.rows, Math.max(this.#rowFloor, working.rows ?? 0)) +
+      releaseIdle(this.rows, Math.max(this.#rowsKept, working.rows ?? 0)) +
       releaseIdle(
         this.metadata,
         Math.max(working.metadata ?? 0, this.#commitMetadataFunding, this.#mergeMetadataFunding),
@@ -508,6 +515,28 @@ export class WriteCredits {
         this.rows.free(WRITE_ROW_STEP_BYTES);
         this.#changed?.();
       },
+    };
+  }
+
+  /**
+   * Keeps the row credit a write step waits beside (`WritePathImpl.#waitForRows`): `bytes`
+   * beyond the account's live allocations and loans stay while it waits, as a prepared step's
+   * floor does, so the governor's reclaim for the step's own admission never returns the rows the
+   * step will use (it did, and the wait asked again forever). Counted in what the owner keeps
+   * while a statement waits (`retainedWhileOpen`). Returns the release.
+   */
+  holdRowsWhileWaiting(bytes: number): () => void {
+    this.#check();
+    if (!Number.isSafeInteger(bytes) || bytes < 0)
+      throw new RangeError("Waiting row credit must be a nonnegative safe integer");
+    const floor = this.rows.allocated + this.rows.loaned + bytes;
+    this.#rowWait = floor;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      if (this.#rowWait === floor) this.#rowWait = 0;
+      this.#changed?.();
     };
   }
 
@@ -620,7 +649,7 @@ export class WriteCredits {
       this.#changed?.(true);
       const working = this.#workingMinimum();
       const floors = [
-        Math.max(this.#rowFloor, working.rows ?? 0),
+        Math.max(this.#rowsKept, working.rows ?? 0),
         Math.max(working.metadata ?? 0, this.#commitMetadataFunding, this.#mergeMetadataFunding),
         this.#commitFloor(),
         Math.max(this.#mergeFloor, working.merge ?? 0),
@@ -915,7 +944,7 @@ export class WriteCredits {
       const idle = Math.max(
         0,
         this.rows.held -
-          Math.max(this.#rowMinimum, this.rows.allocated + this.rows.loaned, this.#rowFloor),
+          Math.max(this.#rowMinimum, this.rows.allocated + this.rows.loaned, this.#rowsKept),
       );
       const returned = Math.min(bytes, idle);
       if (returned > 0) {
