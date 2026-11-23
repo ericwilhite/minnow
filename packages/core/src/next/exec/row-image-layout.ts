@@ -19,18 +19,23 @@ export const REGISTRY_LEAF_BYTES = 32 + REGISTRY_LEAF_RECORDS * REGISTRY_RECORD_
  * appends. 16 leave only the compulsory misses of new blocks (testing/registry-directory-work).
  */
 export const REGISTRY_DIRECTORY_LEAVES = 16;
-export const REGISTRY_NODE_BYTES = 264;
-/** Radix levels from namespace to block: 2 kind digits, 14 owner digits, 13 block digits. */
+/**
+ * A directory node: a 40-byte header (magic, its depth, its skip and up to 28 skipped digits) and
+ * 16 child references of 16 bytes.
+ */
+export const REGISTRY_NODE_BYTES = 296;
+/** Key digits (radix 16) from namespace to block: 2 kind, 14 owner, 13 block. */
 export const REGISTRY_LEVELS = 29;
 /** The directory's own state: its controller, signal, leaf table and file handle. */
 const REGISTRY_CONTROL_BYTES = 4096;
 /**
- * A directory's whole resident charge: its control, the root-to-leaf path buffer, and each
- * resident leaf (its bytes, its record and its buffer object).
+ * A directory's whole resident charge: its control, the root-to-leaf path buffer (at most one
+ * node per key digit, plus one for a split's remainder), and each resident leaf (its bytes, its
+ * record and its buffer object).
  */
 export const REGISTRY_DIRECTORY_BYTES =
   REGISTRY_CONTROL_BYTES +
-  REGISTRY_LEVELS * REGISTRY_NODE_BYTES +
+  (REGISTRY_LEVELS + 1) * REGISTRY_NODE_BYTES +
   OBJECT_OVERHEAD_BYTES +
   REGISTRY_DIRECTORY_LEAVES * (REGISTRY_LEAF_BYTES + 2 * OBJECT_OVERHEAD_BYTES);
 /** The image registry's own control (owner/registry-images.ts `REGISTRY_IMAGE_BYTES`). */
