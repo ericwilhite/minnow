@@ -126,7 +126,7 @@ import type { Statement } from "../access/modify.js";
 import type { SequenceAccess } from "../access/write-path.js";
 import type { ExecutorCosts } from "../ir/costs.js";
 import type { OutputColumn, PhysicalPlan } from "../ir/ir.js";
-import type { Grant, MemoryGovernor } from "../memory/governor.js";
+import type { Grant, LentHoldings, MemoryGovernor } from "../memory/governor.js";
 import type { SpillService } from "../spill/contract.js";
 import type { FlatVector } from "../vector/vector.js";
 import type { MaybePromise } from "../access/key-index.js";
@@ -240,7 +240,15 @@ interface ExecuteBase {
 
 export type ExecuteRequest =
   /** A query over a read snapshot the owner pinned and releases after `executed`. */
-  | (ExecuteBase & { readonly snapshot: Snapshot; readonly statement: null })
+  | (ExecuteBase & {
+      readonly snapshot: Snapshot;
+      readonly statement: null;
+      /**
+       * The writer's holdings, when the query runs inside a writable transaction: it holds the
+       * writer turn, so they stay however long the query waits (`Statement.writerHoldings`).
+       */
+      readonly writerHoldings?: () => LentHoldings | null;
+    })
   /** A DML plan inside an open statement: it reads `statement.view` and ends the statement. */
   | (ExecuteBase & { readonly snapshot: null; readonly statement: Statement });
 
