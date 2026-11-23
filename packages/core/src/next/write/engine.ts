@@ -2023,7 +2023,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const memtables = state.view.memtables.filter((memtable) => memtable !== created);
     // The emptied memtable leaves: its memory returns once no older reader can reach it.
     if (memtables.length !== state.view.memtables.length)
-      this.shared.readers.holdUntilOlderClose(() => created.releaseAll());
+      this.shared.readers.holdUntilOlderClose(
+        () => created.releaseAll(),
+        () => created.bytes,
+      );
     if (
       frozen !== null &&
       frozen.state === "frozen" &&
@@ -2606,17 +2609,20 @@ export class WritePathImpl implements WritePath, EngineHooks {
     // Older readers may still read its memtables (ruling 5): their memory goes when they close,
     // and after a flush of the table still writing them (it abandons at its publish).
     if (state !== undefined)
-      this.shared.readers.holdUntilOlderClose(() => {
-        const release = () => {
-          for (const memtable of state.view.memtables) memtable.releaseAll();
-          this.#chargeMetadata(-state.metadataBytes);
-          state.metadataBytes = 0;
-          this.#dropRunReaders([...state.view.runs.values()].flat());
-        };
-        const flushing = this.#flushing.get(state);
-        if (flushing === undefined) release();
-        else void flushing.then(release, release);
-      });
+      this.shared.readers.holdUntilOlderClose(
+        () => {
+          const release = () => {
+            for (const memtable of state.view.memtables) memtable.releaseAll();
+            this.#chargeMetadata(-state.metadataBytes);
+            state.metadataBytes = 0;
+            this.#dropRunReaders([...state.view.runs.values()].flat());
+          };
+          const flushing = this.#flushing.get(state);
+          if (flushing === undefined) release();
+          else void flushing.then(release, release);
+        },
+        () => this.#tableStateBytes(state),
+      );
   }
 
   /** The flush writing each table now, if any (a drop releases the table's memory after it). */
@@ -4774,14 +4780,18 @@ export class WritePathImpl implements WritePath, EngineHooks {
       for (const memtable of flushed) this.#published.add(memtable);
       // Folded deletions stay for readers older than this publication, then go (with the pin).
       const folded = state.view.groupDeletes;
-      this.shared.readers.holdUntilOlderClose(() => {
-        folded.prune(through);
-        pin.release();
-        for (const memtable of flushed) {
-          memtable.releaseAll();
-          this.#published.delete(memtable);
-        }
-      });
+      this.shared.readers.holdUntilOlderClose(
+        () => {
+          folded.prune(through);
+          pin.release();
+          for (const memtable of flushed) {
+            memtable.releaseAll();
+            this.#published.delete(memtable);
+          }
+        },
+        // What stays charged after the publish below: borrowed chunks and the key deltas.
+        () => flushed.reduce((sum, memtable) => sum + memtable.bytes, 0),
+      );
       for (const memtable of set) {
         const entry = published.get(memtable);
         if (entry !== undefined)
@@ -5564,9 +5574,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
       ...state.view,
       memtables: state.view.memtables.filter((memtable) => !gone.has(memtable)),
     });
-    this.shared.readers.holdUntilOlderClose(() => {
-      for (const memtable of gone) memtable.releaseAll();
-    });
+    this.shared.readers.holdUntilOlderClose(
+      () => {
+        for (const memtable of gone) memtable.releaseAll();
+      },
+      () => [...gone].reduce((sum, memtable) => sum + memtable.bytes, 0),
+    );
   }
 
   // ── Idle maintenance (ruling R10) ───────────────────────────────────────────────────────
@@ -6191,9 +6204,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#setView(state, { ...state.view, runs: viewRuns }, funding.budget);
       // Readers older than this publication may still read the inputs (their pins keep the
       // extents); the inputs' resident parts go once they close.
-      this.shared.readers.holdUntilOlderClose(() => {
-        this.#dropRunReaders(inputs);
-      });
+      this.shared.readers.holdUntilOlderClose(
+        () => {
+          this.#dropRunReaders(inputs);
+        },
+        () => this.#runReaderBytes(inputs),
+      );
       output.release(); // the published root now owns and accounts its boundary keys
       // The merge is complete. Retire its working credit before a future metadata/
       // merge forecast can wait behind a query that needs this very credit.
@@ -6236,6 +6252,23 @@ export class WritePathImpl implements WritePath, EngineHooks {
   }
 
   /** Forgets the resident parts of runs no view can reach any more, returning their charge. */
+  /** The resident bytes of `runs`' open readers (what `#dropRunReaders` returns). */
+  #runReaderBytes(runs: readonly RunRef[]): number {
+    let bytes = 0;
+    for (const run of runs) {
+      const reader = this.#runReaders.get(blobKey(run.entries));
+      if (reader !== undefined && !(reader instanceof Promise)) bytes += reader.bytes;
+    }
+    return bytes;
+  }
+
+  /** What a dropped table's state returns once its older readers close (its release above). */
+  #tableStateBytes(state: TableState): number {
+    let bytes = state.metadataBytes + this.#runReaderBytes([...state.view.runs.values()].flat());
+    for (const memtable of state.view.memtables) bytes += memtable.bytes;
+    return bytes;
+  }
+
   #dropRunReaders(runs: readonly RunRef[]): void {
     for (const run of runs) {
       const key = blobKey(run.entries);
@@ -6652,9 +6685,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
         if (index !== null && !kept.has(index.indexId)) {
           for (const run of index.runs) retired.push(runExtent(run));
           const runs = index.runs;
-          this.shared.readers.holdUntilOlderClose(() => {
-            this.#dropRunReaders(runs);
-          });
+          this.shared.readers.holdUntilOlderClose(
+            () => {
+              this.#dropRunReaders(runs);
+            },
+            () => this.#runReaderBytes(runs),
+          );
         }
     }
     // Tables the previous root had and this one lacks were dropped: retire everything they reach.

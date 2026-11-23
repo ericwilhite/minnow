@@ -1134,6 +1134,9 @@ export class SnapshotImpl implements Snapshot {
     };
   }
   #pinReleased = false;
+  exclusiveBytes(): number {
+    return this.#pinReleased ? 0 : this.shared.readers.exclusiveBytes(this.#reader);
+  }
   #releasePin(): void {
     if (this.#pinReleased) return;
     this.#pinReleased = true;

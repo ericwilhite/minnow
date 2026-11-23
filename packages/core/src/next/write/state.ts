@@ -102,8 +102,13 @@ export interface WriteState {
 export class ReaderRegistry {
   #next = 1;
   readonly #live = new Set<number>();
-  /** Re-point holds (a pin and retained deltas), each waiting for every reader older than `before`. */
-  readonly #pins: Array<{ readonly before: number; readonly release: () => void }> = [];
+  /** Re-point holds (a pin and retained deltas), each waiting for every reader older than `before`,
+   * with the bytes of memory its release returns (where known). */
+  readonly #pins: Array<{
+    readonly before: number;
+    readonly release: () => void;
+    readonly bytes: (() => number) | undefined;
+  }> = [];
 
   constructor(readonly changed?: () => void) {}
 
@@ -124,10 +129,36 @@ export class ReaderRegistry {
     return this.#live.size;
   }
 
-  /** Runs `release` once every reader opened before now is closed (at once if there is none). */
-  holdUntilOlderClose(release: () => void): void {
-    this.#pins.push({ before: this.#next, release });
+  /** Runs `release` once every reader opened before now is closed (at once if there is none).
+   * `bytes` is the memory that release returns, as it stands (`exclusiveBytes`). */
+  holdUntilOlderClose(release: () => void, bytes?: () => number): void {
+    this.#pins.push({ before: this.#next, release, bytes });
     this.#drain();
+  }
+
+  /**
+   * The memory only reader `id` keeps: the held releases that wait for it and for no other live
+   * reader. A hold waits for every reader opened before it, so only the oldest live reader can
+   * keep one alone: those registered after it opened and no later than the next live reader.
+   * Any older reader keeps everything this one does (0).
+   */
+  exclusiveBytes(id: number): number {
+    let oldest: number | undefined,
+      next = Infinity;
+    for (const live of this.#live) {
+      if (oldest === undefined) oldest = live;
+      else {
+        next = live;
+        break;
+      }
+    }
+    if (oldest !== id) return 0;
+    let bytes = 0;
+    for (const pin of this.#pins) {
+      if (pin.before > next) break;
+      if (pin.before > id) bytes += pin.bytes?.() ?? 0;
+    }
+    return bytes;
   }
 
   get heldPins(): number {

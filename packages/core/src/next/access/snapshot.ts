@@ -181,6 +181,13 @@ export interface Snapshot {
   index(tableId: number, indexId: number): IndexReader;
   /** Idempotent. Not allowed on a statement view (its statement releases it). */
   release(): void;
+  /**
+   * Memory only this view keeps alive: what a publication or drop left for readers older than
+   * it when no other live reader is older (write/state.ts `ReaderRegistry.exclusiveBytes`). It
+   * returns when this view closes, never before: a statement waiting while it holds this view
+   * keeps it.
+   */
+  exclusiveBytes?(): number;
 }
 
 export interface TableReadOptions {

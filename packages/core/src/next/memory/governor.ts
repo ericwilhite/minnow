@@ -235,6 +235,9 @@ export interface WaitingHoldings {
   readonly grants: readonly Grant[];
   /** Another owner's holdings kept for the statement: its writer's, while it holds the turn. */
   readonly lent?: LentHoldings;
+  /** Memory only the statement's own snapshots keep alive (`Snapshot.exclusiveBytes`): it
+   * returns when they close, so it stays while the statement waits. */
+  readonly pinned?: () => number;
 }
 
 /** An owner's holdings kept for the statement that holds its turn (the writer's). */
@@ -688,7 +691,12 @@ export class Governor implements MemoryGovernor {
         !(unasked && grant.spillable)
       )
         held += grant.held;
-    return this.usableCapacity(includesProgress) - held - (own.lent?.retained() ?? 0);
+    return (
+      this.usableCapacity(includesProgress) -
+      held -
+      (own.lent?.retained() ?? 0) -
+      (own.pinned?.() ?? 0)
+    );
   }
 
   registerPermanent(bytes: () => number, label = "owner lifetime holdings"): () => void {
