@@ -12,7 +12,7 @@
  * Any other outcome may only be a typed 53200 whose need exceeds that cap. A one-row read (by key)
  * also admits no more than that need plus the remaining terms named below: a step funds what it
  * can use (as in #48). What a read holds is measured, not what it asked: the peak of its grants'
- * summed holdings (credit and reserve loans), observed at every change (`Governor.observeHoldings`:
+ * summed `held` credit (which includes reserve loans), observed at every change (`Governor.observeHoldings`:
  * admissions, growth, transfers, carving, releases), and it must be measured (non-zero).
  * Sizing by the table's widest row, or funding the same row's copies twice, over-admits by several
  * times the row and refuses reads below the cap.
@@ -97,7 +97,7 @@ const cases: Case[] = [
 it.each(cases)(
   "reads beside and of a wide row within its independent need (cap $cap MiB, width $width, copy $copy, stored $stored)",
   async ({ cap, width, copy, stored }) => {
-    // Every change to any grant's holdings (its credit or its reserve loans: growth, transfers,
+    // Every change to any grant's holdings (its `held` credit, loans included: growth, transfers,
     // carving, releases), observed from before the owner opens. A read's holdings are those of
     // the grants first seen while it runs, except the writer's own growth grants: one query runs
     // at a time here, so that set is exactly the query's grants. Their summed holdings, at their

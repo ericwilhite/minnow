@@ -360,23 +360,23 @@ export class GrowthObserverReentryError extends Error {
 
 /**
  * Test builds only (`Governor.observeHoldings` set when the grant is created): turns the grant's
- * `held` and `loan` fields into accessors that report every change. Production grants keep plain
- * fields: the governor's allocate, free, growth and release paths pay nothing for the hook.
+ * `held` field into an accessor that reports every change. `held` already includes an outstanding
+ * loan (a served loan raises it, repaying lowers it), so `loan` is not observed: reporting both
+ * would count a loan twice. Production grants keep plain fields: the governor's allocate, free,
+ * growth and release paths pay nothing for the hook.
  */
 function observeHoldings(grant: GrantImpl): void {
-  for (const field of ["held", "loan"] as const) {
-    let value = grant[field];
-    Object.defineProperty(grant, field, {
-      configurable: true,
-      enumerable: true,
-      get: () => value,
-      set: (bytes: number) => {
-        const delta = bytes - value;
-        value = bytes;
-        if (delta !== 0) Governor.observeHoldings?.(grant, delta);
-      },
-    });
-  }
+  let value = grant.held;
+  Object.defineProperty(grant, "held", {
+    configurable: true,
+    enumerable: true,
+    get: () => value,
+    set: (bytes: number) => {
+      const delta = bytes - value;
+      value = bytes;
+      if (delta !== 0) Governor.observeHoldings?.(grant, delta);
+    },
+  });
 }
 
 class GrantImpl implements Grant {
@@ -636,9 +636,9 @@ export class Governor implements MemoryGovernor {
    */
   static stallAfterMs: number | null = null;
   /**
-   * Test builds only: called after every change to the holdings (its `held` credit or its reserve
-   * `loaned` bytes) of a grant created while this is set, by `delta` bytes: growth, transfers,
-   * carving, releases, loans and close all pass here. Suites install it before the grants they
+   * Test builds only: called after every change to the holdings (its `held` credit, which
+   * includes any outstanding reserve loan) of a grant created while this is set, by `delta` bytes:
+   * growth, transfers, carving, releases, loans and close all pass here. Suites install it before the grants they
    * measure exist, and sum it per owner for exact peak holdings. Grants created while it is null
    * keep plain fields and never call it.
    */
