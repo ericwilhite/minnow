@@ -3367,7 +3367,11 @@ not require a home cache directory.
   non-transaction-control statement" (Transaction Isolation, 13.2). It is taken before
   analysis (`plan`, `Lowerer.takesSnapshot`, as PostgreSQL's `analyze_requires_snapshot`), so a
   statement that then fails analysis has taken it, and with it the isolation level (25001
-  after); a statement that does not parse has not. A write it refuses takes it too (`#guard`).
+  after); a statement that does not parse has not. The front end reads and checks in one pass:
+  a grammar failure (engine/grammar-failure.ts `grammarFailure`, marked where the tokenizer or parser
+  cannot read on) is the raw parse failing; any other refusal came after the statement was
+  read, and its kind, from its first word as the tokenizer reads it (comments skipped),
+  decides. A write it refuses takes it too (`#guard`).
   A row committed between BEGIN and that statement is seen; BEGIN, SAVEPOINT, RELEASE, ROLLBACK
   TO, SET TRANSACTION and SHOW take none. Switching to READ
   ONLY pins at the switch only once a statement ran (the writer turn kept anything from

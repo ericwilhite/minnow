@@ -279,6 +279,26 @@ it("keeps the snapshot a first statement took although its analysis failed", asy
   }
 }, 30_000);
 
+for (const statement of ["SELECT *", "/* c */ SELECT no_such_function(1)", "-- c\nSELECT *"])
+  it(`keeps the snapshot ${JSON.stringify(statement)} took, though it failed after parsing`, async () => {
+    // Astra's re-check of #59: `SELECT *` without FROM is 42601 from analysis, after PostgreSQL
+    // took the snapshot; a leading comment must not hide that a SELECT was read.
+    const { connect, close } = await open();
+    try {
+      const a = await connect();
+      const b = await connect();
+      await a.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+      await a.query("SAVEPOINT s");
+      await expect(a.query(statement)).rejects.toBeDefined();
+      await b.query("INSERT INTO t VALUES (2, 2)");
+      await a.query("ROLLBACK TO s");
+      expect(await count(a), "the failed statement's snapshot").toBe(1);
+      await a.query("ROLLBACK");
+    } finally {
+      await close();
+    }
+  }, 30_000);
+
 it("keeps the snapshot a refused write took, through ROLLBACK TO", async () => {
   await run({
     entry: "begin read only",

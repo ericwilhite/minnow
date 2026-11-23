@@ -2116,6 +2116,14 @@ export const REPIN_BEFORE_OBSERVING_REACH = [
   "refused in place",
 ] as const;
 
+/** A failed statement's snapshot effect by its kind (snapshot-statement-kind-pglite). */
+export const SNAPSHOT_STATEMENT_KIND_REACH = [
+  "parse error",
+  "analysis error",
+  "planning error",
+  "behind a comment",
+] as const;
+
 /** A read-only transaction's snapshot is taken by its first statement (read-only-snapshot-timing). */
 export const READ_ONLY_SNAPSHOT_TIMING_REACH = [
   "commit before the snapshot seen",

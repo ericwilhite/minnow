@@ -136,6 +136,7 @@ import {
   MAX_SQL_TOKENS,
 } from "./cache-limits.js";
 import { SqlCompileError } from "./errors.js";
+import { grammarFailure, markedGrammarFailure } from "./grammar-failure.js";
 import {
   cachedQueryTerms,
   ftsBm25Row,
@@ -1370,19 +1371,52 @@ function normalizeQuerySql(sql: string): { text: string; offset: number } {
  * errors pass through untouched — they come from execution, not from reading the text.
  */
 function throwLocated(error: unknown, offset: number, span: { start: number; end: number }): never {
+  // A grammar failure stays one when it is relocated (grammar-failure.ts `grammarFailure`).
+  const grammar = markedGrammarFailure(error);
+  const located = (relocated: SqlCompileError) => (grammar ? grammarFailure(relocated) : relocated);
   // A negative offset (the `TABLE name` rewrite lengthens the text) never lands before the start.
   if (error instanceof SqlCompileError) {
     if (offset === 0) throw error;
-    throw new SqlCompileError(error.message, Math.max(error.offset + offset, 0), error.length);
+    throw located(
+      new SqlCompileError(error.message, Math.max(error.offset + offset, 0), error.length),
+    );
   }
   if (error instanceof TypeError) {
-    throw new SqlCompileError(
-      error.message,
-      Math.max(offset + span.start, 0),
-      Math.max(span.end - span.start, 0),
+    throw located(
+      new SqlCompileError(
+        error.message,
+        Math.max(offset + span.start, 0),
+        Math.max(span.end - span.start, 0),
+      ),
     );
   }
   throw error;
+}
+
+/**
+ * The statement's first word, upper-cased, as the router reads it: comments (nested block
+ * comments too) and whitespace are skipped by the tokenizer, a leading parenthesis is `(`. Null
+ * when the text does not tokenize or starts with something else.
+ */
+export function leadingKeyword(sql: string): string | null {
+  try {
+    const first = tokenize(normalizeQuerySql(sql).text)[0];
+    if (first === undefined) return null;
+    if (first.kind === "punctuation" && first.text === "(") return "(";
+    return first.kind === "identifier" ? first.text.toUpperCase() : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The parser could not read on: a grammar failure (grammar-failure.ts `grammarFailure`). */
+function syntaxError(message: string): TypeError {
+  return grammarFailure(new TypeError(message));
+}
+
+/** The tokenizer or parser could not read on, at a position: a grammar failure. */
+function syntaxCompileError(message: string, offset: number, length: number): SqlCompileError {
+  return grammarFailure(new SqlCompileError(message, offset, length));
 }
 
 /** One RETURNING item beyond a plain column: its statement text, output name, and the column it names when it is one. */
@@ -1836,7 +1870,7 @@ function parseSettingStatement(keyword: string, tokens: Token[]): CompiledStatem
     const transactionModes = parseTransactionModes(words, index + 1, "SET TRANSACTION");
     if (transactionModes.length === 0) {
       const last = words.at(-1);
-      throw new SqlCompileError("syntax error at end of input", last?.end ?? 0, 0);
+      throw syntaxCompileError("syntax error at end of input", last?.end ?? 0, 0);
     }
     return { kind: "set", action: "set", name: "transaction", transactionModes };
   }
@@ -1845,7 +1879,7 @@ function parseSettingStatement(keyword: string, tokens: Token[]): CompiledStatem
   }
   const name = words[index];
   if (name?.kind !== "identifier") {
-    throw new TypeError(`Expected a setting name, found ${name?.text ?? "end of input"}`);
+    throw syntaxError(`Expected a setting name, found ${name?.text ?? "end of input"}`);
   }
   let cursor = index + 1;
   while (words[cursor]?.text === ".") cursor += 2;
@@ -1890,13 +1924,13 @@ function parseTruncateStatement(tokens: Token[]): CompiledStatement {
   if (upperAt(index) === "ONLY") index += 1;
   const table = words[index];
   if (table?.kind !== "identifier") {
-    throw new TypeError(`Expected table name, found ${table?.text ?? "end of input"}`);
+    throw syntaxError(`Expected table name, found ${table?.text ?? "end of input"}`);
   }
   index += 1;
   if (words[index]?.text === ",") throw new TypeError("TRUNCATE takes one table at a time");
   if (upperAt(index) === "RESTART" || upperAt(index) === "CONTINUE") {
     if (upperAt(index + 1) !== "IDENTITY") {
-      throw new TypeError(`Expected IDENTITY, found ${words[index + 1]?.text ?? "end of input"}`);
+      throw syntaxError(`Expected IDENTITY, found ${words[index + 1]?.text ?? "end of input"}`);
     }
     index += 2;
   }
@@ -1905,7 +1939,7 @@ function parseTruncateStatement(tokens: Token[]): CompiledStatement {
   }
   if (upperAt(index) === "RESTRICT") index += 1;
   if (index !== words.length) {
-    throw new TypeError(`Unexpected input after TRUNCATE: ${words[index]?.text ?? ""}`);
+    throw syntaxError(`Unexpected input after TRUNCATE: ${words[index]?.text ?? ""}`);
   }
   return recordDeclaredTypes
     ? { kind: "delete", table: table.text, predicates: [], truncate: true }
@@ -1916,13 +1950,13 @@ function parseTransactionStatement(keyword: string, tokens: Token[]): CompiledSt
   const identifierAt = (index: number): string => {
     const token = tokens[index];
     if (token?.kind !== "identifier") {
-      throw new TypeError(`Expected savepoint name, found ${token?.text ?? "end of input"}`);
+      throw syntaxError(`Expected savepoint name, found ${token?.text ?? "end of input"}`);
     }
     return token.text;
   };
   if (keyword === "SAVEPOINT") {
     const name = identifierAt(1);
-    if (tokens[2]?.kind !== "eof") throw new TypeError("Unexpected input after SAVEPOINT name");
+    if (tokens[2]?.kind !== "eof") throw syntaxError("Unexpected input after SAVEPOINT name");
     return { kind: "transaction", action: "savepoint", name };
   }
   if (keyword === "RELEASE") {
@@ -1930,7 +1964,7 @@ function parseTransactionStatement(keyword: string, tokens: Token[]): CompiledSt
       tokens[1]?.kind === "identifier" && tokens[1].text.toUpperCase() === "SAVEPOINT";
     const name = identifierAt(hasNoise ? 2 : 1);
     if (tokens[hasNoise ? 3 : 2]?.kind !== "eof") {
-      throw new TypeError("Unexpected input after RELEASE name");
+      throw syntaxError("Unexpected input after RELEASE name");
     }
     return { kind: "transaction", action: "release", name };
   }
@@ -1943,7 +1977,7 @@ function parseTransactionStatement(keyword: string, tokens: Token[]): CompiledSt
       tokens[2]?.kind === "identifier" && tokens[2].text.toUpperCase() === "SAVEPOINT";
     const name = identifierAt(hasNoise ? 3 : 2);
     if (tokens[hasNoise ? 4 : 3]?.kind !== "eof") {
-      throw new TypeError("Unexpected input after ROLLBACK TO name");
+      throw syntaxError("Unexpected input after ROLLBACK TO name");
     }
     return { kind: "transaction", action: "rollback-to", name };
   }
@@ -1957,7 +1991,7 @@ function parseTransactionStatement(keyword: string, tokens: Token[]): CompiledSt
   };
   let index = 1;
   if (keyword === "START") {
-    if (upper(index) !== "TRANSACTION") throw new TypeError("Expected START TRANSACTION");
+    if (upper(index) !== "TRANSACTION") throw syntaxError("Expected START TRANSACTION");
     index += 1;
   } else if (upper(index) === "WORK" || upper(index) === "TRANSACTION") index += 1;
   const begins = keyword === "START" || keyword === "BEGIN";
@@ -2008,7 +2042,7 @@ function parseTransactionModes(
   };
   const syntax = (index: number): never => {
     const token = tokens[index];
-    throw new SqlCompileError(
+    throw syntaxCompileError(
       `syntax error at or near "${token?.kind === "eof" || token === undefined ? "end of input" : token.text}"`,
       token?.start ?? 0,
       token === undefined || token.kind === "eof" ? 0 : token.end - token.start,
@@ -2161,10 +2195,10 @@ function parseCreateView(sql: string, tokens: Token[], orReplace: boolean): Comp
       token?.kind === "identifier" && token.quoted !== true && token.text.toUpperCase() === word
     );
   };
-  if (orReplace && !keywordAt(1, "OR")) throw new TypeError("Expected OR REPLACE");
-  if (orReplace && !keywordAt(2, "REPLACE")) throw new TypeError("Expected OR REPLACE");
+  if (orReplace && !keywordAt(1, "OR")) throw syntaxError("Expected OR REPLACE");
+  if (orReplace && !keywordAt(2, "REPLACE")) throw syntaxError("Expected OR REPLACE");
   const name = tokens[cursor + 1];
-  if (name?.kind !== "identifier") throw new TypeError("Expected a view name");
+  if (name?.kind !== "identifier") throw syntaxError("Expected a view name");
   if (!keywordAt(cursor + 2, "AS")) {
     throw new TypeError("CREATE VIEW takes a name and AS <query>; column lists are not supported");
   }
@@ -2188,7 +2222,7 @@ function parseCreateTrigger(text: string, tokens: Token[]): CompiledStatement {
   };
   const identifier = (what: string): string => {
     const token = tokens[cursor];
-    if (token?.kind !== "identifier") throw new TypeError(`Expected ${what}`);
+    if (token?.kind !== "identifier") throw syntaxError(`Expected ${what}`);
     cursor += 1;
     return token.text;
   };
@@ -2203,12 +2237,12 @@ function parseCreateTrigger(text: string, tokens: Token[]): CompiledStatement {
     throw new TypeError("Trigger event must be INSERT, UPDATE, or DELETE");
   }
   const event = eventText.toLowerCase() as "insert" | "update" | "delete";
-  if (!keywordAt(cursor, "ON")) throw new TypeError("Expected ON before the trigger table");
+  if (!keywordAt(cursor, "ON")) throw syntaxError("Expected ON before the trigger table");
   cursor += 1;
   const table = identifier("the trigger table");
   if (keywordAt(cursor, "FOR")) {
     if (!keywordAt(cursor + 1, "EACH") || !keywordAt(cursor + 2, "ROW")) {
-      throw new TypeError("Expected FOR EACH ROW");
+      throw syntaxError("Expected FOR EACH ROW");
     }
     cursor += 3;
   }
@@ -2284,7 +2318,7 @@ function parseCreateTrigger(text: string, tokens: Token[]): CompiledStatement {
     return { sql, bindings };
   });
   if (tokens[endIndex + 1]?.kind !== "eof") {
-    throw new TypeError("Unexpected input after the trigger body END");
+    throw syntaxError("Unexpected input after the trigger body END");
   }
   return { kind: "create-trigger", table, trigger: { name, event, timing, statements } };
 }
@@ -2385,10 +2419,10 @@ export function compileStatement(sql: string): CompiledStatement {
           values.push(value.text);
           index += 1;
           if (tokens[index]?.text === ")") break;
-          if (tokens[index]?.text !== ",") throw new TypeError("Expected comma in ENUM values");
+          if (tokens[index]?.text !== ",") throw syntaxError("Expected comma in ENUM values");
           index += 1;
         }
-        if (tokens[index + 1]?.kind !== "eof") throw new TypeError("Unexpected input after ENUM");
+        if (tokens[index + 1]?.kind !== "eof") throw syntaxError("Unexpected input after ENUM");
         return {
           kind: "create-enum",
           name: recordDeclaredTypes && name.quoted !== true ? name.text.toLowerCase() : name.text,
@@ -8974,7 +9008,7 @@ class Parser {
           continue;
         }
         if (!this.#isKeyword("CHECK")) {
-          throw new TypeError("Expected PRIMARY KEY, UNIQUE, CHECK, or FOREIGN KEY");
+          throw syntaxError("Expected PRIMARY KEY, UNIQUE, CHECK, or FOREIGN KEY");
         }
         checks.push(
           this.#checkConstraint(constraintName ?? `${table}_check_${String(checks.length + 1)}`),
@@ -9059,7 +9093,7 @@ class Parser {
           ) {
             continue;
           }
-          throw new TypeError(`Expected a constraint after CONSTRAINT ${constraintName}`);
+          throw syntaxError(`Expected a constraint after CONSTRAINT ${constraintName}`);
         }
         if (this.#isKeyword("CHECK")) {
           checks.push(this.#checkConstraint(`${table}_${name}_check`));
@@ -9086,7 +9120,7 @@ class Parser {
           this.#keyword("NOT");
           const token = this.#peek();
           if (token.kind !== "identifier" || token.text.toUpperCase() !== "NULL") {
-            throw new TypeError(`Expected NULL after NOT, found ${token.text || "end of input"}`);
+            throw syntaxError(`Expected NULL after NOT, found ${token.text || "end of input"}`);
           }
           this.#identifier();
           nullable = false;
@@ -9391,7 +9425,7 @@ class Parser {
           let depth = 1;
           while (depth > 0) {
             const token = this.#peek();
-            if (token.kind === "eof") throw new TypeError("Unterminated identity options");
+            if (token.kind === "eof") throw syntaxError("Unterminated identity options");
             this.#index += 1;
             if (token.kind === "punctuation" && token.text === "(") depth += 1;
             if (token.kind === "punctuation" && token.text === ")") depth -= 1;
@@ -10525,7 +10559,7 @@ class Parser {
         this.#keyword("SHARE");
         strength = "KEY SHARE";
       } else {
-        throw new TypeError(`Expected UPDATE or SHARE after FOR, found ${this.#peek().text}`);
+        throw syntaxError(`Expected UPDATE or SHARE after FOR, found ${this.#peek().text}`);
       }
       const targets: string[] = [];
       if (this.#isKeyword("OF")) {
@@ -10620,7 +10654,7 @@ class Parser {
           if (scan?.kind === "punctuation" && scan.text === ")") inner -= 1;
           end += 1;
         }
-        if (inner !== 0) throw new TypeError("Unterminated WINDOW specification");
+        if (inner !== 0) throw syntaxError("Unterminated WINDOW specification");
         if (windows.has(name.text)) throw new TypeError(`Duplicate window name: ${name.text}`);
         windows.set(name.text, { start: cursor + 2, end });
         const next = this.tokens[end];
@@ -11839,7 +11873,7 @@ class Parser {
         }));
       return negated ? { kind: "not", operand: membership } : membership;
     }
-    if (negated) throw new TypeError("Expected IN after NOT");
+    if (negated) throw syntaxError("Expected IN after NOT");
     const token = this.#peek();
     if (
       token.kind !== "operator" ||
@@ -11922,7 +11956,7 @@ class Parser {
       }
       const token = this.#peek();
       if (token.kind !== "identifier" || token.text.toUpperCase() !== "NULL") {
-        throw new TypeError(`Expected NULL, found ${token.text || "end of query"}`);
+        throw syntaxError(`Expected NULL, found ${token.text || "end of query"}`);
       }
       this.#identifier();
       return {
@@ -13486,7 +13520,7 @@ class Parser {
   #comparison(): ComparisonOperator {
     const token = this.#take("operator");
     if (!["=", "!=", "<>", ">", ">=", "<", "<="].includes(token.text))
-      throw new TypeError(`Expected comparison operator, found ${token.text}`);
+      throw syntaxError(`Expected comparison operator, found ${token.text}`);
     return token.text as ComparisonOperator;
   }
 
@@ -13503,13 +13537,13 @@ class Parser {
 
   #keyword(value: string): void {
     if (!this.#isKeyword(value))
-      throw new TypeError(`Expected ${value}, found ${this.#peek().text || "end of query"}`);
+      throw syntaxError(`Expected ${value}, found ${this.#peek().text || "end of query"}`);
     this.#index += 1;
   }
 
   #operator(value: string): void {
     const token = this.#take("operator");
-    if (token.text !== value) throw new TypeError(`Expected ${value}, found ${token.text}`);
+    if (token.text !== value) throw syntaxError(`Expected ${value}, found ${token.text}`);
   }
 
   #punctuation(value: string): boolean {
@@ -13520,13 +13554,13 @@ class Parser {
   }
 
   #expectPunctuation(value: string): void {
-    if (!this.#punctuation(value)) throw new TypeError(`Expected ${value}`);
+    if (!this.#punctuation(value)) throw syntaxError(`Expected ${value}`);
   }
 
   #take(kind: Token["kind"]): Token {
     const token = this.#peek();
     if (token.kind !== kind)
-      throw new TypeError(`Expected ${kind}, found ${token.text || "end of query"}`);
+      throw syntaxError(`Expected ${kind}, found ${token.text || "end of query"}`);
     this.#index += 1;
     return token;
   }
@@ -16295,7 +16329,7 @@ function tokenize(sql: string): Token[] {
         }
       }
       if (!closed) {
-        throw new SqlCompileError("Unterminated string literal", start, sql.length - start);
+        throw syntaxCompileError("Unterminated string literal", start, sql.length - start);
       }
       push({ kind: "string", text: value, start, end: index });
       continue;
@@ -16365,7 +16399,7 @@ function tokenize(sql: string): Token[] {
         } else value += sql[index++] ?? "";
       }
       if (!closed)
-        throw new SqlCompileError("Unterminated string literal", start, sql.length - start);
+        throw syntaxCompileError("Unterminated string literal", start, sql.length - start);
       push({ kind: "string", text: value, start, end: index });
       continue;
     }
@@ -16384,7 +16418,7 @@ function tokenize(sql: string): Token[] {
         } else value += sql[index++] ?? "";
       }
       if (!closed) {
-        throw new SqlCompileError("Unterminated quoted identifier", start, sql.length - start);
+        throw syntaxCompileError("Unterminated quoted identifier", start, sql.length - start);
       }
       if (value.length === 0) {
         throw new SqlCompileError("Quoted identifiers cannot be empty", start, index - start);
@@ -16406,7 +16440,7 @@ function tokenize(sql: string): Token[] {
         const bodyStart = start + tag.length;
         const close = sql.indexOf(tag, bodyStart);
         if (close === -1) {
-          throw new SqlCompileError("Unterminated dollar-quoted string", start, sql.length - start);
+          throw syntaxCompileError("Unterminated dollar-quoted string", start, sql.length - start);
         }
         push({ kind: "string", text: sql.slice(bodyStart, close), start, end: close + tag.length });
         index = close + tag.length;
@@ -16415,7 +16449,7 @@ function tokenize(sql: string): Token[] {
       while (index < sql.length && /\d/.test(sql[index] ?? "")) index += 1;
       const digits = sql.slice(start + 1, index);
       if (digits.length === 0) {
-        throw new SqlCompileError("Expected a parameter number after $", start, 1);
+        throw syntaxCompileError("Expected a parameter number after $", start, 1);
       }
       push({ kind: "parameter", text: digits, start, end: index });
       continue;
@@ -16443,7 +16477,7 @@ function tokenize(sql: string): Token[] {
         } else index += 1;
       }
       if (depth !== 0) {
-        throw new SqlCompileError("Unterminated comment", start, sql.length - start);
+        throw syntaxCompileError("Unterminated comment", start, sql.length - start);
       }
       continue;
     }

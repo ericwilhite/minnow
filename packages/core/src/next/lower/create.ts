@@ -10,6 +10,8 @@ import type {
 } from "../access/catalog.js";
 import type { CreateTableInput } from "../../engine/catalog-mutations.js";
 import type { CompiledStatement, TransactionMode } from "../../engine/query.js";
+import { leadingKeyword } from "../../engine/query.js";
+import { isGrammarFailure } from "../../engine/grammar-failure.js";
 import type { OutputColumn, PhysicalPlan, Rel } from "../ir/ir.js";
 import type { TableRuleExpressions } from "../ir/rules.js";
 import { samePhysicalType } from "../types.js";
@@ -615,10 +617,24 @@ function lowerStatement(text: string, context: LoweringContext): LoweredStatemen
   }
 }
 
-/** The leading keyword of a statement that takes a snapshot (when the front end refuses it
- * before it can say which kind it is): a query, a data statement or a schema change. */
-const SNAPSHOT_KEYWORD =
-  /^\s*(?:\(|(?:SELECT|WITH|VALUES|TABLE|INSERT|UPDATE|DELETE|MERGE|TRUNCATE|CREATE|ALTER|DROP|COMMENT|EXPLAIN)\b)/iu;
+/**
+ * The first words of the statements that take no snapshot (`classifyStatement`'s transaction
+ * control and utility kinds, as the front end routes them): every other statement the front end
+ * read takes one.
+ */
+const NO_SNAPSHOT_KEYWORDS = new Set([
+  "BEGIN",
+  "START",
+  "COMMIT",
+  "END",
+  "ROLLBACK",
+  "ABORT",
+  "SAVEPOINT",
+  "RELEASE",
+  "SET",
+  "RESET",
+  "SHOW",
+]);
 
 export function createLowerer(): Lowerer {
   return {
@@ -632,16 +648,19 @@ export function createLowerer(): Lowerer {
     },
 
     takesSnapshot(text: string): boolean {
+      // PostgreSQL decides on the raw parse tree (exec_simple_query, analyze_requires_snapshot):
+      // a statement whose raw parse fails takes none; one that parsed takes one by its kind,
+      // before its analysis can fail. The front end reads and checks in one pass, so a grammar
+      // failure (engine/grammar-failure.ts `grammarFailure`) is the raw parse failing, and any other
+      // refusal came after the statement was read: its kind, from its first word, decides.
       const ctasData = ctasDataClause(text);
       let parsed: ReturnType<typeof parseAny>;
       try {
         parsed = parseAny(ctasData === null ? text : text.slice(0, ctasData.index));
       } catch (error) {
-        // A syntax error fails before any snapshot. The front end also refuses at parse some
-        // statements PostgreSQL refuses in analysis (after its snapshot): those keep their kind.
-        const refused = frontEndError(error);
-        if (refused instanceof PlanningError && refused.sqlState === "42601") return false;
-        return SNAPSHOT_KEYWORD.test(text);
+        if (isGrammarFailure(error)) return false;
+        const keyword = leadingKeyword(text);
+        return keyword !== null && !NO_SNAPSHOT_KEYWORDS.has(keyword);
       }
       if ("query" in parsed) return true;
       const kind = classifyStatement(parsed.statement).kind;
