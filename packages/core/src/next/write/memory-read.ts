@@ -15,9 +15,19 @@ import {
 } from "../access/snapshot.js";
 import type { SpaceReader } from "../access/space.js";
 import { taskClock, yieldTask } from "../exec/pipeline.js";
-import { MetadataReader } from "../format/metadata-reader.js";
-import { parseCharge } from "../format/manifest-codec.js";
-import { PageEncoding, type BlobRef } from "../format/manifest.js";
+import {
+  MetadataReader,
+  metadataCachesFor,
+  type MetadataCaches,
+} from "../format/metadata-reader.js";
+import {
+  isValidatedGroupRoot,
+  optionalParseAllocation,
+  parseCharge,
+  selectGroupRootColumns,
+} from "../format/manifest-codec.js";
+import { PageEncoding, type BlobRef, type ColumnChunk } from "../format/manifest.js";
+import type { Held } from "../format/reachable.js";
 import {
   ChunkReader,
   PageBudgetError,
@@ -39,6 +49,19 @@ import {
   memoryRowLayout,
   memoryValueBytes,
 } from "./memory-output.js";
+
+/**
+ * One memory read's routed context, with the owner's metadata caches (parsed group roots and
+ * chunk directories) resolved from the caller's pages before they were wrapped. A published memory
+ * group's blobs are immutable and keyed by their full identity, so a point read whose caller passes
+ * the owner's own pages (the ON CONFLICT fetch, write-side checks, read sizing) reuses an earlier
+ * read's parse instead of parsing every column's directory again (and validating its sketch) per
+ * row. Query execution passes pages wrapped by its read step (exec/run.ts `ReadStep`), which do not
+ * resolve to the owner: those reads parse as before.
+ */
+interface RoutedRead extends MemoryReadContext {
+  readonly caches: MetadataCaches | undefined;
+}
 
 export interface MemoryReadSource {
   readonly rowCount: number;
@@ -172,7 +195,7 @@ export class MemoryReads {
 
   #during<T>(
     context: MemoryReadContext,
-    work: (ctx: MemoryReadContext, check: () => void) => Generator<Promise<unknown>, T, unknown>,
+    work: (ctx: RoutedRead, check: () => void) => Generator<Promise<unknown>, T, unknown>,
   ): MaybePromise<T> {
     context.signal.throwIfAborted();
     if (!context.budget.allocate(1024)) throw new PageBudgetError(1024);
@@ -211,10 +234,17 @@ export class MemoryReads {
         }
       },
     };
+    const routed: RoutedRead = {
+      budget: context.budget,
+      pages,
+      signal,
+      ...(context.once === true ? { once: true } : {}),
+      caches: metadataCachesFor(context.pages),
+    };
     const execute = function* (): Generator<Promise<unknown>, T, unknown> {
       try {
         check();
-        return yield* work({ budget: context.budget, pages, signal }, check);
+        return yield* work(routed, check);
       } finally {
         unwatch();
         context.budget.free(1024);
@@ -225,24 +255,28 @@ export class MemoryReads {
 
   *#withReader<T>(
     columnId: number,
-    context: MemoryReadContext,
+    context: RoutedRead,
     check: () => void,
     use: (reader: ChunkReader | { missing: FlatVector }) => Generator<Promise<unknown>, T, unknown>,
   ): Generator<Promise<unknown>, T, unknown> {
     // Do not call a cold LazyGroupRoot.get(): its callback uses the writer's pages and budget.
-    const root = yield* wait(
-      new MetadataReader(context.pages).groupRoot(this.source.publishedRoot(), context.budget),
-    );
+    const caches = context.caches;
+    const root = yield* this.#storedColumn(columnId, context);
     try {
       check();
-      const stored = root.value.columns.find((c) => c.columnId === columnId);
+      const stored = root.value;
       if (stored === undefined) {
         const missing = this.source.publishedMissing?.(columnId);
         if (missing !== undefined) return yield* use({ missing });
         throw new RangeError("The published memory group lacks this column");
       }
       const reader = yield* wait(
-        ChunkReader.open(context.pages, stored, { budget: context.budget, signal: context.signal }),
+        ChunkReader.open(context.pages, stored, {
+          budget: context.budget,
+          signal: context.signal,
+          ...(caches?.directories === undefined ? {} : { directories: caches.directories }),
+          ...(context.once === true ? { once: true } : {}),
+        }),
       );
       try {
         check();
@@ -255,11 +289,78 @@ export class MemoryReads {
     }
   }
 
+  /**
+   * The stored chunk of `columnId` in the published group root (undefined: the group lacks the
+   * column), held under the ordinary decode's charge, `parseCharge` of the root blob, for as long
+   * as the caller reads it: what an uncached read holds for its decoded root, never more. The
+   * owner's cached root (a validated view, whose charge is larger) is borrowed only while this one
+   * column is copied out of it, on optional room, and given back before any reader opens, as
+   * page/query-roots.ts `QueryRoots.read` does. Without the caches, on refused optional room, or
+   * for a one-pass read: the ordinary decode.
+   */
+  *#storedColumn(
+    columnId: number,
+    context: RoutedRead,
+  ): Generator<Promise<unknown>, Held<ColumnChunk | undefined>, unknown> {
+    const ref = this.source.publishedRoot();
+    const ordinary = function* (): Generator<
+      Promise<unknown>,
+      Held<ColumnChunk | undefined>,
+      unknown
+    > {
+      const root = yield* wait(new MetadataReader(context.pages).groupRoot(ref, context.budget));
+      return {
+        value: root.value.columns.find((c) => c.columnId === columnId),
+        release: () => root.release(),
+      };
+    };
+    const caches = context.caches;
+    if (caches?.groupRoots === undefined || context.once === true) return yield* ordinary();
+    const full = yield* wait(
+      new MetadataReader(context.pages, caches).groupRoot(ref, context.budget),
+    );
+    let kept = false;
+    try {
+      if (!isValidatedGroupRoot(full.value)) {
+        // The optional view was refused: this is the ordinary decode, held as it would be.
+        kept = true;
+        return {
+          value: full.value.columns.find((c) => c.columnId === columnId),
+          release: () => full.release(),
+        };
+      }
+      const size = parseCharge(ref.length);
+      if (!optionalParseAllocation(context.budget, size)) {
+        full.release();
+        kept = true; // released above
+        return yield* ordinary();
+      }
+      let stored: ColumnChunk | undefined;
+      try {
+        stored = selectGroupRootColumns(full.value, [columnId])[0];
+      } catch (error) {
+        context.budget.free(size);
+        throw error;
+      }
+      let released = false;
+      return {
+        value: stored,
+        release: () => {
+          if (released) return;
+          released = true;
+          context.budget.free(size);
+        },
+      };
+    } finally {
+      if (!kept) full.release();
+    }
+  }
+
   *#lengths(
     columnId: number,
     request: MemoryReadRequest,
     rows: number,
-    context: MemoryReadContext,
+    context: RoutedRead,
     check: () => void,
     each: (row: number, bytes: number) => void,
   ): Generator<Promise<unknown>, number, unknown> {
@@ -335,7 +436,7 @@ export class MemoryReads {
    */
   *#summary(
     input: MemorySummaryRequest,
-    context: MemoryReadContext,
+    context: RoutedRead,
     check: () => void,
   ): Generator<Promise<unknown>, MemoryReadSummary | null, unknown> {
     const firstChunk = input.chunk,
@@ -421,7 +522,7 @@ export class MemoryReads {
 
   *#hint(
     input: MemoryReadRequest,
-    context: MemoryReadContext,
+    context: RoutedRead,
     check: () => void,
   ): Generator<Promise<unknown>, MemoryReadHint, unknown> {
     const rows = Math.min(
@@ -542,7 +643,7 @@ export class MemoryReads {
     columnId: number,
     out: ChunkOutput,
     hint: MemoryReadHint,
-    context: MemoryReadContext,
+    context: RoutedRead,
     check: () => void,
   ): Generator<Promise<unknown>, ChunkResult, unknown> {
     const r = hint.request,

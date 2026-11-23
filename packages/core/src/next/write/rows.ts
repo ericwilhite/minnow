@@ -6,6 +6,7 @@
  * request order, built in `ColumnChunk`s (so at most `MEMORY_CHUNK_ROWS` rows per call).
  */
 import type { MaybePromise } from "../access/key-index.js";
+import { directoryCacheFor } from "../page/directory-cache.js";
 import { ChunkReader } from "../page/reader.js";
 import type { FlatVector, Vector } from "../vector/vector.js";
 import { missingVector } from "./missing-value.js";
@@ -125,13 +126,19 @@ async function readGroupRows(
   );
   const order = [...rows].sort((a, b) => a.position - b.position);
   const vectors: Vector[] = [];
+  // The owner's parsed directories: an UPDATE that completes rows one at a time (ON CONFLICT DO
+  // UPDATE) reads the same group's chunks again for every row.
+  const directories = directoryCacheFor(shared.space);
   for (const column of table.columns) {
     const stored = root.columns.find((chunk) => chunk.columnId === column.id);
     if (stored === undefined) {
       vectors.push(missingVector(column, positions.length));
       continue;
     }
-    const reader = await ChunkReader.open(shared.space, stored, { budget: shared.budget });
+    const reader = await ChunkReader.open(shared.space, stored, {
+      budget: shared.budget,
+      ...(directories === undefined ? {} : { directories }),
+    });
     try {
       await reader.load(reader.pagesForRows(positions));
       // Out-of-line values decode only once loaded.
