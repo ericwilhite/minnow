@@ -7,6 +7,7 @@ import type { Operator } from "./pipeline.js";
 import type { MaybePromise } from "../access/key-index.js";
 import { SnapshotReleasedError } from "../access/snapshot.js";
 import { sizingSettled } from "../page/read-bounds.js";
+import { checkRetries } from "../memory/retry-guard.js";
 import { QueryRoots, type RootColumns } from "../page/query-roots.js";
 import { readTable } from "./read-table.js";
 import type { ByteBudget } from "../access/space.js";
@@ -1538,6 +1539,8 @@ export class QueryExecution implements Execution {
   #modifySpool: ModifySpool | null = null;
   /** Preparation admissions never wait while holding (exec/preparation.ts). */
   readonly #preparation: PreparationGovernor | null;
+  /** Preparation restarts of this execution (`#restart`, `checkRetries`). */
+  #restarts = 0;
   #atomic: { readonly result: DeferredGrant; readonly window: number } | null = null;
   #committed = false;
   #draining = false;
@@ -1812,6 +1815,8 @@ export class QueryExecution implements Execution {
     if (preparation === null || runtime === null || sink === null) throw error;
     if (sink.rowCount !== 0 || runtime.modification)
       throw new Error("Query preparation restarted after it produced output");
+    // Each restart waits for a larger credit; one that keeps restarting without one is a spin.
+    checkRetries(`query#${String(this.request.queryId)} preparation`, ++this.#restarts);
     runtime.abort(RESTART);
     await runtime.close();
     await sizingSettled(this.#controller.signal);

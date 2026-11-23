@@ -4,6 +4,7 @@
  * estimate must not leave its unused high-water holdings blocking merges or resident metadata.
  */
 import { yieldTask } from "../exec/pipeline.js";
+import { checkRetries } from "../memory/retry-guard.js";
 import type { MaybePromise } from "../access/key-index.js";
 import { ParseBudgetError } from "../format/manifest-codec.js";
 import type { Grant } from "../memory/governor.js";
@@ -120,9 +121,11 @@ export class MetadataBudget implements ByteBudget {
     check: () => void,
     grow?: (wanted: number) => Promise<void>,
     funded = 0,
+    rounds = 0,
   ): MaybePromise<T> {
     const refused = (error: unknown): MaybePromise<T> => {
       if (!(error instanceof MetadataPressure)) throw error;
+      checkRetries(`metadata ${this.grant.label}`, rounds + 1);
       // An earlier attempt of this work was funded to `funded`, and the grant fell below it
       // without this refusal's allocations: the attempt itself moved credit out (a page read's
       // charge handed to the cache). Fund that again on top, or every retry falls short by the
@@ -141,7 +144,7 @@ export class MetadataBudget implements ByteBudget {
         };
         let result: MaybePromise<T>;
         try {
-          result = this.retry(work, check, grow, target);
+          result = this.retry(work, check, grow, target, rounds + 1);
         } catch (error) {
           settle();
           throw error;

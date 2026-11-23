@@ -2,6 +2,7 @@
 type MaybePromise<T> = T | Promise<T>;
 type ReadJob<T> = Generator<Promise<void>, T, void>;
 import type { ByteBudget, ExtentReader as SpaceReader, BlobRef } from "../storage/extents.js";
+import { retryGuard } from "../memory/retry-guard.js";
 import { ReadDeniedError } from "../storage/extents.js";
 import { MetadataReader } from "../format/metadata-reader.js";
 import type { QueryRoots, ScanRootFacts } from "./query-roots.js";
@@ -436,7 +437,9 @@ export function boundSource(
         governor.capBytes,
         Math.max(65536, parseCharge(segment.group.root.length) + segment.group.root.length),
       );
+      const guard = retryGuard("read-step sizing");
       for (;;) {
+        guard.retry();
         signal.throwIfAborted();
         const preferred = Math.max(capacity, caches?.sizingBytes(segment.group.root.length) ?? 0);
         // Optional recipe construction must never wait, jump FIFO or raise the ordinary

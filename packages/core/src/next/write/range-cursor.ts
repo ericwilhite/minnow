@@ -6,6 +6,7 @@ import {
   type MaybePromise,
 } from "../access/key-index.js";
 import { taskClock, yieldTask } from "../exec/pipeline.js";
+import { retryGuard } from "../memory/retry-guard.js";
 import type { RunRef } from "../format/manifest.js";
 import { HolderChainInvariantError, type Grant } from "../memory/governor.js";
 import { MAX_LSN } from "../access/snapshot.js";
@@ -139,7 +140,9 @@ export class StreamingRangeCursor implements IndexCursor {
   }
   *#open(): Generator<Promise<unknown>, void, unknown> {
     const shared = this.index.table.snapshot.shared;
+    const guard = retryGuard("write index range open");
     for (;;) {
+      guard.retry();
       const sizes = this.#sizes(),
         options = { label: "write index range", minimumBytes: sizes.minimum, spillable: false };
       let grant: ByteBudget;

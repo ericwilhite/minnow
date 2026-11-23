@@ -207,6 +207,23 @@ registered cache with the bytes it holds (caches name themselves with `Evictable
 the registered lifetime holdings (which lie inside those grants and caches), and any
 unattributed remainder, which is zero unless the accounting is broken.
 
+A loop that never yields is invisible to that timer. In test builds (`MINNOW_RETRY_GUARD`, set for
+every Vitest suite and browser lane; `memory/retry-guard.ts`) each memory retry loop counts its
+rounds without progress and throws `RetrySpinError` past the limit (64):
+
+- the governor's drain (a round that serves, refuses and withdraws nothing);
+- the write step's row wait, the owner's growth (`WriteCredits.#growTo`), its merge credit and
+  commit preparation;
+- native stabilization (the step boundary's version retry, `#stabilizeNativeStepOnce`, the native
+  root's open and funding);
+- the metadata budget's retry and the native trigger preparation's;
+- cursor and sizing retries (the write index range cursor, read-step sizing, prefix image
+  sources, native defaults);
+- a query's preparation restarts.
+
+A loop that waits on real tasks (`ByteBudget`'s grow fallback) is left to the stall guard, and so
+is the space's background reclaim, whose rounds each do reclaim work that others' writes request.
+
 Memory refusals carry `code: "MINNOW_MEMORY_ADMISSION"`, SQLSTATE `53200`, and a
 `cause` with `requestedBytes` and `admittedBytes`. A private progress step larger
 than its admitted lane raises the same error before allocating or waiting; it

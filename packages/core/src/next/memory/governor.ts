@@ -31,6 +31,7 @@
  * only; browser RSS is measured separately at Gate D.
  */
 import { BATCH_TARGET_BYTES } from "../vector/vector.js";
+import { retryGuard } from "./retry-guard.js";
 import { MemoryAdmissionError } from "../memory-values.js";
 
 export {
@@ -1004,8 +1005,17 @@ export class Governor implements MemoryGovernor {
       return;
     }
     this.#draining = true;
+    // A round that serves, refuses and withdraws nothing, yet goes round again, is a spin.
+    const guard = retryGuard("governor drain");
+    const queued = () =>
+      this.#loans.length + this.#reads.length + this.#holders.length + this.#admissions.length;
+    let progress = -1,
+      waiting = -1;
     try {
       do {
+        if (this.#progress === progress && queued() === waiting) guard.retry();
+        progress = this.#progress;
+        waiting = queued();
         this.#again = false;
         if (this.#permanent.size > 0) this.#refuseUnservable();
         this.#serve(this.#loans, true);

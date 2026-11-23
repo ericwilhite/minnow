@@ -168,10 +168,15 @@ export function xxHash32(bytes: Uint8Array, seed = 0, start = 0, end = bytes.len
   // eviction, so a writer into them fails in the browser lanes too
   // (packages/core/src/next/storage/verify-cached.ts). Off for the opt-in OPFS export and owner-ready timing lanes
   // (next-export-bench / next-storage-owner-reopen.spec.ts), which time reads the guard would re-hash.
+  // The retry guard (packages/core/src/next/memory/retry-guard.ts) is on in every lane: it costs
+  // a counter per retry, and a loop spinning in microtasks would hang a page silently.
   define:
     process.env.MINNOW_NEXT_EXPORT_BENCH === "1" || process.env.MINNOW_OWNER_REOPEN === "1"
-      ? {}
-      : { "globalThis.__MINNOW_VERIFY_CACHED_BYTES__": "true" },
+      ? { "globalThis.__MINNOW_RETRY_GUARD__": "64" }
+      : {
+          "globalThis.__MINNOW_VERIFY_CACHED_BYTES__": "true",
+          "globalThis.__MINNOW_RETRY_GUARD__": "64",
+        },
   // The browser conformance runner loads the same vendored SQLite Wasm and PGlite distributions
   // as the benchmark site. Serving this directory preserves each package's relative asset URLs.
   publicDir: "apps/site/public",

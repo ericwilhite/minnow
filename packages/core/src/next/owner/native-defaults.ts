@@ -1,6 +1,7 @@
 /** Ordered RI defaults over the same lowered, typed expressions as ordinary INSERT.
  * Kernels without a native implementation still refuse at preparation, before writes. */
 import type { CatalogView } from "../access/catalog.js";
+import { retryGuard } from "../memory/retry-guard.js";
 import type { ScalarExpr } from "../ir/ir.js";
 import type { ByteCharge } from "../vector/varlen.js";
 import type { FlatVector } from "../vector/vector.js";
@@ -149,7 +150,9 @@ export class NativeDefaults {
       if (sources.length !== columns.length)
         throw new TypeError("Duplicate or missing default column");
       let requested = this.#minimum;
+      const guard = retryGuard("native defaults preparation");
       for (;;) {
+        guard.retry();
         check();
         await scope.prepare(requested, signal);
         check();

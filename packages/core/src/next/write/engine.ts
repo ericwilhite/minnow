@@ -1,4 +1,5 @@
 import { idleGarbageOverBound } from "./idle-garbage.js";
+import { retryGuard } from "../memory/retry-guard.js";
 import { StagedExtents, EMPTY_STAGED_EXTENTS } from "./staged-extents.js";
 import {
   captureWriterExtents,
@@ -2571,7 +2572,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
     capacity: number,
     signal: AbortSignal,
   ): Promise<void> {
+    const guard = retryGuard("native step stabilization");
     for (;;) {
+      guard.retry();
       this.#checkNativeStep(owner);
       signal.throwIfAborted();
       this.#arenaPool.clear();
@@ -2826,6 +2829,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const governor = this.#credits.governor;
     this.maintenance.rowWaits += 1;
     let keep: (() => void) | null = null;
+    const guard = retryGuard("write path memtable wait");
     try {
       for (;;) {
         signal?.throwIfAborted();
@@ -2834,6 +2838,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         if (this.#headroom(need)) return;
         // The rows it holds stay while it waits: reclaim for this very admission must not return
         // them (it did, and the step asked again forever).
+        guard.retry();
         keep?.();
         keep = this.#credits.holdRowsWhileWaiting(need);
         const deficit = need - (this.#grant.held - this.#grant.allocated);
@@ -3769,7 +3774,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
     // Keyed FTS mutations enter here directly. A preceding read may have
     // reclaimed the dormant WAL forecast; fund it again before any codec buffer.
     // Recheck after an admission await because another phase may have used it.
+    const guard = retryGuard("commit preparation");
     for (;;) {
+      guard.retry();
       const metadata = this.#prepareMinimum(tx.catalog);
       if (metadata instanceof Promise) {
         await metadata;
