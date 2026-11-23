@@ -1,0 +1,4 @@
+{"close":false,"native":[{"aborted":true,"reason":"outer"},{"aborted":true,"reason":"outer"},{"aborted":false}],"step":[{"aborted":true,"reason":"outer"},{"aborted":true,"reason":"outer"},{"aborted":true,"reason":"extra event"}]}
+{"close":true,"native":[{"aborted":true,"reason":"outer"},{"aborted":true,"reason":"outer"},{"aborted":false}],"step":[{"aborted":true,"reason":"outer"},{"aborted":true,"reason":"outer"},{"aborted":true,"reason":"extra event"}]}
+false positive [ 'outside dispatch' ]
+parent step detection [ 'through parent step' ]

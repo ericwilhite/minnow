@@ -1,0 +1,10 @@
+{
+  close: false,
+  victim: false,
+  refused: 'MINNOW_STEP_SIGNAL_INVARIANT'
+}
+{ close: true, victim: false, refused: 'MINNOW_STEP_SIGNAL_INVARIANT' }
+mixed events {"native":["a","b","x"],"step":["a","x","b"]}
+mixed final reason {"native":"x","step":"b"}
+held 0
+pending read final state {"native":{"observed":true,"victim":false},"step":{"observed":false,"victim":true,"reason":"observed live"}}

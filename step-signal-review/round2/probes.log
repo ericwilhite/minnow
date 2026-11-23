@@ -1,0 +1,105 @@
+[
+  {
+    "name": "sibling probe",
+    "native": [
+      "caller",
+      "caller"
+    ],
+    "step": [
+      "caller",
+      "caller"
+    ],
+    "equal": true,
+    "held": 0
+  },
+  {
+    "name": "earlier parent listener probe",
+    "native": "caller",
+    "step": "caller",
+    "equal": true,
+    "held": 0
+  },
+  {
+    "name": "repeat abort",
+    "native": "first",
+    "step": "first",
+    "equal": true,
+    "held": 0
+  },
+  {
+    "name": "create directly inside listener",
+    "native": "caller",
+    "step": "caller",
+    "equal": true,
+    "held": 0
+  },
+  {
+    "name": "create from nested step inside reentrant listener",
+    "native": [
+      "caller",
+      "caller"
+    ],
+    "step": [
+      "caller",
+      "cleanup"
+    ],
+    "equal": false,
+    "held": 0
+  },
+  {
+    "name": "create from already aborted step",
+    "native": [
+      "caller",
+      "caller"
+    ],
+    "step": [
+      "caller",
+      "cleanup"
+    ],
+    "equal": false,
+    "held": 0
+  },
+  {
+    "name": "close sibling inside step listener",
+    "native": [
+      "caller",
+      "caller"
+    ],
+    "step": [
+      "caller",
+      "caller"
+    ],
+    "equal": true,
+    "held": 0
+  },
+  {
+    "name": "close inside parent listener",
+    "native": "caller",
+    "step": "unaborted",
+    "equal": false,
+    "held": 0
+  },
+  {
+    "name": "throwing listener then reentrant listener",
+    "native": [
+      "caller",
+      "caller",
+      [
+        "listener threw"
+      ]
+    ],
+    "step": [
+      "caller",
+      "caller",
+      [
+        "listener threw"
+      ]
+    ],
+    "equal": true,
+    "held": 0
+  }
+]
+nested held after parent close 1
+nested held after both close 0
+abortable following own 0
+abortable reentrant {"native":"caller","step":"cleanup","held":0}
