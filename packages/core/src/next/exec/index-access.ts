@@ -17,7 +17,7 @@ import { selectedSegment } from "./late-fetch.js";
 import { pushAndWait, taskClock, yieldTask, type Operator, type Transfer } from "./pipeline.js";
 import type { QueryRuntime, OperatorIdentity } from "./run.js";
 import { SortOperator } from "./sort.js";
-import { bindParameters } from "./parameters.js";
+import { bindParameter, nullParameter } from "./parameters.js";
 import { ModifyTargetSet } from "./modify-target-set.js";
 import { TableScan } from "./table-scan.js";
 
@@ -102,6 +102,22 @@ export function lookupSegments(
   ) as Promise<WindowSegments | null>;
 }
 
+/** The parameter slots `tuples` read. */
+function keyParameterSlots(tuples: ReadonlyArray<readonly ScalarExpr[]>): Set<number> {
+  const slots = new Set<number>();
+  const visit = (node: unknown): void => {
+    if (Array.isArray(node)) for (const item of node) visit(item);
+    else if (typeof node === "object" && node !== null && !ArrayBuffer.isView(node)) {
+      const expr = node as { op?: unknown; slot?: unknown };
+      if (expr.op === "param" && typeof expr.slot === "number") slots.add(expr.slot);
+      for (const [key, child] of Object.entries(node))
+        if (key !== "type" && key !== "value") visit(child);
+    }
+  };
+  visit(tuples);
+  return slots;
+}
+
 /** `work`'s value, or null when binding or encoding the keys fails (execution raises it). */
 async function orFallback<T>(work: () => MaybePromise<T>): Promise<T | null> {
   try {
@@ -147,17 +163,31 @@ async function readLookup(
     const list = new Uint32Array(bound);
     // Mutated by the cursor reads below.
     const state = { filled: 0, over: false };
-    // Parameters bind at reservation, after sizing: bind them here on the scratch (freed with it).
+    // Parameters bind at reservation, after sizing: bind the ones the keys use here on the
+    // scratch (freed with it). Others never reach a key: a wide value bound for another column
+    // would take the scratch the range plan needs (`IndexRangePlan.open`).
+    const used = keyParameterSlots(indexTuples(rel));
     const params =
       physical.parameters.length === 0
         ? { slots: [] }
-        : await orFallback(() => bindParameters(physical, runtime.request.parameters, grant));
+        : await orFallback(() => ({
+            slots: physical.parameters.map((type, slot) =>
+              used.has(slot)
+                ? bindParameter(type, runtime.request.parameters[slot] ?? null, slot, grant)
+                : nullParameter(type),
+            ),
+          }));
     if (params === null) return null;
     const context: CompileContext = { arena, input: [], params };
     const encode = (tuple: readonly ScalarExpr[]) =>
       orFallback(() => ({ key: encodeIndexKey(tuple, context, grant, keys) }));
     const index = runtime.view.index(rel.tableId, rel.indexId);
     const read = async (plan: IndexRangePlan) => {
+      // Sizing is optional: a range larger than the scratch sizes the whole source instead.
+      if (grant.held - grant.allocated < plan.minimumBytes) {
+        state.over = true;
+        return;
+      }
       const cursor = plan.open({ budget: grant, signal });
       // Cancellation closes at once; the pending call still settles before release.
       let open = true;

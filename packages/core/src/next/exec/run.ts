@@ -1208,7 +1208,12 @@ export class QueryRuntime {
    */
   waitingHoldings(): WaitingHoldings {
     const writer = this.request.statement?.writerHoldings?.() ?? null;
-    return writer === null ? { grants: this.#grants } : { grants: this.#grants, lent: writer };
+    // What only this query's snapshot keeps (a flushed memtable's borrowed chunks, a dropped
+    // table's rows) stays while it waits: it returns when the snapshot closes.
+    const pinned = () => this.view.exclusiveBytes?.() ?? 0;
+    return writer === null
+      ? { grants: this.#grants, pinned }
+      : { grants: this.#grants, lent: writer, pinned };
   }
 
   /** The result grant is tracked but survives pipeline disposal until result delivery. */
@@ -1590,6 +1595,32 @@ export class QueryExecution implements Execution {
       },
     );
     this.delivered.catch(() => undefined);
+    // While this execution runs its statement, the statement's write steps wait for memory
+    // beside what it keeps: its runtime's holdings and its result grant (the modification's
+    // spool drains after the producing runtime closes). A nested execution's registration is
+    // restored to its outer's when it settles.
+    const statement = request.statement;
+    if (statement !== null) {
+      const outer = statement.waitHoldings ?? null;
+      const own = (): WaitingHoldings => {
+        const holdings = this.#runtime?.waitingHoldings() ?? {
+          grants: [],
+          pinned: () => view.exclusiveBytes?.() ?? 0,
+        };
+        return this.#result === null
+          ? holdings
+          : { ...holdings, grants: [...holdings.grants, this.#result] };
+      };
+      const outerSignal = statement.waitSignal ?? null;
+      statement.waitHoldings = own;
+      statement.waitSignal = this.#controller.signal;
+      const restore = () => {
+        if (statement.waitHoldings !== own) return;
+        statement.waitHoldings = outer;
+        statement.waitSignal = outerSignal;
+      };
+      void this.executed.then(restore, restore);
+    }
     request.signal?.addEventListener("abort", onAbort, { once: true });
     try {
       if (request.signal?.aborted === true) this.cancel(request.signal.reason);
@@ -1774,11 +1805,14 @@ export class QueryExecution implements Execution {
     runtime.abort(RESTART);
     await runtime.close();
     await sizingSettled(this.#controller.signal);
-    // Holding nothing but its result grant and, while it holds the writer turn, the writer's.
+    // Holding nothing but its result grant, what only its snapshot keeps alive, and, while it
+    // holds the writer turn, the writer's.
+    const view = runtime.view;
+    const pinned = () => view.exclusiveBytes?.() ?? 0;
     await preparation.regrow(error, this.#controller.signal, () => {
       const writer = this.request.statement?.writerHoldings?.() ?? null;
       const grants = this.#result === null ? [] : [this.#result];
-      return writer === null ? { grants } : { grants, lent: writer };
+      return writer === null ? { grants, pinned } : { grants, lent: writer, pinned };
     });
     const fresh = this.#newRuntime();
     this.#runtime = fresh;

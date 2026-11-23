@@ -248,7 +248,16 @@ for (const seed of seedsFor("next-modify-row-progress", [0x5a01, 0x5a02]))
               await end();
               end = null;
             }
-            if (checked(await statement, context)) {
+            const written = checked(await statement, context);
+            // The fit target (statement-sizing PR 2, proposed): on an otherwise idle engine a
+            // single-row write whose row is at most a sixteenth of the cap is written. Measured
+            // before: every form written up to 2.5 MiB at 32 MiB, 6 MiB at 64 MiB.
+            const rowBytes = row + (mixed ? tableColumn : 0);
+            if (!beside && rowBytes <= (capMiB * MiB) / 16) {
+              expect(written, `${context}: a row of ${String(rowBytes)} bytes fits`).toBe(true);
+              reach.reach("must fit");
+            }
+            if (written) {
               expect(await ids(core)).toEqual(kind === "insert" ? [1, 2] : [1]);
               const stored = await value(core, target);
               if (stored !== null)

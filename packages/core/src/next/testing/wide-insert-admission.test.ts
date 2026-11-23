@@ -17,6 +17,10 @@
  *   forever for a doubled credit of exactly the usable capacity, which its own result grant and
  *   the writer's live bytes kept out of reach.
  *
+ * Since statement-sizing PR 2 the 3.25 MiB row is written, and no generated history at this cap
+ * reaches the memtable's refusal (the fixed buffers refuse first): its mapping to 53200 is
+ * forced in one test here.
+ *
  * Every statement here either writes its row exactly or is refused with 53200 writing nothing,
  * and every read either returns exactly the written rows or is refused with 53200. A stall fails
  * the run as a `GovernorStallError` (no SQLSTATE) through `Governor.stallAfterMs`. Which sizes
@@ -29,6 +33,7 @@ import { createReach, WIDE_INSERT_ADMISSION_REACH } from "../../testing/reach.js
 import { seedsFor } from "../../testing/seeds.js";
 import { oracleRows } from "./differential-adapter.js";
 import { StorageCore } from "./storage-core.js";
+import { MemtableMemoryError } from "../write/bytes.js";
 
 const MiB = 1 << 20;
 const CAP = 32 * MiB;
@@ -193,9 +198,39 @@ it("refuses it before waiting while another statement holds memory too", async (
   }
 }, 60_000);
 
-it("reports the write path's memtable refusal as the typed 53200", async () => {
+it("writes the 3.25 MiB VALUES row whose memtable refusal was once untyped", async () => {
+  // The memtable now charges what a step allocates, from the writer's idle credit too
+  // (statement-sizing PR 2): the row fits at this cap.
   const [outcome] = await run([{ form: "values", width: 3_407_872, copies: 1 }]);
-  expect(outcome?.refused?.label).toBe("write path memtable");
+  expect(outcome?.refused).toBeNull();
+}, 60_000);
+
+it("reports the write path's memtable refusal through SQL as the typed 53200, writing nothing", async () => {
+  // Forced: no generated history at this cap reaches the memtable's refusal since PR 2 (the
+  // fixed buffers refuse first); the mapping must hold wherever it is reached.
+  const core = new StorageCore();
+  Object.defineProperty(core.harness, "governor", { value: new Governor(CAP) });
+  await core.open();
+  try {
+    await core.execute("CREATE TABLE t(id INT PRIMARY KEY, v TEXT)");
+    await core.execute("INSERT INTO t VALUES (1, 'old')");
+    const path = core.harness.path as unknown as { admit: (...args: unknown[]) => unknown };
+    const admit = path.admit;
+    path.admit = () => {
+      throw new MemtableMemoryError(1234, 56);
+    };
+    const outcome: unknown = await core.execute("INSERT INTO t VALUES (2, 'new')").then(
+      () => null,
+      (reason: unknown) => reason,
+    );
+    path.admit = admit;
+    expect(outcome).toMatchObject({ ...TYPED_REFUSAL, label: "write path memtable", bytes: 1234 });
+    expect((await read(core, "SELECT id FROM t ORDER BY id"))?.map((row) => row.id)).toEqual([1]);
+    await core.execute("INSERT INTO t VALUES (3, 'after')");
+    expect(core.harness.path.failure).toBeNull();
+  } finally {
+    await core.close();
+  }
 }, 60_000);
 
 it("reads a table of two 2 MiB rows back, or refuses it typed, without waiting forever", async () => {
@@ -241,7 +276,6 @@ for (const seed of seedsFor("next-wide-insert-admission", [0x5b01, 0x5b02]))
           } else {
             refused = true;
             if (refusal.label.endsWith("/fixed-buffers")) reach.reach("refused before waiting");
-            if (refusal.label === "write path memtable") reach.reach("memtable refusal");
           }
         }
       }),
@@ -259,8 +293,8 @@ for (const seed of seedsFor("next-wide-insert-admission", [0x5b01, 0x5b02]))
               { form: "select", width: 4096, copies: 2 },
             ],
           ],
-          // The three defects: fixed buffers that waited forever, an untyped memtable refusal,
-          // a read-back that waited forever.
+          // The three defects: fixed buffers that waited forever, an untyped memtable refusal
+          // (now written), a read-back that waited forever.
           [
             [
               { form: "select", width: 2 * MiB, copies: 3 },

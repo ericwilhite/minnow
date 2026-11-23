@@ -37,8 +37,16 @@ async function ids(core: StorageCore): Promise<number[]> {
   return oracleRows(rows).map((row) => Number(row.id));
 }
 
-/** The other connection's table: its rows' widths (C1's variants: a 1.5 MB row, two 2 MiB). */
-const READERS: ReadonlyArray<readonly number[]> = [[2 * MiB], [1_500_000], [2 * MiB, 2 * MiB]];
+/** The other connection's table: its rows' widths (C1's variants: a 1.5 MB row, two 2 MiB; and
+ * 1 MB and 1.2 MB rows, whose smaller reads let the insert start and then refused its memtable
+ * charge mid-run: "write path memtable … (6008352 bytes, 1065484 available)"). */
+const READERS: ReadonlyArray<readonly number[]> = [
+  [2 * MiB],
+  [1_500_000],
+  [2 * MiB, 2 * MiB],
+  [1_000_000],
+  [1_200_000],
+];
 
 for (const reader of READERS)
   for (const [sql, width] of [
@@ -61,11 +69,14 @@ for (const reader of READERS)
         const lowered = core.lowerer.lower("SELECT id, v FROM t", core.context());
         if (lowered.kind !== "query") throw new Error("query plan required");
         const other = core.start(core.executor.prepare(lowered.plan));
-        for (let i = 0; i < 200 && governor.usedBytes - idle < 4 * MiB; i++)
+        // It holds at least the rows it read (how much more is its own sizing).
+        const read = reader.reduce((sum, bytes) => sum + bytes, 0);
+        for (let i = 0; i < 200 && governor.usedBytes - idle < read; i++)
           await new Promise((resolve) => setTimeout(resolve, 5));
-        expect(governor.usedBytes - idle, "the other connection holds its read").toBeGreaterThan(
-          4 * MiB,
-        );
+        expect(
+          governor.usedBytes - idle,
+          "the other connection holds its read",
+        ).toBeGreaterThanOrEqual(read);
         const statement = core.execute(sql, ["w".repeat(width)]).then(
           () => "written" as const,
           (error: unknown) => error,
@@ -112,7 +123,10 @@ it("waits for a background flush to publish, then writes", async () => {
     for (let i = 0; i < 200 && held === 0; i++)
       await new Promise((resolve) => setTimeout(resolve, 5));
     expect(held, "a flush is held before it publishes").toBe(1);
-    const statement = core.execute("INSERT INTO t VALUES (10, $1)", ["w".repeat(1_500_000)]);
+    // Wide enough not to fit beside the held flush's rows: since statement-sizing PR 2 the
+    // memtable charges what a step allocates, from the writer's idle credit too, so rows up to
+    // 3.5 MB fit at once here (measured).
+    const statement = core.execute("INSERT INTO t VALUES (10, $1)", ["w".repeat(4_500_000)]);
     expect(await within(statement, 500), "it waits while the flush holds its rows").toBe(PENDING);
     hold = false;
     (resume as (() => void) | null)?.();

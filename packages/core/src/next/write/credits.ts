@@ -2,7 +2,7 @@
  * The write owner's native accounts. A step receives already admitted credit, not a wrapper
  * allocation counter: storage may transfer a real buffer out through native takeFrom.
  */
-import type { Grant, HolderChain, MemoryGovernor } from "../memory/governor.js";
+import type { Grant, HolderChain, MemoryGovernor, WaitingHoldings } from "../memory/governor.js";
 import { GrantClosedError, MemoryAdmissionError } from "../memory/governor.js";
 import type { MaybePromise } from "../access/key-index.js";
 import { releaseIdle } from "./budget.js";
@@ -233,6 +233,26 @@ export class WriteCredits {
   }
 
   /** Includes the funded handoff before the private account is returned. */
+  /**
+   * The bytes this owner's growth waits for in the governor, by whether it may use the progress
+   * reserve (`#growTo`: a merge's credit, a
+   * flush's or merge's metadata, a native step), 0 when none waits. Holder growth is served
+   * before any admission: a statement holding the writer turn waits behind it
+   * (`LentHoldings.queued`).
+   */
+  get queuedGrowth(): { readonly ordinary: number; readonly progress: number } {
+    return { ...this.#queuedGrowth };
+  }
+  readonly #queuedListeners = new Set<() => void>();
+  /** Calls `listener` whenever the owner's work queues growth in the governor; returns the
+   * unsubscription. */
+  onQueuedGrowth(listener: () => void): () => void {
+    this.#queuedListeners.add(listener);
+    return () => this.#queuedListeners.delete(listener);
+  }
+  /** Ordinary growth may not use the progress reserve (`includesProgress`); progress growth may. */
+  readonly #queuedGrowth = { ordinary: 0, progress: 0 };
+
   get hasMergeStep(): boolean {
     return this.#mergeFloor !== 0 || this.#mergeActive !== null;
   }
@@ -496,6 +516,7 @@ export class WriteCredits {
     bytes: number,
     signal?: AbortSignal,
     includesProgress = false,
+    holdings?: () => WaitingHoldings,
   ): MaybePromise<void> {
     const before = this.#metadataHeadroom;
     // The complete simultaneous workspace, before any of its allocations or waits.
@@ -512,7 +533,16 @@ export class WriteCredits {
     // already funded; install the larger requirement when admission succeeds.
     this.#metadataHeadroom = Math.min(this.#metadataHeadroom, bytes);
     if (before !== this.#metadataHeadroom) this.#changed?.();
-    return this.growTo(this.metadata, wanted, signal, includesProgress);
+    return this.#growTo(
+      this.metadata,
+      wanted,
+      signal,
+      0,
+      includesProgress,
+      undefined,
+      false,
+      holdings,
+    );
   }
 
   /** The prepaid next metadata step beyond live allocations (observation only). */
@@ -572,6 +602,7 @@ export class WriteCredits {
     includesProgress = false,
     funding?: "commit" | "merge",
     nativeMinimum = false,
+    holdings?: () => WaitingHoldings,
   ): Promise<void> {
     const stop =
       signal === undefined ? this.#stop.signal : AbortSignal.any([signal, this.#stop.signal]);
@@ -687,19 +718,37 @@ export class WriteCredits {
         if (account) releaseIdle(account, floors[i] ?? 0);
       }
       this.#trimMetadataHeadroom();
-      const credits = await this.governor.admitGroup({
-        label: `complete grow ${grant.label}`,
-        ...(includesProgress ? { includesProgress: true } : {}),
-        // The writer holds its floors (and, inside a native step, the root its retained base)
-        // through this wait and cannot release them: holder growth (GOVERNOR-WAIT-POLICY).
-        holdsCredit: this.holderChain,
-        grants: accounts.map((account, i) => ({
-          label: `write growth ${account.label}`,
-          minimumBytes: Math.max(0, (desired[i] ?? 0) - account.held),
-          spillable: false,
-        })),
-        signal: stop,
-      });
+      const parts = accounts.map((account, i) => ({
+        label: `write growth ${account.label}`,
+        minimumBytes: Math.max(0, (desired[i] ?? 0) - account.held),
+        spillable: false,
+      }));
+      // The owner's queued growth (`queuedGrowth`) while it waits, by capacity class: its own
+      // work's (a flush's, a merge's). A statement's step carries the statement's holdings
+      // instead: the governor bounds it by them, and it is not growth queued ahead of it.
+      const queued =
+        holdings === undefined ? parts.reduce((sum, part) => sum + part.minimumBytes, 0) : 0;
+      const queue = includesProgress ? "progress" : "ordinary";
+      this.#queuedGrowth[queue] += queued;
+      if (queued > 0) {
+        this.#changed?.();
+        for (const listener of [...this.#queuedListeners]) listener();
+      }
+      let credits: readonly Grant[];
+      try {
+        credits = await this.governor.admitGroup({
+          label: `complete grow ${grant.label}`,
+          ...(includesProgress ? { includesProgress: true } : {}),
+          // The writer holds its floors (and, inside a native step, the root its retained base)
+          // through this wait and cannot release them: holder growth (GOVERNOR-WAIT-POLICY).
+          holdsCredit: this.holderChain,
+          grants: parts,
+          ...(holdings === undefined ? {} : { holdings }),
+          signal: stop,
+        });
+      } finally {
+        this.#queuedGrowth[queue] -= queued;
+      }
       try {
         this.#check();
         stop.throwIfAborted();
@@ -716,6 +765,39 @@ export class WriteCredits {
         for (const credit of credits) credit.close();
       }
     }
+  }
+
+  /**
+   * Moves this owner's unused commit and merge credit into `grant` until it holds `wanted`,
+   * without waiting, and returns whether it does. Each keeps what `#growTo` keeps before a wait
+   * (its allocations, loans and floor: a running commit's window, a prepared merge), so this
+   * takes only the forecasts an idle owner may revoke. The caller first grows
+   * from free memory, so warm commit and merge windows stay while memory is free (`#growTo`'s
+   * first pass).
+   */
+  fundFromIdle(grant: Grant, wanted: number): boolean {
+    const accounts = [this.rows, this.metadata, this.commits, this.merge];
+    if (!accounts.includes(grant)) throw new Error("Growth must belong to the native write owner");
+    if (grant.held >= wanted) return true;
+    const working = this.#workingMinimum();
+    const floors = new Map<Grant, number>([
+      [this.commits, this.#commitFloor()],
+      [this.merge, Math.max(this.#mergeFloor, working.merge ?? 0)],
+    ]);
+    // Commit and merge forecasts only: the metadata step is a running phase's workspace, which
+    // must not have to grow again while that phase's writer is open (governor rules 4/5/7).
+    for (const source of [this.commits, this.merge]) {
+      if (source === grant) continue;
+      const retained = Math.max(source.allocated + source.loaned, floors.get(source) ?? 0);
+      const moved = Math.min(wanted - grant.held, Math.max(0, source.held - retained));
+      if (moved <= 0) continue;
+      if (!this.governor.transferCredit(source, grant, moved))
+        throw new Error("Idle native phase credit was not transferred");
+      if (grant.held >= wanted) break;
+    }
+    if (grant.held < wanted) return false;
+    this.#changed?.(true);
+    return true;
   }
 
   /**

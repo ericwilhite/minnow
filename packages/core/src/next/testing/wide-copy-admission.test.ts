@@ -38,7 +38,7 @@ async function open(capMiB: number) {
 async function history(db: MinnowDatabaseClient, width: number): Promise<unknown> {
   await db.execute("CREATE TABLE t(id INT PRIMARY KEY, a TEXT, b TEXT)");
   await db.execute("INSERT INTO t VALUES (1, 'x', NULL)");
-  await insertWide(db, width);
+  await db.execute("INSERT INTO t VALUES (2, $1, NULL)", ["a".repeat(width)]);
   const copy: unknown = await db.execute("UPDATE t SET b = a WHERE id = 2").then(
     () => null,
     (error: unknown) => error,
@@ -54,50 +54,9 @@ async function history(db: MinnowDatabaseClient, width: number): Promise<unknown
   return copy;
 }
 
-async function insertWide(db: MinnowDatabaseClient, width: number): Promise<void> {
-  await db.execute("INSERT INTO t VALUES (2, $1, NULL)", ["a".repeat(width)]);
-}
-
-/**
- * The 3 MiB row at 32 MiB is refused before it writes (typed 53200), until statement-sizing PR 2.
- * Its spool takes one step of twice the encoded row (`wideRowStepBytes`, 6.36 MB), and a statement
- * is never refused part way by that step, so its result progress lane reserves it up front: fixed
- * buffers 10.86 MB (6.32 MB before). Beside the idle writer's commit buffers (6.29 MB held, 0.13 MB
- * used) and merge credit (4.73 MB, unused), the memtable's charge (6.30 MB, twice the row) then
- * finds 0.95 MB. Before, this row was written only because the spool's step grew from free memory
- * at the time; with another holder it was refused part way (statement-wait-release.test.ts).
- * PR 2 (the memtable charging what a step allocates, the writer's idle credit) flips this.
- */
-it("refuses the 3 MiB row at 32 MiB before it writes, typed, until PR 2", async () => {
-  Governor.stallAfterMs = 5_000;
-  const { owner, db } = await open(32);
-  try {
-    await db.execute("CREATE TABLE t(id INT PRIMARY KEY, a TEXT, b TEXT)");
-    await db.execute("INSERT INTO t VALUES (1, 'x', NULL)");
-    const refused: unknown = await insertWide(db, 3 * MiB).then(
-      () => null,
-      (error: unknown) => error,
-    );
-    expect(
-      refused,
-      "refused at the memtable (6.30 MB asked, 0.95 MB available beside the lane's 6.36 MB step); PR 2 writes it",
-    ).toMatchObject({
-      code: "MINNOW_MEMORY_ADMISSION",
-      sqlState: "53200",
-      label: "write path memtable",
-    });
-    // Nothing written, and the engine stays usable.
-    await db.execute("INSERT INTO t VALUES (3, 'y', 'z')");
-    const ids = await db.query("SELECT id FROM t ORDER BY id");
-    expect(ids.rows().map((row) => Number(row.id))).toEqual([1, 3]);
-  } finally {
-    await db.close();
-    await owner.close();
-  }
-}, 60_000);
-
 for (const [cap, width] of [
   [32, 2 * MiB],
+  [32, 3 * MiB],
   [64, 6 * MiB],
 ] as const)
   it(`copies a ${String(width / MiB)} MiB value at ${String(cap)} MiB, or refuses it typed, never waiting forever`, async () => {

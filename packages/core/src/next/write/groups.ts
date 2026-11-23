@@ -86,6 +86,11 @@ export class GroupChunk {
     this.#refs += 1;
   }
 
+  /** What one `release` would free now: the chunk's charge when this is its last reference. */
+  get releaseBytes(): number {
+    return !this.#released && this.#refs === 1 ? this.charge : 0;
+  }
+
   release(): void {
     if (this.#released) return;
     this.#refs -= 1;
@@ -355,6 +360,15 @@ export class GroupDirectory {
     if (this.#refs <= 0) throw new RangeError("A released group directory was retained");
     this.#refs += 1;
     for (const chunk of this.chunks) chunk.retain();
+  }
+
+  /** What one `release` would free now: this object's charge when it is the last reference,
+   * and each chunk's whose last reference it holds. */
+  releaseBytes(): number {
+    if (this.#budget === null || this.#refs <= 0) return 0;
+    let bytes = this.#refs === 1 ? this.charge : 0;
+    for (const chunk of this.chunks) bytes += chunk.releaseBytes;
+    return bytes;
   }
 
   release(): void {

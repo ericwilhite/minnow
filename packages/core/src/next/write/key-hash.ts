@@ -59,8 +59,61 @@ type KeepEntry = (rowId: number, tombstone: boolean) => boolean;
 
 /** Bytes of a fresh delta's arrays (slots 64×4, 5 key arrays 16×4, arena 256, entries 16×(8+8+1+4+4)). */
 const INITIAL_BYTES = 64 * 4 + 5 * 16 * 4 + 256 + 16 * 25;
+/** What a new key delta charges before its first key (`KeyDelta` constructor). */
+export const KEY_DELTA_INITIAL_BYTES = INITIAL_BYTES;
 const ENTRY_BYTES = 25;
 const NO_ENTRIES = new Int32Array(0);
+
+/** A delta's array sizes, for `deltaAppendBytes`. */
+interface DeltaShape {
+  readonly keys: number;
+  readonly keyCapacity: number;
+  readonly slots: number;
+  readonly entries: number;
+  readonly entryCapacity: number;
+  readonly arenaUsed: number;
+  readonly arena: number;
+}
+const FRESH_DELTA: DeltaShape = {
+  keys: 0,
+  keyCapacity: 16,
+  slots: 64,
+  entries: 0,
+  entryCapacity: 16,
+  arenaUsed: 0,
+  arena: 256,
+};
+
+/**
+ * The most a delta charges at once beyond its current arrays while it takes `keys` new keys,
+ * `entries` new entries and `keyBytes` key bytes. Each array grows by doubling (key arrays,
+ * slots, entry arrays, key arena), and a resize charges its new arrays before it frees the old
+ * ones. When several resize in one step, the peak is at most every array's growth to its final
+ * size plus the replaced arrays of one resize, at most half its final size: the largest of
+ * those halves is added.
+ */
+function deltaAppendBytes(shape: DeltaShape, keys: number, entries: number, keyBytes: number) {
+  let growth = 0,
+    overlap = 0;
+  const grow = (capacity: number, needed: number, unit: number) => {
+    if (needed <= capacity) return;
+    // A released delta's arrays are empty: it grows from one slot, never from zero.
+    let size = Math.max(1, capacity) * 2;
+    while (size < needed) size *= 2;
+    growth += (size - capacity) * unit;
+    overlap = Math.max(overlap, (size / 2) * unit);
+  };
+  grow(shape.keyCapacity, shape.keys + keys, 5 * 4);
+  grow(shape.slots, 2 * (shape.keys + keys), 4);
+  grow(shape.entryCapacity, shape.entries + entries, ENTRY_BYTES);
+  grow(shape.arena, shape.arenaUsed + keyBytes, 1);
+  return growth + overlap;
+}
+
+/** `KeyDelta.appendBytes` for a delta a new memtable creates (from its first key). */
+export function freshDeltaAppendBytes(keys: number, entries: number, keyBytes: number): number {
+  return deltaAppendBytes(FRESH_DELTA, keys, entries, keyBytes);
+}
 
 /** Six big-endian bytes, zero padded, fit exactly in a JS integer. Ties still compare bytes. */
 function orderPrefix(bytes: Uint8Array, start: number, end: number): number {
@@ -409,6 +462,25 @@ export class KeyDelta {
 
   /** Conservative pre-admission for distinct incoming key bytes, including resize overlap.
    * No arrays are allocated or changed; a freeze can make this estimate unnecessary. */
+  /** The most this delta charges at once beyond its arrays now while it takes `keys` new keys,
+   * `entries` new entries and `keyBytes` key bytes (`deltaAppendBytes`). */
+  appendBytes(keys: number, entries: number, keyBytes: number): number {
+    return deltaAppendBytes(
+      {
+        keys: this.keyCount,
+        keyCapacity: this.#hashes.length,
+        slots: this.#slots.length,
+        entries: this.entryCount,
+        entryCapacity: this.#rowIds.length,
+        arenaUsed: this.#arenaUsed,
+        arena: this.#arena.length,
+      },
+      keys,
+      entries,
+      keyBytes,
+    );
+  }
+
   appendKeyBytes(bytes: number): number {
     if (this.#arenaUsed + bytes <= this.#arena.length) return 0;
     let size = this.#arena.length * 2;

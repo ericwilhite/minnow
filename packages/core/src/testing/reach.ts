@@ -10763,6 +10763,7 @@ export const MODIFY_ROW_PROGRESS_REACH = [
   "table column in the row",
   "wide table column in the row",
   "beside another connection's read",
+  "must fit",
   "written",
 ] as const;
 
@@ -13765,7 +13766,6 @@ export const WIDE_INSERT_ADMISSION_REACH = [
   "wide table read back",
   "wide table read refused",
   "refused before waiting",
-  "memtable refusal",
   "written after a refusal",
   "three or more statements",
 ] as const;
@@ -13780,4 +13780,37 @@ export const SERVABLE_BESIDE_WRITER_REACH = [
   "served exactly",
   "one more byte refused",
   "refused once the writer settled",
+] as const;
+
+/** Insert steps' charge against their allocation (next/testing/memtable-charge-census.test.ts). */
+export const MEMTABLE_CHARGE_CENSUS_REACH = [
+  "insert",
+  "update",
+  "copy",
+  "allocating step",
+  "batch across a chunk",
+  "multi-MiB step",
+  "several columns growing",
+  "secondary index",
+  "integers widened in a live chunk",
+  "integers widened in a fresh chunk",
+  "no primary key",
+] as const;
+
+/** Keyed UPDATEs of wide values (next/testing/keyed-update-sizing.test.ts). */
+export const KEYED_UPDATE_SIZING_REACH = [
+  "written",
+  "refused typed",
+  "table holds wide values",
+  "update over 2 MiB",
+  "key by parameter",
+  "key by literal",
+] as const;
+
+/** Multi-row writes beside another connection's read (next/testing/multi-row-beside-read.test.ts). */
+export const MULTI_ROW_BESIDE_READ_REACH = [
+  "beside a held read",
+  "waited for the read",
+  "written at once",
+  "two-row memtables",
 ] as const;

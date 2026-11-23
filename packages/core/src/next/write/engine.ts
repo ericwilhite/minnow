@@ -163,6 +163,7 @@ import {
   type Grant,
   type LentHoldings,
   type Loan,
+  type WaitingHoldings,
 } from "../memory/governor.js";
 import { CommandMaintenance, waitCommandMaintenance } from "./command-wait.js";
 import { WriteCredits, WRITE_ROW_STEP_BYTES, type PreparedWriteCredit } from "./credits.js";
@@ -260,6 +261,7 @@ import {
   jsonBound,
   type EngineHooks,
   type PublishedRows,
+  type RowsWait,
 } from "./transaction.js";
 import { SnapshotImpl } from "./view.js";
 import { charged, need } from "./bytes.js";
@@ -605,6 +607,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
   readonly #published = new Set<Memtable>();
   readonly #governorCap: number;
   readonly #memtableRows: number;
+  /** Rows a new memtable takes (`EngineHooks.memtableRows`). */
+  get memtableRows(): number {
+    return this.#memtableRows;
+  }
   /** True while open replays the log (no flush runs before the appender exists). */
   #recovering = true;
   readonly #mergePolicy: MergePolicy;
@@ -689,6 +695,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
     stagedMemtablesDropped: 0,
     /** Stagings a rollback dropped; staged commits replayed at open. */
     stagingRollbacks: 0,
+    /** Write steps that waited in the governor for rows relief could not free (`#waitForRows`). */
+    rowWaits: 0,
     publishedReplays: 0,
     /** Recovery identity work; physical mappings exclude decoded per-effect vectors. */
     replayMappingBuilds: 0,
@@ -849,6 +857,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         this.#reclaimable();
       }),
       pinState: (state, label) => this.#pinState(state, label),
+      exclusiveStateBytes: (state) => this.#exclusiveStateBytes(state),
       runReader: (ref) => this.#runReader(ref),
       groupRoot: (ref, budget) => this.#metadata.groupRoot(ref, budget),
       bitmap: (ref, rowCount, budget) => this.#bitmap(ref, rowCount, budget),
@@ -2019,7 +2028,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const memtables = state.view.memtables.filter((memtable) => memtable !== created);
     // The emptied memtable leaves: its memory returns once no older reader can reach it.
     if (memtables.length !== state.view.memtables.length)
-      this.shared.readers.holdUntilOlderClose(() => created.releaseAll());
+      this.shared.readers.holdUntilOlderClose(
+        () => created.releaseAll(),
+        () => created.bytes,
+      );
     if (
       frozen !== null &&
       frozen.state === "frozen" &&
@@ -2030,13 +2042,17 @@ export class WritePathImpl implements WritePath, EngineHooks {
       !frozen.full
     )
       frozen.state = "live";
-    this.#setView(state, { ...state.view, memtables });
+    this.#withRollbackReserve(() => {
+      this.#setView(state, { ...state.view, memtables });
+    });
   }
 
   createTableState(def: TableDef | null, tableId: number): void {
     if (def === null) {
       this.#tables.delete(tableId);
-      this.#publishState();
+      this.#withRollbackReserve(() => {
+        this.#publishState();
+      });
       return;
     }
     this.#tables.set(tableId, {
@@ -2218,12 +2234,13 @@ export class WritePathImpl implements WritePath, EngineHooks {
     catalog = this.#holder?.catalog ?? this.#catalog,
     signal?: AbortSignal,
     includesProgress = false,
+    holdings?: () => WaitingHoldings,
   ): MaybePromise<void> {
     if (this.#minimumState !== this.#state || this.#minimumCatalog !== catalog) {
       const refreshed = this.#recalculateMinimum(catalog, signal);
       if (refreshed instanceof Promise)
         return this.#trackMinimum(
-          refreshed.then(() => this.#prepareMinimum(catalog, signal, includesProgress)),
+          refreshed.then(() => this.#prepareMinimum(catalog, signal, includesProgress, holdings)),
         );
     }
     const native = this.#nativeSteps.funding || this.#holder?.nativeCommands;
@@ -2231,9 +2248,45 @@ export class WritePathImpl implements WritePath, EngineHooks {
     // acquireMerge prepares the exact step again; active merge credit stays protected.
     if (native) this.#credits.reclaimNativeStep();
     const headroom = this.#metadataHeadroom(catalog);
+    // Provisional writer work settles before any metadata growth waits (governor rules 4/5/7:
+    // open work may not wait for more credit). When this step's metadata would have to wait to
+    // grow while a flush has its writer open, it waits for the running flushes (not the chain
+    // behind them, nor merges, whose idle publication waits for the writer turn), then prepares
+    // again.
+    const deficit = this.#credits.metadata.allocated + headroom - this.#credits.metadata.held;
+    const queued = this.#credits.queuedGrowth;
+    if (
+      !native &&
+      deficit > 0 &&
+      this.#flushing.size > 0 &&
+      // A flush waiting for its own credit is funding, its writer not open (rules 4/5/7): it may
+      // wait for memory this statement holds, so this step does not wait for it.
+      queued.ordinary + queued.progress === 0 &&
+      !(this.#credits.governor.canAdmitNow?.(deficit, false) ?? true)
+    ) {
+      // Until the flushes end, or one of them queues growth after all (an open flush whose
+      // publication meets pressure unwinds its writer and funds again): then this step stops
+      // waiting for it and prepares again, its growth bounded by the governor.
+      const listening: { unsubscribe?: () => void } = {};
+      const ended = new Promise<void>((resolve) => {
+        listening.unsubscribe = this.#credits.onQueuedGrowth(resolve);
+        void Promise.allSettled([...this.#flushing.values()]).then(() => {
+          resolve();
+        });
+      }).finally(() => {
+        listening.unsubscribe?.();
+      });
+      return this.#trackMinimum(
+        (signal === undefined ? ended : waitCommandMaintenance(ended, signal)).then(() =>
+          this.#prepareMinimum(catalog, signal, includesProgress, holdings),
+        ),
+      );
+    }
+    // A statement's step carries its statement's holdings: the governor refuses its growth
+    // (53200) when it could never be served beside them, the owner's queued growth included.
     const metadata = native
       ? this.#credits.prepareNativeMinimum(headroom, signal, includesProgress)
-      : this.#credits.prepareMetadata(headroom, signal);
+      : this.#credits.prepareMetadata(headroom, signal, false, holdings);
     if (metadata instanceof Promise)
       return this.#trackMinimum(
         metadata.then(() => {
@@ -2263,8 +2316,66 @@ export class WritePathImpl implements WritePath, EngineHooks {
           ? FTS_PUBLICATION_MINIMUM_BYTES
           : 0,
       ) +
-      newBuilds * PENDING_INDEX_BYTES
+      newBuilds * PENDING_INDEX_BYTES +
+      // A transaction's next rollback pin (`reserveRollback`) is taken from this step's headroom.
+      (this.#holder !== null && this.#rollbackSpare === 0 ? pinBytes(STATE_PIN) : 0)
     );
+  }
+
+  /**
+   * Metadata charged for the state pins a rollback's republications need: one per recorded
+   * undo that republishes (a memtable freeze, a table the transaction created, a table it
+   * staged), since a live snapshot may keep the pin each republication replaces. `#rollbackSpare`
+   * is funded before an action that may record such an undo (`reserveRollback`) and becomes that
+   * undo's pin when it is recorded (`assignRollback`); all are freed when the transaction ends.
+   * A rollback's republication spends one (`#withRollbackReserve`) and takes nothing back.
+   */
+  #rollbackSpare = 0;
+  #rollbackAssigned = 0;
+  /** Tables of the holder's staging that have a rollback pin. */
+  readonly #rollbackStaged = new Set<number>();
+
+  #chargeRollbackPin(): void {
+    const bytes = pinBytes(STATE_PIN);
+    try {
+      this.#chargeMetadata(bytes);
+    } catch (error) {
+      // Refused before the step that would need it: the typed memory refusal (53200).
+      if (error instanceof ParseBudgetError) throw new MemtableMemoryError(bytes);
+      throw error;
+    }
+  }
+
+  reserveRollback(): void {
+    if (this.#rollbackSpare > 0 || this.#holder === null) return;
+    this.#chargeRollbackPin();
+    this.#rollbackSpare = pinBytes(STATE_PIN);
+  }
+
+  assignRollback(): void {
+    if (this.#rollbackSpare === 0) return;
+    this.#rollbackSpare = 0;
+    this.#rollbackAssigned += 1;
+  }
+
+  /** Runs one republication of a rollback on a pin reserved for it. */
+  #withRollbackReserve(publish: () => void): void {
+    if (this.#rollbackAssigned > 0) {
+      this.#rollbackAssigned -= 1;
+      this.#chargeMetadata(-pinBytes(STATE_PIN));
+    } else if (this.#rollbackSpare > 0) {
+      this.#rollbackSpare = 0;
+      this.#chargeMetadata(-pinBytes(STATE_PIN));
+    }
+    publish();
+  }
+
+  #releaseRollbackPins(): void {
+    const pins = this.#rollbackAssigned + (this.#rollbackSpare > 0 ? 1 : 0);
+    this.#rollbackAssigned = 0;
+    this.#rollbackSpare = 0;
+    this.#rollbackStaged.clear();
+    if (pins > 0) this.#chargeMetadata(-pins * pinBytes(STATE_PIN));
   }
 
   #recalculateMinimum(catalog: Catalog, signal?: AbortSignal): MaybePromise<void> {
@@ -2585,17 +2696,20 @@ export class WritePathImpl implements WritePath, EngineHooks {
     // Older readers may still read its memtables (ruling 5): their memory goes when they close,
     // and after a flush of the table still writing them (it abandons at its publish).
     if (state !== undefined)
-      this.shared.readers.holdUntilOlderClose(() => {
-        const release = () => {
-          for (const memtable of state.view.memtables) memtable.releaseAll();
-          this.#chargeMetadata(-state.metadataBytes);
-          state.metadataBytes = 0;
-          this.#dropRunReaders([...state.view.runs.values()].flat());
-        };
-        const flushing = this.#flushing.get(state);
-        if (flushing === undefined) release();
-        else void flushing.then(release, release);
-      });
+      this.shared.readers.holdUntilOlderClose(
+        () => {
+          const release = () => {
+            for (const memtable of state.view.memtables) memtable.releaseAll();
+            this.#chargeMetadata(-state.metadataBytes);
+            state.metadataBytes = 0;
+            this.#dropRunReaders([...state.view.runs.values()].flat());
+          };
+          const flushing = this.#flushing.get(state);
+          if (flushing === undefined) release();
+          else void flushing.then(release, release);
+        },
+        () => this.#tableStateBytes(state),
+      );
   }
 
   /** The flush writing each table now, if any (a drop releases the table's memory after it). */
@@ -2641,6 +2755,17 @@ export class WritePathImpl implements WritePath, EngineHooks {
     for (const view of state.tables.values()) view.groups.retain();
   }
 
+  /** What releasing `state`'s only pin would free (`Shared.exclusiveStateBytes`). */
+  #exclusiveStateBytes(state: WriteState): number {
+    if (state === this.#state) return 0;
+    const held = this.#statePins.get(state);
+    if (held?.count !== 1) return 0;
+    const root = this.#roots.get(state.root);
+    let bytes = (held.pin.bytes ?? 0) + (root?.refs === 1 ? root.bytes : 0);
+    for (const view of state.tables.values()) bytes += view.groups.releaseBytes();
+    return bytes;
+  }
+
   /** The last holder of `state` is gone. */
   #releaseState(state: WriteState): void {
     for (const view of state.tables.values()) view.groups.release();
@@ -2667,11 +2792,61 @@ export class WritePathImpl implements WritePath, EngineHooks {
    * after relief so a small next batch never carries the old arena's resize estimate. Throws
    * `MemtableMemoryError` when nothing more can be freed.
    */
-  admit(bytes: number, growth?: () => number): MaybePromise<void> {
-    const prepared = this.#prepareMinimum();
-    return prepared instanceof Promise
-      ? this.#admitAfterMinimum(prepared, bytes, growth)
-      : this.#admitRows(bytes, growth);
+  admit(bytes: number, growth?: () => number, wait?: RowsWait): MaybePromise<void> {
+    const prepared = this.#prepareMinimum(undefined, wait?.signal, false, wait?.holdings);
+    const admitted =
+      prepared instanceof Promise
+        ? this.#admitAfterMinimum(prepared, bytes, growth)
+        : this.#admitRows(bytes, growth);
+    // Relief could not free enough: with the statement's holdings, wait for the rest in the
+    // governor rather than refuse (a finite holder, another connection's read, may hold it).
+    const holdings = wait?.holdings;
+    if (holdings === undefined || !(admitted instanceof Promise)) return admitted;
+    return admitted.catch((error: unknown) => {
+      if (!(error instanceof MemtableMemoryError)) throw error;
+      return this.#waitForRows(bytes, growth, holdings, wait?.signal);
+    });
+  }
+
+  /**
+   * Waits for the rows a step needs beyond what relief freed, as an ordinary admission carrying
+   * the statement's holdings: refused (53200, before the step's effect) when it could never be
+   * served beside them (GOVERNOR-WAIT-POLICY point 5), else served once finite holders release,
+   * and cancelled with the statement. Not holder growth: a reader's own growth (its read steps,
+   * the writer metadata it opens run readers with) is served before it, and a query waits for
+   * an admission holding nothing (rule 2), so no reader waits on it. Its credit then moves to
+   * the row account.
+   */
+  async #waitForRows(
+    bytes: number,
+    growth: (() => number) | undefined,
+    holdings: () => WaitingHoldings,
+    signal: AbortSignal | undefined,
+  ) {
+    const governor = this.#credits.governor;
+    this.maintenance.rowWaits += 1;
+    for (;;) {
+      signal?.throwIfAborted();
+      this.#check();
+      if (this.#headroom(bytes + (growth?.() ?? 0))) return;
+      const deficit = bytes + (growth?.() ?? 0) - (this.#grant.held - this.#grant.allocated);
+      const [credit] = await governor.admitGroup({
+        label: "write path memtable",
+        grants: [{ label: "write path memtable", minimumBytes: deficit, spillable: false }],
+        holdings,
+        ...(signal === undefined ? {} : { signal }),
+      });
+      try {
+        this.#check();
+        if (
+          credit === undefined ||
+          !governor.transferCredit(credit, this.#grant, credit.held - credit.allocated)
+        )
+          throw new Error("Admitted memtable credit was not transferred");
+      } finally {
+        credit?.close();
+      }
+    }
   }
 
   /** Root has retired producer/image borrows before this cancellable native prepayment.
@@ -2729,7 +2904,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
     if (free >= bytes || this.#grant.tryGrow(bytes - free)) return true;
     this.#arenaPool.clear();
     const reclaimed = this.#grant.held - this.#grant.allocated;
-    return reclaimed >= bytes || this.#grant.tryGrow(bytes - reclaimed);
+    if (reclaimed >= bytes || this.#grant.tryGrow(bytes - reclaimed)) return true;
+    // No free memory left: the owner's own idle commit and merge forecasts fund its rows
+    // (as `WriteCredits.growTo` does before a wait) rather than refusing beside them.
+    return this.#credits.fundFromIdle(this.#grant, this.#grant.allocated + bytes);
   }
 
   async #relieve(bytes: number, growth?: () => number, signal?: AbortSignal): Promise<void> {
@@ -2766,7 +2944,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#check();
       if (this.#headroom(bytes + (growth?.() ?? 0))) return;
     }
-    throw new MemtableMemoryError(bytes, Math.max(0, this.#grant.held - this.#grant.allocated));
+    // The whole charge the step asked: its base and its growth, recomputed as last tried.
+    throw new MemtableMemoryError(
+      bytes + (growth?.() ?? 0),
+      Math.max(0, this.#grant.held - this.#grant.allocated),
+    );
   }
 
   // ── Public API ───────────────────────────────────────────────────────────────────────────
@@ -2993,6 +3175,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#ftsPending.lsn === 0
     )
       this.#ftsUnclaimed = true;
+    this.#releaseRollbackPins();
     this.#holder = null;
     this.#credits.holderChain.transactionOpen = false;
     this.#reclaimable();
@@ -3061,12 +3244,27 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const credits = this.#credits;
     return {
       grants: credits.grants(),
-      retained: () =>
-        credits.retainedWhileOpen(
-          this.#rowsLifetimeBytes(),
-          this.#stayingRowBytes(),
-          this.#ownWorkIdle(),
-        ),
+      retained: () => {
+        const queued = credits.queuedGrowth;
+        if (queued.ordinary + queued.progress === 0)
+          return credits.retainedWhileOpen(
+            this.#rowsLifetimeBytes(),
+            this.#stayingRowBytes(),
+            this.#ownWorkIdle(),
+          );
+        // The owner's work waits in the governor for growth, served before the statement's
+        // requests: until it is served it frees nothing, and neither does the work that holds
+        // what it waits beside (a flush's frozen rows, a merge's inputs). Everything the owner
+        // holds stays, beyond its registered lifetime holding (which lies inside these grants and
+        // the caches, and `usableCapacity` already subtracts). Never too little: a request that
+        // other running work could have made room for may be refused, none waits forever.
+        let held = 0;
+        for (const grant of credits.grants()) held += grant.held;
+        const lifetimeInGrants =
+          this.#lifetimeBytes() - FIXED_CACHE_BYTES - this.#space.stats.permanentBytes;
+        return Math.max(0, held - lifetimeInGrants);
+      },
+      queued: () => credits.queuedGrowth,
     };
   }
 
@@ -4746,14 +4944,18 @@ export class WritePathImpl implements WritePath, EngineHooks {
       for (const memtable of flushed) this.#published.add(memtable);
       // Folded deletions stay for readers older than this publication, then go (with the pin).
       const folded = state.view.groupDeletes;
-      this.shared.readers.holdUntilOlderClose(() => {
-        folded.prune(through);
-        pin.release();
-        for (const memtable of flushed) {
-          memtable.releaseAll();
-          this.#published.delete(memtable);
-        }
-      });
+      this.shared.readers.holdUntilOlderClose(
+        () => {
+          folded.prune(through);
+          pin.release();
+          for (const memtable of flushed) {
+            memtable.releaseAll();
+            this.#published.delete(memtable);
+          }
+        },
+        // What stays charged after the publish below: borrowed chunks and the key deltas.
+        () => flushed.reduce((sum, memtable) => sum + memtable.bytes, 0),
+      );
       for (const memtable of set) {
         const entry = published.get(memtable);
         if (entry !== undefined)
@@ -4921,6 +5123,19 @@ export class WritePathImpl implements WritePath, EngineHooks {
     candidates: ReadonlyMap<TableState, readonly Memtable[]>,
     signal?: AbortSignal,
   ): Promise<void> {
+    // A table this staging adds is dropped by republishing if the transaction rolls back: its
+    // pin is reserved first.
+    try {
+      for (const state of candidates.keys())
+        if (this.#holder !== null && !this.#rollbackStaged.has(state.tableId)) {
+          this.#chargeRollbackPin();
+          this.#rollbackAssigned += 1;
+          this.#rollbackStaged.add(state.tableId);
+        }
+    } catch (error) {
+      // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors -- Preserve the refusal's identity (MemtableMemoryError).
+      return Promise.reject(error);
+    }
     return this.#trackStaging(
       this.#metadataAsync(() => this.#stageNow(candidates, signal), signal),
     );
@@ -5472,7 +5687,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
       if (staging === undefined) continue;
       state.stagings.delete(id);
       drops.push({ state, staging });
-      this.#discardStagedRows(state, staging.memtables);
+      this.#withRollbackReserve(() => {
+        this.#discardStagedRows(state, staging.memtables);
+      });
     }
     if (drops.length === 0) return;
     this.maintenance.stagingRollbacks += 1;
@@ -5536,9 +5753,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
       ...state.view,
       memtables: state.view.memtables.filter((memtable) => !gone.has(memtable)),
     });
-    this.shared.readers.holdUntilOlderClose(() => {
-      for (const memtable of gone) memtable.releaseAll();
-    });
+    this.shared.readers.holdUntilOlderClose(
+      () => {
+        for (const memtable of gone) memtable.releaseAll();
+      },
+      () => [...gone].reduce((sum, memtable) => sum + memtable.bytes, 0),
+    );
   }
 
   // ── Idle maintenance (ruling R10) ───────────────────────────────────────────────────────
@@ -6163,9 +6383,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#setView(state, { ...state.view, runs: viewRuns }, funding.budget);
       // Readers older than this publication may still read the inputs (their pins keep the
       // extents); the inputs' resident parts go once they close.
-      this.shared.readers.holdUntilOlderClose(() => {
-        this.#dropRunReaders(inputs);
-      });
+      this.shared.readers.holdUntilOlderClose(
+        () => {
+          this.#dropRunReaders(inputs);
+        },
+        () => this.#runReaderBytes(inputs),
+      );
       output.release(); // the published root now owns and accounts its boundary keys
       // The merge is complete. Retire its working credit before a future metadata/
       // merge forecast can wait behind a query that needs this very credit.
@@ -6208,6 +6431,23 @@ export class WritePathImpl implements WritePath, EngineHooks {
   }
 
   /** Forgets the resident parts of runs no view can reach any more, returning their charge. */
+  /** The resident bytes of `runs`' open readers (what `#dropRunReaders` returns). */
+  #runReaderBytes(runs: readonly RunRef[]): number {
+    let bytes = 0;
+    for (const run of runs) {
+      const reader = this.#runReaders.get(blobKey(run.entries));
+      if (reader !== undefined && !(reader instanceof Promise)) bytes += reader.bytes;
+    }
+    return bytes;
+  }
+
+  /** What a dropped table's state returns once its older readers close (its release above). */
+  #tableStateBytes(state: TableState): number {
+    let bytes = state.metadataBytes + this.#runReaderBytes([...state.view.runs.values()].flat());
+    for (const memtable of state.view.memtables) bytes += memtable.bytes;
+    return bytes;
+  }
+
   #dropRunReaders(runs: readonly RunRef[]): void {
     for (const run of runs) {
       const key = blobKey(run.entries);
@@ -6624,9 +6864,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
         if (index !== null && !kept.has(index.indexId)) {
           for (const run of index.runs) retired.push(runExtent(run));
           const runs = index.runs;
-          this.shared.readers.holdUntilOlderClose(() => {
-            this.#dropRunReaders(runs);
-          });
+          this.shared.readers.holdUntilOlderClose(
+            () => {
+              this.#dropRunReaders(runs);
+            },
+            () => this.#runReaderBytes(runs),
+          );
         }
     }
     // Tables the previous root had and this one lacks were dropped: retire everything they reach.
