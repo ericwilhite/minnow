@@ -141,8 +141,8 @@ accounting, not a guess about who might release.
   memtable rows that work will not publish count then, so the value is too large, never too
   small: nothing that could fit is refused.
 - While the writer's growth waits in the governor (a merge's credit, a flush's or merge's
-  metadata), that work frees nothing until it is served, so the writer's holdings count as
-  when it is idle. That growth is holder growth, served before every admission: when it cannot
+  metadata), that work frees nothing until it is served, and neither does the work whose
+  allocations it waits beside: everything the writer holds counts, beyond its lifetime holding. That growth is holder growth, served before every admission: when it cannot
   fit beside what the statement keeps, in its own capacity class (ordinary growth may not use
   the progress reserve), nothing the statement asks can be served either, and its value is 0
   (`LentHoldings.queued`).
@@ -183,9 +183,13 @@ its own idle commit and merge credit before relief. When relief cannot free enou
 waits for the rest as an ordinary admission carrying its statement's holdings
 (`Statement.waitHoldings`, registered by the executing query, and its cancellation): refused with
 53200 only when it could never be served beside them, otherwise served once another
-connection's finite holdings release, never refused part way. A transaction reserves, when it
-first records an undo that republishes the writer's state (a memtable freeze, a table it
-created), the one state pin that republication charges, so a rollback never needs memory.
+connection's finite holdings release, never refused part way. A transaction reserves one state
+pin for each undo it records that republishes the writer's state (a memtable freeze, a table it
+created, a table it staged), funded before the step that records it, so a rollback never needs
+memory, whatever snapshots keep the states it replaces. A step that would wait for a running
+flush before its metadata grows ends that wait when the flush queues growth of its own (it may
+need memory the statement holds) or the statement is cancelled; its metadata growth then
+carries the statement's holdings.
 
 The write path's memtable refusal (`MemtableMemoryError`) is internal: a statement's write call
 reports it as this same `MemoryAdmissionError` (label `write path memtable`, naming the whole
