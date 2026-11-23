@@ -2123,6 +2123,9 @@ export const READ_ONLY_SNAPSHOT_TIMING_REACH = [
   "point read first",
   "refused write first",
   "read only after the first statement",
+  "analysis error first",
+  "syntax error first",
+  "isolation fixed by a failed statement",
 ] as const;
 
 /** PG per-attribute mode transitions, statement attempts, savepoints and transaction cleanup. */

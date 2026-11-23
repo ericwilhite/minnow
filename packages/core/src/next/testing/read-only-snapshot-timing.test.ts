@@ -26,7 +26,25 @@ import { seedsFor } from "../../testing/seeds.js";
 import { StorageCore } from "./storage-core.js";
 
 type Entry = "begin read only" | "start transaction read only" | "set read only" | "switch after";
-type First = "scan" | "point" | "constant" | "refused write";
+type First =
+  | "scan"
+  | "point"
+  | "constant"
+  | "refused write"
+  | "unknown column"
+  | "unknown table"
+  | "type error"
+  | "syntax error";
+
+/** First statements that fail: the query and the SQLSTATE each gives. Analysis errors take the
+ * snapshot first (PostgreSQL); a syntax error fails in the raw parse, before it. */
+const FAILING: Partial<Record<First, { readonly sql: string; readonly state: string }>> = {
+  "unknown column": { sql: "SELECT missing_column FROM t", state: "42703" },
+  "unknown table": { sql: "SELECT * FROM missing_table", state: "42P01" },
+  // PostgreSQL: "CASE types boolean and integer cannot be matched" (checked in PGlite).
+  "type error": { sql: "SELECT CASE WHEN v = 1 THEN 1 ELSE true END FROM t", state: "42804" },
+  "syntax error": { sql: "SELEC v FROM t", state: "42601" },
+};
 type Control = "savepoint" | "show" | "set isolation" | "set read only";
 
 interface History {
@@ -36,6 +54,9 @@ interface History {
   /** Gaps where the other connection commits a row: 0 before BEGIN, 1 after the entry, then one
    * after each control statement, then after the first statement and after the second read. */
   readonly commits: readonly boolean[];
+  /** After a failing first statement: try to change the isolation level (25001 once the
+   * snapshot is taken). */
+  readonly isolation?: boolean;
 }
 
 async function open() {
@@ -86,6 +107,14 @@ async function run(history: History, reach?: ReturnType<typeof createReach>): Pr
     let gap = 0;
     let visible = 1;
     let taken = false;
+    let expected = 0;
+    // The statement that takes the snapshot fixes what every later one sees.
+    const take = () => {
+      if (taken) return;
+      taken = true;
+      expected = visible;
+    };
+    const isTaken = () => taken;
     // A read-write transaction holds the writer turn: the other connection commits only while
     // this one is read-only or outside a transaction.
     let writable = false;
@@ -130,16 +159,52 @@ async function run(history: History, reach?: ReturnType<typeof createReach>): Pr
       }
       await gapEnds();
     }
-    // The first statement takes the snapshot.
-    const expected = visible;
+    // The first statement takes the snapshot (unless it fails to parse).
+    const failing = FAILING[history.first];
     if (history.first === "scan") {
+      take();
       expect(await count(a), `${context}: the first read`).toBe(expected);
     } else if (history.first === "point") {
+      take();
       expect((await a.query("SELECT v FROM t WHERE id = 1")).rows(), context).toEqual([[1]]);
       reach?.reach("point read first");
     } else if (history.first === "constant") {
+      take();
       await a.query("SELECT 1");
+    } else if (failing !== undefined) {
+      // Inside a savepoint, so the transaction continues after ROLLBACK TO.
+      await a.query("SAVEPOINT w");
+      const state = await a.query(failing.sql).then(
+        () => null,
+        (error: unknown) => (error as { sqlState?: string }).sqlState ?? String(error),
+      );
+      expect(state, `${context}: ${failing.sql}`).toBe(failing.state);
+      await a.query("ROLLBACK TO w");
+      if (history.first !== "syntax error") {
+        take();
+        reach?.reach("analysis error first");
+      } else reach?.reach("syntax error first");
+      if (history.isolation === true && savepoints === 0) {
+        await a.query("RELEASE w");
+        const changed = await a.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED").then(
+          () => null,
+          (error: unknown) => (error as { sqlState?: string }).sqlState ?? String(error),
+        );
+        if (isTaken()) {
+          // PostgreSQL: "must be called before any query"; the error aborts the transaction.
+          expect(changed, `${context}: the failed statement fixed the isolation level`).toBe(
+            "25001",
+          );
+          reach?.reach("isolation fixed by a failed statement");
+          await a.query("ROLLBACK");
+          expect(await count(a), `${context}: every commit, after the transaction`).toBe(rows);
+          return;
+        }
+        expect(changed, `${context}: a syntax error fixes nothing`).toBeNull();
+        await a.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+      }
     } else {
+      take();
       // Refused as a write, inside a savepoint so the transaction continues.
       await a.query("SAVEPOINT w");
       const refused = await a.query("INSERT INTO t VALUES (1000, 0)").then(
@@ -153,13 +218,14 @@ async function run(history: History, reach?: ReturnType<typeof createReach>): Pr
       }
       await a.query("ROLLBACK TO w");
     }
-    taken = true;
     if (writable) {
       await a.query("SET TRANSACTION READ ONLY");
       writable = false;
-      reach?.reach("read only after the first statement");
+      if (isTaken()) reach?.reach("read only after the first statement");
     }
     await gapEnds();
+    // After a syntax error, this read takes the snapshot.
+    take();
     expect(await count(a), `${context}: a later read sees the first statement's snapshot`).toBe(
       expected,
     );
@@ -187,6 +253,32 @@ it("sees a row committed between BEGIN READ ONLY and the first SELECT", async ()
   }
 }, 30_000);
 
+it("keeps the snapshot a first statement took although its analysis failed", async () => {
+  // Astra's repro (review of #59): BEGIN READ ONLY; SAVEPOINT s; SELECT missing_column FROM t
+  // (42703); another connection commits; ROLLBACK TO s; SELECT count(*) sees 1, as in PostgreSQL.
+  const { connect, close } = await open();
+  try {
+    const a = await connect();
+    const b = await connect();
+    await a.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    await a.query("SAVEPOINT s");
+    await expect(a.query("SELECT missing_column FROM t")).rejects.toMatchObject({
+      sqlState: "42703",
+    });
+    await b.query("INSERT INTO t VALUES (2, 2)");
+    await a.query("ROLLBACK TO s");
+    expect(await count(a), "the failed statement's snapshot").toBe(1);
+    await a.query("RELEASE s");
+    await expect(
+      a.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"),
+      "the failed statement fixed the isolation level",
+    ).rejects.toMatchObject({ sqlState: "25001" });
+    await a.query("ROLLBACK");
+  } finally {
+    await close();
+  }
+}, 30_000);
+
 it("keeps the snapshot a refused write took, through ROLLBACK TO", async () => {
   await run({
     entry: "begin read only",
@@ -202,7 +294,16 @@ const entry = fc.constantFrom<Entry>(
   "set read only",
   "switch after",
 );
-const first = fc.constantFrom<First>("scan", "point", "constant", "refused write");
+const first = fc.constantFrom<First>(
+  "scan",
+  "point",
+  "constant",
+  "refused write",
+  "unknown column",
+  "unknown table",
+  "type error",
+  "syntax error",
+);
 const control = fc.constantFrom<Control>("savepoint", "show", "set isolation", "set read only");
 
 for (const seed of seedsFor("next-read-only-snapshot-timing", [0x6101, 0x6102]))
@@ -214,12 +315,40 @@ for (const seed of seedsFor("next-read-only-snapshot-timing", [0x6101, 0x6102]))
         fc.array(control, { maxLength: 3 }),
         first,
         fc.array(fc.boolean(), { minLength: 7, maxLength: 7 }),
-        async (entry, controls, first, commits) => {
+        fc.boolean(),
+        async (entry, controls, first, commits, isolation) => {
           reach.beginHistory();
-          await run({ entry, controls, first, commits }, reach);
+          await run({ entry, controls, first, commits, isolation }, reach);
         },
       ),
-      { seed, numRuns: 30 },
+      {
+        seed,
+        numRuns: 40,
+        examples: [
+          // Astra's review of #59: the failed first statement fixed the snapshot.
+          [
+            "begin read only",
+            ["savepoint"],
+            "unknown column",
+            [false, false, false, true, false, false, false],
+            false,
+          ],
+          [
+            "begin read only",
+            [],
+            "type error",
+            [false, false, false, false, false, false, false],
+            true,
+          ],
+          [
+            "begin read only",
+            [],
+            "syntax error",
+            [false, true, false, true, false, false, false],
+            true,
+          ],
+        ],
+      },
     );
     reach.assertReached();
   }, 300_000);

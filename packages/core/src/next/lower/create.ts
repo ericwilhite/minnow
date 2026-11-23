@@ -615,6 +615,11 @@ function lowerStatement(text: string, context: LoweringContext): LoweredStatemen
   }
 }
 
+/** The leading keyword of a statement that takes a snapshot (when the front end refuses it
+ * before it can say which kind it is): a query, a data statement or a schema change. */
+const SNAPSHOT_KEYWORD =
+  /^\s*(?:\(|(?:SELECT|WITH|VALUES|TABLE|INSERT|UPDATE|DELETE|MERGE|TRUNCATE|CREATE|ALTER|DROP|COMMENT|EXPLAIN)\b)/iu;
+
 export function createLowerer(): Lowerer {
   return {
     lower(text: string, context: LoweringContext): LoweredStatement {
@@ -624,6 +629,23 @@ export function createLowerer(): Lowerer {
       } catch (error) {
         throw frontEndError(error);
       }
+    },
+
+    takesSnapshot(text: string): boolean {
+      const ctasData = ctasDataClause(text);
+      let parsed: ReturnType<typeof parseAny>;
+      try {
+        parsed = parseAny(ctasData === null ? text : text.slice(0, ctasData.index));
+      } catch (error) {
+        // A syntax error fails before any snapshot. The front end also refuses at parse some
+        // statements PostgreSQL refuses in analysis (after its snapshot): those keep their kind.
+        const refused = frontEndError(error);
+        if (refused instanceof PlanningError && refused.sqlState === "42601") return false;
+        return SNAPSHOT_KEYWORD.test(text);
+      }
+      if ("query" in parsed) return true;
+      const kind = classifyStatement(parsed.statement).kind;
+      return kind === "query" || kind === "modify" || kind === "ddl";
     },
 
     lowerWrite(shape: WriteShape, context: LoweringContext): LoweredModify {

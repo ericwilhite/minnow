@@ -447,6 +447,11 @@ class ComposedEngine implements CatalogOwnerEngine {
   }
 
   /** Public lowering results/markers use normalized keys; raw constants use full text only. */
+  /** Whether the statement takes a transaction's snapshot before analysis (`Lowerer`). */
+  takesSnapshot(text: string): boolean {
+    return this.#options.planner.takesSnapshot?.(text) ?? false;
+  }
+
   plan(text: string, catalog: CatalogView = this.#options.writePath.catalog): PlannedStatement {
     const context = this.#context(catalog);
     const prefix = `${String(catalog.version)}\u0000${JSON.stringify(context.parameterTypes ?? [])}\u0000`;
@@ -722,6 +727,8 @@ class ComposedSession implements EngineSession {
   #statements = 0;
   /** The statement (`#statements`) whose start pinned the read-only transaction's snapshot. */
   #pinnedBy: number | null = null;
+  /** The planned statement whose planning pinned it, until that statement starts (`#guard`). */
+  #pinnedAtPlan: PlannedStatement | null = null;
   #hasWrites = false;
   readonly #sequenceAccess: SequenceAccess;
   #tx: WriteTransaction | null = null;
@@ -787,6 +794,23 @@ class ComposedSession implements EngineSession {
   }
 
   plan(text: string): PlannedStatement {
+    // PostgreSQL takes the transaction's snapshot before analysis: a first statement whose
+    // analysis then fails (an unknown column) has still fixed it, and with it the isolation level
+    // (25001 after). The statement that planned owns a read-only pin taken here (`#guard`).
+    let pinned = false;
+    if (this.#state === "open" && !this.#snapshotTaken && this.#engine.takesSnapshot(text)) {
+      this.#snapshotTaken = true;
+      if (this.#modes.readOnly && this.#tx === null && this.#readPin === null) {
+        this.#transactionPin();
+        pinned = true;
+      }
+    }
+    const planned = this.#plan(text);
+    if (pinned) this.#pinnedAtPlan = planned;
+    return planned;
+  }
+
+  #plan(text: string): PlannedStatement {
     const catalog = this.#catalog();
     // A transaction whose DDL moved its catalog past the committed one plans privately: another
     // transaction could reach the same version number with different contents.
@@ -932,6 +956,7 @@ class ComposedSession implements EngineSession {
     this.#readPin?.release();
     this.#readPin = null;
     this.#pinnedBy = null;
+    this.#pinnedAtPlan = null;
     this.#modes = { ...DEFAULT_TRANSACTION_MODES };
     this.#snapshotTaken = false;
     this.#hasWrites = false;
@@ -962,11 +987,14 @@ class ComposedSession implements EngineSession {
     ) {
       this.#snapshotTaken = true;
       this.#statements++;
-      if (this.#modes.readOnly && this.#tx === null && this.#readPin === null) {
-        this.#transactionPin();
-        this.#pinnedBy = this.#statements;
+      if (this.#modes.readOnly && this.#tx === null) {
+        if (this.#readPin === null) {
+          this.#transactionPin();
+          this.#pinnedBy = this.#statements;
+        } else if (this.#pinnedAtPlan === statement) this.#pinnedBy = this.#statements;
       }
     }
+    this.#pinnedAtPlan = null;
     const locking = lowered.rowLocking;
     if (this.#modes.readOnly && lowered.kind === "query" && locking !== "none")
       return new ReadOnlyTransactionError(ROW_LOCK_COMMANDS[locking]);

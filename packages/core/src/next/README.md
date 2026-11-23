@@ -3363,10 +3363,13 @@ not require a home cache directory.
   oldest unused across caches, before growth is refused or an operator spills.
 - SQL `BEGIN` / `START TRANSACTION` and `SET TRANSACTION` apply lowering's typed modes.
   READ ONLY starts with no writer slot and no snapshot: its first query or data statement pins
-  one (`#guard`, `#transactionPin`), even a write it refuses, as PostgreSQL takes the
-  transaction snapshot "as of the start of the first non-transaction-control statement"
-  (Transaction Isolation, 13.2). A row committed between BEGIN and that statement is seen;
-  BEGIN, SAVEPOINT, RELEASE, ROLLBACK TO, SET TRANSACTION and SHOW take none. Switching to READ
+  one, as PostgreSQL takes the transaction snapshot "as of the start of the first
+  non-transaction-control statement" (Transaction Isolation, 13.2). It is taken before
+  analysis (`plan`, `Lowerer.takesSnapshot`, as PostgreSQL's `analyze_requires_snapshot`), so a
+  statement that then fails analysis has taken it, and with it the isolation level (25001
+  after); a statement that does not parse has not. A write it refuses takes it too (`#guard`).
+  A row committed between BEGIN and that statement is seen; BEGIN, SAVEPOINT, RELEASE, ROLLBACK
+  TO, SET TRANSACTION and SHOW take none. Switching to READ
   ONLY pins at the switch only once a statement ran (the writer turn kept anything from
   committing since). The statement clock (`now()`) stays the transaction's start, BEGIN, as in
   PostgreSQL. Switching to it after writes
