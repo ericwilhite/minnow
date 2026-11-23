@@ -1495,12 +1495,20 @@ export class RunReader {
       if (bytes === null) missing = true;
     }
     if (!missing) {
-      for (const bytes of blocks) searchBlock(need(bytes), key, out);
+      for (let k = 0; k < blocks.length; k++) {
+        const bytes = need(blocks[k]);
+        validateCached(space, need(this.#blocks[first + k]), bytes);
+        searchBlock(bytes, key, out, true);
+      }
       return;
     }
     return space.read(this.#blocks.slice(first, end), { budget }).then((lease) => {
       try {
-        for (const bytes of lease.bytes) searchBlock(bytes, key, out);
+        for (let k = 0; k < lease.bytes.length; k++) {
+          const bytes = need(lease.bytes[k]);
+          validateCached(space, need(this.#blocks[first + k]), bytes);
+          searchBlock(bytes, key, out, true);
+        }
       } finally {
         lease.release();
       }
@@ -1588,7 +1596,8 @@ export class RunReader {
         };
       }
       try {
-        if (forEachEntry(bytes, visit)) return;
+        validateCached(space, ref, bytes);
+        if (forEachEntry(bytes, visit, true)) return;
       } finally {
         release?.();
       }
@@ -1641,6 +1650,31 @@ function rowIdAt(view: DataView, at: number): number {
   return view.getUint32(at, true) + view.getUint16(at + 4, true) * 2 ** 32;
 }
 
+/**
+ * The mark a run lookup leaves on a block's page cache entry once it has validated those bytes
+ * (storage/extents.ts `ExtentReader.attach`, as page/reader.ts `#parse` does for a page): the
+ * entry's bytes are checksum-verified when read and never written again (storage/verify-cached.ts),
+ * so a lookup that finds the mark on the same bytes skips the walk over every entry. The mark is
+ * dropped with the entry; a block read again after eviction is validated again. Only bytes the
+ * space itself owns carry one: `attach` refuses any other array (a one-pass read's private copy),
+ * and a caller-owned buffer (`blockEntries`) is always validated.
+ */
+class ValidatedBlock {
+  constructor(readonly bytes: Uint8Array) {}
+}
+/** The mark's own size, charged by the space with the entry. */
+const VALIDATED_BLOCK_BYTES = OBJECT_OVERHEAD_BYTES;
+
+/** Validates `block`, the bytes `space` returned for `ref`, once per cache residency. */
+function validateCached(space: SpaceReader, ref: BlobRef, block: Uint8Array): void {
+  const mark = space.parsed?.(ref) ?? null;
+  if (mark instanceof ValidatedBlock && mark.bytes === block) return;
+  if (block.length < 2) throw new StoreCorruptionError("Run block is truncated");
+  const view = new DataView(block.buffer, block.byteOffset, block.byteLength);
+  validateBlock(block, view, view.getUint16(0, true));
+  if (mark === null) space.attach?.(ref, new ValidatedBlock(block), VALIDATED_BLOCK_BYTES, block);
+}
+
 function validateBlock(block: Uint8Array, view: DataView, count: number): void {
   if (count < 1 || 2 + 2 * count > block.length || block.length > BLOCK_BYTES + 2)
     throw new StoreCorruptionError("Run block offsets are invalid");
@@ -1666,12 +1700,12 @@ function validateBlock(block: Uint8Array, view: DataView, count: number): void {
   if (end !== block.length) throw new StoreCorruptionError("Run block has trailing bytes");
 }
 
-/** Appends the entries of `key` in `block` to `out`. */
-function searchBlock(block: Uint8Array, key: Uint8Array, out: RunEntry[]): void {
+/** Appends the entries of `key` in `block` to `out`. `validated`: the caller validated it. */
+function searchBlock(block: Uint8Array, key: Uint8Array, out: RunEntry[], validated = false): void {
   if (block.length < 2) throw new StoreCorruptionError("Run block is truncated");
   const view = new DataView(block.buffer, block.byteOffset, block.byteLength);
   const count = view.getUint16(0, true);
-  validateBlock(block, view, count);
+  if (!validated) validateBlock(block, view, count);
   let lo = 0;
   let hi = count;
   while (lo < hi) {
@@ -1702,11 +1736,12 @@ export function blockEntries(
 function forEachEntry(
   block: Uint8Array,
   visit: (key: Uint8Array, rowId: number, tombstone: boolean) => boolean,
+  validated = false,
 ): boolean {
   if (block.length < 2) throw new StoreCorruptionError("Run block is truncated");
   const view = new DataView(block.buffer, block.byteOffset, block.byteLength);
   const count = view.getUint16(0, true);
-  validateBlock(block, view, count);
+  if (!validated) validateBlock(block, view, count);
   for (let k = 0; k < count; k++) {
     const { keyStart, keyEnd } = locate(block, view, k);
     const tombstone = ((block[keyEnd + 6] ?? 0) & 1) === 1;

@@ -699,6 +699,8 @@ export class TableScan implements BatchSource {
                 pages: this.#options.pages,
                 budget: this.#memory,
                 signal: this.#readAbort.signal,
+                // A non-retaining source borrows cached metadata and admits none (as its groups do).
+                ...(this.#options.directoryOnce === true ? { once: true } : {}),
               },
               targetBytes: this.#target,
             }
@@ -1568,7 +1570,7 @@ export class TableScan implements BatchSource {
    */
   abort(): void {
     this.#aborted = true;
-    this.#readAbort.abort();
+    this.#readAbort.abort(SCAN_ABORTED);
     for (const wake of this.#ownedWaiters) wake();
     this.#ownedWaiters.clear();
     this.#release();
@@ -1584,6 +1586,13 @@ export class TableScan implements BatchSource {
     if (!this.#suspended) this.#repay();
   }
 }
+
+/**
+ * The reason a scan's own reads are cancelled with when it is aborted or closed. One shared
+ * `AbortError`: a point fetch opens and closes a scan per row (ON CONFLICT DO UPDATE), and a
+ * reasonless `abort()` builds a new DOMException, with its stack, every time.
+ */
+const SCAN_ABORTED = new DOMException("The table scan was aborted", "AbortError");
 
 function rowsIn(spec: DecodeSpec): number {
   return "from" in spec ? spec.to - spec.from : spec.count;

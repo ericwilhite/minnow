@@ -285,6 +285,9 @@ export interface MemoryReadContext {
   readonly budget: ByteBudget;
   readonly pages: SpaceReader;
   readonly signal: AbortSignal;
+  /** A one-pass read (exec/table-scan.ts `directoryOnce`): it borrows cached metadata and admits
+   * none of what it parses (page/reader.ts `ChunkReadOptions.once`). */
+  readonly once?: boolean;
 }
 
 export interface MemoryReadRequest {
