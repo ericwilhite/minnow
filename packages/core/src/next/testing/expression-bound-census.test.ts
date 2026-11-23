@@ -102,7 +102,8 @@ for (const seed of seedsFor("next-expression-bound-census", [0x6001, 0x6002]))
           fc.integer({ min: 1, max: 38 }).chain((precision) =>
             fc.tuple(
               fc.constant(precision),
-              fc.integer({ min: 0, max: precision }),
+              // Scale above precision too (PostgreSQL 15+): `NUMERIC(2, 5)` holds -0.00099.
+              fc.integer({ min: 0, max: Math.min(38, precision + 10) }),
               fc.array(fc.integer({ min: 0, max: 9 }), {
                 minLength: precision,
                 maxLength: precision,
@@ -112,8 +113,10 @@ for (const seed of seedsFor("next-expression-bound-census", [0x6001, 0x6002]))
           ),
           async ([precision, scale, digits, negative]) => {
             reach.beginHistory();
-            const whole = digits.slice(0, precision - scale).join("") || "0";
-            const fraction = digits.slice(precision - scale).join("");
+            const wholeDigits = Math.max(0, precision - scale);
+            const whole = digits.slice(0, wholeDigits).join("") || "0";
+            const fraction =
+              "0".repeat(Math.max(0, scale - precision)) + digits.slice(wholeDigits).join("");
             const value = `${negative ? "-" : ""}${whole}${fraction === "" ? "" : `.${fraction}`}`;
             const name = `n${String(++table)}`;
             await core.execute(
@@ -123,7 +126,13 @@ for (const seed of seedsFor("next-expression-bound-census", [0x6001, 0x6002]))
             const sql = `SELECT CAST(v AS TEXT) FROM ${name}`;
             const { bound, values } = await census(core, sql);
             within(sql, bound, values);
-            reach.reach(scale === precision ? "numeric below one" : "numeric with a whole part");
+            reach.reach(
+              scale > precision
+                ? "scale above precision"
+                : scale === precision
+                  ? "numeric below one"
+                  : "numeric with a whole part",
+            );
             if (negative) reach.reach("negative numeric");
           },
         ),
@@ -134,6 +143,8 @@ for (const seed of seedsFor("next-expression-bound-census", [0x6001, 0x6002]))
             [[5, 5, [1, 2, 3, 4, 5], true]],
             [[38, 10, Array.from({ length: 38 }, () => 9), true]],
             [[1, 0, [0], false]],
+            // Astra's case (review of #58): 7 bytes, bounded at 8.
+            [[2, 5, [9, 9], true]],
           ],
         },
       );

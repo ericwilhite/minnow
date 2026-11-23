@@ -13820,4 +13820,5 @@ export const EXPRESSION_BOUND_CENSUS_REACH = [
   "numeric below one",
   "numeric with a whole part",
   "negative numeric",
+  "scale above precision",
 ] as const;
