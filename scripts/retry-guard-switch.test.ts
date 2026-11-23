@@ -52,6 +52,8 @@ describe("the retry guard's switch", () => {
 describe("a guarded loop", () => {
   it("throws on the round past the limit, and only then", () => {
     const guard = retryGuard("a loop", 3);
+    // The first round starts the loop's epoch; the next three are retries within it.
+    guard.retry();
     guard.retry();
     guard.retry();
     guard.retry();
@@ -90,6 +92,29 @@ describe("a guarded loop", () => {
     expect(() => {
       again.round(2);
     }).toThrow(/again: 3 retries without progress/);
+  });
+
+  it("counts only rounds that did not yield to a macrotask", async () => {
+    // Microtask rounds: the macrotask epoch stands still, so they count and the guard trips.
+    const spinning = retryGuard("microtasks", 64);
+    const spin = async () => {
+      for (let round = 0; round < 100; round++) {
+        await Promise.resolve();
+        spinning.retry();
+      }
+    };
+    await expect(spin(), "a microtask spin trips").rejects.toThrow(RetrySpinError);
+    // Timer rounds: each lets a macrotask run, so none counts, however many.
+    const waiting = retryGuard("timers", 64);
+    const wait = async () => {
+      for (let round = 0; round < 100; round++) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        waiting.retry();
+        waiting.round(0);
+      }
+      return "finished";
+    };
+    expect(await wait(), "rounds that yield to a timer never count").toBe("finished");
   });
 
   it("never throws when off", () => {

@@ -67,8 +67,9 @@ The stall guard needs the event loop to run. A loop that asks for memory, finds 
 again without ever giving the event loop a turn would hang with no timer able to report it. Every
 Vitest suite and every browser lane therefore runs with a retry guard (`MINNOW_RETRY_GUARD=64`,
 set in `vitest.config.ts`; `globalThis.__MINNOW_RETRY_GUARD__` in the browser builds). Each
-memory retry loop in the 1.0 engine counts the rounds it goes without the progress it waits for,
-and past 64 it fails with a `RetrySpinError` that names the loop.
+memory retry loop in the 1.0 engine counts the rounds it goes without the progress it waits for
+and without yielding to the event loop (a round after a timer or I/O does not count: the stall
+guard covers those), and past 64 it fails with a `RetrySpinError` that names the loop.
 
 Install the browser binaries once before using a browser runner:
 

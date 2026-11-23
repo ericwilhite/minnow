@@ -4,7 +4,7 @@
  * estimate must not leave its unused high-water holdings blocking merges or resident metadata.
  */
 import { yieldTask } from "../exec/pipeline.js";
-import { checkRetries } from "../memory/retry-guard.js";
+import { checkRetries, macrotaskEpoch } from "../memory/retry-guard.js";
 import type { MaybePromise } from "../access/key-index.js";
 import { ParseBudgetError } from "../format/manifest-codec.js";
 import type { Grant } from "../memory/governor.js";
@@ -123,6 +123,7 @@ export class MetadataBudget implements ByteBudget {
     funded = 0,
     rounds = 0,
     reached = 0,
+    epoch = -1,
   ): MaybePromise<T> {
     const refused = (error: unknown): MaybePromise<T> => {
       if (!(error instanceof MetadataPressure)) throw error;
@@ -137,8 +138,10 @@ export class MetadataBudget implements ByteBudget {
         // Progress: the credit this work's funding has reached (a grant above every earlier
         // retry's). Only retries funded no further count toward the retry guard; asking for more
         // is not progress when nothing more arrives.
+        // A retry after a macrotask (the wait ran a timer or I/O) is not a microtask spin.
         const held = this.grant.held;
-        const next = held > reached ? 0 : rounds + 1;
+        const now = macrotaskEpoch();
+        const next = held > reached || now !== epoch ? 0 : rounds + 1;
         checkRetries(`metadata ${this.grant.label}`, next);
         // The credit was grown for this attempt: reclaim keeps it until the attempt settles.
         // An attempt awaits (a lock, a writer) before it allocates; without this a queued
@@ -150,7 +153,7 @@ export class MetadataBudget implements ByteBudget {
         };
         let result: MaybePromise<T>;
         try {
-          result = this.retry(work, check, grow, target, next, Math.max(reached, held));
+          result = this.retry(work, check, grow, target, next, Math.max(reached, held), now);
         } catch (error) {
           settle();
           throw error;

@@ -209,10 +209,12 @@ unattributed remainder, which is zero unless the accounting is broken.
 
 A loop that never yields is invisible to that timer. In test builds (`MINNOW_RETRY_GUARD`, set for
 every Vitest suite and browser lane; `memory/retry-guard.ts`) each memory retry loop counts its
-rounds without progress and throws `RetrySpinError` past the limit (64). Where a loop can measure
-its progress (credit funded, a requested size), a round that raises it above every earlier one
-starts the count again (`RetryGuard.round`): a long wait that keeps getting closer never trips
-it. `RetrySpinError` is an invariant failure: no handler retries or recovers from it, and a
+rounds without progress and throws `RetrySpinError` past the limit (64). It is for loops that
+spin in microtasks, which the timer-based stall guard cannot see: a round counts only if no
+macrotask (a timer, I/O) ran since the loop's previous round (`macrotaskEpoch`, advanced by a
+timer the guard arms), so a loop that waits on real work is left to the stall guard. Where a
+loop can measure its progress (credit funded, a requested size), a round that raises it above
+every earlier one starts the count again (`RetryGuard.round`). `RetrySpinError` is an invariant failure: no handler retries or recovers from it, and a
 background merge that meets one fails the write path with it. The guarded loops:
 
 - the governor's drain (a round that serves, refuses and withdraws nothing);

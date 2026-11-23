@@ -6,7 +6,8 @@
  * stall check, a test's timeout) ever runs again. A write step waiting for rows did, at a 40 MiB
  * cap, until `WriteCredits.holdRowsWhileWaiting`: reclaim for its own admission returned the rows
  * it already held. Each guarded loop counts the rounds it goes without the progress it waits for
- * (a round that advances it starts the count again); past the limit it throws `RetrySpinError`,
+ * and without yielding to a macrotask (a round that advances its progress, or that follows a
+ * timer or I/O, starts the count again); past the limit it throws `RetrySpinError`,
  * so any such loop in any suite fails loudly instead of hanging. `RetrySpinError` is an
  * invariant failure: no handler retries or recovers from it (the write path fails with it).
  *
@@ -42,15 +43,39 @@ export class RetrySpinError extends Error {
   }
 }
 
+/**
+ * The macrotask epoch: advanced by a timer the guard arms whenever a round is counted, so it
+ * moves only once the event loop has run a macrotask (a timer, I/O) since. A loop that spins in
+ * microtasks never lets that timer run: its epoch stands still. A round in a loop whose epoch has
+ * moved since its previous round yielded to a macrotask, where test timeouts and the governor's
+ * stall guard already see it, so it does not count. One timer at a time, only while the guard is
+ * on (test builds).
+ */
+let epoch = 0;
+let armed = false;
+
+/** The current macrotask epoch, arming the timer that advances it (see `epoch`). */
+export function macrotaskEpoch(): number {
+  if (!armed) {
+    armed = true;
+    setTimeout(() => {
+      armed = false;
+      epoch++;
+    }, 0);
+  }
+  return epoch;
+}
+
 /** Counts one loop's rounds without progress. */
 export interface RetryGuard {
   /** One more round without the progress the loop waits for (a loop with no measure of its
-   * progress: each round needs another owner's change, so every round counts). */
+   * progress counts every round that did not yield to a macrotask). */
   retry(): void;
   /**
    * One more round, measured: `progress` is a quantity that rises as the loop gets closer to
    * done (credit funded, a requested size). A round that raises it above every earlier one
-   * starts the count again; only rounds without progress count toward the limit.
+   * starts the count again; only rounds without progress, and without a macrotask since the
+   * previous round, count toward the limit.
    */
   round(progress: number): void;
 }
@@ -62,7 +87,15 @@ export function retryGuard(label: string, limit = RETRY_GUARD_LIMIT): RetryGuard
   if (limit === null) return OFF;
   let rounds = 0;
   let best = -Infinity;
+  let seen = -1;
   const retry = () => {
+    const now = macrotaskEpoch();
+    if (now !== seen) {
+      // A macrotask ran since the previous round (or this is the first): not a microtask spin.
+      seen = now;
+      rounds = 0;
+      return;
+    }
     rounds++;
     if (rounds > limit) throw new RetrySpinError(label, rounds);
   };
@@ -72,6 +105,7 @@ export function retryGuard(label: string, limit = RETRY_GUARD_LIMIT): RetryGuard
       if (progress > best) {
         best = progress;
         rounds = 0;
+        seen = macrotaskEpoch();
         return;
       }
       retry();
@@ -79,8 +113,8 @@ export function retryGuard(label: string, limit = RETRY_GUARD_LIMIT): RetryGuard
   };
 }
 
-/** For a loop written as recursion: throws when `rounds` (counted by the caller, without
- * progress) passes it. */
+/** For a loop written as recursion: throws when `rounds` (counted by the caller: rounds without
+ * progress in one macrotask epoch, `macrotaskEpoch`) passes it. */
 export function checkRetries(label: string, rounds: number, limit = RETRY_GUARD_LIMIT): void {
   if (limit !== null && rounds > limit) throw new RetrySpinError(label, rounds);
 }
