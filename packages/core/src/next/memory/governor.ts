@@ -218,12 +218,23 @@ interface Request {
   readonly parts: NativeGrantGroupOptions["grants"] | null;
 }
 
+/** A growth observer (Governor.observeGrowth) tried to change grant or governor state. */
+export class GrowthObserverReentryError extends Error {
+  readonly code = "MINNOW_GROWTH_OBSERVER_REENTRY";
+  constructor() {
+    super("A growth observer may only read: it called a grant or governor mutator");
+    this.name = "GrowthObserverReentryError";
+  }
+}
+
 class GrantImpl implements Grant {
   group: readonly GrantImpl[] | null = null;
   /** A grant carved from held credit returns its bytes there while that credit is open. */
   parent: GrantImpl | null = null;
   /** Called after this grant's holdings grow (Governor.observeGrowth). */
   grown: (() => void) | null = null;
+  /** Holdings grew during the current operation; the observer runs once it completes. */
+  pendingGrowth = false;
   held = 0;
   allocated = 0;
   loan = 0;
@@ -238,29 +249,47 @@ class GrantImpl implements Grant {
   ) {}
 
   allocate(bytes: number): boolean {
+    this.governor.assertMutable();
     if (this.closed || this.governor.isIdleCredit(this)) return false;
     const shortfall = this.allocated + bytes - this.held;
-    if (shortfall > 0 && !this.tryGrow(shortfall)) return false;
+    if (shortfall > 0 && !this.#grow(shortfall)) return false;
     this.allocated += bytes;
+    this.settleGrowth();
     return true;
   }
 
+  /** Runs the growth observer once, after a complete operation grew this grant. */
+  settleGrowth(): void {
+    if (!this.pendingGrowth) return;
+    this.pendingGrowth = false;
+    this.governor.notifyGrowth(this);
+  }
+
   free(bytes: number): void {
+    this.governor.assertMutable();
     if (this.closed) return;
     if (bytes > this.allocated) throw new RangeError(`${this.label} freed more than it allocated`);
     this.allocated -= bytes;
   }
 
   tryGrow(bytes: number): boolean {
+    this.governor.assertMutable();
+    const grew = this.#grow(bytes);
+    this.settleGrowth();
+    return grew;
+  }
+  #grow(bytes: number): boolean {
     if (this.closed || !this.spillable || this.governor.isIdleCredit(this)) return false;
     return this.governor.grow(this, bytes);
   }
 
   makeRoom(bytes: number, signal?: AbortSignal): Promise<boolean> {
+    this.governor.assertMutable();
     return this.governor.makeRoom(this, bytes, signal);
   }
 
   reclaimRoom(bytes: number, signal?: AbortSignal): Promise<boolean> {
+    this.governor.assertMutable();
     return this.governor.reclaimRoom(this, bytes, signal);
   }
 
@@ -269,21 +298,26 @@ class GrantImpl implements Grant {
   }
 
   release(bytes: number): void {
+    this.governor.assertMutable();
     if (this.closed) return;
     const releasable = this.held - this.allocated - this.loan;
     if (bytes > releasable) throw new LoanBackedReleaseError(this.label, bytes, releasable);
     this.held -= bytes;
     this.#giveBack(bytes);
+    this.parent?.settleGrowth();
   }
 
   /** Returned bytes go back to an open parent credit, else to the governor. */
   #giveBack(bytes: number): void {
     const parent = this.parent;
-    if (parent !== null && !parent.closed) parent.held += bytes;
-    else this.governor.give(bytes);
+    if (parent !== null && !parent.closed) {
+      parent.held += bytes;
+      if (bytes > 0) parent.pendingGrowth = true;
+    } else this.governor.give(bytes);
   }
 
   borrow(bytes: number, signal?: AbortSignal): Promise<Loan> {
+    this.governor.assertMutable();
     if (this.closed || this.governor.isIdleCredit(this))
       return Promise.reject(new GrantClosedError(this.label));
     if (this.loan > 0 || this.loanPending)
@@ -321,6 +355,7 @@ class GrantImpl implements Grant {
   }
 
   close(): void {
+    this.governor.assertMutable();
     if (this.closed) return;
     this.closed = true;
     // Profiles may retain closed grant handles across passes; they must not keep
@@ -336,6 +371,7 @@ class GrantImpl implements Grant {
     // Loan bytes return to the governor; the rest to an open parent credit.
     if (loan > 0) this.governor.give(loan);
     this.#giveBack(held - loan);
+    this.parent?.settleGrowth();
   }
 }
 
@@ -434,7 +470,7 @@ export class Governor implements MemoryGovernor {
     if (!this.#room(bytes, false)) return false;
     this.#take(bytes);
     grant.held += bytes;
-    grant.grown?.();
+    grant.pendingGrowth = true;
     return true;
   }
 
@@ -662,7 +698,7 @@ export class Governor implements MemoryGovernor {
         this.#grants.add(grant);
       }
       grant.held += taken;
-      if (request.grant !== null) grant.grown?.();
+      if (request.grant !== null) grant.pendingGrowth = true;
       {
         let remaining = wanted - taken;
         for (const pool of this.#idleCredit) {
@@ -688,6 +724,8 @@ export class Governor implements MemoryGovernor {
         grant.loan = wanted;
         grant.loanPending = false;
       }
+      // Idle credit and any loan are installed: the holdings are complete.
+      grant.settleGrowth();
       request.resolve(grant);
     }
   }
@@ -747,6 +785,7 @@ export class Governor implements MemoryGovernor {
   }
 
   async admit(options: AdmitOptions): Promise<Grant> {
+    this.assertMutable();
     if (options.minimumBytes > this.capBytes - this.reserveBytes)
       throw new MemoryAdmissionError(
         options.label,
@@ -767,6 +806,7 @@ export class Governor implements MemoryGovernor {
   }
 
   async admitGroup(options: NativeGrantGroupOptions): Promise<readonly Grant[]> {
+    this.assertMutable();
     const { label, signal, includesProgress } = options;
     // Copy before waiting: the caller cannot change the named minima after admission queues.
     const parts = options.grants.map(({ label, minimumBytes, spillable }) => ({
@@ -858,6 +898,7 @@ export class Governor implements MemoryGovernor {
    * to the governor). Null when `source` cannot spare the bytes.
    */
   carve(source: Grant, label: string, spillable: boolean, bytes: number): Grant | null {
+    this.assertMutable();
     if (!Number.isSafeInteger(bytes) || bytes < 0)
       throw new RangeError("Carved bytes must be a nonnegative safe integer");
     if (
@@ -881,9 +922,26 @@ export class Governor implements MemoryGovernor {
    * or stops with null. Preparation tracks its peak with it. False for a foreign grant.
    */
   observeGrowth(grant: Grant, observer: (() => void) | null): boolean {
+    this.assertMutable();
     if (!(grant instanceof GrantImpl) || grant.governor !== this) return false;
     grant.grown = observer;
     return true;
+  }
+
+  #observing = false;
+  /** Runs `grant`'s growth observer, read-only: any mutator it calls throws. */
+  notifyGrowth(grant: Grant): void {
+    if (!(grant instanceof GrantImpl) || grant.grown === null) return;
+    this.#observing = true;
+    try {
+      grant.grown();
+    } finally {
+      this.#observing = false;
+    }
+  }
+  /** Grant and governor mutators refuse while a growth observer runs. */
+  assertMutable(): void {
+    if (this.#observing) throw new GrowthObserverReentryError();
   }
 
   /**
@@ -892,6 +950,7 @@ export class Governor implements MemoryGovernor {
    * already parented grant.
    */
   adopt(parent: Grant, child: Grant): boolean {
+    this.assertMutable();
     if (
       !(parent instanceof GrantImpl) ||
       !(child instanceof GrantImpl) ||
@@ -910,6 +969,7 @@ export class Governor implements MemoryGovernor {
   }
 
   transferCredit(source: Grant, target: Grant, bytes: number): boolean {
+    this.assertMutable();
     if (!Number.isSafeInteger(bytes) || bytes < 0)
       throw new RangeError("Credit transfer bytes must be a nonnegative safe integer");
     if (
@@ -925,8 +985,9 @@ export class Governor implements MemoryGovernor {
     if (source !== target) {
       source.held -= bytes;
       target.held += bytes;
-      target.grown?.();
+      if (bytes > 0) target.pendingGrowth = true;
     }
+    target.settleGrowth();
     if (
       bytes > 0 &&
       source !== target &&
@@ -937,6 +998,7 @@ export class Governor implements MemoryGovernor {
   }
 
   tryAdmit(options: Omit<AdmitOptions, "signal">): Grant | null {
+    this.assertMutable();
     if (options.minimumBytes > this.capBytes - this.reserveBytes)
       throw new MemoryAdmissionError(
         options.label,

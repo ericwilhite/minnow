@@ -6,7 +6,12 @@
  * holds nothing waits in place (already a wait holding nothing).
  */
 import { afterEach, expect, it, vi } from "vitest";
-import { Governor, MemoryAdmissionError, type Grant } from "../memory/governor.js";
+import {
+  Governor,
+  GrowthObserverReentryError,
+  MemoryAdmissionError,
+  type Grant,
+} from "../memory/governor.js";
 import { PreparationGovernor, PreparationWouldWait } from "./preparation.js";
 
 afterEach(() => {
@@ -206,6 +211,81 @@ it("counts growth after admission in the peak need (review repro)", async () => 
   recipe.close();
   (await competitor).close();
   facade.close();
+  expect(governor.usedBytes).toBe(0);
+});
+
+it("counts a loan served from pooled idle credit in the peak, once it is complete (review repro)", async () => {
+  const MiB = 1 << 20;
+  const governor = new Governor(16 * MiB);
+  const facade = new PreparationGovernor(governor);
+  const recipe = await facade.admit({ label: "recipe", minimumBytes: MiB, spillable: false });
+  const scratch = await facade.admit({ label: "scratch", minimumBytes: MiB, spillable: true });
+  const pool = governor.tryAdmit({ label: "idle", minimumBytes: MiB, spillable: true });
+  if (pool === null) throw new Error("pool");
+  await governor.admitGroup({ label: "idle", idleCredit: pool, grants: [] });
+  // The loan is served from the idle pool: the grant's holdings grow by the whole loan.
+  const loan = await scratch.borrow(MiB);
+  const peak = facade.heldBytes;
+  expect(peak).toBe(3 * MiB);
+  loan.repay();
+  scratch.close();
+  pool.close();
+  const competitor = governor.admit({
+    label: "competitor",
+    minimumBytes: governor.capBytes - governor.reserveBytes,
+    spillable: false,
+  });
+  const wait = await facade
+    .admit({ label: "next", minimumBytes: MiB, spillable: false })
+    .catch((error: unknown) => error);
+  expect(wait).toBeInstanceOf(PreparationWouldWait);
+  expect(wait).toMatchObject({ needed: peak });
+  recipe.close();
+  (await competitor).close();
+  facade.close();
+  expect(governor.usedBytes).toBe(0);
+});
+
+it("notifies growth once per complete operation, including an adopted child's return", () => {
+  const governor = new Governor(16 << 20);
+  const take = (minimumBytes: number) => {
+    const grant = governor.tryAdmit({ label: "test", minimumBytes, spillable: true });
+    if (grant === null) throw new Error("grant");
+    return grant;
+  };
+  const parent = take(1024),
+    child = take(1024);
+  const seen: Array<{ held: number; allocated: number }> = [];
+  governor.observeGrowth(parent, () =>
+    seen.push({ held: parent.held, allocated: parent.allocated }),
+  );
+  // Growth inside allocate: one notification, after the allocation is recorded.
+  expect(parent.allocate(4096)).toBe(true);
+  expect(seen).toEqual([{ held: 4096, allocated: 4096 }]);
+  // An adopted child's returned bytes raise the parent's holdings: one notification.
+  expect(governor.adopt(parent, child)).toBe(true);
+  child.close();
+  expect(seen).toEqual([
+    { held: 4096, allocated: 4096 },
+    { held: 5120, allocated: 4096 },
+  ]);
+  parent.free(4096);
+  parent.close();
+  expect(governor.usedBytes).toBe(0);
+});
+
+it("refuses a growth observer that changes state, leaving the grant consistent", () => {
+  const governor = new Governor(16 << 20);
+  const grant = governor.tryAdmit({ label: "test", minimumBytes: 1024, spillable: true });
+  if (grant === null) throw new Error("grant");
+  governor.observeGrowth(grant, () => grant.close());
+  expect(() => grant.allocate(2048)).toThrow(GrowthObserverReentryError);
+  // The refused close changed nothing: the completed allocation stands and is charged.
+  expect(grant).toMatchObject({ closed: false, held: 2048, allocated: 2048 });
+  expect(governor.usedBytes).toBe(2048);
+  governor.observeGrowth(grant, null);
+  grant.free(2048);
+  grant.close();
   expect(governor.usedBytes).toBe(0);
 });
 
