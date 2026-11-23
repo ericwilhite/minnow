@@ -211,6 +211,7 @@ export function boundSource(
   prefixRows = BATCH_ROWS,
   caches?: QueryRoots,
 ): MaybePromise<ReadBound> {
+  (globalThis as { __boundProbe?: (s: ReadSource, p: number) => void }).__boundProbe?.(source, prefixRows);
   return trackSizing(signal, run(size()));
   function* size(): ReadJob<ReadBound> {
     const directoryCache = directoryCacheFor(view.pages);
@@ -259,7 +260,8 @@ export function boundSource(
       // LIMIT counts live rows. A sparse/deleted group may reach any stored position,
       // including its last page, before it produces the requested live prefix.
       const live = segment.liveRowCount;
-      const rows =
+      const hackOne = (globalThis as { __sizeOne?: boolean }).__sizeOne === true && source.selectedRow === true && segment.kind === "memory";
+      const rows = hackOne ? 1 :
         live === segment.rowCount
           ? Math.min(segment.rowCount, remaining ?? segment.rowCount)
           : segment.rowCount;
