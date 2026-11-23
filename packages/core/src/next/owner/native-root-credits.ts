@@ -6,6 +6,7 @@ import type {
   NativeWriteStepOptions,
 } from "../access/native-write-step.js";
 import type { Grant, MemoryGovernor } from "../memory/governor.js";
+import { stepSignal } from "../step-signal.js";
 import { releaseIdle } from "../write/budget.js";
 
 export const NATIVE_ROOT_CREDIT_BYTES = 4096;
@@ -222,95 +223,108 @@ export class NativeRootCredits {
     this.#reclaim();
   }
   #fund(signal: AbortSignal): Promise<void> {
-    const stop = AbortSignal.any([this.scope.signal, this.#stop.signal, signal]);
+    const step = stepSignal("native root funding", this.scope.signal, this.#stop.signal, signal),
+      stop = step.signal;
     const work = (async () => {
-      for (;;) {
-        stop.throwIfAborted();
-        this.#reclaim();
-        let total = 0,
-          missing = 0;
-        const targets: number[] = [];
-        for (const role of ROLES) {
-          const grant = this.#grants[role],
-            target = Math.max(grant.allocated, this.#wanted[role]);
-          targets.push(target);
-          total = checked(total + target);
-          missing += Math.max(0, target - grant.held);
-        }
-        // A prepaid producer may use already-held metadata without another native
-        // boundary. A NEW wait under its source would be hold-and-wait. Between
-        // producers, restabilize the writer even when the root needs no new credit.
-        if (missing === 0 && this.source.allocated !== 0) return;
-        for (const role of ROLES)
-          if (this.#grants[role].loaned !== 0)
-            throw new TypeError("Native root funding under a progress loan");
-        if (this.source.allocated !== 0)
-          throw new TypeError("Native root funding while a source is retained");
-        const boundary = await this.scope.statement.prepareNativeStep(total, stop, {
-          includesProgress: this.scope.includesProgress === true,
-        });
-        let provisional: readonly Grant[] | null = null;
-        const moved = [0, 0, 0, 0];
-        // What a source may size for until the next step: this step's capacity beside the
-        // writer's protected floor, less what the other roles take.
-        this.#sourceRoom = Math.max(
-          0,
-          boundary.capacityBytes -
-            boundary.protectedWriteBytes -
-            (total - (targets[ROLES.indexOf("source")] ?? 0)),
-        );
-        try {
-          boundary.check();
-          if (missing === 0) {
-            boundary.check();
-            return;
+      // The step signal ends with this funding pass, whatever its outcome.
+      try {
+        for (;;) {
+          stop.throwIfAborted();
+          this.#reclaim();
+          let total = 0,
+            missing = 0;
+          const targets: number[] = [];
+          for (const role of ROLES) {
+            const grant = this.#grants[role],
+              target = Math.max(grant.allocated, this.#wanted[role]);
+            targets.push(target);
+            total = checked(total + target);
+            missing += Math.max(0, target - grant.held);
           }
-          const delta = ROLES.map((role, i) => ({
-            label: `native root ${role} growth`,
-            minimumBytes: Math.max(0, (targets[i] ?? 0) - this.#grants[role].held),
-            spillable: true,
-          }));
-          provisional = await this.scope.governor.admitGroup({
-            label: "native root step",
-            // The root holds its retained base (bindings, rules, parameters) through this wait,
-            // inside the writer's chain: its boundary is the writer's funding witness.
-            holdsCredit: boundary.holderChain,
-            grants: delta,
+          // A prepaid producer may use already-held metadata without another native
+          // boundary. A NEW wait under its source would be hold-and-wait. Between
+          // producers, restabilize the writer even when the root needs no new credit.
+          if (missing === 0 && this.source.allocated !== 0) return;
+          for (const role of ROLES)
+            if (this.#grants[role].loaned !== 0)
+              throw new TypeError("Native root funding under a progress loan");
+          if (this.source.allocated !== 0)
+            throw new TypeError("Native root funding while a source is retained");
+          const boundary = await this.scope.statement.prepareNativeStep(total, stop, {
             includesProgress: this.scope.includesProgress === true,
-            signal: AbortSignal.any([stop, boundary.invalidated]),
           });
-          boundary.check();
-          for (const [i, role] of ROLES.entries()) {
-            const from = provisional[i],
-              amount = delta[i]?.minimumBytes ?? 0;
-            if (!from || !this.scope.governor.transferCredit(from, this.#grants[role], amount))
-              throw new Error("Native root credit transfer failed");
-            moved[i] = amount;
+          let provisional: readonly Grant[] | null = null;
+          const moved = [0, 0, 0, 0];
+          // What a source may size for until the next step: this step's capacity beside the
+          // writer's protected floor, less what the other roles take.
+          this.#sourceRoom = Math.max(
+            0,
+            boundary.capacityBytes -
+              boundary.protectedWriteBytes -
+              (total - (targets[ROLES.indexOf("source")] ?? 0)),
+          );
+          try {
+            boundary.check();
+            if (missing === 0) {
+              boundary.check();
+              return;
+            }
+            const delta = ROLES.map((role, i) => ({
+              label: `native root ${role} growth`,
+              minimumBytes: Math.max(0, (targets[i] ?? 0) - this.#grants[role].held),
+              spillable: true,
+            }));
+            const admission = stepSignal("native root admission", stop, boundary.invalidated);
+            try {
+              provisional = await this.scope.governor.admitGroup({
+                label: "native root step",
+                // The root holds its retained base (bindings, rules, parameters) through this wait,
+                // inside the writer's chain: its boundary is the writer's funding witness.
+                holdsCredit: boundary.holderChain,
+                grants: delta,
+                includesProgress: this.scope.includesProgress === true,
+                signal: admission.signal,
+              });
+            } finally {
+              admission.close();
+            }
+            boundary.check();
+            for (const [i, role] of ROLES.entries()) {
+              const from = provisional[i],
+                amount = delta[i]?.minimumBytes ?? 0;
+              if (!from || !this.scope.governor.transferCredit(from, this.#grants[role], amount))
+                throw new Error("Native root credit transfer failed");
+              moved[i] = amount;
+            }
+            boundary.check();
+            stop.throwIfAborted();
+            return;
+          } catch (error) {
+            // No caller buffer can allocate before this promise resolves. Unwind ONLY
+            // provisional idle funding before retrying the native witness, never SQL.
+            for (let i = ROLES.length - 1; i >= 0; i--) {
+              const role = ROLES[i],
+                to = provisional?.[i],
+                amount = moved[i] ?? 0;
+              if (
+                role &&
+                to &&
+                amount &&
+                !this.scope.governor.transferCredit(this.#grants[role], to, amount)
+              )
+                throw new Error("Native root provisional transfer rollback failed", {
+                  cause: error,
+                });
+            }
+            stop.throwIfAborted();
+            if (!changed(error)) throw error;
+          } finally {
+            closeAll(provisional);
+            boundary.release();
           }
-          boundary.check();
-          stop.throwIfAborted();
-          return;
-        } catch (error) {
-          // No caller buffer can allocate before this promise resolves. Unwind ONLY
-          // provisional idle funding before retrying the native witness, never SQL.
-          for (let i = ROLES.length - 1; i >= 0; i--) {
-            const role = ROLES[i],
-              to = provisional?.[i],
-              amount = moved[i] ?? 0;
-            if (
-              role &&
-              to &&
-              amount &&
-              !this.scope.governor.transferCredit(this.#grants[role], to, amount)
-            )
-              throw new Error("Native root provisional transfer rollback failed", { cause: error });
-          }
-          stop.throwIfAborted();
-          if (!changed(error)) throw error;
-        } finally {
-          closeAll(provisional);
-          boundary.release();
         }
+      } finally {
+        step.close();
       }
     })();
     this.#pending = work;

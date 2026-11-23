@@ -1,6 +1,7 @@
 /** Query-local shares of the native root's admitted workspace. This is not another
  * governor: no admission/loan/cache ownership is delegated to the real governor.
  * A complete producer group may wait only after every previous source share retired. */
+import { stepSignal, type StepSignal } from "../step-signal.js";
 import type {
   AdmitOptions,
   EvictableCache,
@@ -46,13 +47,16 @@ export class PrepaidQueryGovernor implements MemoryGovernor {
   #stop: AbortController;
   #closing: Promise<void> | null = null;
   readonly #signal: AbortSignal;
+  /** Follows the scope for this workspace's life; closed with it. */
+  readonly #step: StepSignal;
   constructor(readonly scope: PrepaidQueryScope) {
     scope.signal.throwIfAborted();
     if (!scope.metadata.allocate(PREPAID_QUERY_BYTES))
       throw new RangeError("Native query metadata must be admitted");
     try {
       this.#stop = new AbortController();
-      this.#signal = AbortSignal.any([scope.signal, this.#stop.signal]);
+      this.#step = stepSignal("native query workspace", scope.signal, this.#stop.signal);
+      this.#signal = this.#step.signal;
     } catch (error) {
       scope.metadata.free(PREPAID_QUERY_BYTES);
       throw error;
@@ -131,7 +135,11 @@ export class PrepaidQueryGovernor implements MemoryGovernor {
         throw new TypeError("Invalid native query phase credit");
       idle.release(idle.held);
     }
-    const signal = options.signal ? AbortSignal.any([this.#signal, options.signal]) : this.#signal;
+    // A caller's signal adds a step that ends when this admission settles.
+    const step = options.signal
+      ? stepSignal("native query admission", this.#signal, options.signal)
+      : null;
+    const signal = step?.signal ?? this.#signal;
     const work = (async () => {
       this.#check(signal);
       // Headers belong to the SAME complete producer step. Protect them before
@@ -183,6 +191,7 @@ export class PrepaidQueryGovernor implements MemoryGovernor {
       }
     })();
     const pending = work.finally(() => {
+      step?.close();
       if (this.#pending === pending) this.#pending = null;
     });
     this.#pending = pending;
@@ -239,6 +248,7 @@ export class PrepaidQueryGovernor implements MemoryGovernor {
     return (this.#closing ??= (async () => {
       this.#closed = true;
       this.#stop.abort(new GrantClosedError("native query workspace"));
+      this.#step.close();
       await this.#pending?.catch(() => undefined);
       while (this.#first) this.#first.close();
       this.scope.metadata.free(PREPAID_QUERY_BYTES);
