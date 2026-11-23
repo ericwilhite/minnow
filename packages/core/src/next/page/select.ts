@@ -473,10 +473,9 @@ function rangeKernel(
     if (kernelObserver !== null) kernelObserver("single-range");
     for (let k = from; k < to; k++) {
       const row = rows === null ? k : (rows[k] ?? 0) - first;
-      const valid = validity === null ? 1 : ((validity[row >>> 5] ?? 0) >>> (row & 31)) & 1;
+      if (validity !== null && (((validity[row >>> 5] ?? 0) >>> (row & 31)) & 1) === 0) continue;
       const value = values === null ? constant : (values[row] ?? 0);
-      out[at + count] = first + row;
-      count += valid & Number(value >= low) & Number(value <= high);
+      if (value >= low && value <= high) out[at + count++] = first + row;
     }
     return count;
   }
@@ -502,8 +501,7 @@ function scan8(
   let count = 0;
   for (let row = from; row < to; row++) {
     const value = values[row] ?? 0;
-    out[at + count] = first + row;
-    count += Number(value >= low) & Number(value <= high);
+    if (value >= low && value <= high) out[at + count++] = first + row;
   }
   return count;
 }
@@ -520,8 +518,7 @@ function scan16(
   let count = 0;
   for (let row = from; row < to; row++) {
     const value = values[row] ?? 0;
-    out[at + count] = first + row;
-    count += Number(value >= low) & Number(value <= high);
+    if (value >= low && value <= high) out[at + count++] = first + row;
   }
   return count;
 }
@@ -538,8 +535,7 @@ function scan32(
   let count = 0;
   for (let row = from; row < to; row++) {
     const value = values[row] ?? 0;
-    out[at + count] = first + row;
-    count += Number(value >= low) & Number(value <= high);
+    if (value >= low && value <= high) out[at + count++] = first + row;
   }
   return count;
 }
@@ -556,8 +552,7 @@ function scanI32(
   let count = 0;
   for (let row = from; row < to; row++) {
     const value = values[row] ?? 0;
-    out[at + count] = first + row;
-    count += Number(value >= low) & Number(value <= high);
+    if (value >= low && value <= high) out[at + count++] = first + row;
   }
   return count;
 }
