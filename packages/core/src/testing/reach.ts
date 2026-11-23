@@ -2167,6 +2167,14 @@ export const READ_ONLY_SNAPSHOT_TIMING_REACH = [
   "isolation fixed by a failed statement",
 ] as const;
 
+/** A comparison of two typed columns, refused for a missing operator or compared (operator-sqlstate-pglite). */
+export const OPERATOR_SQLSTATE_REACH = [
+  "no operator",
+  "compared",
+  "multi-item list",
+  "rows compared",
+] as const;
+
 /** PG per-attribute mode transitions, statement attempts, savepoints and transaction cleanup. */
 export const OWNER_TRANSACTION_MODE_STATES = [
   "read-only begin",

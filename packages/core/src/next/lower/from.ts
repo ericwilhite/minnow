@@ -45,7 +45,7 @@ import { DUAL_TABLE } from "../../engine/query.js";
 import type { CompiledQuery, Expression, JoinPlan, TableSource } from "../../plan/model.js";
 import { isCrossJoinPlan } from "../../plan/model.js";
 import { accessPath, selectivityOf } from "./access-path.js";
-import { baseType, coerce, commonType, settle, type Typed } from "./coerce.js";
+import { baseType, coerce, commonType, comparisonType, settle, type Typed } from "./coerce.js";
 import { PlanningError, unsupported } from "./errors.js";
 import {
   asBool,
@@ -520,7 +520,7 @@ export function lowerFrom(
         big: innerColumn.big,
       };
       const type = baseType(
-        commonType([request.test, innerTyped], builder.parameters, "subquery comparison"),
+        comparisonType([request.test, innerTyped], builder.parameters, request.cmp),
       );
       const test = coerce(request.test, type, "implicit", builder.parameters);
       const cast = coerce(innerTyped, type, "implicit", builder.parameters);
@@ -686,7 +686,7 @@ export function lowerFrom(
       [...sourcesOf(expr)].every((source) => !innerSources.has(source));
     const innerOnly = (expr: ScalarExpr) => subset(sourcesOf(expr), innerSources);
     if (!innerOnly(tested.expr) || !outerOnly(request.test.expr)) return null;
-    const type = baseType(commonType([request.test, tested], builder.parameters, "IN"));
+    const type = baseType(comparisonType([request.test, tested], builder.parameters, request.cmp));
     const probeKey = coerce(request.test, type, "implicit", builder.parameters);
     const buildKey = coerce(tested, type, "implicit", builder.parameters);
     const collation = request.test.collation ?? (tested as Collated).collation ?? null;

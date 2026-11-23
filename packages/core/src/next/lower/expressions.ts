@@ -24,6 +24,7 @@ import {
   baseType,
   coerce,
   commonType,
+  comparisonType,
   resolveFunction,
   settle,
   type ParameterTypes,
@@ -427,7 +428,7 @@ function nullIf(args: readonly Typed[], state: ExpressionState): Typed {
   const [first, second] = args;
   if (first === undefined || second === undefined || args.length !== 2)
     throw new PlanningError("nullif takes two arguments", "42883");
-  const common = commonType(args, state.parameters, "NULLIF");
+  const common = comparisonType(args, state.parameters, "=");
   const a = settle(first, state.parameters);
   const b = settle(second, state.parameters);
   const left = a.pending === undefined ? sqlTypeOf(a.expr.type) : null;
@@ -499,9 +500,23 @@ function unify(
   what: string,
   compared = false,
 ): Typed[] {
-  const common = commonType(values, state.parameters, what);
+  // Comparison operands name PostgreSQL's operator in their refusal (42883); `what` is it.
+  const common = compared
+    ? comparisonType(values, state.parameters, what)
+    : commonType(values, state.parameters, what);
   const type = compared ? baseType(common) : common;
   return values.map((value) => coerce(value, type, "implicit", state.parameters));
+}
+
+/** Whether the values have a common type (no 42804 from `commonType`). */
+function hasCommonType(values: readonly Typed[], state: ExpressionState): boolean {
+  try {
+    commonType(values, state.parameters, "IN");
+    return true;
+  } catch (error) {
+    if (error instanceof PlanningError && error.sqlState === "42804") return false;
+    throw error;
+  }
 }
 
 const COMPARISONS: Readonly<Record<string, "=" | "<>" | "<" | "<=" | ">" | ">=">> = {
@@ -536,7 +551,7 @@ export function lowerCondition(
   if (cmp !== undefined) {
     const l = lowerExpression(left, scope, state);
     const r = lowerExpression(right, scope, state);
-    const [a, b] = unify([l, r], state, "comparison", true) as [Typed, Typed];
+    const [a, b] = unify([l, r], state, cmp, true) as [Typed, Typed];
     return {
       expr: {
         op: "compare",
@@ -565,7 +580,7 @@ export function lowerCondition(
       const [a, b] = unify(
         [lowerExpression(left, scope, state), lowerExpression(right, scope, state)],
         state,
-        "IS DISTINCT FROM",
+        "=",
         true,
       ) as [Typed, Typed];
       return {
@@ -603,7 +618,32 @@ export function lowerCondition(
         );
       const arg = lowerExpression(left, scope, state);
       const items = right.items.map((item) => lowerExpression(item, scope, state));
-      const [first, ...rest] = unify([arg, ...items], state, "IN", true);
+      const cmp = operator === "IN" ? "=" : "<>";
+      // PostgreSQL (transformAExprIn): one comparison with the list in the list's common type;
+      // without one, each item compared on its own, OR-ed (AND-ed for NOT IN) in list order, so
+      // an item without an operator is that pair's 42883 ("operator does not exist").
+      if (!hasCommonType([arg, ...items], state)) {
+        const each = items.map((item) => {
+          const [a, b] = unify([arg, item], state, cmp, true) as [Typed, Typed];
+          return {
+            expr: {
+              op: "compare",
+              cmp,
+              left: a.expr,
+              right: b.expr,
+              collation: collationOf([arg, item]),
+              type: BOOL,
+            } satisfies ScalarExpr,
+            nullable: a.nullable || b.nullable,
+          };
+        });
+        return {
+          expr: { op: operator === "IN" ? "or" : "and", args: each.map((c) => c.expr), type: BOOL },
+          nullable: each.some((c) => c.nullable),
+          big: false,
+        };
+      }
+      const [first, ...rest] = unify([arg, ...items], state, cmp, true);
       if (first === undefined) throw new PlanningError("IN needs a value", "42601");
       return {
         expr: {

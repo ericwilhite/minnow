@@ -3507,7 +3507,12 @@ not require a home cache directory.
   lower each text itself and cache that plan under the text, never under the key. A literal
   point-read loop over 10,000 keys lowers once.
 - Every failure is a `PlanningError` with PostgreSQL's SQLSTATE (42601 syntax, 42P01 relation,
-  42703 column, 42883 function, 42704 type, …) or an `UnsupportedPlanError` (0A000). Front-end
+  42703 column, 42883 function or operator, 42704 type, …) or an `UnsupportedPlanError` (0A000).
+  Comparing types without a comparison operator is 42883 "operator does not exist: integer =
+  boolean" in every comparison form (`comparisonType`); mismatched UNION columns and CASE
+  results are 42804, as in PostgreSQL. An IN list without a common type is compared item by
+  item, OR-ed (AND-ed with `<>` for NOT IN) in list order, as PostgreSQL's
+  `transformAExprIn` does. Front-end
   errors are translated by message (`frontEndError`), keeping the parse position and the
   original as `cause`. The messages it depends on are pinned (`testing/front-end-states.test.ts`:
   a snapshot of every mapped front-end message, and per pattern a PGlite-checked statement).

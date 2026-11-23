@@ -16,6 +16,7 @@ import {
 import type { ScalarExpr } from "../ir/ir.js";
 import { samePhysicalType, type PhysicalType } from "../types.js";
 import { PlanningError, unsupported } from "./errors.js";
+import { sqlTypeName } from "./result.js";
 import {
   boolLiteral,
   decimalLiteral,
@@ -271,6 +272,47 @@ export function settle(typed: Typed, parameters: ParameterTypes): Typed {
     return coerce(typed, type, "implicit", parameters);
   }
   return coerce(typed, { kind: "text" }, "implicit", parameters);
+}
+
+/** An operand's type as PostgreSQL's operator errors print it: `format_type_be`, without a type
+ * modifier (`character varying`, `character`, `numeric`). */
+function operandName(type: PhysicalType): string {
+  if (type.kind === "text" && type.maxLength !== undefined)
+    return type.fixed === true ? "character" : "character varying";
+  return sqlTypeName(baseType(type));
+}
+
+/**
+ * The common type of the operands of a comparison operator (`=`, `<`, IN, IS DISTINCT FROM,
+ * NULLIF, a quantified or IN subquery). Where no common type exists PostgreSQL finds no operator:
+ * "operator does not exist: integer = boolean" (42883), naming the left operand and the first
+ * one it cannot be compared with; `commonType`'s 42804 is for UNION and CASE result matching.
+ */
+export function comparisonType(
+  values: readonly Typed[],
+  parameters: ParameterTypes,
+  operator: string,
+): PhysicalType {
+  try {
+    return commonType(values, parameters, "comparison");
+  } catch (error) {
+    if (!(error instanceof PlanningError) || error.sqlState !== "42804") throw error;
+    const [left, ...rest] = values;
+    if (left === undefined || left.pending !== undefined) throw error;
+    for (const right of rest) {
+      if (right.pending !== undefined) continue;
+      try {
+        commonType([left, right], parameters, "comparison");
+      } catch {
+        throw new PlanningError(
+          `operator does not exist: ${operandName(left.expr.type)} ${operator} ${operandName(right.expr.type)}`,
+          "42883",
+        );
+      }
+    }
+    // Each operand matches the left one but not each other: not an operator failure.
+    throw error;
+  }
 }
 
 /**
