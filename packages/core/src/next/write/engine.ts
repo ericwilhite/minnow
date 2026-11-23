@@ -2232,12 +2232,13 @@ export class WritePathImpl implements WritePath, EngineHooks {
     catalog = this.#holder?.catalog ?? this.#catalog,
     signal?: AbortSignal,
     includesProgress = false,
+    holdings?: () => WaitingHoldings,
   ): MaybePromise<void> {
     if (this.#minimumState !== this.#state || this.#minimumCatalog !== catalog) {
       const refreshed = this.#recalculateMinimum(catalog, signal);
       if (refreshed instanceof Promise)
         return this.#trackMinimum(
-          refreshed.then(() => this.#prepareMinimum(catalog, signal, includesProgress)),
+          refreshed.then(() => this.#prepareMinimum(catalog, signal, includesProgress, holdings)),
         );
     }
     const native = this.#nativeSteps.funding || this.#holder?.nativeCommands;
@@ -2256,21 +2257,34 @@ export class WritePathImpl implements WritePath, EngineHooks {
       !native &&
       deficit > 0 &&
       this.#flushing.size > 0 &&
-      // A flush waiting for its own credit is still funding, its writer not yet open (rules
-      // 4/5/7): it may wait for memory this statement holds, so this step does not wait for it.
+      // A flush waiting for its own credit is funding, its writer not open (rules 4/5/7): it may
+      // wait for memory this statement holds, so this step does not wait for it.
       queued.ordinary + queued.progress === 0 &&
       !(this.#credits.governor.canAdmitNow?.(deficit, false) ?? true)
     ) {
-      const flushed = Promise.allSettled([...this.#flushing.values()]).then(() => undefined);
+      // Until the flushes end, or one of them queues growth after all (an open flush whose
+      // publication meets pressure unwinds its writer and funds again): then this step stops
+      // waiting for it and prepares again, its growth bounded by the governor.
+      const listening: { unsubscribe?: () => void } = {};
+      const ended = new Promise<void>((resolve) => {
+        listening.unsubscribe = this.#credits.onQueuedGrowth(resolve);
+        void Promise.allSettled([...this.#flushing.values()]).then(() => {
+          resolve();
+        });
+      }).finally(() => {
+        listening.unsubscribe?.();
+      });
       return this.#trackMinimum(
-        (signal === undefined ? flushed : waitCommandMaintenance(flushed, signal)).then(() =>
-          this.#prepareMinimum(catalog, signal, includesProgress),
+        (signal === undefined ? ended : waitCommandMaintenance(ended, signal)).then(() =>
+          this.#prepareMinimum(catalog, signal, includesProgress, holdings),
         ),
       );
     }
+    // A statement's step carries its statement's holdings: the governor refuses its growth
+    // (53200) when it could never be served beside them, the owner's queued growth included.
     const metadata = native
       ? this.#credits.prepareNativeMinimum(headroom, signal, includesProgress)
-      : this.#credits.prepareMetadata(headroom, signal);
+      : this.#credits.prepareMetadata(headroom, signal, false, holdings);
     if (metadata instanceof Promise)
       return this.#trackMinimum(
         metadata.then(() => {
@@ -2766,7 +2780,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
    * `MemtableMemoryError` when nothing more can be freed.
    */
   admit(bytes: number, growth?: () => number, wait?: RowsWait): MaybePromise<void> {
-    const prepared = this.#prepareMinimum(undefined, wait?.signal);
+    const prepared = this.#prepareMinimum(undefined, wait?.signal, false, wait?.holdings);
     const admitted =
       prepared instanceof Promise
         ? this.#admitAfterMinimum(prepared, bytes, growth)
@@ -3219,15 +3233,26 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const credits = this.#credits;
     return {
       grants: credits.grants(),
-      retained: () =>
-        credits.retainedWhileOpen(
-          this.#rowsLifetimeBytes(),
-          this.#stayingRowBytes(),
-          // Work waiting in the governor for its growth frees nothing until it is served, and
-          // as holder growth it is served before the statement's requests: what the owner keeps
-          // meanwhile is known (as for a recycle queued for the turn, #51).
-          this.#ownWorkIdle() || credits.queuedGrowth.ordinary + credits.queuedGrowth.progress > 0,
-        ),
+      retained: () => {
+        const queued = credits.queuedGrowth;
+        if (queued.ordinary + queued.progress === 0)
+          return credits.retainedWhileOpen(
+            this.#rowsLifetimeBytes(),
+            this.#stayingRowBytes(),
+            this.#ownWorkIdle(),
+          );
+        // The owner's work waits in the governor for growth, served before the statement's
+        // requests: until it is served it frees nothing, and neither does the work that holds
+        // what it waits beside (a flush's frozen rows, a merge's inputs). Everything the owner
+        // holds stays, beyond its registered lifetime holding (which lies inside these grants and
+        // the caches, and `usableCapacity` already subtracts). Never too little: a request that
+        // other running work could have made room for may be refused, none waits forever.
+        let held = 0;
+        for (const grant of credits.grants()) held += grant.held;
+        const lifetimeInGrants =
+          this.#lifetimeBytes() - FIXED_CACHE_BYTES - this.#space.stats.permanentBytes;
+        return Math.max(0, held - lifetimeInGrants);
+      },
       queued: () => credits.queuedGrowth,
     };
   }

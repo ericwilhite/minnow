@@ -2,7 +2,7 @@
  * The write owner's native accounts. A step receives already admitted credit, not a wrapper
  * allocation counter: storage may transfer a real buffer out through native takeFrom.
  */
-import type { Grant, HolderChain, MemoryGovernor } from "../memory/governor.js";
+import type { Grant, HolderChain, MemoryGovernor, WaitingHoldings } from "../memory/governor.js";
 import { GrantClosedError, MemoryAdmissionError } from "../memory/governor.js";
 import type { MaybePromise } from "../access/key-index.js";
 import { releaseIdle } from "./budget.js";
@@ -242,6 +242,13 @@ export class WriteCredits {
    */
   get queuedGrowth(): { readonly ordinary: number; readonly progress: number } {
     return { ...this.#queuedGrowth };
+  }
+  readonly #queuedListeners = new Set<() => void>();
+  /** Calls `listener` whenever the owner's work queues growth in the governor; returns the
+   * unsubscription. */
+  onQueuedGrowth(listener: () => void): () => void {
+    this.#queuedListeners.add(listener);
+    return () => this.#queuedListeners.delete(listener);
   }
   /** Ordinary growth may not use the progress reserve (`includesProgress`); progress growth may. */
   readonly #queuedGrowth = { ordinary: 0, progress: 0 };
@@ -509,6 +516,7 @@ export class WriteCredits {
     bytes: number,
     signal?: AbortSignal,
     includesProgress = false,
+    holdings?: () => WaitingHoldings,
   ): MaybePromise<void> {
     const before = this.#metadataHeadroom;
     // The complete simultaneous workspace, before any of its allocations or waits.
@@ -525,7 +533,16 @@ export class WriteCredits {
     // already funded; install the larger requirement when admission succeeds.
     this.#metadataHeadroom = Math.min(this.#metadataHeadroom, bytes);
     if (before !== this.#metadataHeadroom) this.#changed?.();
-    return this.growTo(this.metadata, wanted, signal, includesProgress);
+    return this.#growTo(
+      this.metadata,
+      wanted,
+      signal,
+      0,
+      includesProgress,
+      undefined,
+      false,
+      holdings,
+    );
   }
 
   /** The prepaid next metadata step beyond live allocations (observation only). */
@@ -585,6 +602,7 @@ export class WriteCredits {
     includesProgress = false,
     funding?: "commit" | "merge",
     nativeMinimum = false,
+    holdings?: () => WaitingHoldings,
   ): Promise<void> {
     const stop =
       signal === undefined ? this.#stop.signal : AbortSignal.any([signal, this.#stop.signal]);
@@ -705,11 +723,17 @@ export class WriteCredits {
         minimumBytes: Math.max(0, (desired[i] ?? 0) - account.held),
         spillable: false,
       }));
-      // The owner's queued growth (`queuedGrowth`) while it waits, by capacity class.
-      const queued = parts.reduce((sum, part) => sum + part.minimumBytes, 0);
+      // The owner's queued growth (`queuedGrowth`) while it waits, by capacity class: its own
+      // work's (a flush's, a merge's). A statement's step carries the statement's holdings
+      // instead: the governor bounds it by them, and it is not growth queued ahead of it.
+      const queued =
+        holdings === undefined ? parts.reduce((sum, part) => sum + part.minimumBytes, 0) : 0;
       const queue = includesProgress ? "progress" : "ordinary";
       this.#queuedGrowth[queue] += queued;
-      if (queued > 0) this.#changed?.();
+      if (queued > 0) {
+        this.#changed?.();
+        for (const listener of [...this.#queuedListeners]) listener();
+      }
       let credits: readonly Grant[];
       try {
         credits = await this.governor.admitGroup({
@@ -719,6 +743,7 @@ export class WriteCredits {
           // through this wait and cannot release them: holder growth (GOVERNOR-WAIT-POLICY).
           holdsCredit: this.holderChain,
           grants: parts,
+          ...(holdings === undefined ? {} : { holdings }),
           signal: stop,
         });
       } finally {
