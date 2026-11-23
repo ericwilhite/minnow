@@ -17,6 +17,10 @@ import {
   REGISTRY_DIRECTORY_BYTES,
   REGISTRY_RECORD_BYTES,
 } from "./registry-directory.js";
+import { REGISTRY_DIRECTORY_LEAVES } from "../exec/row-image-layout.js";
+
+/** Blocks that fill every resident leaf; the next block evicts one (a flush, a path walk). */
+const FULL = REGISTRY_DIRECTORY_LEAVES;
 
 class Budget {
   used = 0;
@@ -230,11 +234,11 @@ it.each(seedsFor("next-registry-directory-io", [0xb5d7]))(
           };
           const directory = new RegistryDirectory(budget, spill, 1, controller.signal);
           const bytes = new Uint8Array(REGISTRY_RECORD_BYTES);
-          for (let i = 0; i < (phase === "read" ? 24 : 8); i++)
+          for (let i = 0; i < (phase === "read" ? 3 * FULL : FULL); i++)
             await directory.put(0, i * 16, bytes);
           armed = true;
           const pending =
-            phase === "read" ? directory.get(0, 0, bytes) : directory.put(0, 128, bytes);
+            phase === "read" ? directory.get(0, 0, bytes) : directory.put(0, FULL * 16, bytes);
           void pending.catch(() => undefined);
           await started;
           if (cancel) controller.abort(new Error("cancelled registry"));
@@ -351,9 +355,9 @@ it.each(seedsFor("next-registry-directory-faults", [0xb5d8]))(
           const directory = new RegistryDirectory(budget, spill, 1, new AbortController().signal);
           const bytes = new Uint8Array(REGISTRY_RECORD_BYTES);
           const read = phase === "read" || phase === "checksum" || phase === "structure";
-          for (let i = 0; i < (read ? 24 : 8); i++) await directory.put(0, i * 16, bytes);
+          for (let i = 0; i < (read ? 3 * FULL : FULL); i++) await directory.put(0, i * 16, bytes);
           armed = true;
-          const pending = read ? directory.get(0, 0, bytes) : directory.put(0, 128, bytes);
+          const pending = read ? directory.get(0, 0, bytes) : directory.put(0, FULL * 16, bytes);
           let failure: unknown;
           try {
             await pending;

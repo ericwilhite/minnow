@@ -3411,6 +3411,12 @@ not require a home cache directory.
   not measure the real executor, whose index lookup plans remain unsupported, so real warm-PK
   latency is not established by those numbers.
 
+- A native command root's registry directory (`owner/registry-directory.ts`) keeps
+  `REGISTRY_DIRECTORY_LEAVES` (16) record blocks resident and spills the rest behind a 29-level
+  radix directory. Its charge, `REGISTRY_DIRECTORY_BYTES`, is derived from that count
+  (`exec/row-image-layout.ts`). Eight leaves thrashed under a trigger body's per-row working set;
+  `testing/registry-directory-work.test.ts` bounds the misses, page reads and appends per row.
+
 ### IR (`ir/`)
 
 - Fully typed, positional and plain data. It is bound once, with parameter slots.
