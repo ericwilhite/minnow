@@ -233,6 +233,19 @@ export class WriteCredits {
   }
 
   /** Includes the funded handoff before the private account is returned. */
+  /**
+   * The bytes this owner's growth waits for in the governor, by whether it may use the progress
+   * reserve (`#growTo`: a merge's credit, a
+   * flush's or merge's metadata, a native step), 0 when none waits. Holder growth is served
+   * before any admission: a statement holding the writer turn waits behind it
+   * (`LentHoldings.queued`).
+   */
+  get queuedGrowth(): { readonly ordinary: number; readonly progress: number } {
+    return { ...this.#queuedGrowth };
+  }
+  /** Ordinary growth may not use the progress reserve (`includesProgress`); progress growth may. */
+  readonly #queuedGrowth = { ordinary: 0, progress: 0 };
+
   get hasMergeStep(): boolean {
     return this.#mergeFloor !== 0 || this.#mergeActive !== null;
   }
@@ -687,19 +700,30 @@ export class WriteCredits {
         if (account) releaseIdle(account, floors[i] ?? 0);
       }
       this.#trimMetadataHeadroom();
-      const credits = await this.governor.admitGroup({
-        label: `complete grow ${grant.label}`,
-        ...(includesProgress ? { includesProgress: true } : {}),
-        // The writer holds its floors (and, inside a native step, the root its retained base)
-        // through this wait and cannot release them: holder growth (GOVERNOR-WAIT-POLICY).
-        holdsCredit: this.holderChain,
-        grants: accounts.map((account, i) => ({
-          label: `write growth ${account.label}`,
-          minimumBytes: Math.max(0, (desired[i] ?? 0) - account.held),
-          spillable: false,
-        })),
-        signal: stop,
-      });
+      const parts = accounts.map((account, i) => ({
+        label: `write growth ${account.label}`,
+        minimumBytes: Math.max(0, (desired[i] ?? 0) - account.held),
+        spillable: false,
+      }));
+      // The owner's queued growth (`queuedGrowth`) while it waits, by capacity class.
+      const queued = parts.reduce((sum, part) => sum + part.minimumBytes, 0);
+      const queue = includesProgress ? "progress" : "ordinary";
+      this.#queuedGrowth[queue] += queued;
+      if (queued > 0) this.#changed?.();
+      let credits: readonly Grant[];
+      try {
+        credits = await this.governor.admitGroup({
+          label: `complete grow ${grant.label}`,
+          ...(includesProgress ? { includesProgress: true } : {}),
+          // The writer holds its floors (and, inside a native step, the root its retained base)
+          // through this wait and cannot release them: holder growth (GOVERNOR-WAIT-POLICY).
+          holdsCredit: this.holderChain,
+          grants: parts,
+          signal: stop,
+        });
+      } finally {
+        this.#queuedGrowth[queue] -= queued;
+      }
       try {
         this.#check();
         stop.throwIfAborted();

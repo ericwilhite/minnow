@@ -3099,8 +3099,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
         credits.retainedWhileOpen(
           this.#rowsLifetimeBytes(),
           this.#stayingRowBytes(),
-          this.#ownWorkIdle(),
+          // Work waiting in the governor for its growth frees nothing until it is served, and
+          // as holder growth it is served before the statement's requests: what the owner keeps
+          // meanwhile is known (as for a recycle queued for the turn, #51).
+          this.#ownWorkIdle() || credits.queuedGrowth.ordinary + credits.queuedGrowth.progress > 0,
         ),
+      queued: () => credits.queuedGrowth,
     };
   }
 

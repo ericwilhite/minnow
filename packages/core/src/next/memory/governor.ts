@@ -250,6 +250,14 @@ export interface LentHoldings {
    * holdings are not yet known, and it counts none.
    */
   retained(): number;
+  /**
+   * The bytes the owner's own work waits for in the governor as holder growth (a merge's
+   * credit, a flush's metadata), by whether it may use the progress reserve. Holder growth is
+   * served before admissions, so the statement's
+   * requests wait behind it: when it could never be served beside what the statement keeps,
+   * neither could they.
+   */
+  queued?(): { readonly ordinary: number; readonly progress: number };
 }
 
 /** Named parts of one complete minimum. Each part remains a normal native grant. */
@@ -691,12 +699,16 @@ export class Governor implements MemoryGovernor {
         !(unasked && grant.spillable)
       )
         held += grant.held;
-    return (
-      this.usableCapacity(includesProgress) -
-      held -
-      (own.lent?.retained() ?? 0) -
-      (own.pinned?.() ?? 0)
-    );
+    const kept = held + (own.lent?.retained() ?? 0) + (own.pinned?.() ?? 0);
+    const servable = this.usableCapacity(includesProgress) - kept;
+    // The owner's queued growth is served first: beyond what fits beside the statement in its
+    // own capacity class it never is, and every admission of the statement waits behind it.
+    const queued = own.lent?.queued?.();
+    const blocked =
+      queued !== undefined &&
+      (queued.ordinary > this.usableCapacity(false) - kept ||
+        queued.progress > this.usableCapacity(true) - kept);
+    return blocked ? Math.min(0, servable) : servable;
   }
 
   registerPermanent(bytes: () => number, label = "owner lifetime holdings"): () => void {
