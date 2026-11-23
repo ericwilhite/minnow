@@ -104,7 +104,9 @@ async function history(
   }
 }
 
-it("refuses a read typed inside BEGIN rather than wait for the writer's own rows", async () => {
+// P1's history. With a read by key sized to the row it fetches (#52) it is served; on main it was
+// sized 27.46 MB and refused. Either way it must not wait.
+it("serves or refuses typed a read inside BEGIN rather than wait for the writer's own rows", async () => {
   await history(32, 2_500_000, "SELECT v FROM t WHERE id = 1", false);
 }, 60_000);
 
@@ -114,7 +116,9 @@ for (const seed of seedsFor("next-writable-transaction-read", [0x6301, 0x6302]))
     await fc.assert(
       fc.asyncProperty(
         fc.constantFrom(32, 36, 48, 64),
-        fc.constantFrom(1_000_000, 2_000_000, 2_500_000),
+        // 3,000,000-byte rows read in order at 32 MiB are refused typed beside the writer's
+        // holdings; wider rows make the history's own post-rollback check refused at these caps.
+        fc.constantFrom(1_000_000, 2_000_000, 2_500_000, 3_000_000),
         fc.constantFrom(...READS),
         fc.boolean(),
         async (cap, width, read, writeFirst) => {
@@ -122,7 +126,14 @@ for (const seed of seedsFor("next-writable-transaction-read", [0x6301, 0x6302]))
           await history(cap, width, read, writeFirst, reach);
         },
       ),
-      { seed, numRuns: 12, examples: [[32, 2_500_000, READS[0], false]] },
+      {
+        seed,
+        numRuns: 12,
+        examples: [
+          [32, 2_500_000, READS[0], false],
+          [32, 3_000_000, READS[1], false],
+        ],
+      },
     );
     reach.assertReached();
   }, 600_000);
