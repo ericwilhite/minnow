@@ -13823,4 +13823,10 @@ export const STEP_SIGNAL_DIFFERENTIAL_REACH = [
   "nested step",
   "step with several aborted parents",
   "step left unaborted",
+  "step created inside a listener",
+  "step created over an aborted step",
+  "direct abort of an abortable step",
+  "direct abort inside a parent's abort",
+  "close inside an abort",
+  "throwing listener",
 ] as const;

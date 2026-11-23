@@ -24,10 +24,11 @@ import { createReach, STEP_SIGNAL_DIFFERENTIAL_REACH } from "../../testing/reach
 import { seedsFor } from "../../testing/seeds.js";
 import { MinnowDatabaseClient } from "../owner/database-client.js";
 import {
+  abortableStep,
+  ambiguousStepOpens,
   heldStepSignals,
   observeStepSignals,
   stepSignal,
-  type StepSignal,
 } from "../step-signal.js";
 import { publicOwner } from "./public-owner.test.fixture.js";
 
@@ -128,6 +129,103 @@ describe("stepSignal", () => {
     b.close();
   });
 
+  // Astra's re-check of #55 (probes.mjs): each compared with AbortSignal.any.
+  it("takes an aborted step's own reason, never re-derived from its parents", () => {
+    const p = new AbortController(),
+      q = new AbortController();
+    const nativeA = AbortSignal.any([p.signal, q.signal]),
+      a = stepSignal("a", p.signal, q.signal);
+    q.abort("caller");
+    p.abort("cleanup");
+    const nativeB = AbortSignal.any([nativeA]),
+      b = stepSignal("b", a.signal);
+    expect([nativeA.reason, nativeB.reason]).toEqual(["caller", "caller"]);
+    expect([a.signal.reason, b.signal.reason]).toEqual(["caller", "caller"]);
+  });
+
+  it("takes a pending step's decided reason when opened inside a reentrant listener", () => {
+    const run = (open: (...parents: AbortSignal[]) => AbortSignal) => {
+      const p = new AbortController(),
+        q = new AbortController();
+      const a = open(p.signal, q.signal);
+      let b: AbortSignal | undefined;
+      q.signal.addEventListener("abort", () => p.abort("cleanup"));
+      p.signal.addEventListener("abort", () => {
+        b = open(a);
+      });
+      q.abort("caller");
+      return [a.reason as unknown, b?.reason as unknown];
+    };
+    const native = run((...parents) => AbortSignal.any(parents));
+    expect(native).toEqual(["caller", "caller"]);
+    expect(run((...parents) => stepSignal("probe", ...parents).signal)).toEqual(native);
+  });
+
+  it("keeps the caller's reason when a parent's listener aborts an abortable step directly", () => {
+    const p = new AbortController(),
+      stop = new AbortController();
+    const native = AbortSignal.any([p.signal, stop.signal]);
+    const step = abortableStep("own reentrant", p.signal);
+    p.signal.addEventListener("abort", () => {
+      stop.abort("cleanup");
+      step.abort("cleanup");
+    });
+    p.abort("caller");
+    expect(native.reason).toBe("caller");
+    expect(step.signal.reason).toBe("caller");
+  });
+
+  it("still aborts a step closed inside its parent's abort, as a composite would", () => {
+    const p = new AbortController();
+    const native = AbortSignal.any([p.signal]),
+      step = stepSignal("closed in listener", p.signal);
+    const before = heldStepSignals();
+    p.signal.addEventListener("abort", () => step.close());
+    p.abort("caller");
+    expect(native.reason).toBe("caller");
+    expect(step.signal.reason).toBe("caller");
+    expect(heldStepSignals()).toBe(before - 1);
+  });
+
+  /**
+   * Known divergence (#55, C1/Astra): a step opened, inside a listener, over a step two of whose
+   * sources are both mid-abort, one nested in the other through a listener registered before the
+   * steps. Natively it is born aborted (the outer source's reason). No platform signal tells which
+   * source aborted first before their fan-outs run, short of a native composite per step (the
+   * cost this module removes), so it follows that step and takes its reason when the outer
+   * fan-out applies it: the same reason, but its abort event fires then instead of never.
+   */
+  const nested = (open: (...parents: AbortSignal[]) => AbortSignal) => {
+    const p0 = new AbortController(),
+      p1 = new AbortController();
+    const s0 = open(p1.signal, p0.signal);
+    let fired = false,
+      born = false,
+      s1: AbortSignal | undefined;
+    p0.signal.addEventListener("abort", () => p1.abort("p1"));
+    p1.signal.addEventListener("abort", () => {
+      s1 = open(s0);
+      born = s1.aborted;
+      s1.addEventListener("abort", () => {
+        fired = true;
+      });
+    });
+    p0.abort("p0");
+    return { born, fired, reasons: [s0.reason as unknown, s1?.reason as unknown] };
+  };
+  const native = () => nested((...parents) => AbortSignal.any(parents));
+  const steps = () => nested((...parents) => stepSignal("nested", ...parents).signal);
+
+  it("ends a step opened over a step with two nested pending aborts with the native reasons", () => {
+    expect(native()).toEqual({ born: true, fired: false, reasons: ["p0", "p0"] });
+    expect(steps().reasons).toEqual(["p0", "p0"]);
+  });
+
+  // Pinned: the event timing of that known divergence, so a change in either direction is seen.
+  it.fails("is born aborted over a step with two nested pending aborts, as natively", () => {
+    expect(steps()).toEqual(native());
+  });
+
   it("releases a sibling closed during an abort, and aborts a late step at once", () => {
     const parent = new AbortController();
     const before = heldStepSignals();
@@ -156,20 +254,69 @@ describe("stepSignal", () => {
 });
 
 /**
- * A random world of parents, steps (some following other steps) and reentrant listeners, built
- * twice: once with `AbortSignal.any` composites, once with step signals. Each listener aborts a
- * parent with its own reason, so the order of aborts shows in the reasons.
+ * A random world of parents and steps, built twice: with native composites (a step is
+ * `AbortSignal.any(parents)`, an abortable step `AbortSignal.any([...parents, own.signal])` and
+ * its direct abort `own.abort`), and with step signals. Listeners on parents and steps abort
+ * parents, abort abortable steps, open steps (over parents and existing steps), close steps or
+ * throw; every abort carries its own reason, so the order of aborts shows in the reasons.
+ *
+ * A step closed before any abort of it was decided is over: in both worlds it then reads
+ * "closed", runs no listener and is followed by no new step (a native composite has no close; the
+ * model freezes it there). A step closed after its abort was decided (inside that abort's
+ * dispatch) reads that abort's reason, as a composite would.
  */
+type Ref = { parent: number } | { step: number };
+type Action =
+  | { do: "abort parent"; parent: number }
+  | { do: "abort step"; step: number }
+  | { do: "open"; abortable: boolean; parents: readonly Ref[] }
+  | { do: "close"; step: number }
+  | { do: "throw" };
 interface World {
   readonly parents: number;
-  /** Each step's parents: a parent index, or `-1 - k` for step k (an earlier step). */
-  readonly steps: ReadonlyArray<readonly number[]>;
-  /** `on`: a parent index, or `-1 - k` for step k; `before`: registered before the steps. */
-  readonly listeners: ReadonlyArray<{ on: number; before: boolean; aborts: number }>;
-  /** Parents aborted from outside, in order. */
-  readonly aborts: readonly number[];
+  /** Steps opened before any abort. */
+  readonly steps: ReadonlyArray<{ abortable: boolean; parents: readonly Ref[] }>;
+  /** `before`: on a parent, registered before the steps open. */
+  readonly listeners: ReadonlyArray<{ on: Ref; before: boolean; action: Action }>;
+  /** Done from outside, in order. */
+  readonly outside: readonly Action[];
 }
 
+const ref = (parents: number, steps: number): fc.Arbitrary<Ref> =>
+  fc.oneof(
+    fc.integer({ min: 0, max: parents - 1 }).map((parent) => ({ parent })),
+    fc.integer({ min: 0, max: steps - 1 }).map((step) => ({ step })),
+  );
+const action = (parents: number, steps: number): fc.Arbitrary<Action> =>
+  fc.oneof(
+    {
+      weight: 4,
+      arbitrary: fc
+        .integer({ min: 0, max: parents - 1 })
+        .map((parent) => ({ do: "abort parent" as const, parent })),
+    },
+    {
+      weight: 2,
+      arbitrary: fc
+        .integer({ min: 0, max: steps - 1 })
+        .map((step) => ({ do: "abort step" as const, step })),
+    },
+    {
+      weight: 2,
+      arbitrary: fc.record({
+        do: fc.constant("open" as const),
+        abortable: fc.boolean(),
+        parents: fc.array(ref(parents, steps), { minLength: 1, maxLength: 3 }),
+      }),
+    },
+    {
+      weight: 1,
+      arbitrary: fc
+        .integer({ min: 0, max: steps - 1 })
+        .map((step) => ({ do: "close" as const, step })),
+    },
+    { weight: 1, arbitrary: fc.constant({ do: "throw" as const }) },
+  );
 const world: fc.Arbitrary<World> = fc
   .record({ parents: fc.integer({ min: 2, max: 4 }), steps: fc.integer({ min: 1, max: 4 }) })
   .chain(({ parents, steps }) =>
@@ -177,101 +324,233 @@ const world: fc.Arbitrary<World> = fc
       parents: fc.constant(parents),
       steps: fc.tuple(
         ...Array.from({ length: steps }, (_, k) =>
-          fc.array(fc.integer({ min: -k, max: parents - 1 }), {
-            minLength: 1,
-            maxLength: 3,
+          fc.record({
+            abortable: fc.boolean(),
+            parents: fc.array(
+              k === 0 ? ref(parents, 1).filter((r) => "parent" in r) : ref(parents, k),
+              {
+                minLength: 1,
+                maxLength: 3,
+              },
+            ),
           }),
         ),
       ),
+      // Refs to steps may name steps opened later (inside listeners): unknown ones are skipped.
       listeners: fc.array(
         fc.record({
-          on: fc.integer({ min: -steps, max: parents - 1 }),
+          on: ref(parents, steps + 2),
           before: fc.boolean(),
-          aborts: fc.integer({ min: 0, max: parents - 1 }),
+          action: action(parents, steps + 2),
         }),
         { maxLength: 6 },
       ),
-      aborts: fc.array(fc.integer({ min: 0, max: parents - 1 }), { minLength: 1, maxLength: 3 }),
+      outside: fc.array(action(parents, steps + 2), { minLength: 1, maxLength: 3 }),
     }),
   );
 
-/** Each step's (and parent's) final state: its reason's label, or "-" when not aborted. */
-function play(w: World, derive: (parents: readonly AbortSignal[]) => AbortSignal): string[] {
+/** How one world makes and drives its steps. */
+interface Engine {
+  readonly native: boolean;
+  open(
+    parents: readonly AbortSignal[],
+    abortable: boolean,
+  ): { signal: AbortSignal; abort(reason: unknown): void; close(): void };
+}
+const nativeEngine: Engine = {
+  native: true,
+  open(parents, abortable) {
+    const own = new AbortController();
+    const signal = AbortSignal.any(abortable ? [...parents, own.signal] : [...parents]);
+    return { signal, abort: (reason) => own.abort(reason), close: () => undefined };
+  },
+};
+const stepEngine: Engine = {
+  native: false,
+  open(parents, abortable) {
+    if (abortable) {
+      const step = abortableStep("differential", ...parents);
+      return {
+        signal: step.signal,
+        abort: (reason) => step.abort(reason),
+        close: () => step.close(),
+      };
+    }
+    const step = stepSignal("differential", ...parents);
+    return { signal: step.signal, abort: () => undefined, close: () => step.close() };
+  },
+};
+
+/** Each parent's and step's final state: its reason's label, "closed", or "-" when untouched. */
+function play(w: World, engine: Engine, seen: Set<string>): string[] {
   const controllers = Array.from({ length: w.parents }, () => new AbortController());
-  const reasons = new Map<unknown, string>();
+  const labels = new Map<unknown, string>();
+  let next = 0;
   const reason = (label: string) => {
     const value = new Error(label);
-    reasons.set(value, label);
+    labels.set(value, `${label} ${String(next++)}`);
     return value;
   };
-  const signals: AbortSignal[] = [];
-  const target = (on: number) => (on >= 0 ? controllers[on]?.signal : signals[-1 - on]);
-  const listen = (index: number) => {
-    const { on, aborts } = w.listeners[index] ?? { on: 0, aborts: 0 };
-    target(on)?.addEventListener("abort", () =>
-      controllers[aborts]?.abort(reason(`listener ${String(index)}`)),
-    );
+  const steps: Array<{
+    signal: AbortSignal;
+    abort(reason: unknown): void;
+    close(): void;
+    abortable: boolean;
+    closed: string | null;
+  }> = [];
+  const signalOf = (r: Ref) =>
+    "parent" in r ? controllers[r.parent]?.signal : steps[r.step]?.signal;
+  const label = (signal: AbortSignal) =>
+    signal.aborted ? (labels.get(signal.reason) ?? "?") : "-";
+  let dispatching = 0;
+  const pendingListeners: Array<{ on: Ref; action: Action }> = [];
+  const run = (act: Action, source: string) => {
+    if (act.do === "abort parent") {
+      if (dispatching > 0) seen.add("reentrant abort of another parent");
+      controllers[act.parent]?.abort(reason(`${source} aborts parent ${String(act.parent)}`));
+    } else if (act.do === "abort step") {
+      const step = steps[act.step];
+      if (!step?.abortable || step.closed !== null) return;
+      seen.add(
+        dispatching > 0
+          ? "direct abort inside a parent's abort"
+          : "direct abort of an abortable step",
+      );
+      step.abort(reason(`${source} aborts step ${String(act.step)}`));
+    } else if (act.do === "open") {
+      // A closed step is over: nothing may follow it.
+      if (act.parents.some((r) => "step" in r && steps[r.step]?.closed != null)) return;
+      const parents = act.parents.map(signalOf);
+      if (parents.some((p) => p === undefined)) return;
+      if (dispatching > 0) seen.add("step created inside a listener");
+      if (act.parents.some((r) => "step" in r && steps[r.step]?.signal.aborted))
+        seen.add("step created over an aborted step");
+      open(parents as AbortSignal[], act.abortable);
+    } else if (act.do === "close") {
+      const step = steps[act.step];
+      if (step?.closed !== null) return;
+      if (dispatching > 0) seen.add("close inside an abort");
+      step.close();
+      // A native composite has no close: its state at the close is the model's verdict (an abort
+      // already decided stays; otherwise the step is over). A step signal is judged at the end.
+      step.closed = engine.native ? label(step.signal) : "pending";
+    } else {
+      seen.add("throwing listener");
+      throw new Error("listener threw");
+    }
   };
-  for (const [index, listener] of w.listeners.entries())
-    if (listener.before && listener.on >= 0) listen(index);
-  for (const parents of w.steps)
-    signals.push(
-      derive(
-        parents
-          .map((i) => (i >= 0 ? controllers[i]?.signal : signals[-1 - i]))
-          .filter((signal): signal is AbortSignal => signal !== undefined),
-      ),
-    );
-  for (const [index, listener] of w.listeners.entries())
-    if (!listener.before || listener.on < 0) listen(index);
-  for (const [k, index] of w.aborts.entries())
-    controllers[index]?.abort(reason(`outside ${String(k)}`));
-  return [...controllers.map((c) => c.signal), ...signals].map((signal) =>
-    signal.aborted ? (reasons.get(signal.reason) ?? "?") : "-",
-  );
+  const listen = (index: number, on: Ref, act: Action) =>
+    signalOf(on)?.addEventListener("abort", () => {
+      // A step closed before its abort was decided is over (a native composite would fire on).
+      if ("step" in on && steps[on.step]?.closed === "-") return;
+      dispatching++;
+      try {
+        if ("step" in on && act.do === "abort parent") seen.add("step listener aborted a parent");
+        run(act, `listener ${String(index)}`);
+      } finally {
+        dispatching--;
+      }
+    });
+  const open = (parents: AbortSignal[], abortable: boolean) => {
+    const opened = engine.open(parents, abortable);
+    steps.push({ ...opened, abortable, closed: null });
+    const index = steps.length - 1;
+    // Listeners naming this step attach as it opens.
+    for (const [k, l] of w.listeners.entries())
+      if ("step" in l.on && l.on.step === index) listen(k, l.on, l.action);
+    return opened;
+  };
+  void pendingListeners;
+  for (const [k, l] of w.listeners.entries())
+    if (l.before && "parent" in l.on) {
+      seen.add("parent listener registered before the steps");
+      listen(k, l.on, l.action);
+    }
+  for (const step of w.steps) {
+    const parents = step.parents.map(signalOf);
+    if (parents.some((p) => p === undefined)) continue;
+    if (step.parents.some((r) => "step" in r)) seen.add("nested step");
+    open(parents as AbortSignal[], step.abortable);
+  }
+  for (const [k, l] of w.listeners.entries())
+    if (!l.before && "parent" in l.on) listen(k, l.on, l.action);
+  for (const [k, act] of w.outside.entries()) {
+    try {
+      run(act, `outside ${String(k)}`);
+    } catch {
+      // An outside "throw" is not a listener: nothing to compare.
+    }
+  }
+  const verdict = (step: (typeof steps)[number]) => {
+    if (step.closed === null) return label(step.signal);
+    const state = step.closed === "pending" ? label(step.signal) : step.closed;
+    return state === "-" ? "closed" : state;
+  };
+  for (const step of steps) if (verdict(step) === "-") seen.add("step left unaborted");
+  return [...controllers.map((c) => label(c.signal)), ...steps.map(verdict)];
 }
+
+const RUNS = 400;
 
 it.each(seedsFor("next-step-signal-differential", [0x5751, 0x5752]))(
   "aborts exactly as AbortSignal.any under reentrant listeners (seed %i)",
-  (seed) => {
+  async (seed) => {
     const reach = createReach(
       "step signals against AbortSignal.any",
       STEP_SIGNAL_DIFFERENTIAL_REACH,
     );
-    fc.assert(
-      fc.property(world, (w) => {
-        reach.beginHistory();
-        const steps: StepSignal[] = [];
-        const native = play(w, (parents) => AbortSignal.any([...parents]));
-        const ours = play(w, (parents) => {
-          const step = stepSignal("differential", ...parents);
-          steps.push(step);
-          return step.signal;
-        });
-        expect(ours).toEqual(native);
-        for (const step of steps) step.close();
-        const listenerKinds = w.listeners.map((l) => l.on);
-        if (w.listeners.some((l) => l.before && l.on >= 0))
-          reach.reach("parent listener registered before the steps");
-        if (listenerKinds.some((on) => on < 0)) reach.reach("step listener aborted a parent");
-        if (w.listeners.length > 0 && native.filter((r) => r.startsWith("listener")).length > 0)
-          reach.reach("reentrant abort of another parent");
-        if (w.steps.some((parents) => parents.some((i) => i < 0))) reach.reach("nested step");
-        const stepStates = native.slice(w.parents);
-        if (
-          w.steps.some(
-            (parents, k) =>
-              stepStates[k] !== "-" &&
-              parents.filter((i) => i >= 0 && native[i] !== "-").length >= 2,
+    // A throwing listener is reported, not thrown: count the reports per world.
+    let thrown = 0,
+      ambiguousWorlds = 0;
+    const report = () => {
+      thrown++;
+    };
+    process.on("uncaughtException", report);
+    try {
+      await fc.assert(
+        fc.asyncProperty(world, async (w) => {
+          reach.beginHistory();
+          const seen = new Set<string>();
+          thrown = 0;
+          const native = play(w, nativeEngine, seen);
+          await new Promise((resolve) => setImmediate(resolve));
+          const nativeThrown = thrown;
+          thrown = 0;
+          const ambiguousBefore = ambiguousStepOpens();
+          const ours = play(w, stepEngine, new Set());
+          await new Promise((resolve) => setImmediate(resolve));
+          // The pinned known divergence ("opens born-aborted over a step whose two sources are
+          // aborting nested"): a world that reached it is counted, not compared.
+          if (ambiguousStepOpens() !== ambiguousBefore) {
+            ambiguousWorlds++;
+            return;
+          }
+          expect(ours).toEqual(native);
+          expect(thrown, "listeners threw as often").toBe(nativeThrown);
+          for (const state of seen)
+            reach.reach(state as (typeof STEP_SIGNAL_DIFFERENTIAL_REACH)[number]);
+          const stepStates = native.slice(w.parents);
+          if (
+            w.steps.some(
+              (step, k) =>
+                stepStates[k] !== "-" &&
+                step.parents.filter((r) => "parent" in r && native[r.parent] !== "-").length >= 2,
+            )
           )
-        )
-          reach.reach("step with several aborted parents");
-        if (stepStates.includes("-")) reach.reach("step left unaborted");
-      }),
-      { seed, numRuns: 400 },
-    );
+            reach.reach("step with several aborted parents");
+        }),
+        { seed, numRuns: RUNS },
+      );
+    } finally {
+      process.off("uncaughtException", report);
+    }
     reach.assertReached();
+    // The exclusion stays rare: it removes the known divergence, not the differential's power.
+    expect(ambiguousWorlds, "worlds that reached the known divergence").toBeLessThanOrEqual(
+      Math.ceil(RUNS / 100),
+    );
   },
+  120_000,
 );
 
 const ROWS = 2000;

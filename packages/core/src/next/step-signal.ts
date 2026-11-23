@@ -41,7 +41,8 @@ export interface AbortableStep extends StepSignal {
 interface Step {
   /** Its sources: the parents it joined, step parents replaced by their own. */
   readonly parents: readonly AbortSignal[];
-  close(): void;
+  /** Leaves every parent (the fan-out that aborts it, or a close). */
+  release(): void;
 }
 
 /** A parent's sentinel, its open steps and the listener that fans its abort out to them. */
@@ -55,10 +56,24 @@ interface Fanout {
 const fanouts = new WeakMap<AbortSignal, Fanout>();
 /** Parents whose abort has been fanned out to every step that was theirs to abort. */
 const dispatched = new WeakSet<AbortSignal>();
-/** Step signals and the sources they follow (for flattening). */
-const stepSources = new WeakMap<AbortSignal, readonly AbortSignal[]>();
+/**
+ * Each step signal's sources, and what a step that follows it follows instead: a plain step's
+ * sources, an abortable step's sources and its own signal (its direct aborts), as
+ * `AbortSignal.any` replaces a composite source by its sources.
+ */
+const records = new WeakMap<
+  AbortSignal,
+  {
+    readonly sources: readonly AbortSignal[];
+    readonly stands: readonly AbortSignal[];
+    /** Aborted by its owner (`abortableStep`): its signal is then a source of its own. */
+    direct: boolean;
+  }
+>();
 /** Registrations parents hold: one per open step and parent. */
 let held = 0;
+/** Steps opened over a step with several pending aborts (the known divergence below). */
+let ambiguous = 0;
 /** Test builds only: told the site of every step as it opens (null in production). */
 let observer: ((site: string) => void) | null = null;
 
@@ -76,13 +91,8 @@ function fanoutOf(parent: AbortSignal): Fanout {
         for (const [controller, step] of [...steps]) {
           if (controller.signal.aborted) continue;
           // An enclosing abort of another parent decides this step: its fan-out aborts it.
-          if (
-            step.parents.some(
-              (other) => other !== parent && other.aborted && !dispatched.has(other),
-            )
-          )
-            continue;
-          step.close();
+          if (step.parents.some((other) => other !== parent && pending(other, parent))) continue;
+          step.release();
           controller.abort(parent.reason);
         }
       } finally {
@@ -126,58 +136,137 @@ export function stepSignal(site: string, ...parents: readonly AbortSignal[]): St
 
 /**
  * A step signal its owner can also abort (instead of following a fresh controller of its own,
- * which would be one more parent per step). Its signal is a source of its own: a step that
- * follows it follows it, not its parents.
+ * which would be one more parent per step): as `AbortSignal.any([...parents, own.signal])` with a
+ * private `own` controller. Its signal is a source of its own: a step that follows it follows it,
+ * not its parents.
  */
 export function abortableStep(site: string, ...parents: readonly AbortSignal[]): AbortableStep {
-  const step = open(site, parents, false);
-  return {
-    ...step,
-    abort: (reason?: unknown) => {
-      step.close();
-      step.controller.abort(reason);
-    },
-  };
+  return open(site, parents, false);
+}
+
+/**
+ * Whether an abort of these sources is already decided but not yet fanned out: one is aborted
+ * and its fan-out has not run. Natively the composite is aborted then (its reason was fixed when
+ * that source aborted); here the pending fan-out applies it.
+ */
+function decided(sources: readonly AbortSignal[]): boolean {
+  return sources.some((source) => pending(source));
+}
+
+/**
+ * A source aborted whose fan-out has not run, or a step not yet aborted that follows one
+ * (`except`: the source whose fan-out is asking).
+ */
+function pending(signal: AbortSignal, except: AbortSignal | null = null): boolean {
+  if (signal === except) return false;
+  const record = records.get(signal);
+  // A step aborted through its sources is not a source in time of its own: look through it.
+  if (signal.aborted && (record === undefined || record.direct)) return !dispatched.has(signal);
+  return record?.sources.some((source) => pending(source, except)) ?? false;
+}
+
+/** The aborted sources behind `signal` whose fan-outs have not run. */
+function pendingSources(signal: AbortSignal, into: AbortSignal[]): AbortSignal[] {
+  const record = records.get(signal);
+  if (signal.aborted && (record === undefined || record.direct)) {
+    if (!dispatched.has(signal) && !into.includes(signal)) into.push(signal);
+  } else for (const source of record?.sources ?? []) pendingSources(source, into);
+  return into;
 }
 
 function open(
   site: string,
   parents: readonly AbortSignal[],
   flattened: boolean,
-): StepSignal & { readonly controller: AbortController } {
+): StepSignal & { abort(reason?: unknown): void } {
   const controller = new AbortController();
-  const sources: AbortSignal[] = [];
-  for (const parent of parents)
-    for (const source of stepSources.get(parent) ?? [parent])
-      if (!sources.includes(source)) sources.push(source);
+  let released = false,
+    closing = false;
   const joined: AbortSignal[] = [];
-  let closed = false;
-  const close = (): void => {
-    if (closed) return;
-    closed = true;
+  const release = (): void => {
+    if (released) return;
+    released = true;
     for (const parent of joined) leave(parent, controller);
     joined.length = 0;
   };
-  const step: Step = { parents: sources, close };
-  for (const source of sources)
-    if (source.aborted) {
-      close();
-      controller.abort(source.reason);
-      return { signal: controller.signal, close, controller };
+  const sources: AbortSignal[] = [];
+  const step: Step = { parents: sources, release };
+  const handle = {
+    signal: controller.signal,
+    // Closing while an abort of the step is decided but pending waits for that fan-out: the step
+    // still ends aborted with that reason, as a composite would.
+    close: (): void => {
+      if (released || closing) return;
+      if (!controller.signal.aborted && decided(sources)) closing = true;
+      else release();
+    },
+    // A direct abort under a decided, pending abort changes nothing: natively the composite took
+    // the parent's reason first.
+    // After a close the step is over: a direct abort changes nothing.
+    abort: (reason?: unknown): void => {
+      if (controller.signal.aborted || released || closing || decided(sources)) return;
+      release();
+      const record = records.get(controller.signal);
+      if (record !== undefined) record.direct = true;
+      controller.abort(reason);
+    },
+  };
+  for (const parent of parents) {
+    // As AbortSignal.any: the first parent already aborted, in order, decides at once (a step
+    // parent by its own recorded reason, never re-derived from its parents).
+    if (parent.aborted) {
+      released = true;
+      controller.abort(parent.reason);
+      observer?.(site);
+      return handle;
     }
+    const record = records.get(parent);
+    const decidedBy = record === undefined ? [] : pendingSources(parent, []);
+    if (decidedBy.length === 1) {
+      // A step whose abort is decided but pending is aborted natively, with the reason of the one
+      // source whose fan-out has not run (any other aborted source has run: it passed over the
+      // step for this one, which aborted first). As AbortSignal.any: this step is aborted at once.
+      released = true;
+      controller.abort(decidedBy[0]?.reason);
+      observer?.(site);
+      return handle;
+    }
+    if (decidedBy.length > 1) {
+      ambiguous++;
+      // Several pending aborts: which came first is known only once their fan-outs run (the
+      // outermost decides). Follow that step alone and take its reason when it is applied.
+      sources.length = 0;
+      sources.push(parent);
+      break;
+    }
+    for (const source of record?.stands ?? [parent])
+      if (!sources.includes(source)) sources.push(source);
+  }
   for (const source of sources) {
     join(source, controller, step);
     joined.push(source);
   }
-  // Only a step that nothing but its parents can abort may stand for them.
-  if (flattened) stepSources.set(controller.signal, sources);
+  records.set(controller.signal, {
+    sources,
+    stands: flattened ? sources : [...sources, controller.signal],
+    direct: false,
+  });
   observer?.(site);
-  return { signal: controller.signal, close, controller };
+  return handle;
 }
 
 /** Test builds only: observe every step as it opens, by site; null stops observing. */
 export function observeStepSignals(observe: ((site: string) => void) | null): void {
   observer = observe;
+}
+
+/**
+ * Steps opened over a step whose abort several pending sources could have decided (tests). Natively
+ * such a step is born aborted; here it is aborted, with the same reason, when the outermost of
+ * those sources is fanned out (no platform signal orders them before then).
+ */
+export function ambiguousStepOpens(): number {
+  return ambiguous;
 }
 
 /** Step registrations parents still hold (tests: a step never closed stays held). */

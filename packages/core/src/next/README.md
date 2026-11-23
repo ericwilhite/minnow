@@ -540,21 +540,31 @@ leaf supplies captured Date intrinsics to both engines; it cannot import either 
   re-reads its sources on every `aborted`, `reason` and `throwIfAborted` (Node's
   `refreshCompositeSignal`), and a native trigger statement made 57 of them per row. A step is a
   plain `AbortController`. `abortableStep` adds `abort(reason)`, for a step its owner also cancels
-  directly, instead of a fresh controller as one more parent.
-- A step aborts exactly as `AbortSignal.any(parents)` would, by the DOM's two-phase signal abort:
+  directly; it behaves as `AbortSignal.any([...parents, own.signal])`.
+- A step aborts as `AbortSignal.any(parents)` would, by the DOM's two-phase signal abort:
   - each parent with open steps has one sentinel, `AbortSignal.any([parent])`, created once and
     never read. The parent's fan-out listens on it, so steps abort where a composite's event would
     fire: after every listener of the parent, in join order;
-  - the first parent to abort decides the reason. A fan-out passes over a step whose other aborted
-    parent has not finished its own fan-out (that abort encloses this one);
-  - a parent that is a `stepSignal` stands for its own parents, as a composite source does.
+  - the first parent to abort decides the reason. A fan-out passes over a step that another
+    aborted parent has decided but not yet fanned out (that abort encloses this one);
+  - a parent that is a step stands for its own sources (an abortable step also for its own
+    signal), as a composite source does. A parent step already aborted gives its recorded reason;
+    one whose abort is decided by a single pending source gives that source's reason at once.
+  - a close, or an abortable step's direct abort, while its abort is decided but pending, waits
+    for that fan-out: the step ends aborted with the decided reason.
+- **Known divergence, pinned in the tests:** a step opened over a step whose abort two pending
+  sources could have decided (two nested aborts, through a listener registered before the steps)
+  is not born aborted. It ends with the native reason when the outer fan-out runs, so it fires an
+  abort event a composite would not. Ordering those aborts sooner needs a native composite per
+  step, the cost this module removes. `ambiguousStepOpens()` counts it.
 - A step must be closed when it ends (`close()` in a `finally`, including when the work it guards
   refuses to start). A parent's sentinel listener is removed with its last step.
 - Tests: `heldStepSignals()` counts registrations parents still hold, and
   `observeStepSignals(site => …)` sees each step open. `testing/step-signal.test.ts` holds a
-  fast-check differential against `AbortSignal.any` under reentrant listeners, the per-row
-  composite and sentinel counts, no step left held after 2,000 rows, and prompt cancellation at
-  every site.
+  fast-check differential against `AbortSignal.any` covering reentrant listeners, steps opened
+  inside listeners and over aborted steps, direct aborts, throwing listeners and closes inside an
+  abort; the per-row composite and sentinel counts; no step left held after 2,000 rows; and prompt
+  cancellation at every site.
 
 ### Vectors (`vector/`)
 
