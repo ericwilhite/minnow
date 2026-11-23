@@ -283,3 +283,62 @@ it.each(cases)(
   },
   300_000,
 );
+
+/**
+ * A scan that filters on the wide value and returns only the key, over two stored wide rows.
+ *
+ * Its result holds integers, so its result step funds an integer row, not four copies of the
+ * value it never returns (fix 2: plain delivery whose columns are all fixed-width measures no
+ * source column, and still takes the emitted-row recipe once its minimum is over the cap). Found
+ * by writable-transaction-read-wait's post-rollback check (CI seed 25345): over a flushed group of
+ * two 2.5 MB values at 32 MiB, `SELECT id FROM t WHERE v = 'z'` asked 46,350,653 bytes, 18,956,064
+ * of them the result's four-copy envelope, and was refused below its need. The rows are built as
+ * that history builds them (small rows, then one UPDATE), and flushed into a stored group.
+ */
+it.each([MiB, 2 * MiB, 2_500_000])(
+  "a key-only scan over two stored wide rows is served within its need (32 MiB, width %i)",
+  async (width) => {
+    const owner = await publicOwner({ capBytes: 32 * MiB });
+    const db = new MinnowDatabaseClient(owner.client, { ready: Promise.resolve() });
+    const governor = owner.core.harness.governor;
+    try {
+      await db.execute("CREATE TABLE t(id INT PRIMARY KEY, a TEXT)");
+      await db.execute("INSERT INTO t VALUES (1, 'x'), (2, 'y')");
+      await db.execute("UPDATE t SET a = $1", ["w".repeat(width)]);
+      await owner.core.harness.path.quiesce();
+      // An idle writer asked to reclaim freezes and flushes its live memtable (as above).
+      for (let round = 0; round < 2; round++) {
+        const reclaim = new AbortController();
+        const drained = governor
+          .admit({
+            label: "flush the rows into groups",
+            minimumBytes: governor.usableCapacity(),
+            spillable: false,
+            signal: reclaim.signal,
+          })
+          .then(
+            (grant) => {
+              grant.close();
+            },
+            () => undefined,
+          );
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        reclaim.abort();
+        await drained;
+        await owner.core.harness.path.quiesce();
+      }
+      const derived = need(2 * (width + 1 + 8 + 8));
+      const capacity = governor.usableCapacity(true);
+      expect(derived, "the case is one whose need fits").toBeLessThanOrEqual(capacity);
+      const outcome = await db.query("SELECT id FROM t WHERE a = 'z'").then(
+        (result) => result.rows(),
+        (error: unknown) => error,
+      );
+      expect(outcome, `need ${String(derived)} fits ${String(capacity)}`).toEqual([]);
+    } finally {
+      await db.close();
+      await owner.close();
+    }
+  },
+  120_000,
+);
