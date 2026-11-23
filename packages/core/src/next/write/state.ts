@@ -194,6 +194,12 @@ export interface Shared {
    * the space pin is taken once per state and released with the last view).
    */
   pinState(state: WriteState, label: string): SpacePin;
+  /**
+   * The memory a pin of `state` alone keeps (its space pin, its root, its group directories and
+   * chunks no other state shares), when it is the state's only pin and the state is not the
+   * current one; 0 otherwise (`Snapshot.exclusiveBytes`).
+   */
+  exclusiveStateBytes?(state: WriteState): number;
   runReader(ref: RunRef): RunReader | Promise<RunReader>;
   /**
    * A group's root through the metadata reader (format/metadata-reader.ts): cached and shared,

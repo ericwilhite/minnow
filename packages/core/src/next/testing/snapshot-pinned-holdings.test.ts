@@ -108,3 +108,71 @@ it("waits for an older snapshot that alone keeps flushed rows, then serves the r
     await core.close();
   }
 }, 60_000);
+
+it("counts a snapshot's own pin of a superseded state (Astra, review of #56)", async () => {
+  // The snapshot pins the state after `t`; `u` supersedes it. Its root, its space pin and the
+  // group directories only it keeps stay until it closes: a request of what it reported
+  // servable waited forever when they counted nothing.
+  Governor.stallAfterMs = 5_000;
+  const core = new StorageCore();
+  const governor = new Governor(32 * MiB);
+  Object.defineProperty(core.harness, "governor", { value: governor });
+  await core.open();
+  const cancel = new AbortController();
+  let snapshot: ReturnType<typeof core.harness.path.pin> | null = null;
+  try {
+    await core.execute("CREATE TABLE t(id INT PRIMARY KEY)");
+    snapshot = core.harness.path.pin();
+    await core.execute("CREATE TABLE u(id INT PRIMARY KEY)");
+    await core.harness.path.quiesce();
+    const pinned = snapshot;
+    const holdings = () => ({ grants: [], pinned: () => pinned.exclusiveBytes() });
+    const servable = governor.servableNow(holdings());
+    const admit = (bytes: number) =>
+      governor
+        .admitGroup({
+          label: "snapshot request",
+          grants: [{ label: "snapshot request", minimumBytes: bytes, spillable: false }],
+          holdings,
+          signal: cancel.signal,
+        })
+        .then(
+          (grants) => {
+            for (const grant of grants) grant.close();
+            return "served" as const;
+          },
+          (error: unknown) => error,
+        );
+    expect(await within(admit(servable), 1_500), "what it reports is served").toBe("served");
+    expect(await within(admit(servable + 1), 1_500), "one byte more is refused").toMatchObject(
+      TYPED,
+    );
+    expect(pinned.exclusiveBytes(), "its superseded state is its own").toBeGreaterThan(0);
+  } finally {
+    cancel.abort();
+    snapshot?.release();
+    await core.close();
+  }
+}, 60_000);
+
+it("leaves out a superseded state another snapshot also pins, until that one closes", async () => {
+  const core = new StorageCore();
+  Object.defineProperty(core.harness, "governor", { value: new Governor(32 * MiB) });
+  await core.open();
+  const pins: Array<ReturnType<typeof core.harness.path.pin>> = [];
+  try {
+    await core.execute("CREATE TABLE t(id INT PRIMARY KEY)");
+    pins.push(core.harness.path.pin(), core.harness.path.pin());
+    await core.execute("CREATE TABLE u(id INT PRIMARY KEY)");
+    await core.harness.path.quiesce();
+    const [first, second] = pins;
+    if (first === undefined || second === undefined) throw new Error("two pins");
+    expect(first.exclusiveBytes(), "shared: the other keeps it too").toBe(0);
+    expect(second.exclusiveBytes()).toBe(0);
+    second.release();
+    expect(first.exclusiveBytes(), "now its own").toBeGreaterThan(0);
+  } finally {
+    for (const pin of pins) pin.release();
+    await core.close();
+  }
+}, 60_000);

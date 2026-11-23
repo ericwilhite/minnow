@@ -854,6 +854,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         this.#reclaimable();
       }),
       pinState: (state, label) => this.#pinState(state, label),
+      exclusiveStateBytes: (state) => this.#exclusiveStateBytes(state),
       runReader: (ref) => this.#runReader(ref),
       groupRoot: (ref, budget) => this.#metadata.groupRoot(ref, budget),
       bitmap: (ref, rowCount, budget) => this.#bitmap(ref, rowCount, budget),
@@ -2667,6 +2668,17 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const root = this.#roots.get(state.root);
     if (root !== undefined) root.refs += 1;
     for (const view of state.tables.values()) view.groups.retain();
+  }
+
+  /** What releasing `state`'s only pin would free (`Shared.exclusiveStateBytes`). */
+  #exclusiveStateBytes(state: WriteState): number {
+    if (state === this.#state) return 0;
+    const held = this.#statePins.get(state);
+    if (held?.count !== 1) return 0;
+    const root = this.#roots.get(state.root);
+    let bytes = (held.pin.bytes ?? 0) + (root?.refs === 1 ? root.bytes : 0);
+    for (const view of state.tables.values()) bytes += view.groups.releaseBytes();
+    return bytes;
   }
 
   /** The last holder of `state` is gone. */
