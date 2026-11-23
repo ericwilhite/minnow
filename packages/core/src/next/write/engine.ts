@@ -605,6 +605,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
   readonly #published = new Set<Memtable>();
   readonly #governorCap: number;
   readonly #memtableRows: number;
+  /** Rows a new memtable takes (`EngineHooks.memtableRows`). */
+  get memtableRows(): number {
+    return this.#memtableRows;
+  }
   /** True while open replays the log (no flush runs before the appender exists). */
   #recovering = true;
   readonly #mergePolicy: MergePolicy;
@@ -2231,6 +2235,23 @@ export class WritePathImpl implements WritePath, EngineHooks {
     // acquireMerge prepares the exact step again; active merge credit stays protected.
     if (native) this.#credits.reclaimNativeStep();
     const headroom = this.#metadataHeadroom(catalog);
+    // Provisional writer work settles before any metadata growth waits (governor rules 4/5/7:
+    // open work may not wait for more credit). When this step's metadata would have to wait to
+    // grow while a flush has its writer open, it waits for the running flushes (not the chain
+    // behind them, nor merges, whose idle publication waits for the writer turn), then prepares
+    // again.
+    const deficit = this.#credits.metadata.allocated + headroom - this.#credits.metadata.held;
+    if (
+      !native &&
+      deficit > 0 &&
+      this.#flushing.size > 0 &&
+      !(this.#credits.governor.canAdmitNow?.(deficit, false) ?? true)
+    )
+      return this.#trackMinimum(
+        Promise.allSettled([...this.#flushing.values()]).then(() =>
+          this.#prepareMinimum(catalog, signal, includesProgress),
+        ),
+      );
     const metadata = native
       ? this.#credits.prepareNativeMinimum(headroom, signal, includesProgress)
       : this.#credits.prepareMetadata(headroom, signal);

@@ -75,8 +75,15 @@ import {
 } from "../vector/vector.js";
 import type { ByteWriter } from "./bytes.js";
 import { Catalog, encodeLogged, type LoggedChange } from "./catalog.js";
-import { ColumnChunk, encodeColumn, isNullAt, sourceSlot, MEMORY_CHUNK_ROWS } from "./columns.js";
-import type { KeyDelta } from "./key-hash.js";
+import {
+  ColumnChunk,
+  encodeColumn,
+  isNullAt,
+  newChunkBytes,
+  sourceSlot,
+  MEMORY_CHUNK_ROWS,
+} from "./columns.js";
+import { freshDeltaAppendBytes, KEY_DELTA_INITIAL_BYTES, type KeyDelta } from "./key-hash.js";
 import type { Memtable } from "./memtable.js";
 import { readRows } from "./rows.js";
 import { validateAlterNullability } from "./alter-validation.js";
@@ -125,6 +132,8 @@ export interface EngineHooks {
   nextCatalogVersion(): number;
   /** Prepay schema-dependent metadata before synchronous DDL state changes. */
   prepareCatalog(catalog: Catalog): MaybePromise<void>;
+  /** Rows a new memtable takes (`EngineInput.tuning.memtableRows`): sizes its summaries. */
+  readonly memtableRows?: number;
   /**
    * The table's live memtable with room, freezing a full one first: `created` is set when this
    * call created the memtable (and `frozen` is the one it froze, if any).
@@ -1912,7 +1921,9 @@ export class TableWriterImpl implements TableWriter {
         bytes = this.#estimate(columns, plan);
       if (bytes <= BATCH_TARGET_BYTES || count <= 1 || !this.#wideKeys(columns, plan))
         return settle(
-          this.statement.tx.hooks.admit(bytes, () => this.#growth(columns, plan)),
+          this.statement.tx.hooks.admit(this.#rowMetadata(columns, plan), () =>
+            this.#stepCharge(columns, plan),
+          ),
           () => this.#insertRows(columns, plan, false, inserted),
         );
     }
@@ -1934,7 +1945,9 @@ export class TableWriterImpl implements TableWriter {
           }
           offset += plan.count;
           const pending = settle(
-            this.statement.tx.hooks.admit(bytes, () => this.#growth(columns, plan)),
+            this.statement.tx.hooks.admit(this.#rowMetadata(columns, plan), () =>
+              this.#stepCharge(columns, plan),
+            ),
             () => this.statement.guard(() => this.#insertRows(columns, plan, false, inserted)),
           );
           if (pending instanceof Promise) return pending.then(next);
@@ -1967,9 +1980,154 @@ export class TableWriterImpl implements TableWriter {
     return bytes;
   }
 
-  /** Recomputed after relief: native capacity growth is paid BEFORE append, including the
-   * old/new arena overlap. A freeze/stage returns zero for the old arenas instead of making
-   * the next small batch wait for a stale multi-MiB growth estimate. */
+  /**
+   * What the step's rows open before they are stored: each new chunk's fixed arrays for every
+   * column (`newChunkBytes`), and for a new memtable its key deltas and summary arrays. A step
+   * takes at most `MEMORY_CHUNK_ROWS` rows; the live memtable (when it can take rows, as
+   * `liveMemtable` decides) opens the chunks its rows reach past its last, and a new memtable
+   * takes what it cannot.
+   */
+  #opening(input: readonly Vector[], plan: RowPlan): number {
+    const hooks = this.statement.tx.hooks;
+    const columns = this.def.columns;
+    let chunkSet = 0,
+      varlen = 0;
+    for (const [c, column] of columns.entries()) {
+      chunkSet += newChunkBytes(column.type);
+      if (layoutOf(column.type) !== "varlen") continue;
+      varlen++;
+      // The chunk's 256-byte arena may double several times within the step: its final size
+      // and the replaced half beside it (as in `#growth`), beyond the `2 × input` the estimate
+      // already counts for these bytes.
+      const data = this.#inputBytes(need(input[c]), plan);
+      if (data > 256) {
+        let size = 512;
+        while (size < data) size *= 2;
+        chunkSet += Math.max(0, size + size / 2 - 256 - 2 * data);
+      }
+    }
+    // A new memtable's key deltas start empty: their growth for the rows it may take.
+    let freshDeltas = 0;
+    for (const index of this.def.indexes)
+      if (this.statement.catalog.index(index.id)?.invalid !== true)
+        freshDeltas += freshDeltaAppendBytes(
+          plan.count,
+          plan.count,
+          this.#keyBytes(input, plan, index.columnIds),
+        );
+    const memtable = (limit: number) =>
+      this.def.indexes.length * KEY_DELTA_INITIAL_BYTES +
+      freshDeltas +
+      columns.length * 4 +
+      2 * 8 * varlen * Math.ceil(limit / MEMORY_CHUNK_ROWS);
+    const live = hooks.state().tables.get(this.tableId)?.memtables.at(-1);
+    let bytes = 0,
+      rest = plan.count;
+    if (
+      live?.state === "live" &&
+      live.schemaVersion === this.def.schemaVersion &&
+      !live.full &&
+      rest > 0
+    ) {
+      const take = Math.min(rest, live.capacity);
+      const first = Math.floor(live.rowCount / MEMORY_CHUNK_ROWS),
+        last = Math.floor((live.rowCount + take - 1) / MEMORY_CHUNK_ROWS),
+        existing = live.chunks[0]?.length ?? 0;
+      bytes += chunkSet * Math.max(0, last - Math.max(first, existing) + 1);
+      // A memtable charges its summaries with its first rows.
+      if (live.rowCount === 0)
+        bytes +=
+          memtable(live.limit) - this.def.indexes.length * KEY_DELTA_INITIAL_BYTES - freshDeltas;
+      rest -= take;
+    }
+    if (rest > 0)
+      bytes +=
+        memtable(hooks.memtableRows ?? live?.limit ?? MEMORY_CHUNK_ROWS) +
+        chunkSet * Math.ceil(rest / MEMORY_CHUNK_ROWS);
+    return bytes;
+  }
+
+  /**
+   * What an insert step charges beyond its per-row metadata (`#rowMetadata`), recomputed after
+   * relief: a freeze or stage while the step waits changes the memtable its rows reach.
+   * - **Rows into chunks the live memtable already has** (`#intoLiveChunks`): exactly what they
+   *   allocate there, the arenas' growth with the resize overlap (`#growth`) and each chunk's
+   *   lazy arrays (`ColumnChunk.lazyBytes`).
+   * - **Otherwise:** what the step opens (`#opening`), plus the larger of `2 × input` (a fresh
+   *   arena: the next power of two at most doubles the value) and the live arenas' growth.
+   *   Before, both were charged (their sum), 2.0-3.0× what the step allocates.
+   * Both add the key deltas' growth (`#deltaGrowth`). Native capacity growth is paid before the
+   * append; a frozen or staged memtable's arenas count nothing here, so the next small batch
+   * never waits for a stale multi-MiB growth.
+   */
+  #stepCharge(columns: readonly Vector[], plan: RowPlan): number {
+    const live = this.statement.tx.hooks.state().tables.get(this.tableId)?.memtables.at(-1);
+    if (live !== undefined && this.#intoLiveChunks(live, plan)) {
+      let lazy = 0;
+      for (const list of live.chunks) lazy += list.at(-1)?.lazyBytes ?? 0;
+      return this.#growth(columns, plan) + lazy + this.#deltaGrowth(columns, plan);
+    }
+    let input = 0;
+    for (const vector of columns) input += this.#inputBytes(vector, plan);
+    return (
+      this.#opening(columns, plan) +
+      Math.max(2 * input, this.#growth(columns, plan)) +
+      this.#deltaGrowth(columns, plan)
+    );
+  }
+
+  /** Whether `liveMemtable` keeps `live` for the step and every row lands in its last chunk,
+   * so the step opens no chunk, memtable or summary. */
+  #intoLiveChunks(live: Memtable, plan: RowPlan): boolean {
+    return (
+      live.state === "live" &&
+      live.schemaVersion === this.def.schemaVersion &&
+      !live.full &&
+      live.rowCount > 0 &&
+      live.capacity >= plan.count &&
+      Math.floor((live.rowCount + plan.count - 1) / MEMORY_CHUNK_ROWS) <
+        (live.chunks[0]?.length ?? 0)
+    );
+  }
+
+  /** Per-row metadata an insert step charges: row ids, index entries and FTS undo. */
+  #rowMetadata(columns: readonly Vector[], plan: RowPlan): number {
+    return plan.count * (16 * columns.length + 96 * this.def.indexes.length + FTS_ROW_UNDO_BYTES);
+  }
+
+  /** Each index's key bytes for the step's rows (fixed per-key room plus twice the input). */
+  #keyBytes(columns: readonly Vector[], plan: RowPlan, columnIds: readonly number[]): number {
+    let wanted = 32 * plan.count * columnIds.length;
+    for (const id of columnIds)
+      wanted += 2 * this.#inputBytes(need(columns[this.#columnIndex(id)]), plan);
+    return wanted;
+  }
+
+  /** The live memtable's key deltas' growth for the step (`KeyDelta.appendBytes`); a new
+   * memtable's deltas are in `#opening`. */
+  #deltaGrowth(columns: readonly Vector[], plan: RowPlan): number {
+    const live = this.statement.tx.hooks.state().tables.get(this.tableId)?.memtables.at(-1);
+    if (live?.state !== "live") return 0;
+    let bytes = 0;
+    for (const index of this.def.indexes) {
+      if (this.statement.catalog.index(index.id)?.invalid === true) continue;
+      bytes +=
+        live.deltas
+          .get(index.id)
+          ?.appendBytes(plan.count, plan.count, this.#keyBytes(columns, plan, index.columnIds)) ??
+        0;
+    }
+    return bytes;
+  }
+
+  /**
+   * The live memtable's growth for this step: each varlen arena the input outgrows, at its next
+   * power of two, with the resize overlap. A resize charges the new arena before it frees the
+   * old one. An arena the step finds is already charged, so one resize adds the new size; a
+   * batch that resizes the same arena again holds the previous new arena (charged in this step)
+   * beside the next one, at most half of it: `max(0, size / 2 − current)` more. Plus each
+   * index's key room.
+   */
   #growth(columns: readonly Vector[], plan: RowPlan): number {
     const live = this.statement.tx.hooks.state().tables.get(this.tableId)?.memtables.at(-1);
     if (live?.state !== "live") return 0;
@@ -1983,14 +2141,8 @@ export class TableWriterImpl implements TableWriter {
       if (wanted <= arena.length) continue;
       let size = arena.length * 2;
       while (size < wanted) size *= 2;
-      bytes += size;
-    }
-    for (const index of this.def.indexes) {
-      if (this.statement.catalog.index(index.id)?.invalid === true) continue;
-      let wanted = 32 * plan.count * index.columnIds.length;
-      for (const id of index.columnIds)
-        wanted += 2 * this.#inputBytes(need(columns[this.#columnIndex(id)]), plan);
-      bytes += live.deltas.get(index.id)?.appendKeyBytes(wanted) ?? 0;
+      // One row resizes an arena once (`ColumnChunk.#putBytes` jumps to the size it needs).
+      bytes += size + (plan.count > 1 ? Math.max(0, size / 2 - arena.length) : 0);
     }
     return bytes;
   }
@@ -2010,11 +2162,11 @@ export class TableWriterImpl implements TableWriter {
     return false;
   }
 
-  /** Same capacity estimate; a contiguous varlen range uses its two end offsets. */
+  /** The step's size for slicing wide key input (`BATCH_TARGET_BYTES`): what it opens, its
+   * per-row metadata and twice its input (a contiguous varlen range uses its two end offsets).
+   * What it is charged is `#rowMetadata` + `#stepCharge`. */
   #estimate(columns: readonly Vector[], plan: RowPlan): number {
-    let bytes =
-      4096 * columns.length +
-      plan.count * (16 * columns.length + 96 * this.def.indexes.length + FTS_ROW_UNDO_BYTES);
+    let bytes = this.#opening(columns, plan) + this.#rowMetadata(columns, plan);
     for (const vector of columns) bytes += 2 * this.#inputBytes(vector, plan);
     return bytes;
   }

@@ -13781,3 +13781,16 @@ export const SERVABLE_BESIDE_WRITER_REACH = [
   "one more byte refused",
   "refused once the writer settled",
 ] as const;
+
+/** Insert steps' charge against their allocation (next/testing/memtable-charge-census.test.ts). */
+export const MEMTABLE_CHARGE_CENSUS_REACH = [
+  "insert",
+  "update",
+  "copy",
+  "allocating step",
+  "batch across a chunk",
+  "multi-MiB step",
+  "several columns growing",
+  "secondary index",
+  "integers widened in a live chunk",
+] as const;

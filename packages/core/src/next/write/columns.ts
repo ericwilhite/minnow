@@ -161,6 +161,20 @@ export class ColumnChunk {
     return this.length >= MEMORY_CHUNK_ROWS;
   }
 
+  /**
+   * What a later append may still allocate in this chunk outside its arena, at most: the first
+   * NULL's bitmap (`#setNull`), an integer's widening to int64 (both arrays live while it copies)
+   * and a decimal's widening to int128 and its specials. Each is charged before it exists.
+   */
+  get lazyBytes(): number {
+    const n = MEMORY_CHUNK_ROWS;
+    let bytes = this.validity === null ? n / 8 : 0;
+    if (this.safe !== null && this.big === null) bytes += n * 8;
+    if (this.layout === "decimal" && this.limbs === null)
+      bytes += n * 16 + (this.specials === null ? n : 0);
+    return bytes;
+  }
+
   #take(bytes: number): void {
     charged(this.#charge, bytes);
     this.chargedBytes += bytes;
@@ -515,6 +529,12 @@ export class ColumnChunk {
   get varlenBytes(): number {
     return this.offsets === null ? 0 : (this.offsets[this.length] ?? 0);
   }
+}
+
+/** What a new chunk of a column of `type` charges before its first row, its validity bitmap
+ * included (`ColumnChunk` constructor and its first NULL). */
+export function newChunkBytes(type: PhysicalType): number {
+  return initialBytes(layoutOf(type), type) + Math.ceil(MEMORY_CHUNK_ROWS / 32) * 4;
 }
 
 /** Bytes a fresh chunk of `layout` allocates (charged before its arrays exist). */

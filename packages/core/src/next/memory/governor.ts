@@ -206,6 +206,8 @@ export interface MemoryGovernor {
    * prepaid native body's).
    */
   servableNow?(own: WaitingHoldings, includesProgress?: boolean, unasked?: boolean): number;
+  /** Whether `bytes` could be admitted at once, without waiting (`Governor.canAdmitNow`). */
+  canAdmitNow?(bytes: number, includesProgress: boolean): boolean;
   /** Moves idle ordinary credit within this owner. No allocation or global admission occurs. */
   transferCredit(source: Grant, target: Grant, bytes: number): boolean;
   /**
