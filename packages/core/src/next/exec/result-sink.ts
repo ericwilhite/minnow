@@ -1,3 +1,4 @@
+import { trace } from "../trace-ring.js";
 import { DeferredGrant } from "./deferred-grant.js";
 /** Owned, compact result frames. Borrowed input is copied; authorized dedicated input stays charged through frame credit. */
 import type { MaybePromise } from "../access/key-index.js";
@@ -177,9 +178,12 @@ export class ResultSink implements Operator {
     if (this.#batch !== null || this.#waiting !== null)
       throw new TypeError("Result handoff requires a ready producer");
     this.#budgetSuspended = true;
+    trace(`${this.grant.label} suspendBudget:ready? frames=${String(this.#frames.size)}`);
     await this.ready();
+    trace(`${this.grant.label} suspendBudget:ready frames=${String(this.#frames.size)}`);
     while (this.#frames.size > 0) {
       this.#check();
+      trace(`${this.grant.label} suspendBudget:wait frames=${String(this.#frames.size)}`);
       await abortable(
         new Promise<void>((resolve) => this.#creditWaiters.add(resolve)),
         this.#abort.signal,
@@ -187,6 +191,7 @@ export class ResultSink implements Operator {
     }
     this.#check();
     this.#dictionaries.close();
+    trace(`${this.grant.label} suspendBudget:done`);
     if (this.grant.allocated !== 0 || this.grant.loaned !== 0)
       throw new TypeError("Result budget retained buffers at handoff");
   }

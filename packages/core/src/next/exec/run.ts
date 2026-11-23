@@ -1,3 +1,4 @@
+import { trace } from "../trace-ring.js";
 import type { NativeInputTargets } from "./native-target-guard.js";
 import type { NativeParameterBinding } from "./native-parameters.js";
 import { ModifySpool, modifySpoolBytes } from "./modify-spool.js";
@@ -1208,6 +1209,7 @@ export class QueryRuntime {
   /** Called only after the old graph unwound and parameter copies were checkpointed.
    * Neither this operation nor resource scopes release the owner-held snapshot pin. */
   async suspendProducer(sink: ProgramSink, idleCredit: Grant): Promise<void> {
+    trace(`q${String(this.request.queryId)} suspendProducer:enter`);
     if (!this.#handoff || this.#scope !== null || this.#atomicResult === null)
       throw new Error("Producer graph must retire before phase admission");
     await sink.suspendBudget();

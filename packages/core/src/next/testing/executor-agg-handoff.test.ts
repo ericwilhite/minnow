@@ -2,6 +2,8 @@
  * Prefix transitions and membership precede suffix input; the snapshot pin stays owned
  * by the execution and mutable parameters come from its admitted copy. */
 import { PGlite } from "@electric-sql/pglite";
+import { writeFileSync } from "node:fs";
+import { dumpTrace, trace } from "../trace-ring.js";
 import fc from "fast-check";
 import { afterEach, expect, it, vi } from "vitest";
 import { RestoredAggregateOperator } from "../exec/agg/restored.js";
@@ -62,10 +64,18 @@ async function deadline<T>(work: Promise<T>, activity: Set<() => void>): Promise
   let timer: ReturnType<typeof setTimeout> | undefined;
   const reset = () => {
     clearTimeout(timer);
-    timer = setTimeout(
-      () => rejectStall(new Error("Concurrent SQL phase progress stalled")),
-      30000,
-    );
+    timer = setTimeout(() => {
+      try {
+        if (dumpTrace().length > 0)
+          writeFileSync(
+          `/home/eric/.cache/p1/hang11/trace-${String(process.pid)}-${String(Date.now())}.log`,
+          `seed=${String(process.env.MINNOW_SEED ?? "")}\n` + dumpTrace(),
+        );
+      } catch {
+        /* scratch */
+      }
+      rejectStall(new Error("Concurrent SQL phase progress stalled"));
+    }, 30000);
   };
   let rejectStall: (error: Error) => void = () => undefined;
   try {
@@ -288,6 +298,7 @@ it.each(seedsFor("next-aggregation-sql-handoff", [0xb4cb, 0xb4cc]))(
           fc.boolean(),
           async (count, size, shape, cancellation, filtered, residentFollower, lateHeadroom) => {
             campaign.signal.throwIfAborted();
+            trace(`history count=${String(count)} size=${String(size)} shape=${shape} cancel=${cancellation} filtered=${String(filtered)} resident=${String(residentFollower)} late=${String(lateHeadroom)}`);
             const cancel = cancellation === "wait";
             const grouped = shape !== "scalar";
             reach.beginHistory();
