@@ -2039,13 +2039,17 @@ export class WritePathImpl implements WritePath, EngineHooks {
       !frozen.full
     )
       frozen.state = "live";
-    this.#setView(state, { ...state.view, memtables });
+    this.#withRollbackReserve(() => {
+      this.#setView(state, { ...state.view, memtables });
+    });
   }
 
   createTableState(def: TableDef | null, tableId: number): void {
     if (def === null) {
       this.#tables.delete(tableId);
-      this.#publishState();
+      this.#withRollbackReserve(() => {
+        this.#publishState();
+      });
       return;
     }
     this.#tables.set(tableId, {
@@ -2289,8 +2293,52 @@ export class WritePathImpl implements WritePath, EngineHooks {
           ? FTS_PUBLICATION_MINIMUM_BYTES
           : 0,
       ) +
-      newBuilds * PENDING_INDEX_BYTES
+      newBuilds * PENDING_INDEX_BYTES +
+      // A transaction's rollback reserve (`reserveRollback`) is taken from this step's headroom.
+      (this.#holder !== null && this.#rollbackReserve === 0 ? pinBytes(STATE_PIN) : 0)
     );
+  }
+
+  /**
+   * Metadata charged for the state pin a rollback's republication needs (one pin: a publication
+   * charges the new pin before it releases the previous one). Taken when a transaction first
+   * records an undo that republishes (a memtable freeze, a table it creates), released when the
+   * transaction ends, so its rollback never needs memory (`#withRollbackReserve`).
+   */
+  #rollbackReserve = 0;
+
+  reserveRollback(): void {
+    if (this.#rollbackReserve > 0 || this.#holder === null) return;
+    const bytes = pinBytes(STATE_PIN);
+    try {
+      this.#chargeMetadata(bytes);
+    } catch (error) {
+      // Refused before the step that would need it: the typed memory refusal (53200).
+      if (error instanceof ParseBudgetError) throw new MemtableMemoryError(bytes);
+      throw error;
+    }
+    this.#rollbackReserve = bytes;
+  }
+
+  /** Runs a rollback's republication on the reserve: freed for the new pin, taken back from the
+   * previous pin's bytes once that is released. */
+  #withRollbackReserve(publish: () => void): void {
+    const reserve = this.#rollbackReserve;
+    if (reserve > 0) {
+      this.#chargeMetadata(-reserve);
+      this.#rollbackReserve = 0;
+    }
+    try {
+      publish();
+    } finally {
+      if (reserve > 0)
+        try {
+          this.#chargeMetadata(reserve);
+          this.#rollbackReserve = reserve;
+        } catch (error) {
+          if (!(error instanceof ParseBudgetError)) throw error;
+        }
+    }
   }
 
   #recalculateMinimum(catalog: Catalog, signal?: AbortSignal): MaybePromise<void> {
@@ -3083,6 +3131,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#ftsPending.lsn === 0
     )
       this.#ftsUnclaimed = true;
+    if (this.#rollbackReserve > 0) {
+      this.#chargeMetadata(-this.#rollbackReserve);
+      this.#rollbackReserve = 0;
+    }
     this.#holder = null;
     this.#credits.holderChain.transactionOpen = false;
     this.#reclaimable();
@@ -5630,9 +5682,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
         gone.delete(memtable);
         memtable.state = "frozen";
       }
-    this.#setView(state, {
-      ...state.view,
-      memtables: state.view.memtables.filter((memtable) => !gone.has(memtable)),
+    this.#withRollbackReserve(() => {
+      this.#setView(state, {
+        ...state.view,
+        memtables: state.view.memtables.filter((memtable) => !gone.has(memtable)),
+      });
     });
     this.shared.readers.holdUntilOlderClose(
       () => {

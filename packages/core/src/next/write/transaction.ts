@@ -164,6 +164,9 @@ export interface EngineHooks {
   addIndexDelta(tableId: number, indexId: number): Memtable;
   /** Ensures memtable memory for about `bytes` more before an insert (backpressure). */
   admit(bytes: number, growth?: () => number, wait?: RowsWait): MaybePromise<void>;
+  /** Reserves the state pin a rollback's republication needs, before an undo that needs one is
+   * recorded (a memtable freeze, a table created): its rollback never waits for memory. */
+  reserveRollback?(): void;
   /** End-of-statement admission after producer borrows and check views retire. */
   prepareFtsMutation?(signal?: AbortSignal): MaybePromise<void>;
   /** Command primary prepayment, before the root borrows a decoded image. */
@@ -1161,6 +1164,7 @@ export class StatementImpl implements Statement {
     if (logged.length === 0) return;
     const catalog = logged.reduce((next, change) => next.apply(change, version), before);
     return settle(this.tx.hooks.prepareCatalog(catalog), () => {
+      this.tx.hooks.reserveRollback?.();
       this.tx.undo.push({ kind: "catalog", statement: this.ordinal, before, logged });
       this.tx.catalog = catalog;
     });
@@ -1184,6 +1188,7 @@ export class StatementImpl implements Statement {
       return settle(validate, () =>
         settle(this.tx.hooks.prepareCatalog(catalog), () =>
           this.guard(() => {
+            this.tx.hooks.reserveRollback?.();
             this.tx.undo.push({ kind: "catalog", statement: this.ordinal, before, logged });
             this.tx.catalog = catalog;
             const work: Array<MaybePromise<void>> = [];
@@ -2210,6 +2215,8 @@ export class TableWriterImpl implements TableWriter {
     let done = 0;
     const next = (): MaybePromise<void> => {
       while (done < plan.count) {
+        // A freeze is undone by republishing: its pin is reserved first (rollback never waits).
+        tx.hooks.reserveRollback?.();
         const { memtable, created, frozen } = tx.hooks.liveMemtable(
           this.tableId,
           plan.count - done,
