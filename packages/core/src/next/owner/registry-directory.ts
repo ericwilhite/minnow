@@ -5,14 +5,22 @@
 import type { SpillFile, SpillPageRef, SpillService } from "../spill/contract.js";
 import { SpillCorruptionError } from "../spill/contract.js";
 import type { ByteCharge } from "../vector/varlen.js";
+import {
+  REGISTRY_DIRECTORY_BYTES,
+  REGISTRY_DIRECTORY_LEAVES,
+  REGISTRY_LEAF_BYTES,
+  REGISTRY_LEAF_RECORDS,
+  REGISTRY_LEVELS,
+  REGISTRY_NODE_BYTES,
+  REGISTRY_RECORD_BYTES,
+} from "../exec/row-image-layout.js";
 
-export const REGISTRY_RECORD_BYTES = 128;
-export const REGISTRY_DIRECTORY_BYTES = 30720;
-const RECORDS = 16,
-  LEAF_BYTES = 32 + RECORDS * REGISTRY_RECORD_BYTES,
-  LEAVES = 8,
-  NODE_BYTES = 264,
-  LEVELS = 29,
+export { REGISTRY_DIRECTORY_BYTES, REGISTRY_RECORD_BYTES };
+const RECORDS = REGISTRY_LEAF_RECORDS,
+  LEAF_BYTES = REGISTRY_LEAF_BYTES,
+  LEAVES = REGISTRY_DIRECTORY_LEAVES,
+  NODE_BYTES = REGISTRY_NODE_BYTES,
+  LEVELS = REGISTRY_LEVELS,
   NODE_MAGIC = 0x52444952,
   LEAF_MAGIC = 0x524c4546;
 interface Leaf {
@@ -23,6 +31,20 @@ interface Leaf {
   dirty: boolean;
   readonly bytes: Uint8Array;
 }
+/**
+ * The directory's work since load, summed over every directory: plain counters on its spill path
+ * (never on a record copy), read by tests that bound the work per written row.
+ */
+export const REGISTRY_DIRECTORY_WORK = {
+  /** A record block whose leaf was not resident. */
+  leafMisses: 0,
+  /** Dirty leaves written out (each appends the leaf and its root-to-leaf path). */
+  flushes: 0,
+  /** Directory node and leaf pages read back from the spill file. */
+  pageReads: 0,
+  /** Pages appended to the spill file. */
+  appends: 0,
+};
 export class RegistryDirectory {
   readonly #stop = new AbortController();
   #signal: AbortSignal | null = null;
@@ -199,6 +221,7 @@ export class RegistryDirectory {
         else {
           if (!this.#file || ref.length !== NODE_BYTES)
             throw new SpillCorruptionError("Invalid registry directory page");
+          REGISTRY_DIRECTORY_WORK.pageReads++;
           await this.#file.readInto(ref, node);
           this.#check();
           if (new DataView(node.buffer, node.byteOffset).getUint32(0, true) !== NODE_MAGIC)
@@ -214,8 +237,10 @@ export class RegistryDirectory {
   }
   async #flush(leaf: Leaf): Promise<void> {
     if (!leaf.dirty) return;
+    REGISTRY_DIRECTORY_WORK.flushes++;
     const file = await this.#open();
     await this.#walk(leaf.kind, leaf.owner, leaf.block);
+    REGISTRY_DIRECTORY_WORK.appends++;
     let ref = await file.append(leaf.bytes);
     this.#check();
     const path = this.#path;
@@ -223,6 +248,7 @@ export class RegistryDirectory {
     for (let level = LEVELS - 1; level >= 0; level--) {
       const node = path.subarray(level * NODE_BYTES, (level + 1) * NODE_BYTES);
       this.#setRef(node, this.#digit(leaf.kind, leaf.owner, leaf.block, level), ref);
+      REGISTRY_DIRECTORY_WORK.appends++;
       ref = await file.append(node);
       this.#check();
     }
@@ -235,12 +261,14 @@ export class RegistryDirectory {
       (entry) => entry.kind === kind && entry.owner === owner && entry.block === block,
     );
     if (!leaf) {
+      REGISTRY_DIRECTORY_WORK.leafMisses++;
       leaf = this.#leaves.reduce((a, b) => (a.age <= b.age ? a : b));
       await this.#flush(leaf);
       const ref = await this.#walk(kind, owner, block);
       if (ref) {
         if (!this.#file || ref.length !== LEAF_BYTES)
           throw new SpillCorruptionError("Invalid registry leaf size");
+        REGISTRY_DIRECTORY_WORK.pageReads++;
         await this.#file.readInto(ref, leaf.bytes);
         this.#check();
         const view = new DataView(leaf.bytes.buffer);
