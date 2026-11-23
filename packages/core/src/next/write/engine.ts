@@ -695,6 +695,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
     stagedMemtablesDropped: 0,
     /** Stagings a rollback dropped; staged commits replayed at open. */
     stagingRollbacks: 0,
+    /** Write steps that waited in the governor for rows relief could not free (`#waitForRows`). */
+    rowWaits: 0,
     publishedReplays: 0,
     /** Recovery identity work; physical mappings exclude decoded per-effect vectors. */
     replayMappingBuilds: 0,
@@ -2822,6 +2824,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     signal: AbortSignal | undefined,
   ) {
     const governor = this.#credits.governor;
+    this.maintenance.rowWaits += 1;
     for (;;) {
       signal?.throwIfAborted();
       this.#check();

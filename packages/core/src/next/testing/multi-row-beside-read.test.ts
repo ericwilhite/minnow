@@ -42,10 +42,11 @@ async function history(
   read: number,
   memtableRows: number | undefined,
   reach?: ReturnType<typeof createReach>,
-): Promise<void> {
+): Promise<number> {
   Governor.stallAfterMs = 5_000;
   const core = new StorageCore(memtableRows);
-  Object.defineProperty(core.harness, "governor", { value: new Governor(32 * MiB) });
+  const governor = new Governor(32 * MiB);
+  Object.defineProperty(core.harness, "governor", { value: governor });
   await core.open();
   let end: (() => Promise<void>) | null = null;
   try {
@@ -55,8 +56,15 @@ async function history(
       await core.execute("INSERT INTO r VALUES (1, $1)", ["b".repeat(read)]);
       const lowered = core.lowerer.lower("SELECT id, v FROM r", core.context());
       if (lowered.kind !== "query") throw new Error("query plan required");
+      const idle = governor.usedBytes;
       const other = core.start(core.executor.prepare(lowered.plan));
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      // The other connection holds its read before the write starts.
+      for (let i = 0; i < 200 && governor.usedBytes - idle < read; i++)
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      expect(
+        governor.usedBytes - idle,
+        "the other connection holds its read",
+      ).toBeGreaterThanOrEqual(read);
       end = async () => {
         for (let frame = await other.execution.results.next(); frame !== null;) {
           frame.release();
@@ -68,6 +76,7 @@ async function history(
       reach?.reach("beside a held read");
     }
     const sql = `INSERT INTO t SELECT g, $1 FROM generate_series(1, ${String(rows)}) g`;
+    const waitsBefore = core.harness.path.maintenance.rowWaits;
     const statement = core.execute(sql, ["a".repeat(width)]).then(
       () => "written" as const,
       (error: unknown) => error,
@@ -81,6 +90,7 @@ async function history(
     }
     expect(await statement, `${context}: written once the read ends`).toBe("written");
     reach?.reach(early === PENDING ? "waited for the read" : "written at once");
+    const rowWaits = core.harness.path.maintenance.rowWaits - waitsBefore;
     const ids = await core.execute("SELECT id FROM t ORDER BY id");
     if (!("batches" in ids)) throw new Error("rows");
     expect(oracleRows(ids).map((row) => Number(row.id))).toEqual(
@@ -88,6 +98,7 @@ async function history(
     );
     expect(core.harness.path.failure).toBeNull();
     if (memtableRows === 2) reach?.reach("two-row memtables");
+    return rowWaits;
   } finally {
     if (end !== null) await end();
     await core.close();
@@ -95,6 +106,8 @@ async function history(
 }
 
 it("waits for a held 3 MiB read, then writes six 1 MiB rows (two-row memtables)", async () => {
+  // Whether it waits at its fixed buffers or for its rows depends on how much the read holds;
+  // the row wait itself is proven at the write path (write/row-wait.test.ts).
   await history(6, MiB, 3 * MiB, 2);
 }, 60_000);
 
