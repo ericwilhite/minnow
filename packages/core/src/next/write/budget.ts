@@ -4,7 +4,7 @@
  * estimate must not leave its unused high-water holdings blocking merges or resident metadata.
  */
 import { yieldTask } from "../exec/pipeline.js";
-import { checkRetries, macrotaskEpoch } from "../memory/retry-guard.js";
+import { checkRetries, macrotaskEpoch, RETRY_GUARD_LIMIT } from "../memory/retry-guard.js";
 import type { MaybePromise } from "../access/key-index.js";
 import { ParseBudgetError } from "../format/manifest-codec.js";
 import type { Grant } from "../memory/governor.js";
@@ -142,7 +142,7 @@ export class MetadataBudget implements ByteBudget {
         const held = this.grant.held;
         const now = macrotaskEpoch();
         const next = held > reached || now !== epoch ? 0 : rounds + 1;
-        checkRetries(`metadata ${this.grant.label}`, next);
+        if (RETRY_GUARD_LIMIT !== null) checkRetries(`metadata ${this.grant.label}`, next);
         // The credit was grown for this attempt: reclaim keeps it until the attempt settles.
         // An attempt awaits (a lock, a writer) before it allocates; without this a queued
         // request's reclaim could take it back in between, and grow and retry would repeat.

@@ -3,7 +3,7 @@
  * allocation counter: storage may transfer a real buffer out through native takeFrom.
  */
 import type { Grant, HolderChain, MemoryGovernor, WaitingHoldings } from "../memory/governor.js";
-import { retryGuard } from "../memory/retry-guard.js";
+import { RETRY_GUARD_LIMIT, retryGuard } from "../memory/retry-guard.js";
 import { GrantClosedError, MemoryAdmissionError } from "../memory/governor.js";
 import type { MaybePromise } from "../access/key-index.js";
 import { releaseIdle } from "./budget.js";
@@ -649,7 +649,9 @@ export class WriteCredits {
         return;
       }
       // Progress: the credit the owner's accounts hold (each served wait raises it).
-      guard.round(accounts.reduce((sum, account) => sum + account.held, 0));
+      if (RETRY_GUARD_LIMIT !== null) {
+        guard.round(accounts.reduce((sum, account) => sum + account.held, 0));
+      }
       this.#changed?.(true);
       const working = this.#workingMinimum();
       const floors = [

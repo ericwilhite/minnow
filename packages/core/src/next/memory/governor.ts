@@ -31,7 +31,7 @@
  * only; browser RSS is measured separately at Gate D.
  */
 import { BATCH_TARGET_BYTES } from "../vector/vector.js";
-import { retryGuard } from "./retry-guard.js";
+import { RETRY_GUARD_LIMIT, retryGuard } from "./retry-guard.js";
 import { MemoryAdmissionError } from "../memory-values.js";
 
 export {
@@ -1013,9 +1013,11 @@ export class Governor implements MemoryGovernor {
       waiting = -1;
     try {
       do {
-        if (this.#progress === progress && queued() === waiting) guard.retry();
-        progress = this.#progress;
-        waiting = queued();
+        if (RETRY_GUARD_LIMIT !== null) {
+          if (this.#progress === progress && queued() === waiting) guard.retry();
+          progress = this.#progress;
+          waiting = queued();
+        }
         this.#again = false;
         if (this.#permanent.size > 0) this.#refuseUnservable();
         this.#serve(this.#loans, true);
