@@ -24,6 +24,7 @@
  * bigintBytes per retained BigInt; collation-fallback strings use stringBytes. Managed memory
  * only; browser RSS is measured separately at Gate D.
  */
+import { trace } from "../trace-ring.js";
 import { BATCH_TARGET_BYTES } from "../vector/vector.js";
 import { MemoryAdmissionError } from "../memory-values.js";
 
@@ -664,6 +665,7 @@ export class Governor implements MemoryGovernor {
         grant.loan = wanted;
         grant.loanPending = false;
       }
+      trace(`gov served ${request.label} used=${String(this.usedBytes)}`);
       request.resolve(grant);
     }
   }
@@ -691,6 +693,7 @@ export class Governor implements MemoryGovernor {
         const index = queue.indexOf(entry);
         if (index >= 0) queue.splice(index, 1);
         entry.detach();
+        trace(`gov cancelled ${request.label}`);
         reject(abortReason(signal));
         this.#drain();
       };
@@ -709,6 +712,7 @@ export class Governor implements MemoryGovernor {
       };
       signal?.addEventListener("abort", cancel, { once: true });
       queue.push(entry);
+      trace(`gov enqueue ${request.label} bytes=${String(request.bytes)} used=${String(this.usedBytes)} adm=${String(this.#admissions.length)} loans=${String(this.#loans.length)} reads=${String(this.#reads.length)}`);
       this.#drain();
     });
   }

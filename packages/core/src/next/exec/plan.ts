@@ -1,3 +1,4 @@
+import { trace } from "../trace-ring.js";
 import { MODIFY_TARGET_SET_BYTES } from "./modify-target-set.js";
 import { NativeTargetGuard } from "./native-target-guard.js";
 import { statementRuleReach } from "./statement-reach.js";
@@ -4163,19 +4164,27 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           },
         };
         return (async () => {
+          const qid = `q${String(runtime.request.queryId)}`;
+          trace(`${qid} pool:acquire`);
           const idle = await acquirePhasePool(runtime.request.governor, runtime.signal);
+          trace(`${qid} pool:acquired held=${String(idle.pool.held)}`);
           let failed = false,
             failure: unknown;
           try {
+            trace(`${qid} reserve`);
             await runtime.reserve(entries);
+            trace(`${qid} recipe`);
             await recipe(runtime, guarded, []);
+            trace(`${qid} recipe:done pending=${String(state.pending !== null)}`);
             while (state.pending) {
               const cut: Cut = state.pending;
               // Keep a cleanup owner before clearing pending: producer suspension
               // itself awaits consumer credit and can reject on cancellation.
               state.resume = cut;
               state.pending = null;
+              trace(`${qid} suspend`);
               await runtime.suspendProducer(sink, idle.pool);
+              trace(`${qid} suspended pool=${String(idle.pool.held)} used=${String(runtime.request.governor.usedBytes)}`);
               const remaining = new Set<number>();
               const visitRemaining = (node: Rel): void => {
                 remaining.add(node.id);
@@ -4266,15 +4275,20 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
                 jsonCapacities.get(runtime)?.set(cut.rel, cut.phase.capacity);
                 configureJson(next, cut);
               }
+              trace(`${qid} restorePhase`);
               await runtime.restorePhase(next, binding, idle.pool);
+              trace(`${qid} restored`);
               sink.resumeBudget();
               await recipe(runtime, guarded, []);
+              trace(`${qid} recipe:done pending=${String(state.pending !== null)}`);
               state.resume = null;
             }
           } catch (error) {
             failed = true;
             failure = error;
+            trace(`${qid} failed ${String((error as Error).message)}`);
           }
+          trace(`${qid} cleanup`);
           {
             // A resumed recipe may already have installed its next cut. Both
             // slots remain owned until the corresponding files have drained.
@@ -4294,6 +4308,7 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
             state.windows.clear();
             phases.delete(runtime);
             idle.release();
+            trace(`${qid} cleanup:done`);
             const errors = cleanup
               .filter((r): r is PromiseRejectedResult => r.status === "rejected")
               .map((r) => r.reason as unknown);

@@ -9,6 +9,8 @@
  * Released ranges become reusable only after the native release succeeds. Nothing is recovered:
  * startup sweep discards payload and private allocator pages under the owner's fence.
  */
+import { trace } from "../trace-ring.js";
+let serialOps = 0;
 import { xxHash32 } from "../hash/xxhash32.js";
 import {
   DATA_ALIGN,
@@ -99,11 +101,16 @@ export class ScratchSpillService implements SpillService {
     file.next = null;
   }
 
-  #serial<T>(work: () => Promise<T>): Promise<T> {
+  #serial<T>(work: () => Promise<T>, what = "op"): Promise<T> {
+    const op = ++serialOps;
+    trace(`spill queue #${String(op)} ${what}`);
     const run = this.#queue.then(async () => {
       if (this.#failure !== null) throw this.#failure;
       try {
-        return await work();
+        trace(`spill start #${String(op)} ${what}`);
+        const done = await work();
+        trace(`spill end #${String(op)} ${what}`);
+        return done;
       } catch (error) {
         this.#failure = spillError(error);
         throw this.#failure;
@@ -158,6 +165,7 @@ export class ScratchSpillService implements SpillService {
   allocate(bytes: number, chain: RangeChain): Promise<DataRange> {
     return this.#serial(async () => {
       const size = Math.ceil(bytes / DATA_ALIGN) * DATA_ALIGN;
+      trace(`spill allocate ${String(bytes)}`);
       if (!Number.isSafeInteger(size) || size <= 0)
         throw new RangeError("Invalid spill allocation");
       const after = chain.lastOffset + chain.lastLength;

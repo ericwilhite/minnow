@@ -2,6 +2,9 @@
  * Prefix transitions and membership precede suffix input; the snapshot pin stays owned
  * by the execution and mutable parameters come from its admitted copy. */
 import { PGlite } from "@electric-sql/pglite";
+import { writeFileSync } from "node:fs";
+import { dumpTrace, trace } from "../trace-ring.js";
+import { taskClock } from "../task.js";
 import fc from "fast-check";
 import { afterEach, expect, it, vi } from "vitest";
 import { RestoredAggregateOperator } from "../exec/agg/restored.js";
@@ -62,10 +65,18 @@ async function deadline<T>(work: Promise<T>, activity: Set<() => void>): Promise
   let timer: ReturnType<typeof setTimeout> | undefined;
   const reset = () => {
     clearTimeout(timer);
-    timer = setTimeout(
-      () => rejectStall(new Error("Concurrent SQL phase progress stalled")),
-      30000,
-    );
+    timer = setTimeout(() => {
+      try {
+        if (dumpTrace().length > 0)
+          writeFileSync(
+          `/home/eric/.cache/p1/hang/trace-${String(process.pid)}-${String(Date.now())}.log`,
+          `seed=${String(process.env.MINNOW_SEED ?? "")}\n` + dumpTrace(),
+        );
+      } catch {
+        /* scratch */
+      }
+      rejectStall(new Error("Concurrent SQL phase progress stalled"));
+    }, 30000);
   };
   let rejectStall: (error: Error) => void = () => undefined;
   try {
@@ -187,6 +198,22 @@ it.each(seedsFor("next-aggregation-sql-handoff", [0xb4cb, 0xb4cc]))(
   "completes concurrent scalar/grouped restore phases and cancels with no retained credit (seed %i)",
   async (seed) => {
     const reach = createReach("SQL aggregate phase handoff", AGG_HANDOFF_SQL_REACH);
+    // SCRATCH scheduler fuzz: each slice deadline check is due with probability MINNOW_DUE_P.
+    const dueP = Number(process.env.MINNOW_DUE_P ?? "0");
+    const ioFuzz = process.env.MINNOW_IO_FUZZ !== undefined;
+    let ioState = Number(process.env.MINNOW_IO_FUZZ ?? "1") >>> 0;
+    const realNow = taskClock.now;
+    if (dueP > 0) {
+      let x = Number(process.env.MINNOW_DUE_SEED ?? "1") >>> 0 || 1,
+        t = 0;
+      taskClock.now = () => {
+        x ^= x << 13;
+        x ^= x >>> 17;
+        x ^= x << 5;
+        if ((x >>> 0) / 2 ** 32 < dueP) t += 1000;
+        return t;
+      };
+    }
     const campaign = new AbortController();
     campaigns.add(campaign);
     const core = await new StorageCore(8192).open(),
@@ -288,6 +315,7 @@ it.each(seedsFor("next-aggregation-sql-handoff", [0xb4cb, 0xb4cc]))(
           fc.boolean(),
           async (count, size, shape, cancellation, filtered, residentFollower, lateHeadroom) => {
             campaign.signal.throwIfAborted();
+            trace(`history count=${String(count)} size=${String(size)} shape=${shape} cancel=${cancellation} filtered=${String(filtered)} resident=${String(residentFollower)} late=${String(lateHeadroom)}`);
             const cancel = cancellation === "wait";
             const grouped = shape !== "scalar";
             reach.beginHistory();
@@ -525,6 +553,19 @@ it.each(seedsFor("next-aggregation-sql-handoff", [0xb4cb, 0xb4cc]))(
                     }
                     // Opening the admitted scan is after parameter copying, before any handoff.
                     caller[0] = "caller changed after binding";
+                    if (ioFuzz) {
+                      ioState = (Math.imul(ioState, 1103515245) + 12345) >>> 0;
+                      const turns = ioState % 5;
+                      trace(`io open q${String(i + 1)} delay=${String(turns)}`);
+                      const delay =
+                        turns === 4
+                          ? new Promise<void>((resolve) => setTimeout(resolve, 1 + (ioState % 3)))
+                          : Array.from({ length: turns }).reduce<Promise<void>>(
+                              (at) => at.then(() => new Promise<void>((r) => setImmediate(r))),
+                              Promise.resolve(),
+                            );
+                      return delay.then(() => ChunkReader.open(pages, chunk, options));
+                    }
                     return ChunkReader.open(pages, chunk, options);
                   },
                 },
@@ -650,6 +691,7 @@ it.each(seedsFor("next-aggregation-sql-handoff", [0xb4cb, 0xb4cc]))(
       );
       reach.assertReached();
     } finally {
+      taskClock.now = realNow;
       campaign.abort(new Error("Handoff campaign complete"));
       campaigns.delete(campaign);
       await pg.close();
