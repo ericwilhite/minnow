@@ -74,8 +74,10 @@ it("waits for an older snapshot that alone keeps flushed rows, then serves the r
   await core.open();
   try {
     await core.execute("CREATE TABLE t(id INT PRIMARY KEY, v TEXT)");
-    await core.execute("INSERT INTO t VALUES (1, $1)", ["a".repeat(2_000_000)]);
-    await core.execute("INSERT INTO t VALUES (2, $1)", ["b".repeat(2_000_000)]);
+    // 3 MB rows: a read by key is sized to the row it fetches (#52), so the new read below needs
+    // more than is free beside what the older snapshot keeps only with rows this wide.
+    await core.execute("INSERT INTO t VALUES (1, $1)", ["a".repeat(3_000_000)]);
+    await core.execute("INSERT INTO t VALUES (2, $1)", ["b".repeat(3_000_000)]);
     // Another connection reads both rows and holds its result undelivered: its snapshot is
     // older than the flush below, and keeps the published memtable's borrowed chunks.
     const lowered = core.lowerer.lower("SELECT id, v FROM t", core.context());
@@ -101,7 +103,7 @@ it("waits for an older snapshot that alone keeps flushed rows, then serves the r
     if (!(typeof rows === "object" && rows !== null && "batches" in rows))
       throw new Error(`the read is served once the older snapshot closes: ${String(rows)}`);
     expect(
-      oracleRows(rows as Parameters<typeof oracleRows>[0])[0]?.v === "a".repeat(2_000_000),
+      oracleRows(rows as Parameters<typeof oracleRows>[0])[0]?.v === "a".repeat(3_000_000),
     ).toBe(true);
     expect(core.harness.path.failure).toBeNull();
   } finally {

@@ -121,6 +121,7 @@ it("cancels a multi-row write while it waits beside a read, writing nothing", as
     await core.execute("CREATE TABLE t(id INT PRIMARY KEY, v TEXT)");
     await core.execute("CREATE TABLE r(id INT PRIMARY KEY, v TEXT)");
     await core.execute("INSERT INTO r VALUES (1, $1)", ["b".repeat(3 * MiB)]);
+    await core.execute("INSERT INTO r VALUES (2, $1)", ["c".repeat(3 * MiB)]);
     const lowered = core.lowerer.lower("SELECT id, v FROM r", core.context());
     if (lowered.kind !== "query") throw new Error("query plan required");
     const other = core.start(core.executor.prepare(lowered.plan));
