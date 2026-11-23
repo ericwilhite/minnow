@@ -123,7 +123,9 @@ accounting, not a guess about who might release.
   memtable's borrowed chunks and key deltas, a dropped table's rows, retired run readers) for
   the readers older than it (`ReaderRegistry.holdUntilOlderClose`). When the statement's
   snapshot is the only live reader older than such a hold, the hold is its own
-  (`Snapshot.exclusiveBytes`): it returns only when the statement ends. A hold another live,
+  (`Snapshot.exclusiveBytes`): it returns only when the statement ends. So is the snapshot's own
+  pin of a state a newer one superseded (its space pin, its root, the group directories and
+  chunks no other state shares), when no other pin shares that state. A hold another live,
   older reader also keeps is that reader's, and is waited for.
 
 - When the writer runs no work of its own, its holdings are exact: everything it holds beyond
@@ -174,9 +176,16 @@ An insert step charges the memtable what it allocates, before it allocates it
 per-row metadata, and for rows into chunks the live memtable already has, their arenas' growth
 (with the resize overlap when a step resizes an arena twice) and the chunk's lazy arrays;
 otherwise what the step opens plus the larger of twice its input and the live arenas' growth.
-It is recomputed after relief, since a freeze changes the memtable the rows reach. When the
-governor has no free memory left, the write path funds it from its own idle commit and merge
-credit before relief.
+A fresh chunk's charge includes what its rows may make it widen (an integer's int64 array, a
+decimal's int128 array and specials). It is recomputed after relief, since a freeze changes the
+memtable the rows reach. When the governor has no free memory left, the write path funds it from
+its own idle commit and merge credit before relief. When relief cannot free enough, the step
+waits for the rest as an ordinary admission carrying its statement's holdings
+(`Statement.waitHoldings`, registered by the executing query, and its cancellation): refused with
+53200 only when it could never be served beside them, otherwise served once another
+connection's finite holdings release, never refused part way. A transaction reserves, when it
+first records an undo that republishes the writer's state (a memtable freeze, a table it
+created), the one state pin that republication charges, so a rollback never needs memory.
 
 The write path's memtable refusal (`MemtableMemoryError`) is internal: a statement's write call
 reports it as this same `MemoryAdmissionError` (label `write path memtable`, naming the whole
