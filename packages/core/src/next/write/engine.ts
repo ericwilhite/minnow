@@ -1,5 +1,5 @@
 import { idleGarbageOverBound } from "./idle-garbage.js";
-import { retryGuard } from "../memory/retry-guard.js";
+import { RetrySpinError, retryGuard } from "../memory/retry-guard.js";
 import { StagedExtents, EMPTY_STAGED_EXTENTS } from "./staged-extents.js";
 import {
   captureWriterExtents,
@@ -2836,9 +2836,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
         this.#check();
         const need = bytes + (growth?.() ?? 0);
         if (this.#headroom(need)) return;
+        // Progress: the free row credit it reached (it rises as the waits are served).
+        guard.round(this.#grant.held - this.#grant.allocated);
         // The rows it holds stay while it waits: reclaim for this very admission must not return
         // them (it did, and the step asked again forever).
-        guard.retry();
         keep?.();
         keep = this.#credits.holdRowsWhileWaiting(need);
         const deficit = need - (this.#grant.held - this.#grant.allocated);
@@ -6188,6 +6189,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
             break;
           } catch (error) {
             if (error instanceof MergeAbortedError) return;
+            // A retry loop that spun is an invariant failure (test builds): never retried, never
+            // left behind as a merge failure; the write path fails with it.
+            if (error instanceof RetrySpinError) {
+              this.#failure ??= error;
+              return;
+            }
             // The extent-list sink failed: never published around (access/write-path.ts).
             if (error instanceof ExtentSinkError) {
               this.#failure ??= error;

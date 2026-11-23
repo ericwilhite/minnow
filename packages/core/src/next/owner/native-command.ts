@@ -284,7 +284,8 @@ export async function executeNativeCommand(
     let prepared: Prepared | null = null;
     const guard = retryGuard("native trigger preparation");
     while (!prepared) {
-      guard.retry();
+      // Progress: each retry asks for a larger reservation.
+      guard.round(want.metadata);
       signal.throwIfAborted();
       await admit(want, want.need ?? want.metadata);
       const outcome = await prepareWithin();

@@ -66,9 +66,36 @@ describe("a guarded loop", () => {
     }).toThrow(/recursion: 4 retries without progress/);
   });
 
+  it("counts only measured rounds without progress", () => {
+    const guard = retryGuard("measured", 3);
+    // Rising progress never counts, however many rounds.
+    expect(() => {
+      for (let progress = 0; progress < 1_000; progress++) guard.round(progress);
+    }, "rising progress never counts").not.toThrow();
+    // Then three rounds at or below the best so far count, and the fourth throws.
+    guard.round(999);
+    guard.round(10);
+    guard.round(999);
+    expect(() => {
+      guard.round(500);
+    }).toThrow(RetrySpinError);
+    // A new best starts the count again.
+    const again = retryGuard("again", 2);
+    again.round(1);
+    again.round(1);
+    again.round(1);
+    again.round(2);
+    again.round(2);
+    again.round(2);
+    expect(() => {
+      again.round(2);
+    }).toThrow(/again: 3 retries without progress/);
+  });
+
   it("never throws when off", () => {
     const guard = retryGuard("off", null);
     for (let i = 0; i < 1_000; i++) guard.retry();
+    for (let i = 0; i < 1_000; i++) guard.round(0);
     expect(() => {
       checkRetries("off", 1_000, null);
     }).not.toThrow();

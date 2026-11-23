@@ -152,7 +152,8 @@ export class NativeDefaults {
       let requested = this.#minimum;
       const guard = retryGuard("native defaults preparation");
       for (;;) {
-        guard.retry();
+        // Progress: each retry requests more.
+        guard.round(requested);
         check();
         await scope.prepare(requested, signal);
         check();

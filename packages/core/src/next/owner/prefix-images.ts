@@ -315,7 +315,8 @@ export class NativePrefixImages {
         let minimum = baseMinimum;
         const guard = retryGuard("prefix image source");
         for (;;) {
-          guard.retry();
+          // Progress: each retry's minimum is larger (a smaller one is invalid).
+          guard.round(minimum);
           checkPhase();
           const budget = await this.scope.prepareSource(table, minimum, stop);
           this.#check(stop);

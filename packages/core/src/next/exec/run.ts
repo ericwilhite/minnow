@@ -1539,8 +1539,9 @@ export class QueryExecution implements Execution {
   #modifySpool: ModifySpool | null = null;
   /** Preparation admissions never wait while holding (exec/preparation.ts). */
   readonly #preparation: PreparationGovernor | null;
-  /** Preparation restarts of this execution (`#restart`, `checkRetries`). */
+  /** Preparation restarts of this execution without a larger need (`#restart`, `checkRetries`). */
   #restarts = 0;
+  #restartNeed = 0;
   #atomic: { readonly result: DeferredGrant; readonly window: number } | null = null;
   #committed = false;
   #draining = false;
@@ -1816,7 +1817,12 @@ export class QueryExecution implements Execution {
     if (sink.rowCount !== 0 || runtime.modification)
       throw new Error("Query preparation restarted after it produced output");
     // Each restart waits for a larger credit; one that keeps restarting without one is a spin.
-    checkRetries(`query#${String(this.request.queryId)} preparation`, ++this.#restarts);
+    // Progress: a restart for a larger need than any before starts the count again.
+    if (error.needed > this.#restartNeed) {
+      this.#restartNeed = error.needed;
+      this.#restarts = 0;
+    } else this.#restarts++;
+    checkRetries(`query#${String(this.request.queryId)} preparation`, this.#restarts);
     runtime.abort(RESTART);
     await runtime.close();
     await sizingSettled(this.#controller.signal);

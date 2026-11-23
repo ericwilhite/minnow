@@ -142,9 +142,10 @@ export class StreamingRangeCursor implements IndexCursor {
     const shared = this.index.table.snapshot.shared;
     const guard = retryGuard("write index range open");
     for (;;) {
-      guard.retry();
       const sizes = this.#sizes(),
         options = { label: "write index range", minimumBytes: sizes.minimum, spillable: false };
+      // Progress: a retry sizes a larger minimum.
+      guard.round(sizes.minimum);
       let grant: ByteBudget;
       if (this.admitted !== undefined) {
         this.#account = new MinimumBudget(this.admitted.budget, sizes.minimum);

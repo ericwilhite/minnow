@@ -648,7 +648,8 @@ export class WriteCredits {
         this.#rememberFundedMetadata(grant, wanted, metadata, funding);
         return;
       }
-      guard.retry();
+      // Progress: the credit the owner's accounts hold (each served wait raises it).
+      guard.round(accounts.reduce((sum, account) => sum + account.held, 0));
       this.#changed?.(true);
       const working = this.#workingMinimum();
       const floors = [
@@ -911,7 +912,8 @@ export class WriteCredits {
     const guard = retryGuard(`merge credit ${label}`);
     try {
       for (;;) {
-        guard.retry();
+        // Progress: the merge and metadata credit funded so far.
+        guard.round(this.merge.held + this.metadata.held);
         // mergeRuns consumes a ByteBudget: its entire I/O/encoder workspace is
         // prepaid here and never borrows the shared legacy reserve (rules2/3/5).
         const ready = this.#prepareMerge(bytes, undefined, true, headroom);

@@ -209,7 +209,11 @@ unattributed remainder, which is zero unless the accounting is broken.
 
 A loop that never yields is invisible to that timer. In test builds (`MINNOW_RETRY_GUARD`, set for
 every Vitest suite and browser lane; `memory/retry-guard.ts`) each memory retry loop counts its
-rounds without progress and throws `RetrySpinError` past the limit (64):
+rounds without progress and throws `RetrySpinError` past the limit (64). Where a loop can measure
+its progress (credit funded, a requested size), a round that raises it above every earlier one
+starts the count again (`RetryGuard.round`): a long wait that keeps getting closer never trips
+it. `RetrySpinError` is an invariant failure: no handler retries or recovers from it, and a
+background merge that meets one fails the write path with it. The guarded loops:
 
 - the governor's drain (a round that serves, refuses and withdraws nothing);
 - the write step's row wait, the owner's growth (`WriteCredits.#growTo`), its merge credit and

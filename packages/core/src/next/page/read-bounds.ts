@@ -439,7 +439,8 @@ export function boundSource(
       );
       const guard = retryGuard("read-step sizing");
       for (;;) {
-        guard.retry();
+        // Progress: each retry sizes with a larger capacity.
+        guard.round(capacity);
         signal.throwIfAborted();
         const preferred = Math.max(capacity, caches?.sizingBytes(segment.group.root.length) ?? 0);
         // Optional recipe construction must never wait, jump FIFO or raise the ordinary

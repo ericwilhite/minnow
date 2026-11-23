@@ -122,10 +122,10 @@ export class MetadataBudget implements ByteBudget {
     grow?: (wanted: number) => Promise<void>,
     funded = 0,
     rounds = 0,
+    reached = 0,
   ): MaybePromise<T> {
     const refused = (error: unknown): MaybePromise<T> => {
       if (!(error instanceof MetadataPressure)) throw error;
-      checkRetries(`metadata ${this.grant.label}`, rounds + 1);
       // An earlier attempt of this work was funded to `funded`, and the grant fell below it
       // without this refusal's allocations: the attempt itself moved credit out (a page read's
       // charge handed to the cache). Fund that again on top, or every retry falls short by the
@@ -134,6 +134,12 @@ export class MetadataBudget implements ByteBudget {
       const target = error.wanted + lost;
       return this.#wait(target, check, grow).then(() => {
         check();
+        // Progress: the credit this work's funding has reached (a grant above every earlier
+        // retry's). Only retries funded no further count toward the retry guard; asking for more
+        // is not progress when nothing more arrives.
+        const held = this.grant.held;
+        const next = held > reached ? 0 : rounds + 1;
+        checkRetries(`metadata ${this.grant.label}`, next);
         // The credit was grown for this attempt: reclaim keeps it until the attempt settles.
         // An attempt awaits (a lock, a writer) before it allocates; without this a queued
         // request's reclaim could take it back in between, and grow and retry would repeat.
@@ -144,7 +150,7 @@ export class MetadataBudget implements ByteBudget {
         };
         let result: MaybePromise<T>;
         try {
-          result = this.retry(work, check, grow, target, rounds + 1);
+          result = this.retry(work, check, grow, target, next, Math.max(reached, held));
         } catch (error) {
           settle();
           throw error;
