@@ -536,16 +536,25 @@ leaf supplies captured Date intrinsics to both engines; it cannot import either 
 ### Step signals (`step-signal.ts`)
 
 - A short-lived step that must stop when a long-lived signal aborts (a native root's scope, a
-  statement's writer) takes `stepSignal(site, ...parents)`, never `AbortSignal.any`: a composite is
-  a dependant of every source until garbage collection, and a native trigger statement made 57 of
-  them per row.
-- A parent with open steps carries one `abort` listener, removed when its last step closes. A
-  step must be closed when it ends (`close()` in a `finally`, including when the work it guards
-  refuses to start). A parent's abort closes and aborts every open step with the parent's reason;
-  a step opened under an aborted parent is aborted at once.
+  statement's writer) takes `stepSignal(site, ...parents)`, never `AbortSignal.any`. A composite
+  re-reads its sources on every `aborted`, `reason` and `throwIfAborted` (Node's
+  `refreshCompositeSignal`), and a native trigger statement made 57 of them per row. A step is a
+  plain `AbortController`. `abortableStep` adds `abort(reason)`, for a step its owner also cancels
+  directly, instead of a fresh controller as one more parent.
+- A step aborts exactly as `AbortSignal.any(parents)` would, by the DOM's two-phase signal abort:
+  - each parent with open steps has one sentinel, `AbortSignal.any([parent])`, created once and
+    never read. The parent's fan-out listens on it, so steps abort where a composite's event would
+    fire: after every listener of the parent, in join order;
+  - the first parent to abort decides the reason. A fan-out passes over a step whose other aborted
+    parent has not finished its own fan-out (that abort encloses this one);
+  - a parent that is a `stepSignal` stands for its own parents, as a composite source does.
+- A step must be closed when it ends (`close()` in a `finally`, including when the work it guards
+  refuses to start). A parent's sentinel listener is removed with its last step.
 - Tests: `heldStepSignals()` counts registrations parents still hold, and
-  `observeStepSignals(site => …)` sees each step open (`testing/step-signal.test.ts`: under one
-  per row, no step left held after 2,000 rows, prompt cancellation at every site).
+  `observeStepSignals(site => …)` sees each step open. `testing/step-signal.test.ts` holds a
+  fast-check differential against `AbortSignal.any` under reentrant listeners, the per-row
+  composite and sentinel counts, no step left held after 2,000 rows, and prompt cancellation at
+  every site.
 
 ### Vectors (`vector/`)
 

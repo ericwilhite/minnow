@@ -1,7 +1,7 @@
 /** Query-local shares of the native root's admitted workspace. This is not another
  * governor: no admission/loan/cache ownership is delegated to the real governor.
  * A complete producer group may wait only after every previous source share retired. */
-import { stepSignal, type StepSignal } from "../step-signal.js";
+import { abortableStep, stepSignal, type AbortableStep } from "../step-signal.js";
 import type {
   AdmitOptions,
   EvictableCache,
@@ -44,18 +44,16 @@ export class PrepaidQueryGovernor implements MemoryGovernor {
   #held = 0;
   #closed = false;
   #pending: Promise<readonly Grant[]> | null = null;
-  #stop: AbortController;
   #closing: Promise<void> | null = null;
   readonly #signal: AbortSignal;
   /** Follows the scope for this workspace's life; closed with it. */
-  readonly #step: StepSignal;
+  readonly #step: AbortableStep;
   constructor(readonly scope: PrepaidQueryScope) {
     scope.signal.throwIfAborted();
     if (!scope.metadata.allocate(PREPAID_QUERY_BYTES))
       throw new RangeError("Native query metadata must be admitted");
     try {
-      this.#stop = new AbortController();
-      this.#step = stepSignal("native query workspace", scope.signal, this.#stop.signal);
+      this.#step = abortableStep("native query workspace", scope.signal);
       this.#signal = this.#step.signal;
     } catch (error) {
       scope.metadata.free(PREPAID_QUERY_BYTES);
@@ -247,8 +245,7 @@ export class PrepaidQueryGovernor implements MemoryGovernor {
   close(): Promise<void> {
     return (this.#closing ??= (async () => {
       this.#closed = true;
-      this.#stop.abort(new GrantClosedError("native query workspace"));
-      this.#step.close();
+      this.#step.abort(new GrantClosedError("native query workspace"));
       await this.#pending?.catch(() => undefined);
       while (this.#first) this.#first.close();
       this.scope.metadata.free(PREPAID_QUERY_BYTES);

@@ -13781,3 +13781,13 @@ export const SERVABLE_BESIDE_WRITER_REACH = [
   "one more byte refused",
   "refused once the writer settled",
 ] as const;
+
+/** Step signals against `AbortSignal.any` (next/testing/step-signal.test.ts differential). */
+export const STEP_SIGNAL_DIFFERENTIAL_REACH = [
+  "reentrant abort of another parent",
+  "parent listener registered before the steps",
+  "step listener aborted a parent",
+  "nested step",
+  "step with several aborted parents",
+  "step left unaborted",
+] as const;
