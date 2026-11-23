@@ -25,6 +25,7 @@ import { afterEach, expect, it } from "vitest";
 import type { Snapshot } from "../access/snapshot.js";
 import type { Execution, PreparedPlan } from "../exec/executor.js";
 import { Governor, type Grant } from "../memory/governor.js";
+import { RETRY_GUARD_LIMIT } from "../memory/retry-guard.js";
 import { ChunkReader } from "../page/reader.js";
 import { rowsOf } from "../write/test-support.js";
 import { createReach, REPIN_BEFORE_OBSERVING_REACH } from "../../testing/reach.js";
@@ -44,7 +45,7 @@ afterEach(() => {
  * this history publishes once). A grant holds 8 MiB, about what the first refusal's snapshot
  * kept alone, and the fresh snapshot reports keeping them alone.
  */
-type Offer = "none" | "fresh" | "declined" | "republished";
+type Offer = "none" | "fresh" | "declined" | "republished" | "always";
 
 /** C1's history at `capMiB`, then the point read, with the owner's offer as given. */
 async function read(capMiB: number, offer: Offer) {
@@ -83,7 +84,9 @@ async function read(capMiB: number, offer: Offer) {
         return null;
       }
       // Once: a later move (only without the one-move rule) gets a plain fresh snapshot.
-      if (offer === "republished" && offers === 1) {
+      // `always`: every move, so only the one-move rule and the retry guard end the loop.
+      const republish = offer === "always" || (offer === "republished" && offers === 1);
+      if (republish) {
         const target = fresh;
         fresh = new Proxy(target, {
           get(object, key) {
@@ -94,7 +97,7 @@ async function read(capMiB: number, offer: Offer) {
         });
       }
       pin.release();
-      if (offer === "republished" && offers === 1) {
+      if (republish) {
         const held = governor.tryAdmit({
           label: "a second publication's rows",
           minimumBytes: kept,
@@ -164,6 +167,19 @@ for (const cap of [36.5, 36.75])
 
 it("moves at most once per execution, whatever publications follow", async () => {
   const result = await read(36.5, "republished");
+  expect(result.outcome, "the second refusal stands, typed").toMatchObject(TYPED);
+  expect(result.offers, "one move").toBe(1);
+  expect(result.moved).toBe(true);
+}, 60_000);
+
+/**
+ * #60's retry guard counts a re-pin as a preparation restart (exec/run.ts `#repinAfter`), and
+ * the one-move rule still ends the path: with the guard on and a publication after every move,
+ * the execution moves once and the refusal stands typed, never a `RetrySpinError`.
+ */
+it("moves once with the retry guard on, however many publications follow every move", async () => {
+  expect(RETRY_GUARD_LIMIT, "the guard is on in this suite (vitest.config.ts)").not.toBeNull();
+  const result = await read(36.5, "always");
   expect(result.outcome, "the second refusal stands, typed").toMatchObject(TYPED);
   expect(result.offers, "one move").toBe(1);
   expect(result.moved).toBe(true);

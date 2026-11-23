@@ -7,7 +7,7 @@ import type { Operator } from "./pipeline.js";
 import type { MaybePromise } from "../access/key-index.js";
 import { SnapshotReleasedError } from "../access/snapshot.js";
 import { sizingSettled } from "../page/read-bounds.js";
-import { checkRetries, macrotaskEpoch } from "../memory/retry-guard.js";
+import { retryGuard, type RetryGuard } from "../memory/retry-guard.js";
 import { MemoryAdmissionError } from "../memory-values.js";
 import { QueryRoots, type RootColumns } from "../page/query-roots.js";
 import { readTable } from "./read-table.js";
@@ -1545,10 +1545,8 @@ export class QueryExecution implements Execution {
   #modifySpool: ModifySpool | null = null;
   /** Preparation admissions never wait while holding (exec/preparation.ts). */
   readonly #preparation: PreparationGovernor | null;
-  /** Preparation restarts of this execution without a larger need (`#restart`, `checkRetries`). */
-  #restarts = 0;
-  #restartNeed = 0;
-  #restartEpoch = -1;
+  /** Counts this execution's preparation restarts, re-pins included (`#restarted`). */
+  #restarts: RetryGuard | null = null;
   /** The view the next attempt reads: the request's, or a fresher one it re-pinned (`#repin`). */
   #view: Snapshot;
   /** Whether this execution re-pinned: at most once, so a second refusal is the typed 53200
@@ -1851,12 +1849,20 @@ export class QueryExecution implements Execution {
     const preparation = this.#preparation,
       runtime = this.#runtime;
     if (preparation === null || runtime === null) throw refusal;
+    // A re-pin is a restart without a larger need: the retry guard counts it like any other, so
+    // no loop through it can spin unseen, whatever the one-move latch does.
+    this.#restarted().retry();
     runtime.abort(RESTART);
     await runtime.close();
     await sizingSettled(this.#controller.signal);
     preparation.reset();
     this.#repin(refusal);
     return this.#again(program);
+  }
+
+  /** The guard over this execution's restarts, made at its first (memory/retry-guard.ts). */
+  #restarted(): RetryGuard {
+    return (this.#restarts ??= retryGuard(`query#${String(this.request.queryId)} preparation`));
   }
 
   /** The owner's re-pin, offered for a query only (`ExecuteRequest.repin`). */
@@ -1891,13 +1897,7 @@ export class QueryExecution implements Execution {
     // Each restart waits for a larger credit; one that keeps restarting without one is a spin.
     // Progress: a restart for a larger need than any before, or after a macrotask (its wait ran a
     // timer or I/O), starts the count again: only microtask spins count.
-    const epoch = macrotaskEpoch();
-    if (error.needed > this.#restartNeed || epoch !== this.#restartEpoch) {
-      this.#restartNeed = Math.max(this.#restartNeed, error.needed);
-      this.#restartEpoch = epoch;
-      this.#restarts = 0;
-    } else this.#restarts++;
-    checkRetries(`query#${String(this.request.queryId)} preparation`, this.#restarts);
+    this.#restarted().round(error.needed);
     runtime.abort(RESTART);
     await runtime.close();
     await sizingSettled(this.#controller.signal);
