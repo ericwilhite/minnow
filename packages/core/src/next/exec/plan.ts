@@ -4737,9 +4737,17 @@ function compileRecipe(plan: PhysicalPlan, options: CompileOptions, inputOnly: b
           windows = false;
           continue;
         }
-        if (overCap && knownResult && !resultSizing && resultSources.size > 0) {
+        if (
+          overCap &&
+          knownResult &&
+          !resultSizing &&
+          (resultSources.size > 0 || !aggregateResult)
+        ) {
           // Ordinary source-result copies keep the already proven read envelope.
           // Only an over-cap minimum needs these additional per-emitted-column facts.
+          // Plain delivery takes the emitted-row recipe here even when its columns are all
+          // fixed-width (no source column to measure): its result holds those columns, not
+          // four copies of the widest value the source reads.
           resultSizing = true;
           plainSized.on = true;
           continue;
