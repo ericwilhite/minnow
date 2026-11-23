@@ -49,9 +49,7 @@ export function expressionInputBytes(
       );
     }
     case "cast":
-      return expr.input.type.kind === expr.type.kind
-        ? expressionInputBytes(expr.input, input, sizes, coefficient)
-        : null;
+      return castBytes(expr.input, expr.type, input, sizes, coefficient);
     case "case": {
       const values: Array<number | null> = [];
       let otherwise = true;
@@ -164,6 +162,45 @@ export function columnInputBytes(
       return null;
   }
 }
+/**
+ * The longest text of a value of a fixed-width type: an interval's (about 70 bytes, e.g.
+ * "-178956970 years -8 mons -2147483648 days -2562047788:00:54.775808") is the longest;
+ * integers, floats, dates, times, timestamps with zones, booleans and UUIDs are shorter.
+ */
+export const FIXED_TEXT_BYTES = 128;
+
+const utf8 = new TextEncoder();
+
+/** An enum value's bytes: its longest label. */
+const labelBytes = (labels: readonly string[]): number =>
+  labels.reduce((most, label) => Math.max(most, utf8.encode(label).length), 0);
+
+/**
+ * A cast's value bytes, where a rule bounds them: the same kind keeps its input's; text from a
+ * fixed-width type takes that type's longest text, from an enum its longest label, from a NUMERIC
+ * with a declared precision its digits, sign, point and a leading zero. Otherwise unknown (text
+ * input functions and bounded text casts come with the text kernels).
+ */
+function castBytes(
+  from: ScalarExpr,
+  to: ScalarExpr["type"],
+  input: Rel,
+  sizes: InputSizes,
+  coefficient: number,
+): number | null {
+  const source = from.type;
+  if (source.kind === to.kind) return expressionInputBytes(from, input, sizes, coefficient);
+  if (to.kind !== "text") return null;
+  if (!variable(source.kind)) return coefficient * FIXED_TEXT_BYTES;
+  if (source.kind === "enum") return coefficient * labelBytes(source.labels);
+  if (source.kind === "decimal" && source.precision !== null) {
+    const precision = source.precision,
+      scale = source.scale ?? 0;
+    return coefficient * (Math.max(precision, scale, precision - scale) + 3);
+  }
+  return null;
+}
+
 /** Sum physical projections; source prefixes have a separate complete reservation. */
 export function projectedInputBytes(
   exprs: readonly ScalarExpr[],
