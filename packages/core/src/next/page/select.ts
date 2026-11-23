@@ -453,24 +453,19 @@ function rangeKernel(
     const low = ranges.lows[0] ?? 0;
     const high = ranges.highs[0] ?? 0;
     if (values instanceof Uint8Array) {
-      if (kernelObserver !== null) kernelObserver("scan8");
       return scan8(values, from, to, low, high, out, at, first);
     }
     if (values instanceof Uint16Array) {
-      if (kernelObserver !== null) kernelObserver("scan16");
       return scan16(values, from, to, low, high, out, at, first);
     }
     if (values instanceof Uint32Array) {
-      if (kernelObserver !== null) kernelObserver("scan32");
       return scan32(values, from, to, low, high, out, at, first);
     }
-    if (kernelObserver !== null) kernelObserver("scanI32");
     return scanI32(values, from, to, low, high, out, at, first);
   }
   if (ranges.count === 1) {
     const low = ranges.lows[0] ?? 0;
     const high = ranges.highs[0] ?? 0;
-    if (kernelObserver !== null) kernelObserver("single-range");
     for (let k = from; k < to; k++) {
       const row = rows === null ? k : (rows[k] ?? 0) - first;
       const valid = validity === null ? 1 : ((validity[row >>> 5] ?? 0) >>> (row & 31)) & 1;
@@ -1090,3 +1085,4 @@ function maskCodes(
   }
   return ones;
 }
+export const scratchObserverRef = (): unknown => kernelObserver;
