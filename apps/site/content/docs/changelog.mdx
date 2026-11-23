@@ -570,6 +570,29 @@ and the combined worker/client download cap rises once by 768 gzip bytes. Engine
 caps rise once by 2 KiB raw and 768 gzip bytes; the larger adapter measures about 450 KiB gzip. Rebuild code stays
 excluded from published packages.
 
+### Planned 1.0 cutover: no key forwarding
+
+The 1.0 rebuild removes key forwarding (plan decision D14). A rekey,
+`UPDATE t SET id = <new> WHERE id = <old>`, still moves the row, and every declared reference
+follows in the same commit. But the old key is free at once, as in PostgreSQL: it no longer
+reads or writes the row, it no longer counts as taken, and a new row may be inserted with it.
+`keyForwardRetentionMs`, `resolveKey`, `resolveKeys`, `onKeyChanges`, `subscribeKeyChanges`, and
+`mergeKey` are not part of 1.0, and 1.0 stores no forwards table. Live deliveries in 1.0 still
+carry `keyChanges` for rekeys the current owner session saw.
+
+Migration for offline sync: when a record created under a temporary key gets its server key, run
+the rekey and switch every key held outside the database (UI state, outboxes, queued requests) to
+the new key at the same time. Keep temporary keys out of the server's range, so a stale one never
+names another row. To merge a temporary row into an existing server row, update the referencing
+rows to the server key and delete the temporary row in one write scope. The
+[rekeying guide](/docs/engine/rekeying#10-cutover-no-key-forwarding) has the details. This changes
+no shipped 0.x behavior or stored format.
+
+`@minnowdb/core/testing`: `SimulationDriver` gains an optional `keyForwarding` flag. It defaults to
+`true`, the 0.x behavior, so existing drivers are unchanged; a driver for an engine without key
+forwarding sets it to `false`, and the interaction simulator's model then frees a retired key at
+once.
+
 ### Planned 1.0 cutover: full-text search
 
 The unexported 1.0 engine lowers MATCH/BM25 and evaluates them by scan. BM25 uses the whole

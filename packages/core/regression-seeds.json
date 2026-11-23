@@ -97,6 +97,6 @@
     "interaction-simulator-next-constraints": [5, 6, 7, 8, 9, 10, 11, 12],
     "interaction-simulator-next-schema": [5, 6, 7, 8, 9, 10, 11, 12],
     "interaction-simulator-next-full-text": [5, 6, 7, 8, 9, 10, 11, 12],
-    "interaction-simulator-next-rekeying": []
+    "interaction-simulator-next-rekeying": [5, 6, 7, 8, 9, 10, 11, 12]
   }
 }

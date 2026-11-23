@@ -28,13 +28,14 @@ const COMMON: readonly InteractionReachState[] = [
   "read-bypassed-queued-write",
 ];
 /**
- * The states each family's seeds must reach. Rekeying plans declare none while the open
- * rekey-forwards finding blocks them; faults, crashes and index-path explains do not run here.
+ * The states each family's seeds must reach; faults, crashes and index-path explains do not run
+ * here. Rekeying plans are judged against PostgreSQL's behaviour: next/ keeps no key forwards
+ * (decision D14, the driver's `keyForwarding: false`), so a retired key reads nothing.
  */
 const DECLARED: Readonly<Record<string, readonly InteractionReachState[]>> = {
   base: COMMON,
   constraints: [...COMMON, "unique-refused"],
-  rekeying: [],
+  rekeying: [...COMMON, "rekey-moved", "rekey-refused", "retired-key-read"],
   "schema changes": [...COMMON, "alter-populated"],
   "full text": COMMON,
 };

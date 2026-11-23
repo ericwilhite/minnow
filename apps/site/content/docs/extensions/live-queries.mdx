@@ -176,6 +176,11 @@ unchanged. Use `await client.onKeyChanges(listener, { onError })` for future rek
 tables, even without queries. It deduplicates overlapping live sets. The first observing set includes its notices before its
 results in one worker batch; other sets sweep independently. Re-register after reopening the client. Engine-side
 sets offer `await live.subscribeKeyChanges(listener)`; close its returned subscription when done.
+
+In the 1.0 rebuild there are no stored key forwards, and `onKeyChanges` and
+`subscribeKeyChanges` are not offered ([the 1.0 cutover](/docs/engine/rekeying#10-cutover-no-key-forwarding)). Deliveries still carry `keyChanges` for rekeys the
+current owner session saw; when that history cannot cover the gap, the delivery is a reset
+instead.
 See [keys held in application state](/docs/engine/rekeying#following-keys-held-in-application-state)
 for startup, retention, polling, and synchronous-cache limits.
 

@@ -14,6 +14,12 @@ commit, and remembers the old key so it keeps working for a while. There is no s
 join on. Application state can follow key-change notifications; keys persisted outside Minnow
 resolve through the engine before use.
 
+<Callout type="warn" title="Key forwarding is 0.x only">
+  This page describes the current 0.x engine. The 1.0 rebuild still moves the row and its declared
+  references with one `UPDATE`, but it does not forward the old key: the old key is free at once, as
+  in PostgreSQL. See [the 1.0 cutover](#10-cutover-no-key-forwarding).
+</Callout>
+
 ## A record made offline
 
 The examples use the [retail dataset](/#console). In it, `order_items.order_id` and
@@ -336,3 +342,27 @@ its rows. A rekey whose references cannot be moved is refused, and nothing is wr
   that keep a key as plain text can resolve it with `resolveKey` before sending.
 - **Forwards are local.** They live in this device's database and are not synced. Each device keeps
   the forwards for the rekeys it ran or received.
+
+## 1.0 cutover: no key forwarding
+
+The 1.0 rebuild removes key forwarding. PostgreSQL frees a key the moment its row moves, and 1.0
+does the same:
+
+- `UPDATE orders SET order_id = 900001 WHERE order_id = -1` still moves the row, and every declared
+  reference follows in the same commit.
+- After the commit, `-1` names nothing. `WHERE order_id = -1` matches no row, and an `UPDATE` or
+  `DELETE` by `-1` changes nothing.
+- `-1` is free: a new row may be inserted with it, and another row may be rekeyed onto it.
+- A new key is refused only when another row holds it.
+- `keyForwardRetentionMs`, `mergeKey`, `resolveKey`, `resolveKeys`, and `onKeyChanges` are not part
+  of 1.0. No forwards table is stored.
+
+What to do instead when you move to 1.0:
+
+- Run the rekey when the server answers, and switch every key you hold outside the database (UI
+  state, an outbox, a queued request, another tab's copy) to the new key at the same time.
+- Keep temporary keys that can never equal a server key (see
+  [choosing temporary keys](#choosing-temporary-keys)), so a stale temporary key never matches a
+  different row.
+- When the server row already exists, merge the temporary row into it in one write scope: update
+  the children to the server key, then delete the temporary row.

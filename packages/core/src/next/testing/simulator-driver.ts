@@ -58,6 +58,9 @@ export async function createNextDriver(
     entry.port.close();
   };
   return {
+    // Decision D14: the 1.0 rebuild keeps no key forwards (testing/divergences.ts
+    // `key-forwarding`); a rekeyed-away key is free at once, as in PostgreSQL.
+    keyForwarding: false,
     listedGap: (error) => listedGap(error)?.id ?? null,
     open: async (): Promise<SimulatedConnection> => {
       let entry = await connect();

@@ -114,6 +114,11 @@ machines: https://minnowdb.com/llms.txt
   ordered results including duplicates; composite inputs are arrays of arrays. An unchanged key
   does not prove row existence. External outboxes must account for forwarding retention; a UI
   map or an event subscription does not extend it.
+- The planned 1.0 removes key forwarding, `keyForwardRetentionMs`, `resolveKey`, `resolveKeys`,
+  `onKeyChanges`, and `mergeKey`, and frees an old key at once, as PostgreSQL does. Code that must
+  survive the 1.0 cutover should switch every held key (UI state, outboxes, queued requests) when
+  the rekey runs, and merge a temporary row into an existing server row by updating its references
+  to the server key, then deleting the temporary row, in one write scope.
 - One `migrate()` can create mutually referencing tables, enforced or informational. Tables are
   created before references are attached; rerun an interrupted migration before allowing app
   writes. New enforced references validate existing rows before attachment. Existing enforced
