@@ -1,5 +1,5 @@
 /** Publication-stable memory reads: size logical rows, then fill only caller-owned output. */
-import { stepSignal } from "../step-signal.js";
+import { abortableStep } from "../step-signal.js";
 import type { ColumnDef } from "../access/catalog.js";
 import type { MaybePromise } from "../access/key-index.js";
 import {
@@ -177,9 +177,9 @@ export class MemoryReads {
   ): MaybePromise<T> {
     context.signal.throwIfAborted();
     if (!context.budget.allocate(1024)) throw new PageBudgetError(1024);
-    const stop = new AbortController();
+
     // Ends with this read (the generator's finally below, or a failed watch).
-    const step = stepSignal("memory read", context.signal, stop.signal),
+    const step = abortableStep("memory read", context.signal),
       signal = step.signal;
     const check = (): void => {
       this.source.check();
@@ -187,7 +187,7 @@ export class MemoryReads {
     };
     let unwatch: () => void;
     try {
-      unwatch = this.source.watch(() => stop.abort());
+      unwatch = this.source.watch(() => step.abort());
     } catch (error) {
       step.close();
       context.budget.free(1024);

@@ -6,7 +6,7 @@ import type {
 import { NativeWriteStepChangedError } from "../access/native-write-step.js";
 import { TransactionStateError, WritePathClosedError } from "../access/write-path.js";
 import { MemoryAdmissionError, type HolderChain, type MemoryGovernor } from "../memory/governor.js";
-import { stepSignal } from "../step-signal.js";
+import { abortableStep, type AbortableStep } from "../step-signal.js";
 import type { ByteCharge } from "../vector/varlen.js";
 
 /** Controller, one preparing request, one witness and one cancellable wakeup. */
@@ -54,7 +54,7 @@ class Boundary implements NativeWriteStepBoundary {
 export class NativeWriteSteps {
   #scope: NativeWriteStepScope | null;
   #owner: object | null = null;
-  #request: AbortController | null = null;
+  #request: AbortableStep | null = null;
   #pending: Promise<NativeWriteStepBoundary> | null = null;
   #live: Boundary | null = null;
   #version = 0;
@@ -126,8 +126,9 @@ export class NativeWriteSteps {
     const ordinary = scope.governor.capBytes - scope.governor.reserveBytes,
       capacity = options.includesProgress === true ? scope.governor.capBytes : ordinary;
     if (rootBytes > capacity) throw new MemoryAdmissionError("native root", rootBytes, capacity);
-    const request = new AbortController(),
-      step = stepSignal("native write step", signal, request.signal),
+    // Cancelling this preparation aborts its own step (`#request`).
+    const step = abortableStep("native write step", signal),
+      request = step,
       stop = step.signal;
     this.#owner = owner;
     this.#request = request;

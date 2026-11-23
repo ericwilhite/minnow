@@ -13814,3 +13814,13 @@ export const MULTI_ROW_BESIDE_READ_REACH = [
   "written at once",
   "two-row memtables",
 ] as const;
+
+/** Step signals against `AbortSignal.any` (next/testing/step-signal.test.ts differential). */
+export const STEP_SIGNAL_DIFFERENTIAL_REACH = [
+  "reentrant abort of another parent",
+  "parent listener registered before the steps",
+  "step listener aborted a parent",
+  "nested step",
+  "step with several aborted parents",
+  "step left unaborted",
+] as const;
