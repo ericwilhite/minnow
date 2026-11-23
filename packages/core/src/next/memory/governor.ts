@@ -358,6 +358,27 @@ export class GrowthObserverReentryError extends Error {
   }
 }
 
+/**
+ * Test builds only (`Governor.observeHoldings` set when the grant is created): turns the grant's
+ * `held` field into an accessor that reports every change. `held` already includes an outstanding
+ * loan (a served loan raises it, repaying lowers it), so `loan` is not observed: reporting both
+ * would count a loan twice. Production grants keep plain fields: the governor's allocate, free,
+ * growth and release paths pay nothing for the hook.
+ */
+function observeHoldings(grant: GrantImpl): void {
+  let value = grant.held;
+  Object.defineProperty(grant, "held", {
+    configurable: true,
+    enumerable: true,
+    get: () => value,
+    set: (bytes: number) => {
+      const delta = bytes - value;
+      value = bytes;
+      if (delta !== 0) Governor.observeHoldings?.(grant, delta);
+    },
+  });
+}
+
 class GrantImpl implements Grant {
   group: readonly GrantImpl[] | null = null;
   /** A grant carved from held credit returns its bytes there while that credit is open. */
@@ -366,8 +387,10 @@ class GrantImpl implements Grant {
   grown: (() => void) | null = null;
   /** Holdings grew during the current operation; the observer runs once it completes. */
   pendingGrowth = false;
+  /** Credit this grant holds. */
   held = 0;
   allocated = 0;
+  /** Bytes lent from the reserve. */
   loan = 0;
   loanPending = false;
   closed = false;
@@ -377,7 +400,9 @@ class GrantImpl implements Grant {
     readonly governor: Governor,
     readonly label: string,
     readonly spillable: boolean,
-  ) {}
+  ) {
+    if (Governor.observeHoldings !== null) observeHoldings(this);
+  }
 
   allocate(bytes: number): boolean {
     this.governor.assertMutable();
@@ -610,6 +635,14 @@ export class Governor implements MemoryGovernor {
    * longer than the window would also be reported.
    */
   static stallAfterMs: number | null = null;
+  /**
+   * Test builds only: called after every change to the holdings (its `held` credit, which
+   * includes any outstanding reserve loan) of a grant created while this is set, by `delta` bytes:
+   * growth, transfers, carving, releases, loans and close all pass here. Suites install it before the grants they
+   * measure exist, and sum it per owner for exact peak holdings. Grants created while it is null
+   * keep plain fields and never call it.
+   */
+  static observeHoldings: ((grant: Grant, delta: number) => void) | null = null;
   /** Test builds: a waiter queued for this many windows is reported whatever other activity
    * continues (review 10): unrelated grant activity cannot mask a stalled waiter indefinitely. */
   static stallDeadlineWindows = 6;
