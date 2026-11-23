@@ -30,6 +30,8 @@ const RECORDS = REGISTRY_LEAF_RECORDS,
   NODE_HEADER = 40,
   NODE_MAGIC = 0x52444952,
   LEAF_MAGIC = 0x524c4546;
+/** Placeholder before construction allocates (never written). */
+const EMPTY = new Uint8Array(0);
 interface Leaf {
   kind: number;
   owner: number;
@@ -51,6 +53,8 @@ export const REGISTRY_DIRECTORY_WORK = {
   pageReads: 0,
   /** Pages appended to the spill file. */
   appends: 0,
+  /** Nodes split where a key left a node inside its skip. */
+  splits: 0,
 };
 export class RegistryDirectory {
   readonly #stop = new AbortController();
@@ -67,8 +71,9 @@ export class RegistryDirectory {
   #clock = 0;
   /** The cached path: `#pathCount` nodes for the key in `#pathKey` (valid when it is >= 0). */
   #pathCount = -1;
-  readonly #pathKey = new Uint8Array(LEVELS);
-  readonly #key = new Uint8Array(LEVELS);
+  // Allocated after the charge is admitted (its control share covers them).
+  #pathKey: Uint8Array = EMPTY;
+  #key: Uint8Array = EMPTY;
   #charge: ByteCharge | null = null;
   constructor(
     charge: ByteCharge,
@@ -86,6 +91,8 @@ export class RegistryDirectory {
       this.#signal = AbortSignal.any([signal, this.#stop.signal]);
       // One node per key digit at most, plus a scratch node for a split's remainder.
       this.#path = new Uint8Array((LEVELS + 1) * NODE_BYTES);
+      this.#pathKey = new Uint8Array(LEVELS);
+      this.#key = new Uint8Array(LEVELS);
       for (let k = 0; k < LEAVES; k++)
         this.#leaves.push({
           kind: -1,
@@ -279,7 +286,7 @@ export class RegistryDirectory {
       const node = this.#slot(at);
       const cached = this.#pathCount > at && depth <= common;
       if (!cached) {
-        if (!this.#file || ref === null || ref.length !== NODE_BYTES)
+        if (!this.#file || ref.length !== NODE_BYTES)
           throw new SpillCorruptionError("Invalid registry directory page");
         REGISTRY_DIRECTORY_WORK.pageReads++;
         await this.#file.readInto(ref, node);
@@ -319,6 +326,7 @@ export class RegistryDirectory {
       this.#initNode(tail, 0, LEVELS - 1, key, 0);
       this.#setRef(tail, key[LEVELS - 1] ?? 0, ref);
       ref = await this.#append(tail);
+      this.#pathCount = 1;
     } else if (end.kind === "found" || end.kind === "missing") {
       at = end.at;
       const node = this.#slot(at),
@@ -337,6 +345,7 @@ export class RegistryDirectory {
     } else {
       // `key` leaves node `at` inside its skip: split it into a branch over the shared digits,
       // the node's remainder below it, and a new tail for `key`.
+      REGISTRY_DIRECTORY_WORK.splits++;
       at = end.at;
       const old = this.#slot(at),
         depth = old[4] ?? 0,

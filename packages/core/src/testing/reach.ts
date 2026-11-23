@@ -13797,3 +13797,12 @@ export const STEP_SIGNAL_DIFFERENTIAL_REACH = [
   "close inside an abort",
   "throwing listener",
 ] as const;
+
+/** The compressed registry directory against the uncompressed one (next/owner/registry-directory-compression.test.ts). */
+export const REGISTRY_COMPRESSION_REACH = [
+  "split inside a skip",
+  "evicted leaf read back",
+  "absent record",
+  "several namespaces",
+  "deep divergence",
+] as const;
