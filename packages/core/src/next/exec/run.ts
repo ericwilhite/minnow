@@ -12,7 +12,7 @@ import { readTable } from "./read-table.js";
 import type { ByteBudget } from "../access/space.js";
 import type { Snapshot, TableSnapshot, TableReadRecipe } from "../access/snapshot.js";
 import type { Bound, PhysicalPlan, Rel } from "../ir/ir.js";
-import type { Grant, MemoryGovernor, WaitingHoldings } from "../memory/governor.js";
+import type { Grant, LentHoldings, MemoryGovernor, WaitingHoldings } from "../memory/governor.js";
 import { PreparationGovernor, PreparationWouldWait, preparationGovernor } from "./preparation.js";
 import {
   ExecutionError,
@@ -1207,7 +1207,7 @@ export class QueryRuntime {
    * (`MemoryGovernor.servableNow`).
    */
   waitingHoldings(): WaitingHoldings {
-    const writer = this.request.statement?.writerHoldings?.() ?? null;
+    const writer = writerOf(this.request);
     // What only this query's snapshot keeps (a flushed memtable's borrowed chunks, a dropped
     // table's rows) stays while it waits: it returns when the snapshot closes.
     const pinned = () => this.view.exclusiveBytes?.() ?? 0;
@@ -1499,6 +1499,16 @@ export class QueryRuntime {
     };
     observe();
   }
+}
+
+/**
+ * The writer's holdings a statement keeps while it waits: a modification's statement's, or those
+ * the owner passes with a query inside a writable transaction (both hold the writer turn).
+ */
+function writerOf(request: ExecuteRequest): LentHoldings | null {
+  return request.statement === null
+    ? (request.writerHoldings?.() ?? null)
+    : (request.statement.writerHoldings?.() ?? null);
 }
 
 function hasStatement(request: ExecuteRequest): boolean {
@@ -1810,7 +1820,7 @@ export class QueryExecution implements Execution {
     const view = runtime.view;
     const pinned = () => view.exclusiveBytes?.() ?? 0;
     await preparation.regrow(error, this.#controller.signal, () => {
-      const writer = this.request.statement?.writerHoldings?.() ?? null;
+      const writer = writerOf(this.request);
       const grants = this.#result === null ? [] : [this.#result];
       return writer === null ? { grants, pinned } : { grants, lent: writer, pinned };
     });

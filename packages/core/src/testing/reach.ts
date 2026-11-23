@@ -2098,6 +2098,13 @@ export const OWNER_PRIVATE_PLAN_CACHE_STATES = [
   "private close",
 ] as const;
 
+/** A read inside a writable transaction, decided beside its writer (writable-transaction-read-wait). */
+export const WRITABLE_TRANSACTION_READ_REACH = [
+  "served",
+  "refused typed",
+  "after a write in the transaction",
+] as const;
+
 /** A write step waiting for rows, decided without spinning (row-wait-reclaim). */
 export const ROW_WAIT_RECLAIM_REACH = ["waited for rows", "written", "refused typed"] as const;
 

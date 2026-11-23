@@ -116,8 +116,10 @@ checkpoint during a pressure handoff (see below).
 A statement's wait is also bounded by what it keeps while it waits (GOVERNOR-WAIT-POLICY
 point 5, `MemoryGovernor.servableNow`): the usable capacity less its own grants, what only its
 own snapshot keeps alive (`WaitingHoldings.pinned`), and, while it holds the writer turn, what
-the writer keeps until the statement ends (`WriteCredits.retainedWhileOpen`). This is
-accounting, not a guess about who might release.
+the writer keeps until the statement ends (`WriteCredits.retainedWhileOpen`). Every statement of
+a writable transaction holds the turn, a read too: the owner passes the writer's holdings with
+the query (`ExecuteRequest.writerHoldings`). This is accounting, not a guess about who might
+release.
 
 - What only the statement's snapshot keeps: a publication or drop leaves memory (a flushed
   memtable's borrowed chunks and key deltas, a dropped table's rows, retired run readers) for
