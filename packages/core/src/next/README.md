@@ -553,7 +553,8 @@ leaf supplies captured Date intrinsics to both engines; it cannot import either 
   - a close, or an abortable step's direct abort, while its abort is decided but pending, waits
     for that fan-out: the step ends aborted with the decided reason.
 - **Contract:** every step created matches `AbortSignal.any` in reason, final aborted state and
-  abort events. One open is refused instead (a `TypeError`, nothing registered): a step over a
+  abort events. One open is refused instead (`StepSignalInvariantError`, XX000, nothing
+  registered): a step over a
   step whose abort two nested sources are both still dispatching, opened inside one of those
   dispatches. Natively it is born aborted with the first of those sources' reasons, which nothing
   orders yet short of a composite per step (a composite made at that point orders by array, not

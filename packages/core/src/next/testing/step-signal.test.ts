@@ -26,6 +26,7 @@ import { MinnowDatabaseClient } from "../owner/database-client.js";
 import {
   abortableStep,
   refusedStepOpens,
+  StepSignalInvariantError,
   checkStepOpensDuringAbort,
   heldStepSignals,
   observeStepSignals,
@@ -237,7 +238,7 @@ describe("stepSignal", () => {
     });
     q.abort("caller");
     expect(a.signal.reason).toBe("caller");
-    expect(opened).toBeInstanceOf(TypeError);
+    expect(opened).toBeInstanceOf(StepSignalInvariantError);
     a.close();
   });
 
@@ -298,7 +299,14 @@ describe("stepSignal", () => {
       refused = refusedStepOpens();
     const ours = nested((...parents) => stepSignal("nested", ...parents).signal);
     expect(ours.s0).toBe("p0");
-    expect(ours.opened).toBeInstanceOf(TypeError);
+    expect(ours.opened).toBeInstanceOf(StepSignalInvariantError);
+    expect(ours.opened).toMatchObject({
+      code: "MINNOW_STEP_SIGNAL_INVARIANT",
+      sqlState: "XX000",
+      message: expect.stringContaining(
+        "a step may not be opened inside an abort dispatch of one of its sources",
+      ) as unknown,
+    });
     expect(refusedStepOpens()).toBe(refused + 1);
     expect(heldStepSignals(), "nothing registered").toBe(held);
   });
@@ -582,7 +590,7 @@ function play(w: World, engine: Engine, seen: Set<string>, refused: Set<number>)
     try {
       opened = engine.open(parents, abortable);
     } catch (error) {
-      if (engine.native || !(error instanceof TypeError)) throw error;
+      if (engine.native || !(error instanceof StepSignalInvariantError)) throw error;
       refused.add(attempt);
       return null;
     }

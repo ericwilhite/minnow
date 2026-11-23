@@ -14,7 +14,8 @@
  * `own.abort(reason)`: **every step it creates matches that composite in reason, final aborted
  * state and abort events.**
  *
- * One open is refused instead (a `TypeError`, nothing registered): a step over a step whose abort
+ * One open is refused instead (`StepSignalInvariantError`, `MINNOW_STEP_SIGNAL_INVARIANT`, SQLSTATE
+ * XX000; nothing registered): a step over a step whose abort
  * two nested sources are both still dispatching, opened inside one of those dispatches. Natively
  * it is born aborted with the reason of whichever source aborted first, and nothing the platform
  * exposes orders those aborts before their dispatch ends, short of a composite per step (the cost
@@ -48,6 +49,23 @@
  * `close()` ends a step (in a `finally`, including when the work it guards refuses to start): its
  * parents stop holding it, and a parent's sentinel listener is removed with its last step.
  */
+
+/**
+ * The contract's one refused open (an engine invariant, SQLSTATE XX000): a step opened inside an
+ * abort dispatch of one of its sources, over a step whose abort two nested sources decide. Engine
+ * code never does this (`checkStepOpensDuringAbort`); a caller that does sees this rule named.
+ */
+export class StepSignalInvariantError extends Error {
+  readonly code = "MINNOW_STEP_SIGNAL_INVARIANT";
+  readonly sqlState = "XX000";
+  constructor(readonly site: string) {
+    super(
+      `Step signal "${site}": a step may not be opened inside an abort dispatch of one of its ` +
+        "sources (step-signal.ts, Contract)",
+    );
+    this.name = "StepSignalInvariantError";
+  }
+}
 
 export interface StepSignal {
   readonly signal: AbortSignal;
@@ -274,9 +292,7 @@ function open(
       // composite per step (the cost this module removes). Refused rather than guessed: engine
       // code never opens a step inside an abort dispatch (checkStepOpensDuringAbort).
       refused++;
-      throw new TypeError(
-        `step signal "${site}": cannot open over a step whose abort two nested pending aborts decide`,
-      );
+      throw new StepSignalInvariantError(site);
     }
     for (const source of record?.stands ?? [parent])
       if (!sources.includes(source)) sources.push(source);
