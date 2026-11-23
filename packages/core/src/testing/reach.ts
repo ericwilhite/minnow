@@ -13765,7 +13765,6 @@ export const WIDE_INSERT_ADMISSION_REACH = [
   "wide table read back",
   "wide table read refused",
   "refused before waiting",
-  "memtable refusal",
   "written after a refusal",
   "three or more statements",
 ] as const;

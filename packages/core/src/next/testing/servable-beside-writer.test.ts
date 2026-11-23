@@ -162,8 +162,16 @@ async function scenario(
       if (wide.rows < memtableRows && wide.bytes >= 1 << 20) reach.reach("wide live rows");
     }
     if (memtableRows > 700) reach.reach("live memtable rows");
-    // A writable statement holds the writer turn while its request waits.
-    const tx = await path.begin();
+    // A writable statement holds the writer turn while its request waits. `begin` waits while
+    // frozen memtables awaiting publication exceed their cap (engine.ts `begin`, ruling 6):
+    // a held flush is let go then, as for the inserts above.
+    const starting = path.begin();
+    let tx = await within(starting, 1_000);
+    if (tx === PENDING) {
+      hold = false;
+      (resume as (() => void) | null)?.();
+      tx = await starting;
+    }
     const statement = tx.statement({ rules });
     try {
       const lent = statement.writerHoldings();

@@ -2750,7 +2750,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
     if (free >= bytes || this.#grant.tryGrow(bytes - free)) return true;
     this.#arenaPool.clear();
     const reclaimed = this.#grant.held - this.#grant.allocated;
-    return reclaimed >= bytes || this.#grant.tryGrow(bytes - reclaimed);
+    if (reclaimed >= bytes || this.#grant.tryGrow(bytes - reclaimed)) return true;
+    // No free memory left: the owner's own idle commit and merge forecasts fund its rows
+    // (as `WriteCredits.growTo` does before a wait) rather than refusing beside them.
+    return this.#credits.fundFromIdle(this.#grant, this.#grant.allocated + bytes);
   }
 
   async #relieve(bytes: number, growth?: () => number, signal?: AbortSignal): Promise<void> {
@@ -2787,7 +2790,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#check();
       if (this.#headroom(bytes + (growth?.() ?? 0))) return;
     }
-    throw new MemtableMemoryError(bytes, Math.max(0, this.#grant.held - this.#grant.allocated));
+    // The whole charge the step asked: its base and its growth, recomputed as last tried.
+    throw new MemtableMemoryError(
+      bytes + (growth?.() ?? 0),
+      Math.max(0, this.#grant.held - this.#grant.allocated),
+    );
   }
 
   // ── Public API ───────────────────────────────────────────────────────────────────────────

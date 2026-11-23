@@ -112,9 +112,10 @@ it("waits for a background flush to publish, then writes", async () => {
     for (let i = 0; i < 200 && held === 0; i++)
       await new Promise((resolve) => setTimeout(resolve, 5));
     expect(held, "a flush is held before it publishes").toBe(1);
-    // Wide enough not to fit beside the held flush's rows (a 1.5 MB row now fits at once, since
-    // the memtable charges what a step allocates rather than twice it).
-    const statement = core.execute("INSERT INTO t VALUES (10, $1)", ["w".repeat(2_500_000)]);
+    // Wide enough not to fit beside the held flush's rows: since statement-sizing PR 2 the
+    // memtable charges what a step allocates, from the writer's idle credit too, so rows up to
+    // 3.5 MB fit at once here (measured).
+    const statement = core.execute("INSERT INTO t VALUES (10, $1)", ["w".repeat(4_500_000)]);
     expect(await within(statement, 500), "it waits while the flush holds its rows").toBe(PENDING);
     hold = false;
     (resume as (() => void) | null)?.();

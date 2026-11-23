@@ -719,6 +719,39 @@ export class WriteCredits {
   }
 
   /**
+   * Moves this owner's unused commit and merge credit into `grant` until it holds `wanted`,
+   * without waiting, and returns whether it does. Each keeps what `#growTo` keeps before a wait
+   * (its allocations, loans and floor: a running commit's window, a prepared merge), so this
+   * takes only the forecasts an idle owner may revoke. The caller first grows
+   * from free memory, so warm commit and merge windows stay while memory is free (`#growTo`'s
+   * first pass).
+   */
+  fundFromIdle(grant: Grant, wanted: number): boolean {
+    const accounts = [this.rows, this.metadata, this.commits, this.merge];
+    if (!accounts.includes(grant)) throw new Error("Growth must belong to the native write owner");
+    if (grant.held >= wanted) return true;
+    const working = this.#workingMinimum();
+    const floors = new Map<Grant, number>([
+      [this.commits, this.#commitFloor()],
+      [this.merge, Math.max(this.#mergeFloor, working.merge ?? 0)],
+    ]);
+    // Commit and merge forecasts only: the metadata step is a running phase's workspace, which
+    // must not have to grow again while that phase's writer is open (governor rules 4/5/7).
+    for (const source of [this.commits, this.merge]) {
+      if (source === grant) continue;
+      const retained = Math.max(source.allocated + source.loaned, floors.get(source) ?? 0);
+      const moved = Math.min(wanted - grant.held, Math.max(0, source.held - retained));
+      if (moved <= 0) continue;
+      if (!this.governor.transferCredit(source, grant, moved))
+        throw new Error("Idle native phase credit was not transferred");
+      if (grant.held >= wanted) break;
+    }
+    if (grant.held < wanted) return false;
+    this.#changed?.(true);
+    return true;
+  }
+
+  /**
    * Growth is complete: the grant reached `wanted`, the metadata step is funded, and a native
    * step's own workspace is ready. The exits of `#growTo` share this one check: callers
    * re-prepare until a request is immediate, so an exit that resolved short would spin them.
