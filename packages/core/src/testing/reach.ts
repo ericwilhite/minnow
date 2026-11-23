@@ -2122,6 +2122,7 @@ export const SNAPSHOT_STATEMENT_KIND_REACH = [
   "analysis error",
   "planning error",
   "behind a comment",
+  "an audited class",
 ] as const;
 
 /** A read-only transaction's snapshot is taken by its first statement (read-only-snapshot-timing). */

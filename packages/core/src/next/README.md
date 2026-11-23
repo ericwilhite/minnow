@@ -3370,8 +3370,10 @@ not require a home cache directory.
   after); a statement that does not parse has not. The front end reads and checks in one pass:
   a grammar failure (engine/grammar-failure.ts `grammarFailure`, marked where the tokenizer or parser
   cannot read on) is the raw parse failing; any other refusal came after the statement was
-  read, and its kind, from its first word as the tokenizer reads it (comments skipped),
-  decides. A write it refuses takes it too (`#guard`).
+  read, and its kind, from its first word (comments skipped), decides. Every throw of the
+  front end's parse phase is classified, grammar or read: scripts/grammar-failure-audit.test.ts
+  computes the phase from the parser's call graph and fails on a throw that is neither marked
+  nor listed with its class (analysis, unsupported, evaluation, limit and the like). A write it refuses takes it too (`#guard`).
   A row committed between BEGIN and that statement is seen; BEGIN, SAVEPOINT, RELEASE, ROLLBACK
   TO, SET TRANSACTION and SHOW take none. Switching to READ
   ONLY pins at the switch only once a statement ran (the writer turn kept anything from

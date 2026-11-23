@@ -1395,18 +1395,53 @@ function throwLocated(error: unknown, offset: number, span: { start: number; end
 
 /**
  * The statement's first word, upper-cased, as the router reads it: comments (nested block
- * comments too) and whitespace are skipped by the tokenizer, a leading parenthesis is `(`. Null
- * when the text does not tokenize or starts with something else.
+ * comments too) and whitespace skipped as the tokenizer skips them, a leading parenthesis is `(`.
+ * Null when the text starts with something else or an unterminated comment.
  */
 export function leadingKeyword(sql: string): string | null {
-  try {
-    const first = tokenize(normalizeQuerySql(sql).text)[0];
-    if (first === undefined) return null;
-    if (first.kind === "punctuation" && first.text === "(") return "(";
-    return first.kind === "identifier" ? first.text.toUpperCase() : null;
-  } catch {
-    return null;
+  // Its own scan of the leading whitespace and comments, as the tokenizer skips them: the rest of
+  // the text may not tokenize (an unsupported character later on is a refusal after reading).
+  const text = normalizeQuerySql(sql).text;
+  let index = 0;
+  for (;;) {
+    while (index < text.length && /\s/u.test(text[index] ?? "")) index += 1;
+    if (text.startsWith("--", index)) {
+      const newline = text.indexOf("\n", index);
+      index = newline === -1 ? text.length : newline + 1;
+      continue;
+    }
+    if (text.startsWith("/*", index)) {
+      let depth = 0;
+      while (index < text.length) {
+        if (text.startsWith("/*", index)) {
+          depth += 1;
+          index += 2;
+        } else if (text.startsWith("*/", index)) {
+          depth -= 1;
+          index += 2;
+          if (depth === 0) break;
+        } else index += 1;
+      }
+      if (depth !== 0) return null;
+      continue;
+    }
+    break;
   }
+  if (text[index] === "(") return "(";
+  const word = /^[A-Za-z_][A-Za-z0-9_$]*/u.exec(text.slice(index))?.[0];
+  return word === undefined ? null : word.toUpperCase();
+}
+
+/** A bare `*` where a value belongs: PostgreSQL's grammar has no such expression (`t.*` is one). */
+function bareWildcard(expression: Expression): boolean {
+  return expression.kind === "wildcard" && expression.table === undefined;
+}
+
+/** A refusal while reading: a grammar failure when `grammar` holds (PostgreSQL's raw parser rejects
+ * the text), else a refusal of what was read. */
+function refusal(message: string, grammar: boolean): TypeError {
+  const error = new TypeError(message);
+  return grammar ? grammarFailure(error) : error;
 }
 
 /** The parser could not read on: a grammar failure (grammar-failure.ts `grammarFailure`). */
@@ -1431,7 +1466,7 @@ export interface ReturningItem {
 export function compileQuery(sql: string, options: CompileQueryOptions = {}): CompiledQuery {
   validateSqlSource(sql);
   const { text, offset } = normalizeQuerySql(sql);
-  if (text.length === 0) throw new SqlCompileError("Enter a SELECT query", offset, 0);
+  if (text.length === 0) throw syntaxCompileError("Enter a SELECT query", offset, 0);
   let parser: Parser | undefined;
   let plan: CompiledQuery;
   try {
@@ -1838,7 +1873,7 @@ function parseSettingStatement(keyword: string, tokens: Token[]): CompiledStatem
   if (keyword === "RESET") {
     const name = words[1];
     if (name === undefined || (name.kind !== "identifier" && name.kind !== "string")) {
-      throw new TypeError("RESET takes a setting name or ALL");
+      throw syntaxError("RESET takes a setting name or ALL");
     }
     return { kind: "set", action: "reset", name: name.text };
   }
@@ -1892,9 +1927,9 @@ function parseSettingStatement(keyword: string, tokens: Token[]): CompiledStatem
     separator === undefined ||
     (separator.text.toUpperCase() !== "TO" && separator.text !== "=")
   ) {
-    throw new TypeError(`SET ${settingName} takes TO or = and a value`);
+    throw syntaxError(`SET ${settingName} takes TO or = and a value`);
   }
-  if (words[cursor + 1] === undefined) throw new TypeError(`SET ${settingName} needs a value`);
+  if (words[cursor + 1] === undefined) throw syntaxError(`SET ${settingName} needs a value`);
   if (settingName.toLowerCase() === "timezone" || settingName.toLowerCase() === "time_zone") {
     const zone = words[cursor + 1];
     const spelled = zone?.kind === "string" ? zone.text : (zone?.text ?? "");
@@ -2203,8 +2238,7 @@ function parseCreateView(sql: string, tokens: Token[], orReplace: boolean): Comp
     throw new TypeError("CREATE VIEW takes a name and AS <query>; column lists are not supported");
   }
   const body = tokens[cursor + 3];
-  if (body === undefined || body.kind === "eof")
-    throw new TypeError("CREATE VIEW requires a query");
+  if (body === undefined || body.kind === "eof") throw syntaxError("CREATE VIEW requires a query");
   const view = name.text;
   const text = sql.slice(body.start).trim();
   // Compiling now means a broken view fails where it is written, not on the first read.
@@ -2230,11 +2264,11 @@ function parseCreateTrigger(text: string, tokens: Token[]): CompiledStatement {
   let timing: "before" | "after";
   if (keywordAt(cursor, "AFTER")) timing = "after";
   else if (keywordAt(cursor, "BEFORE")) timing = "before";
-  else throw new TypeError("CREATE TRIGGER supports BEFORE and AFTER triggers");
+  else throw syntaxError("CREATE TRIGGER supports BEFORE and AFTER triggers");
   cursor += 1;
   const eventText = identifier("a trigger event").toUpperCase();
   if (eventText !== "INSERT" && eventText !== "UPDATE" && eventText !== "DELETE") {
-    throw new TypeError("Trigger event must be INSERT, UPDATE, or DELETE");
+    throw syntaxError("Trigger event must be INSERT, UPDATE, or DELETE");
   }
   const event = eventText.toLowerCase() as "insert" | "update" | "delete";
   if (!keywordAt(cursor, "ON")) throw syntaxError("Expected ON before the trigger table");
@@ -2246,7 +2280,7 @@ function parseCreateTrigger(text: string, tokens: Token[]): CompiledStatement {
     }
     cursor += 3;
   }
-  if (!keywordAt(cursor, "BEGIN")) throw new TypeError("Trigger bodies use BEGIN ... END");
+  if (!keywordAt(cursor, "BEGIN")) throw syntaxError("Trigger bodies use BEGIN ... END");
   cursor += 1;
   let endIndex = -1;
   for (let index = tokens.length - 1; index > cursor; index -= 1) {
@@ -2255,7 +2289,7 @@ function parseCreateTrigger(text: string, tokens: Token[]): CompiledStatement {
       break;
     }
   }
-  if (endIndex <= cursor) throw new TypeError("Trigger bodies use BEGIN ... END");
+  if (endIndex <= cursor) throw syntaxError("Trigger bodies use BEGIN ... END");
   const spans: Array<[number, number]> = [];
   let statementStart = cursor;
   for (let index = cursor; index < endIndex; index += 1) {
@@ -2266,14 +2300,14 @@ function parseCreateTrigger(text: string, tokens: Token[]): CompiledStatement {
     }
   }
   if (endIndex > statementStart) spans.push([statementStart, endIndex]);
-  if (spans.length === 0) throw new TypeError("A trigger body needs at least one statement");
+  if (spans.length === 0) throw syntaxError("A trigger body needs at least one statement");
   const statements = spans.map(([from, to]) => {
     const bindings: Array<{ source: "new" | "old"; column: string }> = [];
     const rewrites: Array<{ start: number; end: number }> = [];
     for (let index = from; index < to; index += 1) {
       const token = tokens[index];
       if (token?.kind === "parameter") {
-        throw new TypeError("Trigger bodies cannot contain parameters");
+        throw syntaxError("Trigger bodies cannot contain parameters");
       }
       if (
         (keywordAt(index, "NEW") || keywordAt(index, "OLD")) &&
@@ -2301,19 +2335,19 @@ function parseCreateTrigger(text: string, tokens: Token[]): CompiledStatement {
     }
     const compiled = compileStatement(sql);
     if (compiled.kind !== "insert" && compiled.kind !== "update" && compiled.kind !== "delete") {
-      throw new TypeError("Trigger bodies support INSERT, UPDATE, and DELETE statements");
+      throw syntaxError("Trigger bodies support INSERT, UPDATE, and DELETE statements");
     }
     if (compiled.kind === "insert" && compiled.query !== undefined) {
-      throw new TypeError("Trigger body INSERTs use VALUES");
+      throw syntaxError("Trigger body INSERTs use VALUES");
     }
     if (compiled.kind === "insert" && compiled.onConflict !== undefined) {
-      throw new TypeError("Trigger body INSERTs cannot carry ON CONFLICT");
+      throw syntaxError("Trigger body INSERTs cannot carry ON CONFLICT");
     }
     if (compiled.returning !== undefined) {
-      throw new TypeError("Trigger bodies cannot carry RETURNING");
+      throw syntaxError("Trigger bodies cannot carry RETURNING");
     }
     if ((compiled.parameterCount ?? 0) !== bindings.length) {
-      throw new TypeError("Trigger body placeholders must all come from NEW/OLD references");
+      throw syntaxError("Trigger body placeholders must all come from NEW/OLD references");
     }
     return { sql, bindings };
   });
@@ -2331,7 +2365,7 @@ function parseCreateTrigger(text: string, tokens: Token[]): CompiledStatement {
 export function compileStatement(sql: string): CompiledStatement {
   validateSqlSource(sql);
   const { text, offset } = normalizeQuerySql(sql);
-  if (text.length === 0) throw new SqlCompileError("Enter a SQL statement", offset, 0);
+  if (text.length === 0) throw syntaxCompileError("Enter a SQL statement", offset, 0);
   let parser: Parser | undefined;
   try {
     const tokens = tokenize(text);
@@ -2365,7 +2399,7 @@ export function compileStatement(sql: string): CompiledStatement {
     if (keyword === "SHOW") {
       const name = tokens[1];
       if (name?.kind !== "identifier" || (tokens[2]?.kind !== "eof" && tokens[2]?.text !== ".")) {
-        throw new TypeError("SHOW takes one setting name");
+        throw syntaxError("SHOW takes one setting name");
       }
       const setting = tokens
         .slice(1)
@@ -2399,7 +2433,7 @@ export function compileStatement(sql: string): CompiledStatement {
       second = tokens[1];
       if (second?.kind === "identifier" && second.text.toUpperCase() === "TYPE") {
         const name = tokens[2];
-        if (name?.kind !== "identifier") throw new TypeError("CREATE TYPE needs a name");
+        if (name?.kind !== "identifier") throw syntaxError("CREATE TYPE needs a name");
         const as = tokens[3];
         const enumToken = tokens[4];
         if (
@@ -2415,7 +2449,7 @@ export function compileStatement(sql: string): CompiledStatement {
         let index = 6;
         for (;;) {
           const value = tokens[index];
-          if (value?.kind !== "string") throw new TypeError("ENUM values must be string literals");
+          if (value?.kind !== "string") throw syntaxError("ENUM values must be string literals");
           values.push(value.text);
           index += 1;
           if (tokens[index]?.text === ")") break;
@@ -2431,7 +2465,7 @@ export function compileStatement(sql: string): CompiledStatement {
       }
       if (second?.kind === "identifier" && second.text.toUpperCase() === "SEQUENCE") {
         const name = tokens[2];
-        if (name?.kind !== "identifier") throw new TypeError("CREATE SEQUENCE needs a name");
+        if (name?.kind !== "identifier") throw syntaxError("CREATE SEQUENCE needs a name");
         if (tokens[3]?.kind !== "eof") {
           throw new TypeError("CREATE SEQUENCE options are not supported yet");
         }
@@ -8723,7 +8757,7 @@ class Parser {
       if (!this.#punctuation(",")) break;
     }
     this.#expectPunctuation(")");
-    if (columns.length === 0) throw new TypeError("A CTE column list cannot be empty");
+    if (columns.length === 0) throw syntaxError("A CTE column list cannot be empty");
     return columns;
   }
 
@@ -8857,7 +8891,7 @@ class Parser {
         !member.parenthesized &&
         (member.block.orderBy.length > 0 || member.block.limit !== undefined)
       ) {
-        throw new TypeError("ORDER BY or LIMIT in a UNION member requires parentheses");
+        throw syntaxError("ORDER BY or LIMIT in a UNION member requires parentheses");
       }
     }
     return compoundSelectBlock(
@@ -9272,7 +9306,7 @@ class Parser {
         const event = this.#isKeyword("DELETE") ? "delete" : "update";
         this.#keyword(event === "delete" ? "DELETE" : "UPDATE");
         if (recordDeclaredTypes && (event === "delete" ? seenDelete : seenUpdate))
-          throw new TypeError(`Multiple ON ${event.toUpperCase()} clauses are not allowed`);
+          throw syntaxError(`Multiple ON ${event.toUpperCase()} clauses are not allowed`);
         if (event === "delete") seenDelete = true;
         else seenUpdate = true;
         if (event === "update" && !recordDeclaredTypes) {
@@ -9391,7 +9425,7 @@ class Parser {
     const start = this.#peek().start;
     const expression = this.#expression();
     const sql = this.text.slice(start, this.#peek().start).trim();
-    if (sql.length === 0) throw new TypeError("DEFAULT requires an expression");
+    if (sql.length === 0) throw syntaxError("DEFAULT requires an expression");
     return columnDefaultFor(expression, sql);
   }
 
@@ -9417,7 +9451,7 @@ class Parser {
       if (this.#isKeyword("IDENTITY")) {
         this.#keyword("IDENTITY");
         if (recordDeclaredTypes && mode === undefined)
-          throw new TypeError("IDENTITY requires ALWAYS or BY DEFAULT");
+          throw syntaxError("IDENTITY requires ALWAYS or BY DEFAULT");
         // Sequence options in parentheses are accepted and ignored; the counter starts at 1.
         if (this.#punctuation("(")) {
           if (recordDeclaredTypes)
@@ -9608,7 +9642,7 @@ class Parser {
   #typeWidth(): number {
     const token = this.#take("number");
     if (!/^\d+$/.test(token.text)) {
-      throw new SqlCompileError(
+      throw syntaxCompileError(
         `A type width must be an integer: ${token.text}`,
         token.start,
         token.end - token.start,
@@ -9803,7 +9837,7 @@ class Parser {
     if (this.#punctuation("(")) {
       width = this.#typeWidth();
       if (this.#punctuation(",")) {
-        throw new TypeError(`${word} takes one width`);
+        throw syntaxError(`${word} takes one width`);
       }
       this.#expectPunctuation(")");
       // PostgreSQL writes a timestamp's precision before its zone: `TIMESTAMP(3) WITH TIME ZONE`.
@@ -9974,7 +10008,7 @@ class Parser {
     }
     this.#expectPunctuation(")");
     const column = columns[0];
-    if (column === undefined) throw new TypeError("ON CONFLICT needs at least one column");
+    if (column === undefined) throw syntaxError("ON CONFLICT needs at least one column");
     const target = columns.length === 1 ? {} : { columns };
     this.#keyword("DO");
     if (this.#isKeyword("NOTHING")) {
@@ -10224,7 +10258,7 @@ class Parser {
         action: { kind: "insert", columns, values },
       });
     }
-    if (branches.length === 0) throw new TypeError("MERGE needs at least one WHEN clause");
+    if (branches.length === 0) throw syntaxError("MERGE needs at least one WHEN clause");
     if (this.#isKeyword("RETURNING")) {
       throw new TypeError("MERGE does not support RETURNING; read the rows back with a SELECT");
     }
@@ -10644,7 +10678,7 @@ class Parser {
           open?.kind !== "punctuation" ||
           open.text !== "("
         ) {
-          throw new TypeError("WINDOW takes name AS (window specification)");
+          throw syntaxError("WINDOW takes name AS (window specification)");
         }
         let inner = 1;
         let end = cursor + 3;
@@ -10939,7 +10973,7 @@ class Parser {
     this.#expectPunctuation("(");
     const columns = this.#expressionList();
     this.#expectPunctuation(")");
-    if (columns.length === 0) throw new TypeError("ROLLUP/CUBE take at least one expression");
+    if (columns.length === 0) throw syntaxError("ROLLUP/CUBE take at least one expression");
     if (cube) {
       if (columns.length > 5) {
         throw new TypeError("CUBE supports at most 5 expressions (32 grouping sets)");
@@ -11056,7 +11090,7 @@ class Parser {
       const source = operand.base;
       if (natural) {
         if (this.#isKeyword("ON") || this.#isKeyword("USING")) {
-          throw new TypeError("A NATURAL join takes no ON or USING clause");
+          throw syntaxError("A NATURAL join takes no ON or USING clause");
         }
         if (right) {
           // The RIGHT mirror below rewrites the join's sources, which the shared-column search
@@ -11357,8 +11391,9 @@ class Parser {
         if (!this.#punctuation(",")) break;
       }
       this.#expectPunctuation(")");
+      // A bare `*` is not an expression (a grammar failure); `t.*` is one, refused after.
       if (row.some((expression) => expression.kind === "wildcard")) {
-        throw new TypeError("VALUES rows take scalar expressions");
+        throw refusal("VALUES rows take scalar expressions", row.some(bareWildcard));
       }
       if (width === undefined) width = row.length;
       else if (row.length !== width) throw new TypeError("VALUES rows must share one width");
@@ -12019,7 +12054,7 @@ class Parser {
       const items = this.#expressionList();
       this.#expectPunctuation(")");
       if (items.some((item) => item.kind === "wildcard" || item.kind === "subquery")) {
-        throw new TypeError("IN lists accept only scalar expressions");
+        throw refusal("IN lists accept only scalar expressions", items.some(bareWildcard));
       }
       return { kind: "condition", operator, left, right: { kind: "list", items } };
     }
@@ -12268,7 +12303,7 @@ class Parser {
     const token = this.#take("parameter");
     if (token.text === "") {
       if (this.#highestNumberedParameter > 0) {
-        throw new TypeError("Use either ? or $n placeholders in one statement, not both");
+        throw syntaxError("Use either ? or $n placeholders in one statement, not both");
       }
       this.#positionalParameters += 1;
       if (this.#positionalParameters > MAX_SQL_PARAMETERS) {
@@ -12279,7 +12314,7 @@ class Parser {
       return { kind: "parameter", index: this.#positionalParameters - 1 };
     }
     if (this.#positionalParameters > 0) {
-      throw new TypeError("Use either ? or $n placeholders in one statement, not both");
+      throw syntaxError("Use either ? or $n placeholders in one statement, not both");
     }
     const number = Number(token.text);
     if (!Number.isInteger(number) || number < 1) {
@@ -12409,7 +12444,7 @@ class Parser {
         this.#keyword("THEN");
         branches.push({ when, then: this.#expression() });
       }
-      if (branches.length === 0) throw new TypeError("CASE requires at least one WHEN branch");
+      if (branches.length === 0) throw syntaxError("CASE requires at least one WHEN branch");
       let otherwise: Expression | undefined;
       if (this.#isKeyword("ELSE")) {
         this.#keyword("ELSE");
@@ -12420,7 +12455,7 @@ class Parser {
     }
     if (upper === "EXISTS" && this.#peek().text === "(") {
       this.#expectPunctuation("(");
-      if (!this.#isKeyword("SELECT")) throw new TypeError("EXISTS requires a subquery");
+      if (!this.#isKeyword("SELECT")) throw syntaxError("EXISTS requires a subquery");
       const block = this.#selectBlock("(subquery)");
       this.#expectPunctuation(")");
       // Existence needs at most one row, so cap the subquery unless it already limits itself.
@@ -12444,7 +12479,7 @@ class Parser {
         };
       }
       if (queryToken.kind !== "string") {
-        throw new TypeError(`${upper} ... AGAINST requires a string literal or parameter query`);
+        throw syntaxError(`${upper} ... AGAINST requires a string literal or parameter query`);
       }
       this.#index += 1;
       validateFtsQuery(queryToken.text);
@@ -12891,7 +12926,10 @@ class Parser {
       }
       const distinctArity = name === "STRING_AGG" || jsonObjectAggregate ? 2 : 1;
       if (distinct && (args.length !== distinctArity || args[0]?.kind === "wildcard")) {
-        throw new TypeError(`${name}(DISTINCT) requires exactly one scalar argument`);
+        throw refusal(
+          `${name}(DISTINCT) requires exactly one scalar argument`,
+          args[0] !== undefined && bareWildcard(args[0]),
+        );
       }
       if (name === "STRING_AGG" && args.length !== 2) {
         throw new TypeError("STRING_AGG requires a value and delimiter");
@@ -12903,7 +12941,7 @@ class Parser {
       )
         throw new TypeError(`${name} requires exactly one argument`);
       if (name === "JSON_ARRAYAGG" && args[0]?.kind === "wildcard") {
-        throw new TypeError("JSON_ARRAYAGG requires a scalar value expression");
+        throw refusal("JSON_ARRAYAGG requires a scalar value expression", bareWildcard(args[0]));
       }
       const simple = simpleScalarFunctions.get(name);
       if (simple !== undefined) {
@@ -12931,7 +12969,7 @@ class Parser {
       if (name === "ROUND" && (args.length < 1 || args.length > 2))
         throw new TypeError("ROUND requires one or two arguments");
       if (name === "COALESCE" && args.length < 1)
-        throw new TypeError("COALESCE requires at least one argument");
+        throw syntaxError("COALESCE requires at least one argument");
       if (
         (name === "UPPER" ||
           name === "LOWER" ||
@@ -12958,7 +12996,7 @@ class Parser {
         throw new TypeError("OVERLAY requires a string, a replacement, a start, and a length");
       }
       if (statementDatetimeNames.has(name) && args.length !== 0) {
-        throw new TypeError(`${name} takes no arguments`);
+        throw syntaxError(`${name} takes no arguments`);
       }
       if (volatileScalarFunctionNames.has(name) && args.length !== 0) {
         throw new TypeError(`${name} takes no arguments`);
@@ -12986,10 +13024,11 @@ class Parser {
         (name === "NULLIF" || name === "MOD" || name === "POWER" || name === "INSTR") &&
         args.length !== 2
       ) {
-        throw new TypeError(`${name} requires exactly two arguments`);
+        // NULLIF has its own grammar rule (two arguments); MOD, POWER and INSTR are functions.
+        throw refusal(`${name} requires exactly two arguments`, name === "NULLIF");
       }
       if ((name === "GREATEST" || name === "LEAST") && args.length < 1) {
-        throw new TypeError(`${name} requires at least one argument`);
+        throw syntaxError(`${name} requires at least one argument`);
       }
       if (name === "REPLACE" && args.length !== 3) {
         throw new TypeError("REPLACE requires a string, a search, and a replacement");
@@ -13358,7 +13397,7 @@ class Parser {
         (start.kind === "current-row" && end.kind === "preceding") ||
         (start.kind === "following" && (end.kind === "preceding" || end.kind === "current-row"))
       )
-        throw new TypeError("Window frame bounds are reversed");
+        throw syntaxError("Window frame bounds are reversed");
       if (unit === "groups" && orderBy.length === 0) {
         throw new TypeError("GROUPS frames require ORDER BY inside OVER (...)");
       }
@@ -16350,7 +16389,16 @@ function tokenize(sql: string): Token[] {
         while (index < sql.length && /[0-9a-fA-F_]/.test(sql[index] ?? "")) index += 1;
         const digits = sql.slice(start + 2, index);
         const value = Number.parseInt(digits.replaceAll("_", ""), radix);
-        if (!validNumericLiteral(digits, radix) || !Number.isSafeInteger(value)) {
+        // A malformed literal is a grammar failure; a well-formed one too large for a safe
+        // integer is read (PostgreSQL makes it a numeric) and refused after.
+        if (!validNumericLiteral(digits, radix)) {
+          throw syntaxCompileError(
+            `Invalid number: ${sql.slice(start, index)}`,
+            start,
+            index - start,
+          );
+        }
+        if (!Number.isSafeInteger(value)) {
           throw new SqlCompileError(
             `Invalid number: ${sql.slice(start, index)}`,
             start,
@@ -16380,7 +16428,7 @@ function tokenize(sql: string): Token[] {
           ? spelled.replace(".", ".0")
           : spelled;
       if (!validNumericLiteral(text, 10))
-        throw new SqlCompileError(`Invalid number: ${spelled}`, start, index - start);
+        throw syntaxCompileError(`Invalid number: ${spelled}`, start, index - start);
       push({ kind: "number", text: text.replaceAll("_", ""), start, end: index });
       continue;
     }
@@ -16421,7 +16469,7 @@ function tokenize(sql: string): Token[] {
         throw syntaxCompileError("Unterminated quoted identifier", start, sql.length - start);
       }
       if (value.length === 0) {
-        throw new SqlCompileError("Quoted identifiers cannot be empty", start, index - start);
+        throw syntaxCompileError("Quoted identifiers cannot be empty", start, index - start);
       }
       push({ kind: "identifier", text: value, quoted: true, start, end: index });
       continue;
