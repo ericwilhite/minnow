@@ -3362,7 +3362,14 @@ not require a home cache directory.
   evictable caches (`registerCache`): charged at a size walked from the expressions, and evicted,
   oldest unused across caches, before growth is refused or an operator spills.
 - SQL `BEGIN` / `START TRANSACTION` and `SET TRANSACTION` apply lowering's typed modes.
-  READ ONLY starts with a pinned snapshot and no writer slot. Switching to it after writes
+  READ ONLY starts with no writer slot and no snapshot: its first query or data statement pins
+  one (`#guard`, `#transactionPin`), even a write it refuses, as PostgreSQL takes the
+  transaction snapshot "as of the start of the first non-transaction-control statement"
+  (Transaction Isolation, 13.2). A row committed between BEGIN and that statement is seen;
+  BEGIN, SAVEPOINT, RELEASE, ROLLBACK TO, SET TRANSACTION and SHOW take none. Switching to READ
+  ONLY pins at the switch only once a statement ran (the writer turn kept anything from
+  committing since). The statement clock (`now()`) stays the transaction's start, BEGIN, as in
+  PostgreSQL. Switching to it after writes
   keeps the transaction and commits those earlier writes; subsequent writes fail with 25006.
   Sequence mutation is checked at `SequenceAccess.next` / `set`, when execution reaches it:
   currval and unexecuted conditional calls remain allowed. SQL lastval() is still refused

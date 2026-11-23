@@ -2108,6 +2108,15 @@ export const WRITABLE_TRANSACTION_READ_REACH = [
 /** A write step waiting for rows, decided without spinning (row-wait-reclaim). */
 export const ROW_WAIT_RECLAIM_REACH = ["waited for rows", "written", "refused typed"] as const;
 
+/** A read-only transaction's snapshot is taken by its first statement (read-only-snapshot-timing). */
+export const READ_ONLY_SNAPSHOT_TIMING_REACH = [
+  "commit before the snapshot seen",
+  "commit after the snapshot unseen",
+  "point read first",
+  "refused write first",
+  "read only after the first statement",
+] as const;
+
 /** PG per-attribute mode transitions, statement attempts, savepoints and transaction cleanup. */
 export const OWNER_TRANSACTION_MODE_STATES = [
   "read-only begin",

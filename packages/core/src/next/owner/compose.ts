@@ -807,9 +807,15 @@ class ComposedSession implements EngineSession {
     return statementTimeOf(this.#startedAtMs ?? this.#engine.now());
   }
 
-  /** The read-only transaction's pin. */
+  /**
+   * The read-only transaction's pin, taken by its first statement that needs one: PostgreSQL's
+   * transaction snapshot is "as of the start of the first non-transaction-control statement"
+   * (Transaction Isolation, 13.2), so a commit between BEGIN and that statement is seen.
+   */
   #transactionPin(): Snapshot {
-    if (this.#readPin === null) throw new TypeError("No read-only transaction is open");
+    if (this.#state === "idle" || !this.#modes.readOnly || this.#tx !== null)
+      throw new TypeError("No read-only transaction is open");
+    this.#readPin ??= this.#writePath().pin(this.#pinOptions());
     return this.#readPin;
   }
 
@@ -890,12 +896,16 @@ class ComposedSession implements EngineSession {
     if (this.#state === "timedOut" && !ends)
       return new TransactionIdleTimeoutError(this.#engine.options.transactionIdleTimeoutMs ?? 0);
     // A query/data attempt takes the snapshot even when its effect is refused. ROLLBACK TO
-    // restores access modes, never this transaction-wide boundary (PostgreSQL).
+    // restores access modes, never this transaction-wide boundary (PostgreSQL). A read-only
+    // transaction pins it here: PostgreSQL takes the transaction snapshot before the executor's
+    // read-only check, so a refused write inside a savepoint fixes what later statements see.
     if (
       this.#state === "open" &&
       (lowered.kind === "query" || lowered.kind === "modify" || lowered.kind === "ddl")
-    )
+    ) {
       this.#snapshotTaken = true;
+      if (this.#modes.readOnly && this.#tx === null) this.#transactionPin();
+    }
     const locking = lowered.rowLocking;
     if (this.#modes.readOnly && lowered.kind === "query" && locking !== "none")
       return new ReadOnlyTransactionError(ROW_LOCK_COMMANDS[locking]);
@@ -1539,7 +1549,10 @@ class ComposedSession implements EngineSession {
     const readOnly = modes.readOnly ?? this.#modes.readOnly;
     if (readOnly !== this.#modes.readOnly) {
       if (readOnly && !this.#hasWrites) {
-        const pin = this.#writePath().pin(this.#pinOptions());
+        // After a statement, the snapshot it took: pinned while the writer turn is still held,
+        // nothing has committed since. Before one, the first statement takes it
+        // (`#transactionPin`).
+        const pin = this.#snapshotTaken ? this.#writePath().pin(this.#pinOptions()) : null;
         this.#tx?.rollback();
         this.#tx = null;
         this.#readPin = pin;
@@ -1587,11 +1600,8 @@ class ComposedSession implements EngineSession {
   async begin(readOnly: boolean, signal: AbortSignal): Promise<void> {
     if (this.#state !== "idle")
       throw new TypeError("A transaction is already open in this session");
-    if (readOnly) {
-      this.#readPin = this.#writePath().pin(this.#pinOptions());
-    } else {
-      this.#tx = await this.#writePath().begin({ signal });
-    }
+    // A read-only transaction takes its snapshot at its first statement (`#transactionPin`).
+    if (!readOnly) this.#tx = await this.#writePath().begin({ signal });
     this.#modes = { ...DEFAULT_TRANSACTION_MODES, readOnly };
     this.#snapshotTaken = false;
     this.#hasWrites = false;
