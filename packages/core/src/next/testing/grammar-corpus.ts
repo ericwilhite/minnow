@@ -1,12 +1,14 @@
 /**
- * The SQL corpus of the grammar-verdict differential (grammar-verdict-pglite.test.ts): the
- * repository's real statements, and seeded mutations of them that land near the grammar's edges.
+ * The SQL corpus of the snapshot differential (snapshot-corpus-pglite.test.ts): the repository's
+ * real statements, and seeded mutations of them that land near the grammar's edges.
  *
  * Sources: the committed SQLLogicTest profile, the SQL feature matrix's examples, every `sql` block
  * of the documentation, the console's sample queries, and the interaction simulator's statements
  * (recorded by the test from a run). Mutations: token deletion (one to three tokens), truncation,
  * a duplicated token, a keyword swapped for another of its kind, an emptied argument list, a type
- * modifier on a type name, and a subquery replaced by another query form.
+ * modifier on a type name, and a subquery replaced by another query form. A mutation edits the
+ * original text in place, so the spacing between the tokens it keeps is the original's: adjacent
+ * forms (`~<~`, `a[1:2]`, `:=`, `a$b`, `1_000.`) survive.
  */
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -23,27 +25,18 @@ export interface CorpusSource {
   readonly statements: readonly string[];
 }
 
-/** Splits text into statements at top-level semicolons, keeping quotes and comments whole. */
+/**
+ * Splits text into statements at top-level semicolons (scanned as PostgreSQL's scanner reads them:
+ * quoted strings with their escapes, dollar quotes, nested comments), keeping each statement's
+ * text as written.
+ */
 export function splitStatements(text: string): string[] {
   const out: string[] = [];
   let start = 0;
-  let index = 0;
-  while (index < text.length) {
-    const c = text[index];
-    const next = text[index + 1];
-    if (c === "'" || c === '"') {
-      const end = text.indexOf(c, index + 1);
-      index = end < 0 ? text.length : end + 1;
-    } else if (c === "-" && next === "-") {
-      const end = text.indexOf("\n", index);
-      index = end < 0 ? text.length : end + 1;
-    } else if (c === "/" && next === "*") {
-      const end = text.indexOf("*/", index + 2);
-      index = end < 0 ? text.length : end + 2;
-    } else if (c === ";" && !openTriggerBody(text.slice(start, index))) {
-      out.push(text.slice(start, index));
-      start = ++index;
-    } else index++;
+  for (const token of scan(text)) {
+    if (token.text !== ";" || openTriggerBody(text.slice(start, token.start))) continue;
+    out.push(text.slice(start, token.start));
+    start = token.end;
   }
   out.push(text.slice(start));
   return out.map((statement) => statement.trim()).filter((statement) => statement !== "");
@@ -93,7 +86,7 @@ function documentation(): CorpusSource {
   for (const path of files(join(REPO, "apps", "site", "content", "docs"), ".mdx")) {
     const text = readFileSync(path, "utf8");
     for (const block of text.matchAll(/```sql[^\n]*\n([\s\S]*?)```/gu))
-      statements.push(...splitStatements(block[1] ?? ""));
+      for (const statement of splitStatements(block[1] ?? "")) statements.push(statement);
   }
   return { name: "documentation", statements: unique(statements) };
 }
@@ -138,6 +131,61 @@ const POSTGRES_FORMS = [
   "SELECT sum(v) OVER (ORDER BY v ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t WINDOW x AS (PARTITION BY v)",
 ];
 
+/**
+ * Fixed forms from the reviews of #59 (Neon, 2026-11-23): valid PostgreSQL that #59's token rules
+ * claimed PostgreSQL rejects, statements PostgreSQL takes no snapshot for (each first word of
+ * `PlannedStmtRequiresSnapshot`'s refusals but transaction control, which the probe cannot run),
+ * text before the first word PostgreSQL's scanner skips, and several statements in one text.
+ */
+const REVIEW_FORMS = [
+  "SELECT (ARRAY[1, 2, 3])[1:2]",
+  "SELECT v[1:2] FROM t",
+  "SELECT substr(string := 'abc', start := 2)",
+  "SELECT 1 AS café",
+  "SELECT π",
+  "SELECT 1 AS a$b",
+  "SELECT $é$hello$é$",
+  "SELECT 0x7fffffffffffffff, 0o777777777777777777777, 0x_1, 1_000., 1_0.e5",
+  "SELECT (1 -- a comment\r)",
+  "CREATE TABLE trigger (id integer)",
+  "CREATE SCHEMA trigger",
+  "SELECT s FROM t ORDER BY s USING ~<~",
+  "SELECT v FROM t ORDER BY v USING <<",
+  "CREATE TABLE z (a boolean CHECK (NOT pg_is_in_recovery()))",
+  "SELECT j OPERATOR(pg_catalog.?) 'a' FROM t",
+  "SELECT 1 case",
+  "SELECT xmlelement(name window)",
+  "CREATE TABLE z (a integer UNIQUE NULLS NOT DISTINCT)",
+  "SELECT * FROM (SELECT 1 distinct) x",
+  "VALUES (***1)",
+  "SELECT * FROM (SELECT 1) int (a) ORDER BY a USING <",
+  "WITH int (a) AS (SELECT 1) TABLE int",
+  "WITH nullif (a) AS (SELECT 1) TABLE nullif",
+  "CREATE TABLE coalesce ()",
+  "SELECT * FROM (SELECT 1) AS enum (a) ORDER BY a USING <",
+  "WITH c AS (SELECT 1 FROM rows WHERE range BETWEEN following AND preceding) TABLE c",
+  "SELECT sum(1) OVER (ORDER BY 1 ROWS BETWEEN unbounded + 1 FOLLOWING AND 2 FOLLOWING) FROM t",
+  "LOCK TABLE t IN ACCESS SHARE MODE",
+  "LOCK TABLE missing_table",
+  "LISTEN channel",
+  "UNLISTEN channel",
+  "NOTIFY channel, 'payload'",
+  "FETCH 1 FROM missing_cursor",
+  "MOVE 1 FROM missing_cursor",
+  "CHECKPOINT",
+  "SET CONSTRAINTS ALL DEFERRED",
+  "RESET search_path",
+  "SHOW search_path",
+  "; SELECT 1",
+  ";; SELECT missing_column FROM t",
+  "-- a comment\rSELECT 1",
+  "/* a /* nested */ comment */; SELECT 1",
+  "SELECT 1; SELECT 2",
+  "SELECT 1; SELEC 2",
+  "SET search_path = public; SELECT 1",
+  "INSERT INTO t VALUES (2, 2, 'b'); SELECT 1",
+];
+
 /** The sources read from the repository (the simulator's are recorded by the test). */
 export function repositorySources(): CorpusSource[] {
   return [
@@ -146,32 +194,142 @@ export function repositorySources(): CorpusSource[] {
     documentation(),
     consoleQueries(),
     { name: "PostgreSQL forms", statements: POSTGRES_FORMS },
+    { name: "review forms", statements: REVIEW_FORMS },
   ];
 }
 
 // --- Tokens -------------------------------------------------------------------------------------
 
-/** One token of a statement: its text, and whether it is a word (a keyword or a name). */
+/** One token of a statement: its text, whether it is a word (a keyword or a name), and where. */
 export interface Token {
   readonly text: string;
   readonly word: boolean;
+  readonly start: number;
+  readonly end: number;
 }
 
-const TOKEN =
-  /\s+|--[^\n]*|\/\*[\s\S]*?\*\/|'(?:[^']|'')*'?|"(?:[^"]|"")*"?|\$\d+|\d+(?:\.\d*)?(?:[eE][-+]?\d+)?|\.\d+(?:[eE][-+]?\d+)?|[A-Za-z_\u0080-￿][A-Za-z0-9_$\u0080-￿]*|->>|#>>|::|<=|>=|<>|!=|\|\||->|#>|@>|<@|@@|[^\s]/gu;
+const OPERATOR_CHARACTERS = "+-*/<>=~!@#%^&|`?";
 
-/** The tokens of `sql` without whitespace and comments (an approximation of PostgreSQL's scanner). */
+/**
+ * The tokens of `sql` without whitespace and comments, as PostgreSQL's scanner (scan.l) splits
+ * them: `--` comments end at a line feed or a carriage return; block comments nest; strings take
+ * `''` (and, after E, backslash escapes); `$tag$` quotes; identifiers take letters, digits, `_`,
+ * `$` and non-ASCII characters; numbers take `_` separators and 0x, 0o and 0b prefixes; an
+ * operator is the longest run of operator characters. Unterminated text runs to the end.
+ */
 export function tokens(sql: string): Token[] {
+  return scan(sql);
+}
+
+function scan(sql: string): Token[] {
   const out: Token[] = [];
-  for (const match of sql.matchAll(TOKEN)) {
-    const text = match[0];
-    if (/^\s/u.test(text) || text.startsWith("--") || text.startsWith("/*")) continue;
-    out.push({ text, word: /^[A-Za-z_]/u.test(text) });
+  let i = 0;
+  const at = (k: number) => sql[k] ?? "";
+  const isWordStart = (c: string) => /[A-Za-z_\u0080-\uffff]/u.test(c) && c !== "";
+  const isWordPart = (c: string) => /[A-Za-z0-9_$\u0080-\uffff]/u.test(c) && c !== "";
+  const quoted = (from: number, quote: string, backslash: boolean): number => {
+    let k = from + 1;
+    while (k < sql.length) {
+      if (backslash && at(k) === "\\") k += 2;
+      else if (at(k) === quote && at(k + 1) === quote) k += 2;
+      else if (at(k) === quote) return k + 1;
+      else k += 1;
+    }
+    return sql.length;
+  };
+  while (i < sql.length) {
+    const c = at(i);
+    const start = i;
+    if (/\s/u.test(c)) {
+      i += 1;
+      continue;
+    }
+    if (c === "-" && at(i + 1) === "-") {
+      while (i < sql.length && at(i) !== "\n" && at(i) !== "\r") i += 1;
+      continue;
+    }
+    if (c === "/" && at(i + 1) === "*") {
+      let depth = 0;
+      while (i < sql.length) {
+        if (at(i) === "/" && at(i + 1) === "*") {
+          depth += 1;
+          i += 2;
+        } else if (at(i) === "*" && at(i + 1) === "/") {
+          depth -= 1;
+          i += 2;
+          if (depth === 0) break;
+        } else i += 1;
+      }
+      continue;
+    }
+    let word = false;
+    if (c === "'") i = quoted(i, "'", false);
+    else if ((c === "E" || c === "e") && at(i + 1) === "'") i = quoted(i + 1, "'", true);
+    else if (
+      (c === "U" || c === "u") &&
+      at(i + 1) === "&" &&
+      (at(i + 2) === "'" || at(i + 2) === '"')
+    )
+      i = quoted(i + 2, at(i + 2), false);
+    else if (c === '"') i = quoted(i, '"', false);
+    else if (c === "$" && /[0-9]/u.test(at(i + 1))) {
+      i += 1;
+      while (/[0-9]/u.test(at(i))) i += 1;
+    } else if (c === "$") {
+      const tag = /^\$(?:[A-Za-z_\u0080-\uffff][A-Za-z0-9_\u0080-\uffff]*)?\$/u.exec(
+        sql.slice(i),
+      )?.[0];
+      if (tag === undefined) i += 1;
+      else {
+        const close = sql.indexOf(tag, i + tag.length);
+        i = close < 0 ? sql.length : close + tag.length;
+      }
+    } else if (/[0-9]/u.test(c) || (c === "." && /[0-9]/u.test(at(i + 1)))) {
+      const number =
+        /^(?:0[xX][0-9A-Fa-f_]*|0[oO][0-7_]*|0[bB][01_]*|(?:[0-9][0-9_]*)?\.?[0-9_]*(?:[eE][-+]?[0-9_]+)?)/u.exec(
+          sql.slice(i),
+        )?.[0];
+      i += Math.max(1, number?.length ?? 1);
+    } else if (isWordStart(c)) {
+      word = true;
+      i += 1;
+      while (isWordPart(at(i))) i += 1;
+    } else if (c === ":" && (at(i + 1) === ":" || at(i + 1) === "=")) i += 2;
+    else if (OPERATOR_CHARACTERS.includes(c)) {
+      while (
+        i < sql.length &&
+        OPERATOR_CHARACTERS.includes(at(i)) &&
+        !(at(i) === "-" && at(i + 1) === "-") &&
+        !(at(i) === "/" && at(i + 1) === "*")
+      )
+        i += 1;
+    } else i += 1;
+    out.push({ text: sql.slice(start, i), word, start, end: i });
   }
   return out;
 }
 
-const join_ = (list: readonly Token[]): string => list.map((token) => token.text).join(" ");
+/**
+ * `sql` with tokens `from` to `to` (exclusive) replaced by `text`: the text between the tokens
+ * kept is the original's. A space keeps the replacement apart from a word beside it.
+ */
+function splice(
+  sql: string,
+  list: readonly Token[],
+  from: number,
+  to: number,
+  text: string,
+): string {
+  const begin = list[from]?.start ?? sql.length;
+  const finish = list[to - 1]?.end ?? begin;
+  const before = sql.slice(0, begin);
+  const after = sql.slice(to > from ? finish : begin);
+  const pad = (left: string, right: string) =>
+    left !== "" && right !== "" && /[A-Za-z0-9_$]$/u.test(left) && /^[A-Za-z0-9_$]/u.test(right)
+      ? " "
+      : "";
+  return `${before}${pad(before, text)}${text}${pad(text === "" ? before : text, after)}${after}`;
+}
 
 /** Keywords that stand where another of their group could: a swap is a near miss of the grammar. */
 const SWAPS: ReadonlyArray<readonly string[]> = [
@@ -268,25 +426,29 @@ export function mutate(sql: string, kind: Mutation, pick: (n: number) => number)
     case "deleted tokens": {
       const at = pick(list.length);
       const span = 1 + pick(3);
-      return join_([...list.slice(0, at), ...list.slice(at + span)]);
+      return splice(sql, list, at, Math.min(list.length, at + span), "");
     }
     case "truncated":
-      return list.length < 2 ? null : join_(list.slice(0, 1 + pick(list.length - 1)));
+      return list.length < 2 ? null : sql.slice(0, list[pick(list.length - 1)]?.end ?? 0);
     case "duplicated token": {
       const at = pick(list.length);
-      return join_([...list.slice(0, at + 1), ...list.slice(at)]);
+      const token = list[at];
+      if (token === undefined) return null;
+      // The token again, after itself, with the spacing that preceded it (a space at the start).
+      const gap = at === 0 ? " " : sql.slice(list[at - 1]?.end ?? 0, token.start) || " ";
+      return `${sql.slice(0, token.end)}${gap}${token.text}${sql.slice(token.end)}`;
     }
     case "swapped keyword": {
       const places: Array<[number, readonly string[]]> = [];
       list.forEach((token, index) => {
         for (const group of SWAPS)
-          if (group.some((word) => word.split(" ")[0] === token.text.toUpperCase()))
+          if (token.word && group.some((word) => word.split(" ")[0] === token.text.toUpperCase()))
             places.push([index, group]);
       });
       if (places.length === 0) return null;
       const [at, group] = places[pick(places.length)] ?? [0, []];
       const word = group[pick(group.length)] ?? "";
-      return join_([...list.slice(0, at), { text: word, word: true }, ...list.slice(at + 1)]);
+      return splice(sql, list, at, at + 1, word);
     }
     case "emptied list": {
       const opens = list.flatMap((token, index) => (token.text === "(" ? [index] : []));
@@ -294,18 +456,20 @@ export function mutate(sql: string, kind: Mutation, pick: (n: number) => number)
       const open = opens[pick(opens.length)] ?? 0;
       const close = closing(list, open);
       if (close < 0) return null;
-      return join_([...list.slice(0, open + 1), ...list.slice(close)]);
+      return splice(sql, list, open + 1, close, "");
     }
     case "type modifier": {
       const places = list.flatMap((token, index) =>
-        TYPE_SET.has(token.text.toUpperCase()) ? [index] : [],
+        token.word && TYPE_SET.has(token.text.toUpperCase()) ? [index] : [],
       );
       if (places.length === 0) return null;
       const at = places[pick(places.length)] ?? 0;
       const after = list[at + 1]?.text === "(" ? closing(list, at + 1) + 1 : at + 1;
       if (after <= at) return null;
       const modifier = MODIFIERS[pick(MODIFIERS.length)] ?? "";
-      return `${join_(list.slice(0, at + 1))} ${modifier} ${join_(list.slice(after))}`.trim();
+      const token = list[at];
+      if (token === undefined) return null;
+      return `${sql.slice(0, token.end)}${modifier}${sql.slice(list[after - 1]?.end ?? token.end)}`;
     }
     case "subquery form": {
       const opens = list.flatMap((token, index) =>
@@ -318,7 +482,7 @@ export function mutate(sql: string, kind: Mutation, pick: (n: number) => number)
       const close = closing(list, open);
       if (close < 0) return null;
       const form = QUERY_FORMS[pick(QUERY_FORMS.length)] ?? "";
-      return `${join_(list.slice(0, open + 1))} ${form} ${join_(list.slice(close))}`;
+      return splice(sql, list, open + 1, close, form);
     }
   }
 }

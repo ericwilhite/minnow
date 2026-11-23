@@ -598,26 +598,35 @@ export const FTS_RENDERING_AUTHORITY = {
 } as const;
 
 /**
- * Lead ruling 2026-11-23 (#59, option 1): a failed statement's snapshot follows PostgreSQL's raw
- * parse, as far as next/ can tell it. Its parser reads a subset of PostgreSQL's grammar, so a
- * failure counts as parsed unless lower/raw-parse.ts `rawParseRejects` finds text gram.y reads
- * nowhere. Only statements that fail in PostgreSQL are affected: a syntax error next/ meets only
- * after refusing something earlier (or never meets, in syntax it accepts as an extension: `?`
- * placeholders, MATCH ... AGAINST) fixes a read-only transaction's snapshot where PostgreSQL's
- * would not. grammar-verdict-pglite.test.ts measures, of the statements PostgreSQL's raw parser
- * rejects in its seeded corpus, the share next/ reads, and holds it to `ceiling`, which may only go
- * down; no statement PostgreSQL parses may skip the snapshot.
+ * Lead ruling 2026-11-23 (#59, after Neon's review): next/ cannot tell PostgreSQL's raw parse
+ * from its own (its parser reads a subset of PostgreSQL's grammar), so a statement that fails to
+ * lower counts as raw-parsed, and its first words decide its snapshot (lower/snapshot-rule.ts).
+ * Only statements PostgreSQL rejects before its snapshot are affected: a raw syntax error, or
+ * several statements in one request (refused by PostgreSQL's extended protocol, and by next/),
+ * fixes a transaction's snapshot in next/ unless its first word starts a statement that takes
+ * none (`SELEC 1` takes one; bare `SHOW` takes none); in PostgreSQL it takes none. So does a
+ * syntax next/ accepts as an extension (`?` placeholders, MATCH ... AGAINST, `SELECT 1e`).
+ * snapshot-corpus-pglite.test.ts checks every other statement of its seeded corpus agrees, and
+ * reports how many take the snapshot through this divergence; there is no ceiling.
  */
-export const LATE_SYNTAX_ERROR_SNAPSHOT = {
-  id: "late-syntax-error-snapshot",
+export const SYNTAX_ERROR_SNAPSHOT = {
+  id: "syntax-error-snapshot",
   ruling:
-    "lead 2026-11-23, #59 re-check: a failure counts as parsed unless gram.y reads it nowhere",
+    "lead 2026-11-23, #59 after Neon's review: a failed statement counts as raw-parsed; its first words decide",
   authority:
-    "PostgreSQL's exec_simple_query takes the transaction snapshot for a statement only after its raw parse succeeds (snapshot-statement-kind-pglite.test.ts probes it in PGlite with 25001)",
-  /**
-   * Of the statements PostgreSQL's raw parser rejects, the share next/ reads: measured 0.6083 and
-   * 0.5910 on the default seeds (1,241 of 2,040 and 1,192 of 2,017; 78 and 79 of those next/ runs
-   * as extensions), 2026-11-23.
-   */
-  ceiling: 0.609,
+    "PostgreSQL takes the transaction snapshot only after a statement's raw parse succeeds (exec_simple_query, exec_parse_message); probed in PGlite with 25001 (snapshot-statement-kind-pglite.test.ts, snapshot-corpus-pglite.test.ts)",
+} as const;
+
+/**
+ * Found while fixing #59 (2026-11-23), not changed by it: PostgreSQL's extended-protocol Parse
+ * that fails (a syntax error, an unknown column) aborts the open transaction, and every later
+ * statement is refused with 25P02 until ROLLBACK (checked in PGlite). next/'s failed prepare
+ * request (`prepareTask`, owner/server.ts `#prepare`) answers the error and leaves the
+ * transaction open. Its snapshot does follow PostgreSQL's Parse (snapshot-planning-only.test.ts).
+ */
+export const FAILED_PREPARE_KEEPS_TRANSACTION = {
+  id: "failed-prepare-keeps-transaction",
+  ruling: "lead 2026-11-23: register it; not widened into #59",
+  authority:
+    "PostgreSQL exec_parse_message: an error during Parse aborts the transaction (25P02 after), observed in PGlite",
 } as const;

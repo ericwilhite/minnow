@@ -34,16 +34,24 @@ type First =
   | "unknown column"
   | "unknown table"
   | "type error"
-  | "syntax error";
+  | "syntax error"
+  | "control syntax error";
 
-/** First statements that fail: the query and the SQLSTATE each gives. Analysis errors take the
- * snapshot first (PostgreSQL); a syntax error fails in the raw parse, before it. */
+/**
+ * First statements that fail: the query and the SQLSTATE each gives. Analysis errors take the
+ * snapshot first (PostgreSQL). A syntax error fails in PostgreSQL's raw parse, before it; next/
+ * cannot tell PostgreSQL's raw parse from its own, so a failed statement counts as parsed and its
+ * first word decides (lower/snapshot-rule.ts): `SELEC` takes the snapshot (divergence
+ * `syntax-error-snapshot`), and a syntax error behind a first word that takes none (bare `SHOW`)
+ * takes none, as in PostgreSQL.
+ */
 const FAILING: Partial<Record<First, { readonly sql: string; readonly state: string }>> = {
   "unknown column": { sql: "SELECT missing_column FROM t", state: "42703" },
   "unknown table": { sql: "SELECT * FROM missing_table", state: "42P01" },
   // PostgreSQL: "CASE types boolean and integer cannot be matched" (checked in PGlite).
   "type error": { sql: "SELECT CASE WHEN v = 1 THEN 1 ELSE true END FROM t", state: "42804" },
   "syntax error": { sql: "SELEC v FROM t", state: "42601" },
+  "control syntax error": { sql: "SHOW", state: "42601" },
 };
 type Control = "savepoint" | "show" | "set isolation" | "set read only";
 
@@ -159,7 +167,7 @@ async function run(history: History, reach?: ReturnType<typeof createReach>): Pr
       }
       await gapEnds();
     }
-    // The first statement takes the snapshot (unless it fails to parse).
+    // The first statement takes the snapshot (unless its first word takes none).
     const failing = FAILING[history.first];
     if (history.first === "scan") {
       take();
@@ -180,10 +188,13 @@ async function run(history: History, reach?: ReturnType<typeof createReach>): Pr
       );
       expect(state, `${context}: ${failing.sql}`).toBe(failing.state);
       await a.query("ROLLBACK TO w");
-      if (history.first !== "syntax error") {
+      if (history.first === "control syntax error") reach?.reach("control syntax error first");
+      else {
         take();
-        reach?.reach("analysis error first");
-      } else reach?.reach("syntax error first");
+        reach?.reach(
+          history.first === "syntax error" ? "syntax error first" : "analysis error first",
+        );
+      }
       if (history.isolation === true && savepoints === 0) {
         await a.query("RELEASE w");
         const changed = await a.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED").then(
@@ -200,7 +211,7 @@ async function run(history: History, reach?: ReturnType<typeof createReach>): Pr
           expect(await count(a), `${context}: every commit, after the transaction`).toBe(rows);
           return;
         }
-        expect(changed, `${context}: a syntax error fixes nothing`).toBeNull();
+        expect(changed, `${context}: a statement that takes none fixes nothing`).toBeNull();
         await a.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
       }
     } else {
@@ -224,7 +235,7 @@ async function run(history: History, reach?: ReturnType<typeof createReach>): Pr
       if (isTaken()) reach?.reach("read only after the first statement");
     }
     await gapEnds();
-    // After a syntax error, this read takes the snapshot.
+    // After a statement that took none, this read takes the snapshot.
     take();
     expect(await count(a), `${context}: a later read sees the first statement's snapshot`).toBe(
       expected,
@@ -323,6 +334,7 @@ const first = fc.constantFrom<First>(
   "unknown table",
   "type error",
   "syntax error",
+  "control syntax error",
 );
 const control = fc.constantFrom<Control>("savepoint", "show", "set isolation", "set read only");
 

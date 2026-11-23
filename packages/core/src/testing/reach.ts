@@ -2108,19 +2108,24 @@ export const WRITABLE_TRANSACTION_READ_REACH = [
 /** A write step waiting for rows, decided without spinning (row-wait-reclaim). */
 export const ROW_WAIT_RECLAIM_REACH = ["waited for rows", "written", "refused typed"] as const;
 
-/** A failed statement's snapshot effect by its kind (snapshot-statement-kind-pglite). */
+/** A statement's snapshot by its kind, behind each prefix (snapshot-statement-kind-pglite). */
 export const SNAPSHOT_STATEMENT_KIND_REACH = [
-  "parse error",
-  "late error",
-  "analysis error",
-  "planning error",
+  "syntax",
+  "several",
+  "control syntax",
+  "analysis",
+  "valid",
+  "no snapshot",
+  "empty",
   "behind a comment",
-  "an audited class",
+  "behind a carriage-return comment",
+  "behind semicolons",
 ] as const;
 
-/** The grammar-verdict corpus (next/testing/grammar-verdict-pglite.test.ts): each source of
- * statements and mutation, both of PostgreSQL's verdicts, a claimed rejection, and B. */
-export const GRAMMAR_VERDICT_REACH = [
+/** The snapshot corpus (next/testing/snapshot-corpus-pglite.test.ts): each source of statements
+ * and mutation, both engines' agreement either way, both divergence classes, and the
+ * transaction control the probe skips. */
+export const SNAPSHOT_CORPUS_REACH = [
   "original",
   "deleted tokens",
   "truncated",
@@ -2130,10 +2135,13 @@ export const GRAMMAR_VERDICT_REACH = [
   "type modifier",
   "subquery form",
   "simulator statement",
-  "PostgreSQL parses",
-  "PostgreSQL rejects",
-  "claimed rejection",
-  "read past a syntax error",
+  "next/ ran it",
+  "next/ refused it",
+  "both take it",
+  "neither takes it",
+  "syntax error taken",
+  "several statements taken",
+  "transaction control, not probed",
 ] as const;
 
 /** A read-only transaction's snapshot is taken by its first statement (read-only-snapshot-timing). */
@@ -2145,6 +2153,7 @@ export const READ_ONLY_SNAPSHOT_TIMING_REACH = [
   "read only after the first statement",
   "analysis error first",
   "syntax error first",
+  "control syntax error first",
   "isolation fixed by a failed statement",
 ] as const;
 

@@ -76,6 +76,10 @@ import {
   type ParameterizedPlan,
   type NotParameterizable,
 } from "../lower/parameterize.js";
+import {
+  failedPrepareTakesSnapshot,
+  failedStatementTakesSnapshot,
+} from "../lower/snapshot-rule.js";
 import { statisticsDrifted, type PlanningStatistics } from "../lower/statistics.js";
 import type { LentHoldings, MemoryGovernor } from "../memory/governor.js";
 import { ReturnPool } from "../exec/return-pool.js";
@@ -447,11 +451,6 @@ class ComposedEngine implements CatalogOwnerEngine {
   }
 
   /** Public lowering results/markers use normalized keys; raw constants use full text only. */
-  /** Whether the statement takes a transaction's snapshot before analysis (`Lowerer`). */
-  takesSnapshot(text: string): boolean {
-    return this.#options.planner.takesSnapshot?.(text) ?? false;
-  }
-
   plan(text: string, catalog: CatalogView = this.#options.writePath.catalog): PlannedStatement {
     const context = this.#context(catalog);
     const prefix = `${String(catalog.version)}\u0000${JSON.stringify(context.parameterTypes ?? [])}\u0000`;
@@ -787,19 +786,8 @@ class ComposedSession implements EngineSession {
     return this.#catalog().version;
   }
 
+  /** Plans only: a statement takes the snapshot when it runs (`#guard`, `statementFailed`). */
   plan(text: string): PlannedStatement {
-    // PostgreSQL takes the transaction's snapshot before analysis: a first statement whose
-    // analysis then fails (an unknown column) has still fixed it, and with it the isolation level
-    // (25001 after).
-    if (this.#state === "open" && !this.#snapshotTaken && this.#engine.takesSnapshot(text)) {
-      this.#snapshotTaken = true;
-      if (this.#modes.readOnly && this.#tx === null && this.#readPin === null)
-        this.#transactionPin();
-    }
-    return this.#plan(text);
-  }
-
-  #plan(text: string): PlannedStatement {
     const catalog = this.#catalog();
     // A transaction whose DDL moved its catalog past the committed one plans privately: another
     // transaction could reach the same version number with different contents.
@@ -834,6 +822,35 @@ class ComposedSession implements EngineSession {
       throw new TypeError("No read-only transaction is open");
     this.#readPin ??= this.#writePath().pin(this.#pinOptions());
     return this.#readPin;
+  }
+
+  /**
+   * The open transaction's first statement that needs a snapshot takes it: a read-only
+   * transaction pins it now, and the isolation level is fixed (25001 after) in either.
+   */
+  #takeSnapshot(): void {
+    if (this.#state !== "open") return;
+    this.#snapshotTaken = true;
+    if (this.#modes.readOnly && this.#tx === null) this.#transactionPin();
+  }
+
+  statementFailed(text: string): void {
+    // PostgreSQL takes the snapshot once the raw parse succeeds, before analysis or the run can
+    // fail: next/ counts its failure as parsed, and the first words decide (lower/snapshot-rule.ts).
+    if (failedStatementTakesSnapshot(text)) this.#takeSnapshot();
+  }
+
+  prepared(text: string, planned: PlannedStatement | null): void {
+    // An extended-protocol Parse takes the snapshot for what it analyses (`analyze_requires_
+    // snapshot`): a query or data statement, and CREATE TABLE AS; a failed Parse too (PGlite).
+    const lowered = planned?.lowered;
+    const takes =
+      lowered === undefined
+        ? failedPrepareTakesSnapshot(text)
+        : lowered.kind === "query" ||
+          lowered.kind === "modify" ||
+          (lowered.kind === "ddl" && lowered.followUp !== null);
+    if (takes) this.#takeSnapshot();
   }
 
   #pinOptions() {
@@ -912,17 +929,14 @@ class ComposedSession implements EngineSession {
     if (this.#state === "failed" && !ends) return new InFailedTransactionError();
     if (this.#state === "timedOut" && !ends)
       return new TransactionIdleTimeoutError(this.#engine.options.transactionIdleTimeoutMs ?? 0);
-    // A query/data attempt takes the snapshot even when its effect is refused. ROLLBACK TO
-    // restores access modes, never this transaction-wide boundary (PostgreSQL). A read-only
-    // transaction pins it here: PostgreSQL takes the transaction snapshot before the executor's
+    // The planned kind decides, as PostgreSQL's does: a query or data statement takes the
+    // snapshot at its analysis (`analyze_requires_snapshot`), a schema change when it runs
+    // (`PlannedStmtRequiresSnapshot`, utility.c); transaction control, SET, RESET and SHOW take
+    // none. Taken even when the effect is refused: PostgreSQL takes it before the executor's
     // read-only check, so a refused write inside a savepoint fixes what later statements see.
-    if (
-      this.#state === "open" &&
-      (lowered.kind === "query" || lowered.kind === "modify" || lowered.kind === "ddl")
-    ) {
-      this.#snapshotTaken = true;
-      if (this.#modes.readOnly && this.#tx === null) this.#transactionPin();
-    }
+    // ROLLBACK TO restores access modes, never this transaction-wide boundary.
+    if (lowered.kind === "query" || lowered.kind === "modify" || lowered.kind === "ddl")
+      this.#takeSnapshot();
     const locking = lowered.rowLocking;
     if (this.#modes.readOnly && lowered.kind === "query" && locking !== "none")
       return new ReadOnlyTransactionError(ROW_LOCK_COMMANDS[locking]);

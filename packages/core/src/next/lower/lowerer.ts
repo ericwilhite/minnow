@@ -212,14 +212,6 @@ export interface Lowerer {
   /** Lowers one SQL statement (see the module comment). */
   lower(text: string, context: LoweringContext): LoweredStatement;
   /**
-   * Whether the statement takes a transaction's snapshot before it is analysed, as PostgreSQL's
-   * `analyze_requires_snapshot` decides from the raw parse: a query, a data statement or a schema
-   * change does, even if its analysis then fails (an unknown column, table or operator);
-   * transaction control, SET, RESET and SHOW do not, and neither does text that does not parse
-   * (a syntax error, SQLSTATE 42601). Parses only; never reads the catalog.
-   */
-  takesSnapshot(text: string): boolean;
-  /**
    * A batch write as a `modify` plan whose input is the client's rows (IR request 3 in
    * INVENTORY.md, an `input` relation typed as the named columns): insert fills omitted columns
    * with their defaults and computes generated columns; upsert conflicts on the primary key and

@@ -165,6 +165,17 @@ export interface EngineSession {
    * when the transaction ends or rolls back to a savepoint.
    */
   plan(text: string): PlannedStatement;
+  /**
+   * An admitted statement failed to plan (`text`'s lowering threw): it takes the open
+   * transaction's snapshot as PostgreSQL's would once the text raw-parsed, by its first words
+   * (lower/snapshot-rule.ts). Call before `fail`. Planning alone never takes it.
+   */
+  statementFailed(text: string): void;
+  /**
+   * A prepare request planned `text` (`planned`, or null when planning failed): it takes the open
+   * transaction's snapshot where PostgreSQL's extended-protocol Parse does, for what it analyses.
+   */
+  prepared(text: string, planned: PlannedStatement | null): void;
   /** This session's last commit LSN: relaxed read-your-writes pins at least this (B3 `atLeastLsn`). */
   readonly lastCommitLsn: number | null;
   /**

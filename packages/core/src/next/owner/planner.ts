@@ -23,6 +23,4 @@ export type {
 export type StatementPlanner = Pick<
   Lowerer,
   "lower" | "lowerWrite" | "lowerTableRules" | "parameterize" | "lowerParameterized"
-> &
-  /** Without it, a transaction's snapshot is taken by its first statement's execution only. */
-  Partial<Pick<Lowerer, "takesSnapshot">>;
+>;

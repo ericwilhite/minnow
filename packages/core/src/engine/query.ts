@@ -1091,7 +1091,7 @@ const MAX_RECURSIVE_ROWS = 1_000_000;
 
 type RowContext = Record<string, DatabaseRow | undefined>;
 
-export interface Token {
+interface Token {
   kind: "identifier" | "number" | "string" | "operator" | "punctuation" | "parameter" | "eof";
   /** For parameter tokens: the 1-based number of `$n`, or "" for positional `?`. */
   text: string;
@@ -16212,7 +16212,7 @@ function validNumericLiteral(text: string, radix: number): boolean {
   return new RegExp(pattern).test(text);
 }
 
-export function tokenize(sql: string): Token[] {
+function tokenize(sql: string): Token[] {
   const tokens: Token[] = [];
   let nestingDepth = 0;
   const push = (token: Token): void => {

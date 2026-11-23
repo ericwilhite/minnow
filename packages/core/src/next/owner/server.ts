@@ -1064,9 +1064,11 @@ class Connection {
     const session = slot === null ? null : this.#engineSession(slot);
     let planned: PlannedStatement | null = null;
     let planError: unknown = null;
+    // The text whose lowering threw, if planning failed there (not on a protocol error).
+    const lowering: { text: string | null } = { text: null };
     if (request.t === "statement" && session !== null) {
       try {
-        planned = this.#planStatement(session, request.text, request.prepared);
+        planned = this.#planStatement(session, request.text, request.prepared, lowering);
         if (
           request.scopedTransaction === true &&
           (planned.control === "begin" ||
@@ -1121,6 +1123,9 @@ class Connection {
       return;
     }
     if (planError !== null) {
+      // Admitted: a statement that failed to lower takes the snapshot it would have taken in
+      // PostgreSQL before failing; an unadmitted, expired or refused retry above took none.
+      if (lowering.text !== null) session?.statementFailed(lowering.text);
       session?.fail();
       this.#finishLedger(request, planned, before, session, null, true, planError);
       this.post({ t: "error", seq: request.seq, error: toWireError(planError) });
@@ -1134,11 +1139,19 @@ class Connection {
     session: EngineSession,
     text: string | null,
     prepared: number | null,
+    lowering: { text: string | null } = { text: null },
   ): PlannedStatement {
+    // Records the text being lowered: when lowering throws, it stays (`statementFailed`).
+    const plan = (sql: string): PlannedStatement => {
+      lowering.text = sql;
+      const planned = session.plan(sql);
+      lowering.text = null;
+      return planned;
+    };
     if (prepared !== null) {
       const entry = this.#prepared.get(String(prepared));
       if (entry === undefined) {
-        if (text !== null) return session.plan(text);
+        if (text !== null) return plan(text);
         throw new ProtocolError(`Prepared statement ${String(prepared)} does not exist`);
       }
       if (text !== null && text !== entry.text)
@@ -1147,10 +1160,10 @@ class Connection {
       // shared one, so a transaction's private plan never outlives it).
       return entry.planned.catalogVersion === session.catalogVersion
         ? entry.planned
-        : session.plan(entry.text);
+        : plan(entry.text);
     }
     if (text === null) throw new ProtocolError("A statement needs text or a prepared id");
-    return session.plan(text);
+    return plan(text);
   }
 
   #answerAdmission(
@@ -1557,9 +1570,13 @@ class Connection {
     try {
       planned = session === null ? engine.plan(request.text) : session.plan(request.text);
     } catch (error) {
+      // PostgreSQL's failed Parse takes the snapshot for what it analyses, and aborts the
+      // transaction (25P02); next/ keeps it open (divergence failed-prepare-keeps-transaction).
+      session?.prepared(request.text, null);
       this.post({ t: "error", seq: request.seq, error: toWireError(error) });
       return;
     }
+    session?.prepared(request.text, planned);
     // A private catalog's plan stays in its native session cache; retaining it in a connection
     // cache would outlive transaction end and could collide with a later catalog version.
     if (session === null || session.transaction === "idle")

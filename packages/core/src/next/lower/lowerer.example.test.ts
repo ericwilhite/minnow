@@ -85,9 +85,6 @@ const countPlan = (version: number): PhysicalPlan => {
 /** A stub: counts calls, and knows two statements. */
 class StubLowerer implements Lowerer {
   calls = 0;
-  takesSnapshot(text: string): boolean {
-    return !/^\s*(?:BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE|SET|SHOW|RESET)\b/iu.test(text);
-  }
   lower(text: string, context: LoweringContext): LoweredStatement {
     this.calls += 1;
     const base = {

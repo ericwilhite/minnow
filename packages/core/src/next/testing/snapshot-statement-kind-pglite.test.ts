@@ -1,26 +1,25 @@
 /**
- * A failed statement takes its transaction's snapshot exactly when PostgreSQL's would: a statement
- * whose raw parse fails takes none; one that parsed takes one by its kind, before its analysis
- * or planning can fail.
+ * A statement takes its transaction's snapshot exactly when PostgreSQL's would, except where
+ * PostgreSQL rejects the text before taking one (divergence `syntax-error-snapshot`).
  *
- * Astra's re-check of #59: the first `Lowerer.takesSnapshot` decided a failed statement from its
- * SQLSTATE (42601 taken for a raw parse failure) and its text (a leading-keyword pattern). Both
- * are wrong: `SELECT *` without FROM is 42601 from PostgreSQL's parse analysis, after the
- * snapshot; `/* c *\/ SELECT no_such_function(1)` starts with a comment.
+ * The law next/ follows (lead ruling 2026-11-23, after Neon's review of #59):
+ * - A statement that lowers: its planned kind decides (owner/compose.ts `#guard`).
+ * - A statement that fails to lower: next/'s parser reads a subset of PostgreSQL's grammar, so its
+ *   failure says nothing about PostgreSQL's raw parse. It counts as raw-parsed, and takes the
+ *   snapshot unless its first word starts a statement that takes none (lower/snapshot-rule.ts):
+ *   whitespace, leading semicolons and both comment forms (a `--` comment ends at `\n` or `\r`)
+ *   skipped first.
+ * - So a raw syntax error, or several statements in one request, takes the snapshot in next/ and
+ *   none in PostgreSQL, unless its first word takes none.
  *
- * #59's later re-check: next/'s parser reads a subset of PostgreSQL's grammar, so its failing to
- * read on is no grammar failure of PostgreSQL's (`EXISTS (VALUES (1))` is valid there). Since,
- * a failure counts as parsed unless `rawParseRejects` (lower/raw-parse.ts) finds text gram.y
- * reads nowhere (checked at scale by grammar-verdict-pglite.test.ts). A
- * syntax error next/ meets only after refusing something earlier is the divergence
- * `late-syntax-error-snapshot` (testing/divergences.ts): the "late" kind below, where PostgreSQL
- * takes no snapshot and next/ takes one.
- *
- * Law: PostgreSQL's exec_simple_query raw-parses, then takes the transaction snapshot for each
- * statement analyze_requires_snapshot accepts, before parse analysis; a utility statement takes
- * it when it runs. Observed in PGlite and in next/ the same way: after `BEGIN ISOLATION LEVEL
- * REPEATABLE READ READ ONLY; SAVEPOINT s; <statement>; ROLLBACK TO s; RELEASE s`, changing the
- * isolation level is refused with 25001 exactly when the statement took the snapshot.
+ * Law: PostgreSQL 18 takes the transaction snapshot once a statement's raw parse succeeds:
+ * `analyze_requires_snapshot` for queries and data statements, before analysis; utility
+ * statements when they run, unless `PlannedStmtRequiresSnapshot` (utility.c) refuses them
+ * (transaction control, LOCK, SET, RESET, SHOW, SET CONSTRAINTS, FETCH, MOVE, LISTEN, NOTIFY,
+ * UNLISTEN, CHECKPOINT). Observed in PGlite and in next/ the same way: after `BEGIN ISOLATION
+ * LEVEL REPEATABLE READ READ ONLY; SAVEPOINT s; <statement>; ROLLBACK TO s; RELEASE s`, changing
+ * the isolation level is refused with 25001 exactly when the statement took the snapshot.
+ * `pg.query` is PostgreSQL's extended protocol, as next/'s requests are: one statement each.
  */
 import { PGlite } from "@electric-sql/pglite";
 import fc from "fast-check";
@@ -39,10 +38,13 @@ const SETUP = [
   "INSERT INTO t VALUES (1, 1)",
 ];
 
-/** Statements by how they fail; each kind's snapshot effect is PostgreSQL's (probed). */
+/**
+ * Statements by kind; each kind's snapshot is PostgreSQL's (probed), and next/'s follows it
+ * except for `syntax` and `several`, the divergence.
+ */
 const STATEMENTS = {
-  // The raw parse fails, and next/ claims it (a mark, or a rule of rawParseRejects).
-  parse: [
+  // PostgreSQL's raw parse fails; the first word takes a snapshot: next/ takes one.
+  syntax: [
     "SELEC 1",
     "SELECT FROM WHERE",
     "SELECT (1",
@@ -50,18 +52,23 @@ const STATEMENTS = {
     "SELECT 'abc",
     "INSERT INTO t VALUES (1, 2",
     "SELECT 1 LIMIT",
-  ],
-  // The raw parse fails where next/'s parser had already stopped on a form it does not read: the
-  // divergence late-syntax-error-snapshot. PostgreSQL takes no snapshot; next/ takes one.
-  late: [
     "DELETE t",
     "SELECT 1 1",
-    "SELECT v w x FROM t",
-    "UPDATE SET v = 1",
     "UPDATE t SET v + 1",
     "SELECT * FROM t JOIN u",
+    "SELECT 1 WINDOW w",
+    "SELECT CASE END",
+    "CREATE VIEW v AS",
+    "CREATE VIEW v",
+    "SELECT count(DISTINCT) FROM t",
   ],
-  // Parsed, then refused by PostgreSQL's parse analysis.
+  // Several statements: PostgreSQL's extended protocol refuses them before any snapshot (42601,
+  // "cannot insert multiple commands into a prepared statement"); next/ refuses them too, and
+  // the first word decides.
+  several: ["SELECT 1; SELECT 2", "SELECT 1; SELEC 2", "VALUES (1); SET search_path = public"],
+  // PostgreSQL's raw parse fails, and the first word takes none: neither takes one.
+  "control syntax": ["SHOW", "SET", "LOCK", "SAVEPOINT", "SET search_path = public; SELECT 1"],
+  // Parsed, then refused by PostgreSQL's parse analysis (or run): both take one.
   analysis: [
     "SELECT *",
     "SELECT missing_column FROM t",
@@ -70,79 +77,81 @@ const STATEMENTS = {
     "SELECT CASE WHEN v = 1 THEN 1 ELSE true END FROM t",
     "SELECT v FROM t GROUP BY id",
     "INSERT INTO missing_table VALUES (1)",
+    "CREATE VIEW v (a) AS SELECT 1",
+    "SELECT round(1, 2, 3)",
+    "CALL no_such()",
+    "DROP TABLE missing_table",
   ],
-  // Parsed and run by PostgreSQL; refused by next/ after it read them (0A000).
-  planning: [
+  // Parsed and run by PostgreSQL; refused by next/ after it read them, or before (it does not
+  // read them): both take one. Neon's review of #59 lists the second group: valid PostgreSQL
+  // that #59's token rules claimed PostgreSQL rejects.
+  valid: [
     "SELECT id FROM t WHERE id IN (SELECT t.id FROM u)",
-    "SELECT id FROM t GROUP BY id HAVING max(v) > (SELECT max(v) FROM u WHERE u.id = t.id)",
+    "SELECT EXISTS (VALUES (1))",
+    "SELECT CAST(1 AS text(1.5))",
+    "SELECT (ARRAY[1, 2, 3])[1:2]",
+    "SELECT substr(string := 'abc', start := 2)",
+    "SELECT 1 AS café",
+    "SELECT 1 AS a$b",
+    "SELECT 0x7fffffffffffffff",
+    "SELECT 1_000.",
+    "SELECT (1 -- a comment\r)",
+    "CREATE TABLE trigger (id integer)",
+    "SELECT v FROM t ORDER BY v USING ~<~",
+    "SELECT 1 case",
+    "SELECT (SELECT 1 distinct)",
+    "CREATE TABLE z (a integer UNIQUE NULLS NOT DISTINCT)",
+    "WITH int (a) AS (SELECT 1) TABLE int",
+    "WITH c AS (SELECT 1 FROM t AS rows WHERE true) TABLE c",
+    "CREATE TABLE coalesce ()",
+    "VALUES (***1)",
+    "EXPLAIN SELECT 1",
+    "DECLARE c CURSOR FOR SELECT 1",
+    "DISCARD ALL",
+    "DEALLOCATE ALL",
+    "CLOSE ALL",
+    "VACUUM",
+    "PREPARE p AS SELECT 1",
   ],
+  // The statements PostgreSQL takes no snapshot for, run or failing: neither takes one.
+  "no snapshot": [
+    "SHOW search_path",
+    "SET search_path = public",
+    "RESET search_path",
+    "SET CONSTRAINTS ALL DEFERRED",
+    "LOCK TABLE t IN ACCESS SHARE MODE",
+    "LOCK TABLE missing_table",
+    "LISTEN channel",
+    "UNLISTEN channel",
+    "UNLISTEN *",
+    "NOTIFY channel",
+    "NOTIFY channel, 'payload'",
+    "FETCH 1 FROM missing_cursor",
+    "MOVE 1 FROM missing_cursor",
+    "CHECKPOINT",
+    "COMMIT PREPARED 'x'",
+    "ROLLBACK PREPARED 'x'",
+  ],
+  // No statement at all: an empty query takes none.
+  empty: ["", ";", ";;", "-- only a comment"],
 } as const;
 type Kind = keyof typeof STATEMENTS;
 
-/**
- * Grammar-failure classes, each with statements PostgreSQL's raw parser rejects and, where one
- * exists, a neighbour it reads; a rejection next/ meets late is "late". Not here:
- * text next/'s grammar reads but PostgreSQL's rejects (`SELECT 1e` is `1 AS e` to next/; a CAST
- * to `varchar(1, 2)`; a `?` placeholder): next/ reads them, so they take the snapshot.
- */
-const AUDITED: ReadonlyArray<readonly [string, Kind, string]> = [
-  ["lexical", "parse", "SELECT 'abc"],
-  ["lexical", "parse", "SELECT 1 /* open"],
-  ["lexical", "parse", 'SELECT "abc'],
-  ["lexical", "parse", "SELECT 0x"],
-  ["lexical", "parse", 'SELECT ""'],
-  ["token", "late", "SELECT 1 FROM t WHERE v IN"],
-  ["token", "late", "SELECT v FROM t ORDER"],
-  ["fixed arity", "parse", "SELECT COALESCE()"],
-  ["fixed arity", "parse", "SELECT NULLIF(1)"],
-  ["fixed arity", "parse", "SELECT GREATEST()"],
-  ["fixed arity", "analysis", "SELECT round(1, 2, 3)"],
-  ["empty list", "parse", "SELECT CASE END"],
-  ["empty list", "parse", "SELECT 1 FROM t GROUP BY ROLLUP()"],
-  ["empty list", "parse", "WITH x() AS (SELECT 1) SELECT 1"],
-  ["empty list", "parse", "INSERT INTO t VALUES (1, 1) ON CONFLICT () DO NOTHING"],
-  ["empty list", "parse", "MERGE INTO t USING u ON t.id = u.id"],
-  ["missing body", "parse", "CREATE VIEW v AS"],
-  ["missing body", "parse", "SELECT 1 WINDOW w"],
-  ["missing body", "late", "CREATE TABLE z (a integer DEFAULT)"],
-  ["type modifier", "parse", "CREATE TABLE z (a varchar(1, 2))"],
-  ["type modifier", "parse", "SELECT CAST(1 AS varchar(1.5))"],
-  ["bare wildcard", "parse", "VALUES (*)"],
-  ["bare wildcard", "parse", "SELECT 1 IN (*)"],
-  ["bare wildcard", "parse", "SELECT count(DISTINCT *) FROM t"],
-  ["bare wildcard", "analysis", "SELECT count(DISTINCT v, id) FROM t"],
-  ["frame bounds", "parse", "SELECT sum(v) OVER (ROWS BETWEEN 1 FOLLOWING AND 1 PRECEDING) FROM t"],
-  ["frame bounds", "analysis", "SELECT sum(v) OVER (GROUPS 1 PRECEDING) FROM t"],
-  ["statement shape", "parse", "SHOW"],
-  ["statement shape", "parse", "CREATE TYPE"],
-  ["statement shape", "parse", "CREATE TYPE e AS ENUM (1)"],
-  ["statement shape", "parse", "CREATE SEQUENCE"],
-  ["placeholders", "parse", "SELECT 1, $1, ?"],
-  ["operator character", "analysis", "SELECT 1 ` 2"],
-  // Astra's re-check of #59 at 2badb7ee0: unsupported by next/ is not rejected by PostgreSQL.
-  ["re-check", "parse", "CREATE VIEW v"],
-  ["re-check", "analysis", "CREATE VIEW v (a) AS SELECT 1"],
-  ["re-check", "parse", "SELECT count(DISTINCT) FROM t"],
-  ["re-check", "planning", "SELECT EXISTS (VALUES (1))"],
-  ["re-check", "planning", "SELECT EXISTS (WITH w AS (SELECT 1) SELECT * FROM w)"],
-  ["re-check", "analysis", "CREATE TRIGGER tr AFTER INSERT ON t EXECUTE FUNCTION f()"],
-  [
-    "re-check",
-    "analysis",
-    "CREATE TRIGGER tr INSTEAD OF INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()",
-  ],
-  ["re-check", "analysis", "CREATE TRIGGER tr AFTER TRUNCATE ON t EXECUTE FUNCTION f()"],
-  ["re-check", "parse", "CREATE TRIGGER tr INSTEAD OF INSERT ON t BEGIN DELETE FROM u; END"],
-  ["re-check", "analysis", "SELECT CAST(1 AS text(1.5))"],
-  ["re-check", "analysis", "CREATE TABLE z (a text(1, 2))"],
-];
+/** Kinds where PostgreSQL takes the snapshot. */
+const POSTGRES_TAKES: ReadonlySet<Kind> = new Set<Kind>(["analysis", "valid"]);
+/** Kinds where next/ takes it although PostgreSQL does not (divergence syntax-error-snapshot). */
+const DIVERGES: ReadonlySet<Kind> = new Set<Kind>(["syntax", "several"]);
 
+/** Text before the statement that PostgreSQL's scanner skips. */
 const PREFIXES = [
   "",
   "-- a comment\n",
+  "-- a comment\r",
   "/* a comment */ ",
   "/* outer /* nested */ still a comment */ ",
   "\n\t/* x */ -- y\n  ",
+  "; ",
+  ";; /* x */ ; ",
 ] as const;
 
 /** One session: runs a statement, resolving with the SQLSTATE it failed with or "00000". */
@@ -230,59 +239,42 @@ async function compare(
   const authority = await tookSnapshot(postgres, statement);
   const ours = await tookSnapshot(next, statement);
   const context = `${kind}: ${JSON.stringify(statement)} (PostgreSQL ${authority.state}, next/ ${ours.state})`;
-  // The kind is PostgreSQL's: a raw parse failure takes none; a parsed statement takes one.
-  expect(authority.took, `${context}: PostgreSQL's snapshot`).toBe(
-    kind !== "parse" && kind !== "late",
-  );
-  // A late syntax error takes the snapshot in next/ (divergence late-syntax-error-snapshot).
-  expect(ours.took, `${context}: the snapshot it took`).toBe(kind === "late" || authority.took);
-  reach?.reach(`${kind} error`);
+  // The kind is PostgreSQL's, probed: a kind that is wrong here is a wrong test, not a pass.
+  expect(authority.took, `${context}: PostgreSQL's snapshot`).toBe(POSTGRES_TAKES.has(kind));
+  expect(ours.took, `${context}: the snapshot it took`).toBe(DIVERGES.has(kind) || authority.took);
+  reach?.reach(kind);
 }
 
-it("takes no snapshot for the grammar failures Astra's audit request named", async () => {
-  // Re-check of #59 at e827b24c5: unmarked grammar checks took a snapshot.
-  for (const prefix of PREFIXES) {
-    await compare("parse", `${prefix}SELECT 1 WINDOW w`);
-    await compare("parse", `${prefix}SELECT CASE END`);
-    await compare("parse", `${prefix}CREATE VIEW v AS`);
-  }
-});
+for (const kind of Object.keys(STATEMENTS) as Kind[])
+  it(`takes the snapshot as PostgreSQL does: ${kind}`, async () => {
+    for (const statement of STATEMENTS[kind]) await compare(kind, statement);
+  });
 
-it("takes the snapshot for Astra's two statements, with and without comments", async () => {
-  // Review of #59: `SELECT *` is 42601 from analysis; a leading comment must not hide the kind.
-  for (const prefix of PREFIXES) {
-    await compare("analysis", `${prefix}SELECT *`);
-    await compare("analysis", `${prefix}SELECT no_such_function(1)`);
-    await compare("parse", `${prefix}SELEC 1`);
-  }
+it("takes no snapshot for PREPARE TRANSACTION (PostgreSQL's ends the transaction)", async () => {
+  // PostgreSQL ends the transaction (55000, then 25P01), so its probe cannot see this one:
+  // `PlannedStmtRequiresSnapshot` refuses TransactionStmt (utility.c) is the authority.
+  expect((await tookSnapshot(next, "PREPARE TRANSACTION 'x'")).took).toBe(false);
+  expect((await tookSnapshot(next, "PREPARE p AS SELECT 1")).took).toBe(true);
 });
 
 for (const seed of seedsFor("next-snapshot-statement-kind", [0x6601, 0x6602]))
-  it(`a failed statement takes the snapshot as PostgreSQL's does (seed ${String(seed)})`, async () => {
+  it(`a statement takes the snapshot as PostgreSQL's does, behind any prefix (seed ${String(seed)})`, async () => {
     const reach = createReach("snapshot statement kind", SNAPSHOT_STATEMENT_KIND_REACH);
     await fc.assert(
       fc.asyncProperty(
-        fc.oneof(
-          fc
-            .constantFrom<Kind>("parse", "late", "analysis", "planning")
-            .chain((kind) =>
-              fc.tuple(
-                fc.constant("listed"),
-                fc.constant(kind),
-                fc.constantFrom(...STATEMENTS[kind]),
-              ),
-            ),
-          fc.constantFrom(...AUDITED),
-        ),
+        fc
+          .constantFrom(...(Object.keys(STATEMENTS) as Kind[]))
+          .chain((kind) => fc.tuple(fc.constant(kind), fc.constantFrom(...STATEMENTS[kind]))),
         fc.constantFrom(...PREFIXES),
-        async ([group, kind, statement], prefix) => {
+        async ([kind, statement], prefix) => {
           reach.beginHistory();
-          if (prefix !== "") reach.reach("behind a comment");
-          if (group !== "listed") reach.reach("an audited class");
+          if (prefix.includes("\r")) reach.reach("behind a carriage-return comment");
+          else if (prefix.includes(";")) reach.reach("behind semicolons");
+          else if (prefix !== "") reach.reach("behind a comment");
           await compare(kind, `${prefix}${statement}`, reach);
         },
       ),
-      { seed, numRuns: 80 },
+      { seed, numRuns: 120 },
     );
     reach.assertReached();
   }, 300_000);

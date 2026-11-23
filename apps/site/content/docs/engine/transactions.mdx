@@ -183,14 +183,18 @@ does not nest; use a savepoint instead. A transaction may hold at most 64 savepo
 retained rollback state may total at most 8 MiB. Release markers that are no longer needed.
 
 In the 1.0 rebuild, a read-only transaction takes its snapshot at its first statement, as
-PostgreSQL does. In PostgreSQL, a statement its grammar cannot read takes no snapshot. One
-difference remains, and it affects only statements that fail in PostgreSQL. A statement that fails because of
-a syntax error that Minnow detects later than PostgreSQL's grammar may fix a read-only
-transaction's snapshot where PostgreSQL would not. Minnow checks this against PostgreSQL with
-about 3,800 test statements, most of them deliberately broken. Of the ones PostgreSQL rejects as
-syntax errors, about three in five are detected late by Minnow; a few of those are syntax Minnow
-accepts on purpose, such as `?` placeholders. A statement PostgreSQL can read always takes the
-snapshot in Minnow too.
+PostgreSQL does. The first statement that reads or changes data, or changes the schema, takes it,
+even when it then fails (for example on an unknown column) or is refused as a write. `BEGIN`,
+`COMMIT`, `ROLLBACK`, `SAVEPOINT`, `RELEASE`, `SET`, `RESET`, `SHOW`, `LOCK`, `LISTEN`, `NOTIFY`,
+`UNLISTEN`, `FETCH`, `MOVE` and `CHECKPOINT` never take it. Explaining a statement does not run
+it, so it takes no snapshot. Preparing one takes the snapshot only where PostgreSQL's does: for a
+query or a data change.
+
+One difference remains, and it affects only statements that fail. PostgreSQL takes no snapshot
+for text it rejects as a syntax error, or for several statements sent as one. Minnow cannot always
+tell a syntax error apart from SQL it does not support, so it treats such text like any other
+failed statement: it takes the snapshot unless the text starts with one of the words above. For
+example, `SELEC 1` fixes a read-only transaction's snapshot in Minnow, but not in PostgreSQL.
 
 ### A failed scope stays failed
 

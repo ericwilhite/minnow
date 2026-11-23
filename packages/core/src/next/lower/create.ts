@@ -10,7 +10,6 @@ import type {
 } from "../access/catalog.js";
 import type { CreateTableInput } from "../../engine/catalog-mutations.js";
 import type { CompiledStatement, TransactionMode } from "../../engine/query.js";
-import { leadingKeyword, rawParseRejects } from "./raw-parse.js";
 import type { OutputColumn, PhysicalPlan, Rel } from "../ir/ir.js";
 import type { TableRuleExpressions } from "../ir/rules.js";
 import { samePhysicalType } from "../types.js";
@@ -616,25 +615,6 @@ function lowerStatement(text: string, context: LoweringContext): LoweredStatemen
   }
 }
 
-/**
- * The first words of the statements that take no snapshot (`classifyStatement`'s transaction
- * control and utility kinds, as the front end routes them): every other statement the front end
- * read takes one.
- */
-const NO_SNAPSHOT_KEYWORDS = new Set([
-  "BEGIN",
-  "START",
-  "COMMIT",
-  "END",
-  "ROLLBACK",
-  "ABORT",
-  "SAVEPOINT",
-  "RELEASE",
-  "SET",
-  "RESET",
-  "SHOW",
-]);
-
 export function createLowerer(): Lowerer {
   return {
     lower(text: string, context: LoweringContext): LoweredStatement {
@@ -644,26 +624,6 @@ export function createLowerer(): Lowerer {
       } catch (error) {
         throw frontEndError(error);
       }
-    },
-
-    takesSnapshot(text: string): boolean {
-      // PostgreSQL decides on the raw parse tree (exec_simple_query, analyze_requires_snapshot):
-      // a statement whose raw parse fails takes none; one that parsed takes one by its kind,
-      // before its analysis can fail. The front end reads a subset of PostgreSQL's grammar, so
-      // its failure counts as parsed (its kind, from its first word, decides) unless
-      // `rawParseRejects` (raw-parse.ts) finds text gram.y reads nowhere.
-      const ctasData = ctasDataClause(text);
-      let parsed: ReturnType<typeof parseAny>;
-      try {
-        parsed = parseAny(ctasData === null ? text : text.slice(0, ctasData.index));
-      } catch {
-        if (rawParseRejects(text)) return false;
-        const keyword = leadingKeyword(text);
-        return keyword !== null && !NO_SNAPSHOT_KEYWORDS.has(keyword);
-      }
-      if ("query" in parsed) return true;
-      const kind = classifyStatement(parsed.statement).kind;
-      return kind === "query" || kind === "modify" || kind === "ddl";
     },
 
     lowerWrite(shape: WriteShape, context: LoweringContext): LoweredModify {

@@ -1566,9 +1566,6 @@ export function withTestStatements(lowerer: StatementPlanner): StatementPlanner 
     parameterize: (text) => lowerer.parameterize(text),
     lowerParameterized: (parameterized, context) =>
       lowerer.lowerParameterized(parameterized, context),
-    ...(lowerer.takesSnapshot === undefined
-      ? {}
-      : { takesSnapshot: (text: string) => lowerer.takesSnapshot?.(text) ?? false }),
     lower(text: string, context: PlannerContext): LoweredStatement {
       if (!SPIN.test(text)) return lowerer.lower(text, context);
       const INT: PhysicalType = { kind: "int32", bits: 32 };

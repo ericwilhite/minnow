@@ -3362,25 +3362,31 @@ not require a home cache directory.
   evictable caches (`registerCache`): charged at a size walked from the expressions, and evicted,
   oldest unused across caches, before growth is refused or an operator spills.
 - SQL `BEGIN` / `START TRANSACTION` and `SET TRANSACTION` apply lowering's typed modes.
-  READ ONLY starts with no writer slot and no snapshot: its first query or data statement pins
-  one, as PostgreSQL takes the transaction snapshot "as of the start of the first
-  non-transaction-control statement" (Transaction Isolation, 13.2). It is taken before
-  analysis (`plan`, `Lowerer.takesSnapshot`, as PostgreSQL's `analyze_requires_snapshot`), so a
-  statement that then fails analysis has taken it, and with it the isolation level (25001
-  after); a statement that does not parse has not. The front end reads a subset of PostgreSQL's
-  grammar, so its failing to read on proves nothing: a failed statement counts as parsed, and its
-  kind, from its first word (comments skipped), decides, unless `rawParseRejects`
-  (lower/raw-parse.ts) finds text gram.y or scan.l reads nowhere, by token rules: a lexical
-  failure, a first word that starts no statement, unbalanced brackets, a comma beside another, a
-  bracket or an end, a query ending in an operator or a reserved word that is no label, CASE
-  without WHEN or END, WINDOW w without AS (, CREATE VIEW v without AS, CREATE TRIGGER without
-  EXECUTE, EXISTS before no query, DISTINCT), an empty or non-integer modifier of a restricted
-  type, and the like. engine/query.ts carries none of it (the shipped engine's bundles stay as
-  they were). testing/grammar-verdict-pglite.test.ts is the gate: over a seeded corpus (the
-  SQLLogicTest profile, the feature matrix, the docs and console SQL, the simulator's statements,
-  and mutations of them), no rule rejects text PostgreSQL parses, and the share of PostgreSQL's
-  syntax errors next/ reads stays under a ceiling that only goes down (divergence
-  `late-syntax-error-snapshot`). A write it refuses takes it too (`#guard`).
+  READ ONLY starts with no writer slot and no snapshot: its first statement that needs one pins
+  it, as PostgreSQL takes the transaction snapshot "as of the start of the first
+  non-transaction-control statement" (Transaction Isolation, 13.2). Planning never takes it
+  (`ComposedSession.plan` is pure: an explain, the read bypass's classification, a request the
+  ledger refuses plan without effect); a statement takes it when it runs. One that lowers decides
+  by its planned kind (`#guard`): a query or data statement, as PostgreSQL's
+  `analyze_requires_snapshot`, and a schema change, which PostgreSQL's utility statements take
+  when they run (`PlannedStmtRequiresSnapshot`, utility.c); transaction control, SET, RESET and
+  SHOW take none. One that fails to lower, once admitted (`EngineSession.statementFailed`), counts
+  as raw-parsed: the front end reads a subset of PostgreSQL's grammar, so its failure says
+  nothing about PostgreSQL's raw parse. Its first words decide (lower/snapshot-rule.ts, after
+  whitespace, leading semicolons, nested block comments and `--` comments ending at `\n` or
+  `\r`): every statement takes it but those `PlannedStmtRequiresSnapshot` refuses (BEGIN, START,
+  COMMIT, END, ROLLBACK, ABORT, SAVEPOINT, RELEASE, PREPARE TRANSACTION, LOCK, SET, RESET, SHOW,
+  FETCH, MOVE, LISTEN, NOTIFY, UNLISTEN, CHECKPOINT). So a statement that fails analysis has
+  taken it, and with it the isolation level (25001 after). A raw syntax error, or several
+  statements in one request, takes it too unless its first word takes none, where PostgreSQL's
+  takes none (divergence `syntax-error-snapshot`). A prepare request takes it where PostgreSQL's
+  extended-protocol Parse does (`EngineSession.prepared`): for a query, a data statement or
+  CREATE TABLE AS, parsed or failing analysis; a failed prepare leaves the transaction open where
+  PostgreSQL's aborts it (divergence `failed-prepare-keeps-transaction`).
+  testing/snapshot-corpus-pglite.test.ts compares the decision with PostgreSQL's through the 25001
+  probe for every statement of a seeded corpus (the SQLLogicTest profile, the feature matrix, the
+  docs and console SQL, the simulator's statements, PostgreSQL's forms, the review forms, and
+  mutations of them that keep the original spacing). A write it refuses takes it too (`#guard`).
   A row committed between BEGIN and that statement is seen; BEGIN, SAVEPOINT, RELEASE, ROLLBACK
   TO, SET TRANSACTION and SHOW take none. Switching to READ
   ONLY pins at the switch only once a statement ran (the writer turn kept anything from
