@@ -10,8 +10,7 @@ import type {
 } from "../access/catalog.js";
 import type { CreateTableInput } from "../../engine/catalog-mutations.js";
 import type { CompiledStatement, TransactionMode } from "../../engine/query.js";
-import { leadingKeyword } from "../../engine/query.js";
-import { isGrammarFailure } from "../../engine/grammar-failure.js";
+import { leadingKeyword, rawParseRejects } from "./raw-parse.js";
 import type { OutputColumn, PhysicalPlan, Rel } from "../ir/ir.js";
 import type { TableRuleExpressions } from "../ir/rules.js";
 import { samePhysicalType } from "../types.js";
@@ -650,15 +649,15 @@ export function createLowerer(): Lowerer {
     takesSnapshot(text: string): boolean {
       // PostgreSQL decides on the raw parse tree (exec_simple_query, analyze_requires_snapshot):
       // a statement whose raw parse fails takes none; one that parsed takes one by its kind,
-      // before its analysis can fail. The front end reads and checks in one pass, so a grammar
-      // failure (engine/grammar-failure.ts `grammarFailure`) is the raw parse failing, and any other
-      // refusal came after the statement was read: its kind, from its first word, decides.
+      // before its analysis can fail. The front end reads a subset of PostgreSQL's grammar, so
+      // its failure counts as parsed (its kind, from its first word, decides) unless
+      // `rawParseRejects` (raw-parse.ts) finds text gram.y reads nowhere.
       const ctasData = ctasDataClause(text);
       let parsed: ReturnType<typeof parseAny>;
       try {
         parsed = parseAny(ctasData === null ? text : text.slice(0, ctasData.index));
-      } catch (error) {
-        if (isGrammarFailure(error)) return false;
+      } catch {
+        if (rawParseRejects(text)) return false;
         const keyword = leadingKeyword(text);
         return keyword !== null && !NO_SNAPSHOT_KEYWORDS.has(keyword);
       }

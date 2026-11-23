@@ -29,10 +29,7 @@ const SNAPSHOT = join(import.meta.dirname, "front-end-states.json");
 /** Message templates (`${…}` as `X`) of every error the front end's sources construct. */
 function frontEndMessages(): Array<{ file: string; message: string; state: string }> {
   const found: Array<{ file: string; message: string; state: string }> = [];
-  // Grammar failures are built by helpers (engine/query.ts `syntaxError`, `syntaxCompileError`,
-  // `refusal`): the same TypeError / SqlCompileError messages.
-  const constructed =
-    /(?:new (?:TypeError|SqlCompileError)|syntaxError|syntaxCompileError|refusal)\(\s*(["'`])((?:\\.|(?!\1)[\s\S])*?)\1/gu;
+  const constructed = /new (?:TypeError|SqlCompileError)\(\s*(["'`])((?:\\.|(?!\1)[\s\S])*?)\1/gu;
   for (const file of readdirSync(ENGINE).sort()) {
     if (!file.endsWith(".ts") || file.endsWith(".test.ts")) continue;
     const text = readFileSync(join(ENGINE, file), "utf8");

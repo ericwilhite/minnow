@@ -6,10 +6,15 @@
  * Astra's re-check of #59: the first `Lowerer.takesSnapshot` decided a failed statement from its
  * SQLSTATE (42601 taken for a raw parse failure) and its text (a leading-keyword pattern). Both
  * are wrong: `SELECT *` without FROM is 42601 from PostgreSQL's parse analysis, after the
- * snapshot; `/* c *\/ SELECT no_such_function(1)` starts with a comment. It now decides from the
- * front end's own boundary: a grammar failure (engine/grammar-failure.ts `grammarFailure`, marked where
- * the tokenizer or parser cannot read on) is the raw parse failing; any other refusal came after
- * the statement was read, and its kind, from its first word as the tokenizer reads it, decides.
+ * snapshot; `/* c *\/ SELECT no_such_function(1)` starts with a comment.
+ *
+ * #59's later re-check: next/'s parser reads a subset of PostgreSQL's grammar, so its failing to
+ * read on is no grammar failure of PostgreSQL's (`EXISTS (VALUES (1))` is valid there). Since,
+ * a failure counts as parsed unless `rawParseRejects` (lower/raw-parse.ts) finds text gram.y
+ * reads nowhere (checked at scale by grammar-verdict-pglite.test.ts). A
+ * syntax error next/ meets only after refusing something earlier is the divergence
+ * `late-syntax-error-snapshot` (testing/divergences.ts): the "late" kind below, where PostgreSQL
+ * takes no snapshot and next/ takes one.
  *
  * Law: PostgreSQL's exec_simple_query raw-parses, then takes the transaction snapshot for each
  * statement analyze_requires_snapshot accepts, before parse analysis; a utility statement takes
@@ -36,7 +41,7 @@ const SETUP = [
 
 /** Statements by how they fail; each kind's snapshot effect is PostgreSQL's (probed). */
 const STATEMENTS = {
-  // The raw parse fails (and next/'s front end cannot read on before any other refusal).
+  // The raw parse fails, and next/ claims it (a mark, or a rule of rawParseRejects).
   parse: [
     "SELEC 1",
     "SELECT FROM WHERE",
@@ -44,13 +49,17 @@ const STATEMENTS = {
     "SELECT 1 +",
     "SELECT 'abc",
     "INSERT INTO t VALUES (1, 2",
+    "SELECT 1 LIMIT",
+  ],
+  // The raw parse fails where next/'s parser had already stopped on a form it does not read: the
+  // divergence late-syntax-error-snapshot. PostgreSQL takes no snapshot; next/ takes one.
+  late: [
     "DELETE t",
     "SELECT 1 1",
     "SELECT v w x FROM t",
     "UPDATE SET v = 1",
     "UPDATE t SET v + 1",
     "SELECT * FROM t JOIN u",
-    "SELECT 1 LIMIT",
   ],
   // Parsed, then refused by PostgreSQL's parse analysis.
   analysis: [
@@ -71,8 +80,8 @@ const STATEMENTS = {
 type Kind = keyof typeof STATEMENTS;
 
 /**
- * The audited grammar-failure classes (scripts/grammar-failure-audit.test.ts), each with
- * statements PostgreSQL's raw parser rejects and, where one exists, a neighbour it reads. Not here:
+ * Grammar-failure classes, each with statements PostgreSQL's raw parser rejects and, where one
+ * exists, a neighbour it reads; a rejection next/ meets late is "late". Not here:
  * text next/'s grammar reads but PostgreSQL's rejects (`SELECT 1e` is `1 AS e` to next/; a CAST
  * to `varchar(1, 2)`; a `?` placeholder): next/ reads them, so they take the snapshot.
  */
@@ -82,8 +91,8 @@ const AUDITED: ReadonlyArray<readonly [string, Kind, string]> = [
   ["lexical", "parse", 'SELECT "abc'],
   ["lexical", "parse", "SELECT 0x"],
   ["lexical", "parse", 'SELECT ""'],
-  ["token", "parse", "SELECT 1 FROM t WHERE v IN"],
-  ["token", "parse", "SELECT v FROM t ORDER"],
+  ["token", "late", "SELECT 1 FROM t WHERE v IN"],
+  ["token", "late", "SELECT v FROM t ORDER"],
   ["fixed arity", "parse", "SELECT COALESCE()"],
   ["fixed arity", "parse", "SELECT NULLIF(1)"],
   ["fixed arity", "parse", "SELECT GREATEST()"],
@@ -95,7 +104,7 @@ const AUDITED: ReadonlyArray<readonly [string, Kind, string]> = [
   ["empty list", "parse", "MERGE INTO t USING u ON t.id = u.id"],
   ["missing body", "parse", "CREATE VIEW v AS"],
   ["missing body", "parse", "SELECT 1 WINDOW w"],
-  ["missing body", "parse", "CREATE TABLE z (a integer DEFAULT)"],
+  ["missing body", "late", "CREATE TABLE z (a integer DEFAULT)"],
   ["type modifier", "parse", "CREATE TABLE z (a varchar(1, 2))"],
   ["type modifier", "parse", "SELECT CAST(1 AS varchar(1.5))"],
   ["bare wildcard", "parse", "VALUES (*)"],
@@ -110,6 +119,22 @@ const AUDITED: ReadonlyArray<readonly [string, Kind, string]> = [
   ["statement shape", "parse", "CREATE SEQUENCE"],
   ["placeholders", "parse", "SELECT 1, $1, ?"],
   ["operator character", "analysis", "SELECT 1 ` 2"],
+  // Astra's re-check of #59 at 2badb7ee0: unsupported by next/ is not rejected by PostgreSQL.
+  ["re-check", "parse", "CREATE VIEW v"],
+  ["re-check", "analysis", "CREATE VIEW v (a) AS SELECT 1"],
+  ["re-check", "parse", "SELECT count(DISTINCT) FROM t"],
+  ["re-check", "planning", "SELECT EXISTS (VALUES (1))"],
+  ["re-check", "planning", "SELECT EXISTS (WITH w AS (SELECT 1) SELECT * FROM w)"],
+  ["re-check", "analysis", "CREATE TRIGGER tr AFTER INSERT ON t EXECUTE FUNCTION f()"],
+  [
+    "re-check",
+    "analysis",
+    "CREATE TRIGGER tr INSTEAD OF INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()",
+  ],
+  ["re-check", "analysis", "CREATE TRIGGER tr AFTER TRUNCATE ON t EXECUTE FUNCTION f()"],
+  ["re-check", "parse", "CREATE TRIGGER tr INSTEAD OF INSERT ON t BEGIN DELETE FROM u; END"],
+  ["re-check", "analysis", "SELECT CAST(1 AS text(1.5))"],
+  ["re-check", "analysis", "CREATE TABLE z (a text(1, 2))"],
 ];
 
 const PREFIXES = [
@@ -206,8 +231,11 @@ async function compare(
   const ours = await tookSnapshot(next, statement);
   const context = `${kind}: ${JSON.stringify(statement)} (PostgreSQL ${authority.state}, next/ ${ours.state})`;
   // The kind is PostgreSQL's: a raw parse failure takes none; a parsed statement takes one.
-  expect(authority.took, `${context}: PostgreSQL's snapshot`).toBe(kind !== "parse");
-  expect(ours.took, `${context}: the snapshot it took`).toBe(authority.took);
+  expect(authority.took, `${context}: PostgreSQL's snapshot`).toBe(
+    kind !== "parse" && kind !== "late",
+  );
+  // A late syntax error takes the snapshot in next/ (divergence late-syntax-error-snapshot).
+  expect(ours.took, `${context}: the snapshot it took`).toBe(kind === "late" || authority.took);
   reach?.reach(`${kind} error`);
 }
 
@@ -236,7 +264,7 @@ for (const seed of seedsFor("next-snapshot-statement-kind", [0x6601, 0x6602]))
       fc.asyncProperty(
         fc.oneof(
           fc
-            .constantFrom<Kind>("parse", "analysis", "planning")
+            .constantFrom<Kind>("parse", "late", "analysis", "planning")
             .chain((kind) =>
               fc.tuple(
                 fc.constant("listed"),

@@ -2119,10 +2119,29 @@ export const REPIN_BEFORE_OBSERVING_REACH = [
 /** A failed statement's snapshot effect by its kind (snapshot-statement-kind-pglite). */
 export const SNAPSHOT_STATEMENT_KIND_REACH = [
   "parse error",
+  "late error",
   "analysis error",
   "planning error",
   "behind a comment",
   "an audited class",
+] as const;
+
+/** The grammar-verdict corpus (next/testing/grammar-verdict-pglite.test.ts): each source of
+ * statements and mutation, both of PostgreSQL's verdicts, a claimed rejection, and B. */
+export const GRAMMAR_VERDICT_REACH = [
+  "original",
+  "deleted tokens",
+  "truncated",
+  "duplicated token",
+  "swapped keyword",
+  "emptied list",
+  "type modifier",
+  "subquery form",
+  "simulator statement",
+  "PostgreSQL parses",
+  "PostgreSQL rejects",
+  "claimed rejection",
+  "read past a syntax error",
 ] as const;
 
 /** A read-only transaction's snapshot is taken by its first statement (read-only-snapshot-timing). */

@@ -3367,13 +3367,20 @@ not require a home cache directory.
   non-transaction-control statement" (Transaction Isolation, 13.2). It is taken before
   analysis (`plan`, `Lowerer.takesSnapshot`, as PostgreSQL's `analyze_requires_snapshot`), so a
   statement that then fails analysis has taken it, and with it the isolation level (25001
-  after); a statement that does not parse has not. The front end reads and checks in one pass:
-  a grammar failure (engine/grammar-failure.ts `grammarFailure`, marked where the tokenizer or parser
-  cannot read on) is the raw parse failing; any other refusal came after the statement was
-  read, and its kind, from its first word (comments skipped), decides. Every throw of the
-  front end's parse phase is classified, grammar or read: scripts/grammar-failure-audit.test.ts
-  computes the phase from the parser's call graph and fails on a throw that is neither marked
-  nor listed with its class (analysis, unsupported, evaluation, limit and the like). A write it refuses takes it too (`#guard`).
+  after); a statement that does not parse has not. The front end reads a subset of PostgreSQL's
+  grammar, so its failing to read on proves nothing: a failed statement counts as parsed, and its
+  kind, from its first word (comments skipped), decides, unless `rawParseRejects`
+  (lower/raw-parse.ts) finds text gram.y or scan.l reads nowhere, by token rules: a lexical
+  failure, a first word that starts no statement, unbalanced brackets, a comma beside another, a
+  bracket or an end, a query ending in an operator or a reserved word that is no label, CASE
+  without WHEN or END, WINDOW w without AS (, CREATE VIEW v without AS, CREATE TRIGGER without
+  EXECUTE, EXISTS before no query, DISTINCT), an empty or non-integer modifier of a restricted
+  type, and the like. engine/query.ts carries none of it (the shipped engine's bundles stay as
+  they were). testing/grammar-verdict-pglite.test.ts is the gate: over a seeded corpus (the
+  SQLLogicTest profile, the feature matrix, the docs and console SQL, the simulator's statements,
+  and mutations of them), no rule rejects text PostgreSQL parses, and the share of PostgreSQL's
+  syntax errors next/ reads stays under a ceiling that only goes down (divergence
+  `late-syntax-error-snapshot`). A write it refuses takes it too (`#guard`).
   A row committed between BEGIN and that statement is seen; BEGIN, SAVEPOINT, RELEASE, ROLLBACK
   TO, SET TRANSACTION and SHOW take none. Switching to READ
   ONLY pins at the switch only once a statement ran (the writer turn kept anything from

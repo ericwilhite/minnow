@@ -65,10 +65,8 @@ const SQL_ENGINE_MODULES =
 // Copy-meter hooks for metered native trigger preparation (inert in this engine), including
 // grouping-set metering and linear-time integer and datetime typing: 1,182,025 raw / 354,678 gzip. Raise raw
 // once by 1.75 KiB and gzip by 768.
-// Grammar-failure marks for 1.0 snapshot timing (audit of 162 parser functions): 1,181,702 raw /
-// 354,847 gzip (+147 gzip over 354,700). Raise gzip once by 512; raw cap unchanged.
 const COMPLETE_ENTRY_RAW_BUDGET = 1154.5 * 1024;
-const COMPLETE_ENTRY_GZIP_BUDGET = 347 * 1024;
+const COMPLETE_ENTRY_GZIP_BUDGET = 346.5 * 1024;
 // The engine with the larger durable adapter, OPFS.
 // JSON_TABLE metadata: 1,585,069 raw / 458,168 gzip bytes; counterfactual
 // 1,584,618 / 458,049 (+451 / +119). Raw cap +512 once, gzip cap unchanged.
@@ -123,9 +121,7 @@ const INDEXEDDB_WORKER_RAW_BUDGET = 1553.75 * 1024;
 // official Node 24.22.2 compressor, matching CI 44044406507 (13 bytes over the old cap).
 // Raise once by the existing 128-byte budget step; raw, sibling and isolation caps stay.
 // Copy-meter hooks and linear typing: 459,029 gzip bytes (the test's own build). Raise gzip once by 896 bytes.
-// Grammar-failure marks for 1.0 snapshot timing (the same shared-compiler audit): 1,590,150 raw /
-// 459,273 gzip (9 over the old cap). Raise gzip once by 128; raw cap unchanged.
-const INDEXEDDB_WORKER_GZIP_BUDGET = 448.5 * 1024 + 128;
+const INDEXEDDB_WORKER_GZIP_BUDGET = 448.5 * 1024;
 // What a page that hosts the engine in a worker ships on the main thread: the client, the schema
 // DSL and error classes, the Kysely dialect and live queries, and the React hooks, with `kysely`
 // and `react` left to the application. 105.9 KiB raw / 31.6 KiB gzip.

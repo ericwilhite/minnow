@@ -311,9 +311,7 @@ describe("published core tarball", () => {
       // Interaction simulator's listed-gap hook and SQLSTATE judging for the next/ driver
       // (testing/interaction-simulator.ts): 1,030,160 packed bytes (+517 over main
       // 1,029,643). Raise packed once by 1,000; unpacked/isolation limits stay unchanged.
-      // Grammar-failure marks for 1.0 snapshot timing: 1,031,271 packed bytes (+304 over
-      // 1,030,967). Raise once by 500; unpacked/isolation limits unchanged.
-      expect(report?.size, "packed bytes").toBeLessThanOrEqual(1_031_500);
+      expect(report?.size, "packed bytes").toBeLessThanOrEqual(1_031_000);
       expect(report?.unpackedSize, "unpacked bytes").toBeLessThanOrEqual(4_500_000);
       const emitted = await readFile(join(isolatedCore, "dist", "engine", "optimizer.js"), "utf8");
       expect(emitted).not.toContain("/**");

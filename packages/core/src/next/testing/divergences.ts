@@ -596,3 +596,28 @@ export const FTS_RENDERING_AUTHORITY = {
   authority:
     "PostgreSQL type output (::text), verified by fts-render-pglite.test.ts; canonical TIME fractions and array quoting, JSON source text and JSONB stored text",
 } as const;
+
+/**
+ * Lead ruling 2026-11-23 (#59, option 1): a failed statement's snapshot follows PostgreSQL's raw
+ * parse, as far as next/ can tell it. Its parser reads a subset of PostgreSQL's grammar, so a
+ * failure counts as parsed unless lower/raw-parse.ts `rawParseRejects` finds text gram.y reads
+ * nowhere. Only statements that fail in PostgreSQL are affected: a syntax error next/ meets only
+ * after refusing something earlier (or never meets, in syntax it accepts as an extension: `?`
+ * placeholders, MATCH ... AGAINST) fixes a read-only transaction's snapshot where PostgreSQL's
+ * would not. grammar-verdict-pglite.test.ts measures, of the statements PostgreSQL's raw parser
+ * rejects in its seeded corpus, the share next/ reads, and holds it to `ceiling`, which may only go
+ * down; no statement PostgreSQL parses may skip the snapshot.
+ */
+export const LATE_SYNTAX_ERROR_SNAPSHOT = {
+  id: "late-syntax-error-snapshot",
+  ruling:
+    "lead 2026-11-23, #59 re-check: a failure counts as parsed unless gram.y reads it nowhere",
+  authority:
+    "PostgreSQL's exec_simple_query takes the transaction snapshot for a statement only after its raw parse succeeds (snapshot-statement-kind-pglite.test.ts probes it in PGlite with 25001)",
+  /**
+   * Of the statements PostgreSQL's raw parser rejects, the share next/ reads: measured 0.6083 and
+   * 0.5910 on the default seeds (1,241 of 2,040 and 1,192 of 2,017; 78 and 79 of those next/ runs
+   * as extensions), 2026-11-23.
+   */
+  ceiling: 0.609,
+} as const;
