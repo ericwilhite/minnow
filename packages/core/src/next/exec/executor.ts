@@ -248,17 +248,6 @@ export type ExecuteRequest =
        * writer turn, so they stay however long the query waits (`Statement.writerHoldings`).
        */
       readonly writerHoldings?: () => LentHoldings | null;
-      /**
-       * Offered when the owner may move the query to a newer snapshot: an autocommit query, the
-       * statement that took a read-only transaction's snapshot, or a query in a writable
-       * transaction (its statement view at the same bound), never one that calls a sequence
-       * function or locks rows. Returns a fresh snapshot at `catalogVersion`, releasing the old
-       * one, or null (the catalog moved). The execution asks only while it prepares, before any
-       * row, when a memory admission was refused while its own snapshot alone kept memory
-       * (`Snapshot.exclusiveBytes`): PostgreSQL takes a statement's snapshot when it begins to
-       * run, and one that has observed nothing has not begun in any visible sense.
-       */
-      readonly repin?: (catalogVersion: number) => Snapshot | null;
     })
   /** A DML plan inside an open statement: it reads `statement.view` and ends the statement. */
   | (ExecuteBase & { readonly snapshot: null; readonly statement: Statement });

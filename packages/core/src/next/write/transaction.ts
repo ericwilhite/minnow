@@ -946,17 +946,6 @@ export class StatementImpl implements Statement {
     return this.#view;
   }
 
-  renewView(): SnapshotImpl {
-    this.#checkOpen();
-    if (!this.readOnly)
-      throw new TransactionStateError("Only a read-only statement renews its view");
-    const old = this.#view;
-    this.#view = null;
-    const fresh = this.view;
-    old?.releaseInternal();
-    return fresh;
-  }
-
   get catalog(): Catalog {
     return this.tx.catalog;
   }
