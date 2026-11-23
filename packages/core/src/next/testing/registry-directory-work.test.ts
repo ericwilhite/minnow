@@ -15,7 +15,7 @@ import { publicOwner } from "./public-owner.test.fixture.js";
 
 const ROWS = 400;
 /** Per updated row: at most this much directory work. */
-const BOUNDS = { leafMisses: 4.5, pageReads: 130, appends: 70 };
+const BOUNDS = { leafMisses: 4.5, pageReads: 15, appends: 10 };
 
 it("a trigger UPDATE's registry work per row stays within the resident leaves", async () => {
   const owner = await publicOwner({ capBytes: 64 << 20 });

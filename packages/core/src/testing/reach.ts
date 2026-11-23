@@ -13814,3 +13814,12 @@ export const MULTI_ROW_BESIDE_READ_REACH = [
   "written at once",
   "two-row memtables",
 ] as const;
+
+/** The compressed registry directory against the uncompressed one (next/owner/registry-directory-compression.test.ts). */
+export const REGISTRY_COMPRESSION_REACH = [
+  "split inside a skip",
+  "evicted leaf read back",
+  "absent record",
+  "several namespaces",
+  "deep divergence",
+] as const;
