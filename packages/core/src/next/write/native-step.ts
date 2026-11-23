@@ -4,6 +4,7 @@ import type {
   NativeWriteStepOptions,
 } from "../access/native-write-step.js";
 import { NativeWriteStepChangedError } from "../access/native-write-step.js";
+import { retryGuard } from "../memory/retry-guard.js";
 import { TransactionStateError, WritePathClosedError } from "../access/write-path.js";
 import { MemoryAdmissionError, type HolderChain, type MemoryGovernor } from "../memory/governor.js";
 import type { ByteCharge } from "../vector/varlen.js";
@@ -130,6 +131,7 @@ export class NativeWriteSteps {
     this.#owner = owner;
     this.#request = request;
     const pending = Promise.resolve().then(async () => {
+      const guard = retryGuard("native write step boundary");
       for (;;) {
         const version = this.#version;
         await scope.stabilize(owner, rootBytes, capacity, stop);
@@ -138,7 +140,10 @@ export class NativeWriteSteps {
         // A native change can land after stabilize returns, before this continuation.
         // Retry preparation, not SQL, rather than publish unfunded/stale headroom or
         // classify a temporary change as an impossible compound minimum.
-        if (version !== this.#version) continue;
+        if (version !== this.#version) {
+          guard.retry();
+          continue;
+        }
         const bytes = scope.protectedBytes();
         if (bytes + rootBytes > capacity)
           throw new MemoryAdmissionError("native root and writer", bytes + rootBytes, capacity);

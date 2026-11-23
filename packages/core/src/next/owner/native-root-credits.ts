@@ -6,6 +6,7 @@ import type {
   NativeWriteStepOptions,
 } from "../access/native-write-step.js";
 import type { Grant, MemoryGovernor } from "../memory/governor.js";
+import { retryGuard } from "../memory/retry-guard.js";
 import { releaseIdle } from "../write/budget.js";
 
 export const NATIVE_ROOT_CREDIT_BYTES = 4096;
@@ -80,7 +81,9 @@ export class NativeRootCredits {
     for (const grant of grants) grant.onReclaimRequest(() => this.#reclaim());
   }
   static async open(scope: NativeRootCreditScope): Promise<NativeRootCredits> {
+    const guard = retryGuard("native root open");
     for (;;) {
+      guard.retry();
       scope.signal.throwIfAborted();
       const boundary = await scope.statement.prepareNativeStep(
         NATIVE_ROOT_CREDIT_BYTES,
@@ -224,7 +227,9 @@ export class NativeRootCredits {
   #fund(signal: AbortSignal): Promise<void> {
     const stop = AbortSignal.any([this.scope.signal, this.#stop.signal, signal]);
     const work = (async () => {
+      const guard = retryGuard("native root funding");
       for (;;) {
+        guard.retry();
         stop.throwIfAborted();
         this.#reclaim();
         let total = 0,

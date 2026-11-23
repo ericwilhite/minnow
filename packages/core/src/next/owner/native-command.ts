@@ -2,6 +2,7 @@
  * caller retains the writer transaction and alone chooses commit/savepoint recovery.
  * Internal owner dispatch only; the public package/default engine is unchanged. */
 import { layoutOf } from "../types.js";
+import { retryGuard } from "../memory/retry-guard.js";
 import type { TableDef } from "../access/catalog.js";
 import type { TableRules } from "../access/modify.js";
 import type { WriteTransaction } from "../access/write-path.js";
@@ -281,7 +282,10 @@ export async function executeNativeCommand(
           parameters: parameters.bytes,
         };
     let prepared: Prepared | null = null;
+    const guard = retryGuard("native trigger preparation");
     while (!prepared) {
+      // Progress: each retry asks for a larger reservation.
+      guard.round(want.metadata);
       signal.throwIfAborted();
       await admit(want, want.need ?? want.metadata);
       const outcome = await prepareWithin();

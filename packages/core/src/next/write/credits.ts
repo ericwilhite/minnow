@@ -3,6 +3,7 @@
  * allocation counter: storage may transfer a real buffer out through native takeFrom.
  */
 import type { Grant, HolderChain, MemoryGovernor, WaitingHoldings } from "../memory/governor.js";
+import { RETRY_GUARD_LIMIT, retryGuard } from "../memory/retry-guard.js";
 import { GrantClosedError, MemoryAdmissionError } from "../memory/governor.js";
 import type { MaybePromise } from "../access/key-index.js";
 import { releaseIdle } from "./budget.js";
@@ -639,12 +640,17 @@ export class WriteCredits {
     const target = accounts.indexOf(grant);
     if (target < 0) throw new Error("Growth must belong to the native write owner");
     let relieved = false;
+    const guard = retryGuard(`complete grow ${grant.label}`);
     for (;;) {
       this.#check();
       stop.throwIfAborted();
       if (this.#grown(grant, wanted, metadata, nativeMinimum)) {
         this.#rememberFundedMetadata(grant, wanted, metadata, funding);
         return;
+      }
+      // Progress: the credit the owner's accounts hold (each served wait raises it).
+      if (RETRY_GUARD_LIMIT !== null) {
+        guard.round(accounts.reduce((sum, account) => sum + account.held, 0));
       }
       this.#changed?.(true);
       const working = this.#workingMinimum();
@@ -905,8 +911,11 @@ export class WriteCredits {
     if (this.#mergeActive || this.#mergeFloor !== 0)
       throw new Error("Merge credit is already in use");
     const headroom = this.#metadataHeadroom;
+    const guard = retryGuard(`merge credit ${label}`);
     try {
       for (;;) {
+        // Progress: the merge and metadata credit funded so far.
+        guard.round(this.merge.held + this.metadata.held);
         // mergeRuns consumes a ByteBudget: its entire I/O/encoder workspace is
         // prepaid here and never borrows the shared legacy reserve (rules2/3/5).
         const ready = this.#prepareMerge(bytes, undefined, true, headroom);

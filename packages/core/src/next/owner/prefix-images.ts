@@ -1,6 +1,7 @@
 /** Native OLD payload capture. The source step is prepaid, one physical row is decoded,
  * then streamed to the root image file. No legacy uncharged row copies or user callbacks. */
 import type { TableDef } from "../access/catalog.js";
+import { retryGuard } from "../memory/retry-guard.js";
 import type { MaybePromise } from "../access/key-index.js";
 import type { RowImageRef } from "../access/statement-command.js";
 import {
@@ -312,7 +313,10 @@ export class NativePrefixImages {
         const table = this.scope.statement.catalog.table(tableId) ?? invalid(),
           baseMinimum = nativePrefixSourceBytes(table);
         let minimum = baseMinimum;
+        const guard = retryGuard("prefix image source");
         for (;;) {
+          // Progress: each retry's minimum is larger (a smaller one is invalid).
+          guard.round(minimum);
           checkPhase();
           const budget = await this.scope.prepareSource(table, minimum, stop);
           this.#check(stop);

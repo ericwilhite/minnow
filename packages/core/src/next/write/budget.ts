@@ -4,6 +4,7 @@
  * estimate must not leave its unused high-water holdings blocking merges or resident metadata.
  */
 import { yieldTask } from "../exec/pipeline.js";
+import { checkRetries, macrotaskEpoch, RETRY_GUARD_LIMIT } from "../memory/retry-guard.js";
 import type { MaybePromise } from "../access/key-index.js";
 import { ParseBudgetError } from "../format/manifest-codec.js";
 import type { Grant } from "../memory/governor.js";
@@ -120,6 +121,9 @@ export class MetadataBudget implements ByteBudget {
     check: () => void,
     grow?: (wanted: number) => Promise<void>,
     funded = 0,
+    rounds = 0,
+    reached = 0,
+    epoch = -1,
   ): MaybePromise<T> {
     const refused = (error: unknown): MaybePromise<T> => {
       if (!(error instanceof MetadataPressure)) throw error;
@@ -131,6 +135,14 @@ export class MetadataBudget implements ByteBudget {
       const target = error.wanted + lost;
       return this.#wait(target, check, grow).then(() => {
         check();
+        // Progress: the credit this work's funding has reached (a grant above every earlier
+        // retry's). Only retries funded no further count toward the retry guard; asking for more
+        // is not progress when nothing more arrives.
+        // A retry after a macrotask (the wait ran a timer or I/O) is not a microtask spin.
+        const held = this.grant.held;
+        const now = macrotaskEpoch();
+        const next = held > reached || now !== epoch ? 0 : rounds + 1;
+        if (RETRY_GUARD_LIMIT !== null) checkRetries(`metadata ${this.grant.label}`, next);
         // The credit was grown for this attempt: reclaim keeps it until the attempt settles.
         // An attempt awaits (a lock, a writer) before it allocates; without this a queued
         // request's reclaim could take it back in between, and grow and retry would repeat.
@@ -141,7 +153,7 @@ export class MetadataBudget implements ByteBudget {
         };
         let result: MaybePromise<T>;
         try {
-          result = this.retry(work, check, grow, target);
+          result = this.retry(work, check, grow, target, next, Math.max(reached, held), now);
         } catch (error) {
           settle();
           throw error;

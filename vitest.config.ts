@@ -52,7 +52,9 @@ export default defineConfig({
     // Test builds re-verify a cached blob's checksum when its lease is released or it is evicted
     // (packages/core/src/next/storage/verify-cached.ts): a consumer that writes into bytes the
     // cache treats as immutable fails loudly in whichever suite does it.
-    env: { MINNOW_VERIFY_CACHED_BYTES: "1" },
+    // And a retry loop that goes round 64 times without progress throws instead of spinning in
+    // microtasks, where no timeout can see it (packages/core/src/next/memory/retry-guard.ts).
+    env: { MINNOW_VERIFY_CACHED_BYTES: "1", MINNOW_RETRY_GUARD: "64" },
     projects: [
       {
         extends: true,

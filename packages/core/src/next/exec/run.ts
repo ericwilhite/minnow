@@ -7,6 +7,7 @@ import type { Operator } from "./pipeline.js";
 import type { MaybePromise } from "../access/key-index.js";
 import { SnapshotReleasedError } from "../access/snapshot.js";
 import { sizingSettled } from "../page/read-bounds.js";
+import { checkRetries, macrotaskEpoch } from "../memory/retry-guard.js";
 import { QueryRoots, type RootColumns } from "../page/query-roots.js";
 import { readTable } from "./read-table.js";
 import type { ByteBudget } from "../access/space.js";
@@ -1543,6 +1544,10 @@ export class QueryExecution implements Execution {
   #modifySpool: ModifySpool | null = null;
   /** Preparation admissions never wait while holding (exec/preparation.ts). */
   readonly #preparation: PreparationGovernor | null;
+  /** Preparation restarts of this execution without a larger need (`#restart`, `checkRetries`). */
+  #restarts = 0;
+  #restartNeed = 0;
+  #restartEpoch = -1;
   #atomic: { readonly result: DeferredGrant; readonly window: number } | null = null;
   #committed = false;
   #draining = false;
@@ -1817,6 +1822,16 @@ export class QueryExecution implements Execution {
     if (preparation === null || runtime === null || sink === null) throw error;
     if (sink.rowCount !== 0 || runtime.modification)
       throw new Error("Query preparation restarted after it produced output");
+    // Each restart waits for a larger credit; one that keeps restarting without one is a spin.
+    // Progress: a restart for a larger need than any before, or after a macrotask (its wait ran a
+    // timer or I/O), starts the count again: only microtask spins count.
+    const epoch = macrotaskEpoch();
+    if (error.needed > this.#restartNeed || epoch !== this.#restartEpoch) {
+      this.#restartNeed = Math.max(this.#restartNeed, error.needed);
+      this.#restartEpoch = epoch;
+      this.#restarts = 0;
+    } else this.#restarts++;
+    checkRetries(`query#${String(this.request.queryId)} preparation`, this.#restarts);
     runtime.abort(RESTART);
     await runtime.close();
     await sizingSettled(this.#controller.signal);
