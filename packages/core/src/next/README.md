@@ -552,18 +552,21 @@ leaf supplies captured Date intrinsics to both engines; it cannot import either 
     one whose abort is decided by a single pending source gives that source's reason at once.
   - a close, or an abortable step's direct abort, while its abort is decided but pending, waits
     for that fan-out: the step ends aborted with the decided reason.
-- **Known divergence, pinned in the tests:** a step opened over a step whose abort two pending
-  sources could have decided (two nested aborts, through a listener registered before the steps)
-  is not born aborted. It ends with the native reason when the outer fan-out runs, so it fires an
-  abort event a composite would not. Ordering those aborts sooner needs a native composite per
-  step, the cost this module removes. `ambiguousStepOpens()` counts it.
+- **Contract:** every step created matches `AbortSignal.any` in reason, final aborted state and
+  abort events. One open is refused instead (a `TypeError`, nothing registered): a step over a
+  step whose abort two nested sources are both still dispatching, opened inside one of those
+  dispatches. Natively it is born aborted with the first of those sources' reasons, which nothing
+  orders yet short of a composite per step (a composite made at that point orders by array, not
+  time). Engine code never opens a step inside an abort dispatch: every vitest project that runs
+  next/ code checks it (`checkStepOpensDuringAbort`, `testing/step-signal-checks.setup.ts`).
 - A step must be closed when it ends (`close()` in a `finally`, including when the work it guards
   refuses to start). A parent's sentinel listener is removed with its last step.
 - Tests: `heldStepSignals()` counts registrations parents still hold, and
   `observeStepSignals(site => …)` sees each step open. `testing/step-signal.test.ts` holds a
   fast-check differential against `AbortSignal.any` covering reentrant listeners, steps opened
   inside listeners and over aborted steps, direct aborts, throwing listeners and closes inside an
-  abort; the per-row composite and sentinel counts; no step left held after 2,000 rows; and prompt
+  abort (every world compared; a refused open is skipped in both worlds); the per-row composite
+  and sentinel counts; no step left held after 2,000 rows; and prompt
   cancellation at every site.
 
 ### Vectors (`vector/`)

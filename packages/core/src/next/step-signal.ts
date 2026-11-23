@@ -11,13 +11,16 @@
  *
  * `stepSignal(site, ...parents)` behaves as `AbortSignal.any(parents)`, and `abortableStep(site,
  * ...parents)` as `AbortSignal.any([...parents, own.signal])` whose `abort(reason)` is
- * `own.abort(reason)`. **A step's reason and final aborted state always match that composite's.**
- * One difference, of event timing only: a step opened inside an abort listener, over a step whose
- * abort two nested sources are dispatching at once, is not born aborted as the composite would be.
- * It aborts, with the composite's reason, when the outer source's dispatch reaches it, so it may
- * fire one abort event the composite never fires (`ambiguousStepOpens()` counts it; pinned in
- * testing/step-signal.test.ts). Engine code opens no step inside an abort dispatch of one of its
- * sources: test builds check that across the whole next/ suite (`checkStepOpensDuringAbort`).
+ * `own.abort(reason)`: **every step it creates matches that composite in reason, final aborted
+ * state and abort events.**
+ *
+ * One open is refused instead (a `TypeError`, nothing registered): a step over a step whose abort
+ * two nested sources are both still dispatching, opened inside one of those dispatches. Natively
+ * it is born aborted with the reason of whichever source aborted first, and nothing the platform
+ * exposes orders those aborts before their dispatch ends, short of a composite per step (the cost
+ * this module removes). Engine code opens no step inside an abort dispatch of one of its sources:
+ * test builds check that in every project that runs next/ code (`checkStepOpensDuringAbort`).
+ *
  * A closed step is over: it no longer follows its parents, unless its abort was already decided
  * when it closed (then it ends aborted with that reason), and a direct abort after a close does
  * nothing.
@@ -74,8 +77,8 @@ interface Fanout {
 }
 
 const fanouts = new WeakMap<AbortSignal, Fanout>();
-/** Parents whose abort has been fanned out to every step that was theirs to abort. */
-const dispatched = new WeakSet<AbortSignal>();
+/** Parents whose fan-out is running now. */
+const fanningOut = new WeakSet<AbortSignal>();
 /**
  * Each step signal's sources, and what a step that follows it follows instead: a plain step's
  * sources, an abortable step's sources and its own signal (its direct aborts), as
@@ -92,8 +95,8 @@ const records = new WeakMap<
 >();
 /** Registrations parents hold: one per open step and parent. */
 let held = 0;
-/** Steps opened over a step with several pending aborts (the contract's timing difference). */
-let ambiguous = 0;
+/** Opens refused: over a step whose abort several pending sources decide (the contract). */
+let refused = 0;
 /** Test builds only: the sites of steps opened while a source's abort was in dispatch. */
 let opensDuringAbort: string[] | null = null;
 /** Test builds only: told the site of every step as it opens (null in production). */
@@ -109,6 +112,7 @@ function fanoutOf(parent: AbortSignal): Fanout {
     listening: false,
     listener: () => {
       fanout.listening = false;
+      fanningOut.add(parent);
       try {
         for (const [controller, step] of [...steps]) {
           if (controller.signal.aborted) continue;
@@ -118,7 +122,7 @@ function fanoutOf(parent: AbortSignal): Fanout {
           controller.abort(parent.reason);
         }
       } finally {
-        dispatched.add(parent);
+        fanningOut.delete(parent);
       }
     },
   };
@@ -176,6 +180,15 @@ function decided(sources: readonly AbortSignal[]): boolean {
 }
 
 /**
+ * An aborted source whose abort is still being dispatched to its steps: its fan-out is armed (it
+ * fires at the end of the source's dispatch) or running. Once the source's `abort()` has returned,
+ * this is false, whether or not it ever had a fan-out.
+ */
+function inDispatch(signal: AbortSignal): boolean {
+  return fanouts.get(signal)?.listening === true || fanningOut.has(signal);
+}
+
+/**
  * A source aborted whose fan-out has not run, or a step not yet aborted that follows one
  * (`except`: the source whose fan-out is asking).
  */
@@ -183,7 +196,7 @@ function pending(signal: AbortSignal, except: AbortSignal | null = null): boolea
   if (signal === except) return false;
   const record = records.get(signal);
   // A step aborted through its sources is not a source in time of its own: look through it.
-  if (signal.aborted && (record === undefined || record.direct)) return !dispatched.has(signal);
+  if (signal.aborted && (record === undefined || record.direct)) return inDispatch(signal);
   return record?.sources.some((source) => pending(source, except)) ?? false;
 }
 
@@ -191,7 +204,7 @@ function pending(signal: AbortSignal, except: AbortSignal | null = null): boolea
 function pendingSources(signal: AbortSignal, into: AbortSignal[]): AbortSignal[] {
   const record = records.get(signal);
   if (signal.aborted && (record === undefined || record.direct)) {
-    if (!dispatched.has(signal) && !into.includes(signal)) into.push(signal);
+    if (inDispatch(signal) && !into.includes(signal)) into.push(signal);
   } else for (const source of record?.sources ?? []) pendingSources(source, into);
   return into;
 }
@@ -256,12 +269,14 @@ function open(
       return handle;
     }
     if (decidedBy.length > 1) {
-      ambiguous++;
-      // Several pending aborts: which came first is known only once their fan-outs run (the
-      // outermost decides). Follow that step alone and take its reason when it is applied.
-      sources.length = 0;
-      sources.push(parent);
-      break;
+      // Natively this step is born aborted with the reason of whichever of those sources aborted
+      // first; nothing the platform exposes orders them before their fan-outs run, short of a
+      // composite per step (the cost this module removes). Refused rather than guessed: engine
+      // code never opens a step inside an abort dispatch (checkStepOpensDuringAbort).
+      refused++;
+      throw new TypeError(
+        `step signal "${site}": cannot open over a step whose abort two nested pending aborts decide`,
+      );
     }
     for (const source of record?.stands ?? [parent])
       if (!sources.includes(source)) sources.push(source);
@@ -284,13 +299,9 @@ export function observeStepSignals(observe: ((site: string) => void) | null): vo
   observer = observe;
 }
 
-/**
- * Steps opened over a step whose abort several pending sources could have decided (tests). Natively
- * such a step is born aborted; here it is aborted, with the same reason, when the outermost of
- * those sources is fanned out (no platform signal orders them before then).
- */
-export function ambiguousStepOpens(): number {
-  return ambiguous;
+/** Opens refused by the contract's one exclusion (tests). */
+export function refusedStepOpens(): number {
+  return refused;
 }
 
 /**

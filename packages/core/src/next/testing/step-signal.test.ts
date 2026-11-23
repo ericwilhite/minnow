@@ -25,7 +25,7 @@ import { seedsFor } from "../../testing/seeds.js";
 import { MinnowDatabaseClient } from "../owner/database-client.js";
 import {
   abortableStep,
-  ambiguousStepOpens,
+  refusedStepOpens,
   checkStepOpensDuringAbort,
   heldStepSignals,
   observeStepSignals,
@@ -151,6 +151,19 @@ describe("stepSignal", () => {
     ]);
   });
 
+  it("records no open over a source whose abort has returned, fan-out or not", () => {
+    checkStepOpensDuringAbort(true);
+    const bare = new AbortController();
+    bare.abort("finished");
+    stepSignal("after a bare abort", bare.signal).close();
+    const followed = new AbortController(),
+      step = stepSignal("follows", followed.signal);
+    followed.abort("finished");
+    stepSignal("after a fanned-out abort", followed.signal).close();
+    step.close();
+    expect(checkStepOpensDuringAbort(true)).toEqual([]);
+  });
+
   // Astra's re-check of #55 (probes.mjs): each compared with AbortSignal.any.
   it("takes an aborted step's own reason, never re-derived from its parents", () => {
     const p = new AbortController(),
@@ -165,22 +178,67 @@ describe("stepSignal", () => {
     expect([a.signal.reason, b.signal.reason]).toEqual(["caller", "caller"]);
   });
 
-  it("takes a pending step's decided reason when opened inside a reentrant listener", () => {
+  it("opens over a pending step born aborted with its reason when one source decides it", () => {
+    // Astra's probe, with one of A's sources mid-dispatch: exact (born aborted, no event).
     const run = (open: (...parents: AbortSignal[]) => AbortSignal) => {
       const p = new AbortController(),
         q = new AbortController();
-      const a = open(p.signal, q.signal);
-      let b: AbortSignal | undefined;
+      const a = open(p.signal);
+      let b: AbortSignal | undefined,
+        born = false;
       q.signal.addEventListener("abort", () => p.abort("cleanup"));
       p.signal.addEventListener("abort", () => {
-        b = open(a);
+        b = open(a, q.signal);
+        born = b.aborted;
       });
       q.abort("caller");
-      return [a.reason as unknown, b?.reason as unknown];
+      return { a: a.reason as unknown, b: b?.reason as unknown, born };
     };
     const native = run((...parents) => AbortSignal.any(parents));
-    expect(native).toEqual(["caller", "caller"]);
+    expect(native).toEqual({ a: "cleanup", b: "cleanup", born: true });
     expect(run((...parents) => stepSignal("probe", ...parents).signal)).toEqual(native);
+  });
+
+  // Why the exclusion is refused, not built on a composite of A's sources at that point: once
+  // both have aborted, AbortSignal.any takes the first in array order, not the first in time.
+  it.each([false, true])(
+    "a composite made after two nested aborts orders them by array, not time (reversed: %s)",
+    (reversed) => {
+      const p = new AbortController(),
+        q = new AbortController();
+      const sources = reversed ? [q.signal, p.signal] : [p.signal, q.signal];
+      const a = AbortSignal.any(sources);
+      let late: AbortSignal | undefined, native: AbortSignal | undefined;
+      p.signal.addEventListener("abort", () => q.abort("inner"));
+      q.signal.addEventListener("abort", () => {
+        native = AbortSignal.any([a]);
+        late = AbortSignal.any(sources);
+      });
+      p.abort("outer");
+      expect(native?.reason).toBe("outer");
+      expect(late?.reason).toBe(reversed ? "inner" : "outer");
+    },
+  );
+
+  it("refuses Astra's nested probe, where two of A's sources are mid-dispatch", () => {
+    // A = step(P, Q); Q's listener aborts P; P's listener opens B over A. Natively B is born
+    // aborted with "caller" (Q aborted first): the contract's exclusion.
+    const p = new AbortController(),
+      q = new AbortController();
+    const a = stepSignal("a", p.signal, q.signal);
+    let opened: unknown;
+    q.signal.addEventListener("abort", () => p.abort("cleanup"));
+    p.signal.addEventListener("abort", () => {
+      try {
+        opened = stepSignal("b", a.signal);
+      } catch (error) {
+        opened = error;
+      }
+    });
+    q.abort("caller");
+    expect(a.signal.reason).toBe("caller");
+    expect(opened).toBeInstanceOf(TypeError);
+    a.close();
   });
 
   it("keeps the caller's reason when a parent's listener aborts an abortable step directly", () => {
@@ -210,43 +268,80 @@ describe("stepSignal", () => {
   });
 
   /**
-   * Known divergence (#55, C1/Astra): a step opened, inside a listener, over a step two of whose
-   * sources are both mid-abort, one nested in the other through a listener registered before the
-   * steps. Natively it is born aborted (the outer source's reason). No platform signal tells which
-   * source aborted first before their fan-outs run, short of a native composite per step (the
-   * cost this module removes), so it follows that step and takes its reason when the outer
-   * fan-out applies it: the same reason, but its abort event fires then instead of never.
+   * The contract's one exclusion: a step opened, inside an abort dispatch, over a step whose abort
+   * two nested sources are both still dispatching. Natively it is born aborted with the reason of
+   * the source that aborted first, which nothing orders yet: it is refused, with nothing
+   * registered.
    */
   const nested = (open: (...parents: AbortSignal[]) => AbortSignal) => {
     const p0 = new AbortController(),
       p1 = new AbortController();
     const s0 = open(p1.signal, p0.signal);
-    let fired = false,
-      born = false,
-      s1: AbortSignal | undefined;
+    let opened: AbortSignal | Error | undefined;
     p0.signal.addEventListener("abort", () => p1.abort("p1"));
     p1.signal.addEventListener("abort", () => {
-      s1 = open(s0);
-      born = s1.aborted;
-      s1.addEventListener("abort", () => {
-        fired = true;
-      });
+      try {
+        opened = open(s0);
+      } catch (error) {
+        opened = error as Error;
+      }
     });
     p0.abort("p0");
-    return { born, fired, reasons: [s0.reason as unknown, s1?.reason as unknown] };
+    return { s0: s0.reason as unknown, opened };
   };
-  const native = () => nested((...parents) => AbortSignal.any(parents));
-  const steps = () => nested((...parents) => stepSignal("nested", ...parents).signal);
 
-  it("ends a step opened over a step with two nested pending aborts with the native reasons", () => {
-    expect(native()).toEqual({ born: true, fired: false, reasons: ["p0", "p0"] });
-    expect(steps().reasons).toEqual(["p0", "p0"]);
+  it("refuses to open over a step whose abort two nested pending sources decide", () => {
+    const native = nested((...parents) => AbortSignal.any(parents));
+    expect(native.s0).toBe("p0");
+    expect((native.opened as AbortSignal).reason).toBe("p0");
+    const held = heldStepSignals(),
+      refused = refusedStepOpens();
+    const ours = nested((...parents) => stepSignal("nested", ...parents).signal);
+    expect(ours.s0).toBe("p0");
+    expect(ours.opened).toBeInstanceOf(TypeError);
+    expect(refusedStepOpens()).toBe(refused + 1);
+    expect(heldStepSignals(), "nothing registered").toBe(held);
   });
 
-  // Pinned: the event timing of that known divergence, so a change in either direction is seen.
-  it.fails("is born aborted over a step with two nested pending aborts, as natively", () => {
-    expect(steps()).toEqual(native());
-  });
+  // Astra's final check of #55 (adversarial.mjs): with the open refused, nothing fires that a
+  // composite would not, so an independent step its listener would abort stays unaborted.
+  it.each([false, true])(
+    "aborts no independent step through a refused open (closed inside dispatch: %s)",
+    (close) => {
+      const run = (native: boolean) => {
+        const open = (...parents: AbortSignal[]) => {
+          if (native) {
+            const own = new AbortController();
+            return {
+              signal: AbortSignal.any([...parents, own.signal]),
+              abort: (r: unknown) => own.abort(r),
+              close: () => undefined,
+            };
+          }
+          return abortableStep("adversarial", ...parents);
+        };
+        const p = new AbortController(),
+          q = new AbortController();
+        const a = open(p.signal, q.signal),
+          victim = open();
+        p.signal.addEventListener("abort", () => q.abort("inner"));
+        q.signal.addEventListener("abort", () => {
+          try {
+            const b = open(a.signal);
+            b.signal.addEventListener("abort", () => victim.abort("extra event"));
+            if (close) b.close();
+          } catch {
+            // Refused (step signals only).
+          }
+        });
+        p.abort("outer");
+        a.close();
+        return { a: a.signal.reason as unknown, victim: victim.signal.aborted };
+      };
+      expect(run(true)).toEqual({ a: "outer", victim: false });
+      expect(run(false)).toEqual(run(true));
+    },
+  );
 
   it("releases a sibling closed during an abort, and aborts a late step at once", () => {
     const parent = new AbortController();
@@ -403,8 +498,14 @@ const stepEngine: Engine = {
   },
 };
 
-/** Each parent's and step's final state: its reason's label, "closed", or "-" when untouched. */
-function play(w: World, engine: Engine, seen: Set<string>): string[] {
+/**
+ * Each parent's and step's final state: its reason's label, "closed", or "-" when untouched.
+ * `refused` holds the indices (in order of attempt) of opens the step world refused (the
+ * contract's one exclusion): the step world records them, the native world skips them.
+ */
+function play(w: World, engine: Engine, seen: Set<string>, refused: Set<number>): string[] {
+  let attempts = 0,
+    throws = 0;
   const controllers = Array.from({ length: w.parents }, () => new AbortController());
   const labels = new Map<unknown, string>();
   let next = 0;
@@ -458,6 +559,7 @@ function play(w: World, engine: Engine, seen: Set<string>): string[] {
       step.closed = engine.native ? label(step.signal) : "pending";
     } else {
       seen.add("throwing listener");
+      throws++;
       throw new Error("listener threw");
     }
   };
@@ -474,7 +576,16 @@ function play(w: World, engine: Engine, seen: Set<string>): string[] {
       }
     });
   const open = (parents: AbortSignal[], abortable: boolean) => {
-    const opened = engine.open(parents, abortable);
+    const attempt = attempts++;
+    if (engine.native && refused.has(attempt)) return null;
+    let opened: ReturnType<Engine["open"]>;
+    try {
+      opened = engine.open(parents, abortable);
+    } catch (error) {
+      if (engine.native || !(error instanceof TypeError)) throw error;
+      refused.add(attempt);
+      return null;
+    }
     steps.push({ ...opened, abortable, closed: null });
     const index = steps.length - 1;
     // Listeners naming this step attach as it opens.
@@ -509,7 +620,11 @@ function play(w: World, engine: Engine, seen: Set<string>): string[] {
     return state === "-" ? "closed" : state;
   };
   for (const step of steps) if (verdict(step) === "-") seen.add("step left unaborted");
-  return [...controllers.map((c) => label(c.signal)), ...steps.map(verdict)];
+  return [
+    ...controllers.map((c) => label(c.signal)),
+    ...steps.map(verdict),
+    `listeners threw ${String(throws)}`,
+  ];
 }
 
 const RUNS = 400;
@@ -521,34 +636,22 @@ it.each(seedsFor("next-step-signal-differential", [0x5751, 0x5752]))(
       "step signals against AbortSignal.any",
       STEP_SIGNAL_DIFFERENTIAL_REACH,
     );
-    // A throwing listener is reported, not thrown: count the reports per world.
-    let thrown = 0,
-      ambiguousWorlds = 0;
-    const report = () => {
-      thrown++;
-    };
+    // A throwing listener's error is reported, not thrown: each world counts its own throws (in
+    // the states it returns); the reports are swallowed here.
+    const report = () => undefined;
     process.on("uncaughtException", report);
     try {
       await fc.assert(
         fc.asyncProperty(world, async (w) => {
           reach.beginHistory();
-          const seen = new Set<string>();
-          thrown = 0;
-          const native = play(w, nativeEngine, seen);
+          const seen = new Set<string>(),
+            refused = new Set<number>();
+          // Step signals first: the opens they refuse (the contract's exclusion) are skipped in
+          // the native world too, and every world is compared.
+          const ours = play(w, stepEngine, new Set(), refused);
+          const native = play(w, nativeEngine, seen, refused);
           await new Promise((resolve) => setImmediate(resolve));
-          const nativeThrown = thrown;
-          thrown = 0;
-          const ambiguousBefore = ambiguousStepOpens();
-          const ours = play(w, stepEngine, new Set());
-          await new Promise((resolve) => setImmediate(resolve));
-          // The pinned known divergence ("opens born-aborted over a step whose two sources are
-          // aborting nested"): a world that reached it is counted, not compared.
-          if (ambiguousStepOpens() !== ambiguousBefore) {
-            ambiguousWorlds++;
-            return;
-          }
           expect(ours).toEqual(native);
-          expect(thrown, "listeners threw as often").toBe(nativeThrown);
           for (const state of seen)
             reach.reach(state as (typeof STEP_SIGNAL_DIFFERENTIAL_REACH)[number]);
           const stepStates = native.slice(w.parents);
@@ -567,10 +670,6 @@ it.each(seedsFor("next-step-signal-differential", [0x5751, 0x5752]))(
       process.off("uncaughtException", report);
     }
     reach.assertReached();
-    // The exclusion stays rare: it removes the known divergence, not the differential's power.
-    expect(ambiguousWorlds, "worlds that reached the known divergence").toBeLessThanOrEqual(
-      Math.ceil(RUNS / 100),
-    );
   },
   120_000,
 );

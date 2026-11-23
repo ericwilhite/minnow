@@ -13,6 +13,8 @@ const modifyPressureWorkload = "packages/core/src/next/testing/modify-large-targ
  */
 const preparationScaling = "packages/core/src/next/testing/native-preparation-scaling.test.ts";
 const reachUnions = "packages/**/*.reach.test.ts";
+/** Every project that runs next/ engine code checks it never opens a step inside an abort. */
+const stepSignalChecks = "packages/core/src/next/testing/step-signal-checks.setup.ts";
 
 /**
  * Set by CI on each part of the unit suite it spreads across runners (`.github/workflows/ci.yml`).
@@ -80,7 +82,7 @@ export default defineConfig({
             // A governor wait with no progress for this long fails, naming every holder.
             ...(process.env.MINNOW_GOVERNOR_STALL_MS ? ["scripts/governor-stall.setup.ts"] : []),
             // Engine code opens no step signal inside an abort dispatch of one of its sources.
-            "packages/core/src/next/testing/step-signal-checks.setup.ts",
+            stepSignalChecks,
           ],
           // Nonzero groups also preserve this order with Vitest's single-worker shortcut.
           sequence: { groupOrder: 1 },
@@ -107,6 +109,7 @@ export default defineConfig({
           // maintenance, isolate this bounded-cap campaign from unrelated database suites;
           // its rows, seeds, differential checks and memory cap stay unchanged.
           fileParallelism: false,
+          setupFiles: [stepSignalChecks],
           sequence: { groupOrder: 3 },
         },
       },
@@ -120,6 +123,7 @@ export default defineConfig({
             "--no-maglev",
             "--sampling-heap-profiler-suppress-randomness",
           ],
+          setupFiles: [stepSignalChecks],
           sequence: { groupOrder: 1 },
         },
       },
@@ -130,6 +134,7 @@ export default defineConfig({
           // Each asserts the union of what a split campaign's files reached, so it runs after
           // them; scripts/test-shards.ts keeps it in their run part.
           include: [reachUnions],
+          setupFiles: [stepSignalChecks],
           sequence: { groupOrder: 4 },
         },
       },
