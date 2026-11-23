@@ -13824,3 +13824,11 @@ export const MULTI_ROW_BESIDE_READ_REACH = [
   "written at once",
   "two-row memtables",
 ] as const;
+
+/** Casts to text against their input-size bounds (next/testing/expression-bound-census.test.ts). */
+export const EXPRESSION_BOUND_CENSUS_REACH = [
+  "numeric below one",
+  "numeric with a whole part",
+  "negative numeric",
+  "scale above precision",
+] as const;

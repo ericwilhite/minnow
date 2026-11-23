@@ -17,11 +17,9 @@ import { FUNCTIONS } from "../ir/functions.js";
 const text: PhysicalType = { kind: "text" };
 const empty: Rel = { op: "values", id: 1, output: [], rows: [] };
 const arg: ScalarExpr = { op: "param", slot: 0, type: text };
-const unknown: ScalarExpr = {
-  op: "cast",
-  input: { op: "param", slot: 0, type: { kind: "int32", bits: 32 } },
-  type: text,
-};
+/** An expression with no size rule (a text function: no kernel sizes it yet). A cast to text is
+ * bounded from its type now, so it no longer serves here. */
+const unknown: ScalarExpr = { op: "call", fn: "replace", args: [arg, arg, arg], type: text };
 
 for (const seed of seedsFor("next-exec-call-lists", [47409, 47410]))
   it(`sizes list cardinalities without a native argument limit seed ${String(seed)}`, async () => {
@@ -40,7 +38,7 @@ for (const seed of seedsFor("next-exec-call-lists", [47409, 47410]))
           const coalesce: ScalarExpr = { op: "call", fn: "coalesce", args, type: text };
           expect(expressionInputBytes(coalesce, empty, sizes)).toBe(length === 0 ? 0 : width);
           if (length > 0) {
-            // An expanding cast makes the entire maximum unknown, even after known operands.
+            // An unsized operand makes the entire maximum unknown, even after known operands.
             args[length - 1] = unknown;
             expect(expressionInputBytes(coalesce, empty, sizes)).toBeNull();
           }
