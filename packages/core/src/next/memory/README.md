@@ -212,7 +212,9 @@ every Vitest suite and browser lane; `memory/retry-guard.ts`) each memory retry 
 rounds without progress and throws `RetrySpinError` past the limit (64). It is for loops that
 spin in microtasks, which the timer-based stall guard cannot see: a round counts only if no
 macrotask (a timer, I/O) ran since the loop's previous round (`macrotaskEpoch`, advanced by a
-timer the guard arms), so a loop that waits on real work is left to the stall guard. Where a
+timer the guard arms), so a loop that waits on real work is left to the stall guard. With the
+guard off (every shipped build) the epoch is a constant: no timer is armed and no work done; on,
+the timer is unreferenced, so it never delays a process's exit. Where a
 loop can measure its progress (credit funded, a requested size), a round that raises it above
 every earlier one starts the count again (`RetryGuard.round`). `RetrySpinError` is an invariant failure: no handler retries or recovers from it, and a
 background merge that meets one fails the write path with it. The guarded loops:

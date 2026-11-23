@@ -49,19 +49,25 @@ export class RetrySpinError extends Error {
  * microtasks never lets that timer run: its epoch stands still. A round in a loop whose epoch has
  * moved since its previous round yielded to a macrotask, where test timeouts and the governor's
  * stall guard already see it, so it does not count. One timer at a time, only while the guard is
- * on (test builds).
+ * on (test builds), and unreferenced: it never delays a process's exit.
  */
 let epoch = 0;
 let armed = false;
 
-/** The current macrotask epoch, arming the timer that advances it (see `epoch`). */
+/**
+ * The current macrotask epoch, arming the timer that advances it (see `epoch`). With the guard
+ * off (every shipped build) it is a constant: no timer, no work. The timer never keeps a Node
+ * process alive (`unref`).
+ */
 export function macrotaskEpoch(): number {
+  if (RETRY_GUARD_LIMIT === null) return 0;
   if (!armed) {
     armed = true;
-    setTimeout(() => {
+    const timer: unknown = setTimeout(() => {
       armed = false;
       epoch++;
     }, 0);
+    (timer as { unref?: () => void }).unref?.();
   }
   return epoch;
 }

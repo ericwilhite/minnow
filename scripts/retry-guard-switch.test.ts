@@ -7,11 +7,12 @@
 import { build } from "esbuild";
 import { runInNewContext } from "node:vm";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   RETRY_GUARD_LIMIT,
   RetrySpinError,
   checkRetries,
+  macrotaskEpoch,
   retryGuard,
 } from "../packages/core/src/next/memory/retry-guard.ts";
 import libraryConfig from "../vite.library.config.ts";
@@ -46,6 +47,112 @@ describe("the retry guard's switch", () => {
     expect(define["globalThis.__MINNOW_RETRY_GUARD__"]).toBe("64");
     expect(await inBrowser(define)).toBe(64);
     expect(await inBrowser({})).toBeNull();
+  });
+});
+
+const BUDGET = fileURLToPath(new URL("../packages/core/src/next/write/budget.ts", import.meta.url));
+
+/**
+ * A metadata pressure retry run by the shipped code, bundled for a browser (no `process`) with
+ * the given defines, in a fresh context whose `setTimeout` counts its calls. Returns how many
+ * timers the retry scheduled (Astra's re-check of #60: the guard's epoch timer was armed in a
+ * shipped build).
+ */
+async function timersOfPressureRetry(define: Record<string, string>): Promise<number> {
+  const bundled = await build({
+    entryPoints: [BUDGET],
+    bundle: true,
+    write: false,
+    format: "iife",
+    globalName: "budget",
+    platform: "browser",
+    define,
+  });
+  let timers = 0;
+  const context: Record<string, unknown> = {
+    performance,
+    TextEncoder,
+    TextDecoder,
+    queueMicrotask,
+    console,
+    setTimeout: (callback: () => void) => {
+      timers++;
+      void Promise.resolve().then(callback);
+      return timers;
+    },
+  };
+  runInNewContext(bundled.outputFiles[0]?.text ?? "", context);
+  const { MetadataBudget } = context.budget as {
+    MetadataBudget: new (
+      grant: unknown,
+      reclaim: () => number,
+      cap: number,
+    ) => {
+      allocate(bytes: number): boolean;
+      free(bytes: number): void;
+      retry<T>(work: () => T, check: () => void, grow: (wanted: number) => Promise<void>): T;
+    };
+  };
+  // A grant of one byte, funded exactly when asked: a few pressure retries.
+  const grant = {
+    label: "metadata",
+    held: 1,
+    allocated: 0,
+    loaned: 0,
+    allocate(bytes: number) {
+      if (this.allocated + bytes > this.held) return false;
+      this.allocated += bytes;
+      return true;
+    },
+    free(bytes: number) {
+      this.allocated -= bytes;
+    },
+    tryGrow: () => false,
+  };
+  const metadata = new MetadataBudget(grant, () => 0, 1 << 20);
+  let attempts = 0;
+  const work = () => {
+    attempts++;
+    let taken = 0;
+    try {
+      while (taken < 4) {
+        metadata.allocate(1);
+        taken++;
+      }
+    } catch (error) {
+      metadata.free(taken);
+      throw error;
+    }
+    metadata.free(taken);
+    return attempts;
+  };
+  const grow = (wanted: number) => {
+    if (wanted > grant.held) grant.held = wanted;
+    return Promise.resolve();
+  };
+  expect(await metadata.retry(work, () => undefined, grow), "the retry ran").toBe(4);
+  return timers;
+}
+
+describe("the guard costs a shipped build nothing", () => {
+  it("schedules no timer during a pressure retry when the guard is off", async () => {
+    expect(await timersOfPressureRetry({}), "no guard configured").toBe(0);
+    // The check sees timers: with the library lanes' define, the same retry arms the epoch's.
+    const define = (libraryConfig as { define?: Record<string, string> }).define ?? {};
+    expect(await timersOfPressureRetry(define), "the guard on").toBeGreaterThan(0);
+  });
+
+  it("never lets the epoch's timer keep a process alive", async () => {
+    // Let any timer already armed fire, so the next call arms a fresh one.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const armed = vi.spyOn(globalThis, "setTimeout");
+    try {
+      macrotaskEpoch();
+      const handle = armed.mock.results[0]?.value as { hasRef?: () => boolean } | undefined;
+      expect(handle?.hasRef?.(), "the epoch timer is unreferenced").toBe(false);
+    } finally {
+      armed.mockRestore();
+    }
   });
 });
 
