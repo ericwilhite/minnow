@@ -13793,6 +13793,8 @@ export const MEMTABLE_CHARGE_CENSUS_REACH = [
   "several columns growing",
   "secondary index",
   "integers widened in a live chunk",
+  "integers widened in a fresh chunk",
+  "no primary key",
 ] as const;
 
 /** Keyed UPDATEs of wide values (next/testing/keyed-update-sizing.test.ts). */

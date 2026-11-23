@@ -180,12 +180,13 @@ async function run(
   statements: readonly Statement[],
   indexed: boolean,
   reach: ReturnType<typeof createReach>,
+  keyed = true,
 ) {
   const core = new StorageCore(1 << 16);
   Object.defineProperty(core.harness, "governor", { value: new Governor(512 * MiB) });
   await core.open();
   await core.execute(
-    "CREATE TABLE t(id INT PRIMARY KEY, n INT, big BIGINT, a TEXT, b TEXT, c TEXT)",
+    `CREATE TABLE t(id INT${keyed ? " PRIMARY KEY" : ""}, n INT, big BIGINT, d NUMERIC, a TEXT, b TEXT, c TEXT)`,
   );
   if (indexed) await core.execute("CREATE INDEX t_n ON t(n)");
   const watch = census(core.harness.path);
@@ -202,7 +203,7 @@ async function run(
         next += statement.rows;
         const expression = names.map(() => "$1").join(", ");
         await core.execute(
-          `INSERT INTO t(id, n, big, ${names.join(", ")}) SELECT g, g % 7, ${statement.wide === true ? "9007199254740993" : "g"}, ${expression} FROM generate_series(${String(first)}, ${String(first + statement.rows - 1)}) g`,
+          `INSERT INTO t(id, n, big, d, ${names.join(", ")}) SELECT g, g % 7, ${statement.wide === true ? "9007199254740993, 123456789012345678901234567890" : "g, g"}, ${expression} FROM generate_series(${String(first)}, ${String(first + statement.rows - 1)}) g`,
           [value],
         );
       } else if (statement.kind === "update") {
@@ -218,12 +219,15 @@ async function run(
       if (statement.width * statement.rows > MiB) reach.reach("multi-MiB step");
       if (statement.columns > 1) reach.reach("several columns growing");
       reach.reach(statement.kind);
-      if (statement.kind === "insert" && statement.wide === true && at > 0)
-        reach.reach("integers widened in a live chunk");
+      if (statement.kind === "insert" && statement.wide === true)
+        reach.reach(
+          at > 0 ? "integers widened in a live chunk" : "integers widened in a fresh chunk",
+        );
     }
     for (const step of watch.steps) if (step.peak > 0) reach.reach("allocating step");
     watch.check();
     if (indexed) reach.reach("secondary index");
+    if (!keyed) reach.reach("no primary key");
   } finally {
     watch.restore();
     await core.close();
@@ -289,6 +293,20 @@ it("bounds one write-path batch that doubles a fresh arena several times", async
   }
 }, 60_000);
 
+it("charges a fresh chunk's integer and decimal widening (Astra, review of #56)", async () => {
+  // BIGINT beyond 2^53 and a 30-digit NUMERIC into a table with no key: the fresh chunk widens in
+  // the step (was admitted 16,692 / 20,788 bytes, peaked at 32,800 / 53,280).
+  const reach = createReach("memtable census fresh widening", [
+    "insert",
+    "allocating step",
+    "integers widened in a fresh chunk",
+    "no primary key",
+  ]);
+  reach.beginHistory();
+  await run([{ kind: "insert", rows: 1, width: 8, columns: 1, wide: true }], false, reach, false);
+  reach.assertReached();
+}, 60_000);
+
 const statement: fc.Arbitrary<Statement> = fc.oneof(
   fc.record({
     kind: fc.constantFrom("insert" as const, "update" as const, "copy" as const),
@@ -312,16 +330,19 @@ for (const seed of seedsFor("next-memtable-charge-census", [0x5d01, 0x5d02]))
       fc.asyncProperty(
         fc.array(statement, { minLength: 1, maxLength: 4 }),
         fc.boolean(),
-        async (statements, indexed) => {
+        fc.boolean(),
+        async (statements, indexed, keyed) => {
           reach.beginHistory();
-          await run(statements, indexed, reach);
+          await run(statements, indexed, reach, keyed);
         },
       ),
       {
         seed,
         numRuns: 24,
         examples: [
-          [[{ kind: "insert", rows: 300, width: 1024, columns: 1 }], false],
+          // Astra's review of #56: a fresh chunk widens (no key masks it).
+          [[{ kind: "insert", rows: 1, width: 8, columns: 1, wide: true }], false, false],
+          [[{ kind: "insert", rows: 300, width: 1024, columns: 1 }], false, true],
           // A later row's integer beyond 2^53 widens the live chunk's integers (16 KiB).
           [
             [
@@ -329,6 +350,7 @@ for (const seed of seedsFor("next-memtable-charge-census", [0x5d01, 0x5d02]))
               { kind: "insert", rows: 1, width: 8, columns: 1, wide: true },
             ],
             false,
+            true,
           ],
           // A small row first, so the next step doubles the live arena several times.
           [
@@ -337,6 +359,7 @@ for (const seed of seedsFor("next-memtable-charge-census", [0x5d01, 0x5d02]))
               { kind: "insert", rows: 300, width: 1024, columns: 1 },
             ],
             false,
+            true,
           ],
           [
             [
@@ -344,12 +367,14 @@ for (const seed of seedsFor("next-memtable-charge-census", [0x5d01, 0x5d02]))
               { kind: "copy", rows: 2, width: 3 * MiB, columns: 1 },
             ],
             true,
+            true,
           ],
           [
             [
               { kind: "insert", rows: 2100, width: 100, columns: 3 },
               { kind: "update", rows: 2100, width: 1024, columns: 3 },
             ],
+            true,
             true,
           ],
         ],

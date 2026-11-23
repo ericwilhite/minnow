@@ -531,10 +531,20 @@ export class ColumnChunk {
   }
 }
 
-/** What a new chunk of a column of `type` charges before its first row, its validity bitmap
- * included (`ColumnChunk` constructor and its first NULL). */
+/** What a new chunk of a column of `type` charges before its first row: its arrays
+ * (`ColumnChunk` constructor), its first NULL's bitmap, and what its rows may make it widen
+ * (as `ColumnChunk.lazyBytes` counts for a chunk that exists: an integer's int64 array beside
+ * the one it replaces, a decimal's int128 array and specials). */
 export function newChunkBytes(type: PhysicalType): number {
-  return initialBytes(layoutOf(type), type) + Math.ceil(MEMORY_CHUNK_ROWS / 32) * 4;
+  const n = MEMORY_CHUNK_ROWS,
+    layout = layoutOf(type);
+  const widening =
+    layout === "int64" || layout === "interval"
+      ? n * 8
+      : layout === "decimal"
+        ? n * 8 + n * 16 + n
+        : 0;
+  return initialBytes(layout, type) + Math.ceil(n / 32) * 4 + widening;
 }
 
 /** Bytes a fresh chunk of `layout` allocates (charged before its arrays exist). */
