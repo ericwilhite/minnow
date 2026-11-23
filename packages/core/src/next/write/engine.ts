@@ -163,6 +163,7 @@ import {
   type Grant,
   type LentHoldings,
   type Loan,
+  type WaitingHoldings,
 } from "../memory/governor.js";
 import { CommandMaintenance, waitCommandMaintenance } from "./command-wait.js";
 import { WriteCredits, WRITE_ROW_STEP_BYTES, type PreparedWriteCredit } from "./credits.js";
@@ -2250,17 +2251,23 @@ export class WritePathImpl implements WritePath, EngineHooks {
     // behind them, nor merges, whose idle publication waits for the writer turn), then prepares
     // again.
     const deficit = this.#credits.metadata.allocated + headroom - this.#credits.metadata.held;
+    const queued = this.#credits.queuedGrowth;
     if (
       !native &&
       deficit > 0 &&
       this.#flushing.size > 0 &&
+      // A flush waiting for its own credit is still funding, its writer not yet open (rules
+      // 4/5/7): it may wait for memory this statement holds, so this step does not wait for it.
+      queued.ordinary + queued.progress === 0 &&
       !(this.#credits.governor.canAdmitNow?.(deficit, false) ?? true)
-    )
+    ) {
+      const flushed = Promise.allSettled([...this.#flushing.values()]).then(() => undefined);
       return this.#trackMinimum(
-        Promise.allSettled([...this.#flushing.values()]).then(() =>
+        (signal === undefined ? flushed : waitCommandMaintenance(flushed, signal)).then(() =>
           this.#prepareMinimum(catalog, signal, includesProgress),
         ),
       );
+    }
     const metadata = native
       ? this.#credits.prepareNativeMinimum(headroom, signal, includesProgress)
       : this.#credits.prepareMetadata(headroom, signal);
@@ -2328,17 +2335,20 @@ export class WritePathImpl implements WritePath, EngineHooks {
       this.#chargeMetadata(-reserve);
       this.#rollbackReserve = 0;
     }
+    let failure: { readonly error: unknown } | null = null;
     try {
       publish();
-    } finally {
-      if (reserve > 0)
-        try {
-          this.#chargeMetadata(reserve);
-          this.#rollbackReserve = reserve;
-        } catch (error) {
-          if (!(error instanceof ParseBudgetError)) throw error;
-        }
+    } catch (error) {
+      failure = { error };
     }
+    if (reserve > 0)
+      try {
+        this.#chargeMetadata(reserve);
+        this.#rollbackReserve = reserve;
+      } catch (error) {
+        if (!(error instanceof ParseBudgetError)) failure ??= { error };
+      }
+    if (failure !== null) throw failure.error;
   }
 
   #recalculateMinimum(catalog: Catalog, signal?: AbortSignal): MaybePromise<void> {
@@ -2756,17 +2766,18 @@ export class WritePathImpl implements WritePath, EngineHooks {
    * `MemtableMemoryError` when nothing more can be freed.
    */
   admit(bytes: number, growth?: () => number, wait?: RowsWait): MaybePromise<void> {
-    const prepared = this.#prepareMinimum();
+    const prepared = this.#prepareMinimum(undefined, wait?.signal);
     const admitted =
       prepared instanceof Promise
         ? this.#admitAfterMinimum(prepared, bytes, growth)
         : this.#admitRows(bytes, growth);
     // Relief could not free enough: with the statement's holdings, wait for the rest in the
     // governor rather than refuse (a finite holder, another connection's read, may hold it).
-    if (wait === undefined || !(admitted instanceof Promise)) return admitted;
+    const holdings = wait?.holdings;
+    if (holdings === undefined || !(admitted instanceof Promise)) return admitted;
     return admitted.catch((error: unknown) => {
       if (!(error instanceof MemtableMemoryError)) throw error;
-      return this.#waitForRows(bytes, growth, wait);
+      return this.#waitForRows(bytes, growth, holdings, wait?.signal);
     });
   }
 
@@ -2779,18 +2790,23 @@ export class WritePathImpl implements WritePath, EngineHooks {
    * an admission holding nothing (rule 2), so no reader waits on it. Its credit then moves to
    * the row account.
    */
-  async #waitForRows(bytes: number, growth: (() => number) | undefined, wait: RowsWait) {
+  async #waitForRows(
+    bytes: number,
+    growth: (() => number) | undefined,
+    holdings: () => WaitingHoldings,
+    signal: AbortSignal | undefined,
+  ) {
     const governor = this.#credits.governor;
     for (;;) {
-      wait.signal?.throwIfAborted();
+      signal?.throwIfAborted();
       this.#check();
       if (this.#headroom(bytes + (growth?.() ?? 0))) return;
       const deficit = bytes + (growth?.() ?? 0) - (this.#grant.held - this.#grant.allocated);
       const [credit] = await governor.admitGroup({
         label: "write path memtable",
         grants: [{ label: "write path memtable", minimumBytes: deficit, spillable: false }],
-        holdings: wait.holdings,
-        ...(wait.signal === undefined ? {} : { signal: wait.signal }),
+        holdings,
+        ...(signal === undefined ? {} : { signal }),
       });
       try {
         this.#check();

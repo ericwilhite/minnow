@@ -113,7 +113,8 @@ const FTS_ROW_UNDO_BYTES = 32;
 /** What a write step's memory wait carries: the statement's holdings while it waits (the
  * governor refuses the wait typed when it could never be served beside them) and its signal. */
 export interface RowsWait {
-  readonly holdings: () => WaitingHoldings;
+  /** Without it (no executing query registered) a step refuses rather than wait for rows. */
+  readonly holdings?: () => WaitingHoldings;
   readonly signal?: AbortSignal;
 }
 
@@ -841,17 +842,21 @@ export class StatementImpl implements Statement {
     return this.readOnly ? null : (this.tx.hooks.writerHoldings?.() ?? null);
   }
 
-  /** How a write step of this statement may wait for memory (`EngineHooks.admit`), when a
-   * query executing it has said what it keeps held meanwhile. */
+  /** How a write step of this statement may wait for memory (`EngineHooks.admit`): what an
+   * executing query keeps held meanwhile, and the statement's cancellation. */
   memoryWait(): RowsWait | undefined {
-    const holdings = this.waitHoldings;
-    if (holdings === null) return undefined;
+    const holdings = this.waitHoldings ?? undefined;
     const signals = [this.#signal, this.waitSignal].filter(
       (signal): signal is AbortSignal => signal !== undefined && signal !== null,
     );
     const [only] = signals;
-    if (only === undefined) return { holdings };
-    return { holdings, signal: signals.length === 1 ? only : AbortSignal.any(signals) };
+    const signal =
+      only === undefined ? undefined : signals.length === 1 ? only : AbortSignal.any(signals);
+    if (holdings === undefined && signal === undefined) return undefined;
+    return {
+      ...(holdings === undefined ? {} : { holdings }),
+      ...(signal === undefined ? {} : { signal }),
+    };
   }
   /** Whether this statement inserted row `rowId` of `tableId` (ON CONFLICT `statement`). */
   inserted(tableId: number, rowId: number): boolean {
