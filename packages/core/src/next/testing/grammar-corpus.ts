@@ -184,6 +184,30 @@ const REVIEW_FORMS = [
   "SELECT 1; SELEC 2",
   "SET search_path = public; SELECT 1",
   "INSERT INTO t VALUES (2, 2, 'b'); SELECT 1",
+  // Neon's re-check of #59 (f361faf1): statements analysed at Parse, utility statements, the
+  // PREPARE forms (TRANSACTION is an unreserved keyword), and a keyword folded beyond ASCII.
+  "EXPLAIN SELECT 1",
+  "EXPLAIN (COSTS OFF) SELECT v FROM t",
+  "DECLARE c CURSOR FOR SELECT 1",
+  "CALL no_such()",
+  "DO $$ BEGIN END $$",
+  "PREPARE p AS SELECT 1",
+  "PREPARE transaction AS SELECT 1",
+  "PREPARE transaction (integer) AS SELECT $1",
+  "/* c */ PREPARE /* c */ transaction AS SELECT 1",
+  "TRUNCATE t",
+  "TRUNCATE missing_table",
+  "CREATE TABLE z AS SELECT 1 WITH NO DATA",
+  "CREATE TABLE IF NOT EXISTS t AS SELECT 1",
+  "CREATE TABLE z AS SELECT missing_column FROM t",
+  "CREATE TEMP TABLE z AS SELECT 1",
+  "CREATE UNLOGGED TABLE z AS SELECT 1",
+  "CREATE TABLE z (a integer GENERATED ALWAYS AS (1) STORED)",
+  "CREATE TABLE z (a integer GENERATED ALWAYS AS (1) STORED, b no_such_type)",
+  "CREATE MATERIALIZED VIEW mv AS SELECT 1",
+  "CREATE MATERIALIZED VIEW mv AS SELECT 1 WITH NO DATA",
+  "SELECT (",
+  "ſelect 1",
 ];
 
 /** The sources read from the repository (the simulator's are recorded by the test). */

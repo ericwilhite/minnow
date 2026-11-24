@@ -24,10 +24,9 @@
  * COMMIT, END, ROLLBACK, ABORT, SAVEPOINT, RELEASE, PREPARE TRANSACTION); snapshot-statement-kind
  * and read-only-snapshot-timing cover them.
  */
-import { PGlite } from "@electric-sql/pglite";
+import { PGlite, protocol } from "@electric-sql/pglite";
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { chunkReads } from "../exec/scan.js";
-import { leadingWords } from "../lower/snapshot-rule.js";
 import { ProtocolClient } from "../owner/client.js";
 import { composeEngine } from "../owner/compose.js";
 import { OwnerServer } from "../owner/server.js";
@@ -40,7 +39,7 @@ import {
 import { createReach, SNAPSHOT_CORPUS_REACH } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
 import { SYNTAX_ERROR_SNAPSHOT } from "./divergences.js";
-import { drawCorpus, repositorySources, type CorpusSource } from "./grammar-corpus.js";
+import { drawCorpus, repositorySources, tokens, type CorpusSource } from "./grammar-corpus.js";
 import { createNextDriver } from "./simulator-driver.js";
 import { StorageCore } from "./storage-core.js";
 
@@ -53,6 +52,23 @@ const SETUP = [
   "INSERT INTO t VALUES (1, 1, 'a')",
 ];
 
+/**
+ * Whether the probe cannot run `sql` inside its own transaction: transaction control that ends
+ * or nests it. The test's own reading of the first tokens (grammar-corpus.ts `tokens`), not
+ * next/'s: PREPARE TRANSACTION is told from a statement named `transaction` by its third token
+ * (a string constant), as gram.y does.
+ */
+function probeBreaking(sql: string): boolean {
+  const [first, second, third] = tokens(sql)
+    .filter((token) => token.text !== ";")
+    .map((token) =>
+      token.word ? token.text.replace(/[a-z]+/gu, (l) => l.toUpperCase()) : token.text,
+    );
+  if (first === undefined) return false;
+  if (first === "PREPARE") return second === "TRANSACTION" && /^(?:[Ee]?'|\$)/u.test(third ?? "");
+  return PROBE_BREAKING.has(first);
+}
+
 /** First words of the statements the probe cannot run inside its own transaction. */
 const PROBE_BREAKING = new Set(
   "BEGIN START COMMIT END ROLLBACK ABORT SAVEPOINT RELEASE".split(" "),
@@ -64,6 +80,9 @@ type Run = (sql: string) => Promise<{ state: string; message: string }>;
 let pg: PGlite;
 let postgres: Run;
 let next: Run;
+/** An extended-protocol Parse of the statement alone (PostgreSQL) and next/'s prepare request. */
+let postgresPrepare: Run;
+let nextPrepare: Run;
 let close: () => Promise<void>;
 let statements = 0;
 
@@ -83,9 +102,9 @@ async function freshPostgres(): Promise<void> {
 const faulted = (state: string) => state === "54001" || !/^[0-9A-Z]{5}$/u.test(state);
 
 /** PostgreSQL's 25001 probe, on a fresh instance once if PGlite faulted in it. */
-async function probePostgres(statement: string) {
+async function probePostgres(statement: string, action: Run = postgres) {
   for (let attempt = 0; ; attempt++) {
-    const result = await probe(postgres, statement, "PostgreSQL", attempt === 0).catch(
+    const result = await probe(postgres, statement, "PostgreSQL", attempt === 0, action).catch(
       (error: unknown) => {
         if (attempt === 0) return null;
         throw error;
@@ -97,7 +116,13 @@ async function probePostgres(statement: string) {
 }
 
 /** Whether `statement` took the transaction's snapshot: the 25001 probe. */
-async function probe(run: Run, statement: string, engine: string, retryable = false) {
+async function probe(
+  run: Run,
+  statement: string,
+  engine: string,
+  retryable = false,
+  action: Run = run,
+) {
   const step = async (sql: string) => {
     const { state, message } = await run(sql);
     if (retryable && state !== "00000" && faulted(state)) throw new Error(`faulted: ${message}`);
@@ -107,7 +132,7 @@ async function probe(run: Run, statement: string, engine: string, retryable = fa
   };
   await step("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
   await step("SAVEPOINT s");
-  const outcome = await run(statement);
+  const outcome = await action(statement);
   await step("ROLLBACK TO s");
   await step("RELEASE s");
   const changed = await run("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
@@ -181,6 +206,23 @@ beforeAll(async () => {
   };
   pg = new PGlite();
   await pg.waitReady;
+  postgresPrepare = async (sql) => {
+    const bytes = new Uint8Array([
+      ...protocol.serialize.parse({ text: sql }),
+      ...protocol.serialize.sync(),
+    ]);
+    try {
+      const { messages } = await pg.execProtocol(bytes, { throwOnError: false });
+      const error = messages.find((message) => message.name === "error") as
+        { code?: string; message?: string } | undefined;
+      return error === undefined
+        ? { state: "00000", message: "" }
+        : { state: error.code ?? "?", message: error.message ?? "" };
+    } catch (error) {
+      const e = error as { code?: string; message?: string };
+      return { state: e.code ?? String(error), message: e.message ?? "" };
+    }
+  };
   for (const sql of SETUP) expect((await postgres(sql)).state, sql).toBe("00000");
   const core = await new StorageCore().open();
   const engine = composeEngine({
@@ -198,6 +240,15 @@ beforeAll(async () => {
   next = async (sql) => {
     try {
       await client.query(sql);
+      return { state: "00000", message: "" };
+    } catch (error) {
+      const e = error as { sqlState?: string; message?: string };
+      return { state: e.sqlState ?? String(error), message: e.message ?? "" };
+    }
+  };
+  nextPrepare = async (sql) => {
+    try {
+      await client.prepareTask(sql, 0).promise;
       return { state: "00000", message: "" };
     } catch (error) {
       const e = error as { sqlState?: string; message?: string };
@@ -263,41 +314,54 @@ for (const seed of seedsFor("next-snapshot-corpus", [0x6701, 0x6702]))
       reach.beginHistory();
       reach.reach(entry.mutation ?? "original");
       if (entry.source === "interaction simulator") reach.reach("simulator statement");
-      const [first, second] = leadingWords(entry.sql, 2);
-      if (
-        (first !== undefined && PROBE_BREAKING.has(first)) ||
-        (first === "PREPARE" && second === "TRANSACTION")
-      ) {
+      if (probeBreaking(entry.sql)) {
         notProbed++;
         reach.reach("transaction control, not probed");
         continue;
       }
       if (++statements % 100 === 0) await freshPostgres();
       probed++;
-      const theirs = await probePostgres(entry.sql);
-      const ours = await probe(next, entry.sql, "next/");
-      reach.reach(ours.state === "00000" ? "next/ ran it" : "next/ refused it");
-      const before =
-        !theirs.took &&
-        (theirs.message.includes("cannot insert multiple commands") ||
-          !(await postgresRawParses(entry.sql)));
-      if (before) rejectedBefore++;
-      if (theirs.took === ours.took) {
-        reach.reach(ours.took ? "both take it" : "neither takes it");
-        continue;
-      }
-      if (ours.took && before) {
-        diverged++;
-        reach.reach(
-          theirs.message.includes("cannot insert multiple commands")
-            ? "several statements taken"
-            : "syntax error taken",
+      let before: boolean | null = null;
+      // Rejected before PostgreSQL's snapshot: several statements, or a raw parse that fails.
+      const rejectedEarly = async (message: string) =>
+        message.includes("cannot insert multiple commands") ||
+        (before ??= !(await postgresRawParses(entry.sql)));
+      for (const mode of ["execute", "prepare"] as const) {
+        const theirs = await probePostgres(
+          entry.sql,
+          mode === "execute" ? postgres : postgresPrepare,
         );
-        continue;
+        const ours = await probe(
+          next,
+          entry.sql,
+          "next/",
+          false,
+          mode === "execute" ? next : nextPrepare,
+        );
+        const label = mode === "execute" ? "" : "prepare: ";
+        if (mode === "execute")
+          reach.reach(ours.state === "00000" ? "next/ ran it" : "next/ refused it");
+        const early = !theirs.took && (await rejectedEarly(theirs.message));
+        if (early && mode === "execute") rejectedBefore++;
+        if (theirs.took === ours.took) {
+          reach.reach(`${label}${ours.took ? "both take it" : "neither takes it"}`);
+          continue;
+        }
+        if (ours.took && early) {
+          if (mode === "execute") diverged++;
+          reach.reach(
+            `${label}${
+              theirs.message.includes("cannot insert multiple commands")
+                ? "several statements taken"
+                : "syntax error taken"
+            }`,
+          );
+          continue;
+        }
+        wrong.push(
+          `${mode} ${JSON.stringify(entry.sql)}: PostgreSQL ${theirs.took ? "took" : "took none"} (${theirs.state}), next/ ${ours.took ? "took" : "took none"} (${ours.state} ${ours.message})`,
+        );
       }
-      wrong.push(
-        `${JSON.stringify(entry.sql)}: PostgreSQL ${theirs.took ? "took" : "took none"} (${theirs.state}), next/ ${ours.took ? "took" : "took none"} (${ours.state} ${ours.message})`,
-      );
     }
     console.log(
       `snapshot corpus, seed ${String(seed)}: ${String(seen.size)} statements, ${String(probed)} probed, ${String(notProbed)} transaction control not probed; PostgreSQL rejected ${String(rejectedBefore)} before its snapshot, next/ took one for ${String(diverged)} of them (${SYNTAX_ERROR_SNAPSHOT.id}); ${String(wrong.length)} wrong`,

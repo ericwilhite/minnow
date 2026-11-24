@@ -61,6 +61,8 @@ const STATEMENTS = {
     "CREATE VIEW v AS",
     "CREATE VIEW v",
     "SELECT count(DISTINCT) FROM t",
+    // Keywords fold ASCII letters only: `ſelect` is no SELECT, and no statement in PostgreSQL.
+    "ſelect 1",
   ],
   // Several statements: PostgreSQL's extended protocol refuses them before any snapshot (42601,
   // "cannot insert multiple commands into a prepared statement"); next/ refuses them too, and
@@ -112,6 +114,11 @@ const STATEMENTS = {
     "CLOSE ALL",
     "VACUUM",
     "PREPARE p AS SELECT 1",
+    // TRANSACTION is an unreserved keyword: a prepared statement may be named so (gram.y).
+    "PREPARE transaction AS SELECT 1",
+    "PREPARE transaction (integer) AS SELECT $1",
+    "/* c */ PREPARE /* c */ transaction AS SELECT 1",
+    "DO $$ BEGIN END $$",
   ],
   // The statements PostgreSQL takes no snapshot for, run or failing: neither takes one.
   "no snapshot": [

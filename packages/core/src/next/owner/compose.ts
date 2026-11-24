@@ -24,7 +24,8 @@ import { StatementRules } from "../exec/statement-rules.js";
  *
  * ## Session transaction state (PostgreSQL's)
  * - `idle` → BEGIN → `open`. A read-write BEGIN takes the writer slot at once (ruling R11.2);
- *   BEGIN READ ONLY pins one snapshot for the whole transaction.
+ *   BEGIN READ ONLY takes no snapshot: its first statement that needs one pins it for the whole
+ *   transaction, as PostgreSQL does (`#takeSnapshot`; `pinSnapshot` pins it at once).
  * - A failing statement inside `open` → `failed` (25P02 for every later statement) until ROLLBACK,
  *   or ROLLBACK TO a savepoint, which reopens it. COMMIT of a failed transaction rolls back and
  *   reports `ROLLBACK`, as PostgreSQL does.
@@ -834,6 +835,10 @@ class ComposedSession implements EngineSession {
     if (this.#modes.readOnly && this.#tx === null) this.#transactionPin();
   }
 
+  pinSnapshot(): void {
+    this.#takeSnapshot();
+  }
+
   statementFailed(text: string): void {
     // PostgreSQL takes the snapshot once the raw parse succeeds, before analysis or the run can
     // fail: next/ counts its failure as parsed, and the first words decide (lower/snapshot-rule.ts).
@@ -842,14 +847,16 @@ class ComposedSession implements EngineSession {
 
   prepared(text: string, planned: PlannedStatement | null): void {
     // An extended-protocol Parse takes the snapshot for what it analyses (`analyze_requires_
-    // snapshot`): a query or data statement, and CREATE TABLE AS; a failed Parse too (PGlite).
+    // snapshot`), parsed or failing analysis (PGlite): a query, a data change but TRUNCATE (a
+    // utility statement), and CREATE TABLE AS in every form (its command tag is SELECT's, with or
+    // without data, whether or not IF NOT EXISTS finds the table).
     const lowered = planned?.lowered;
     const takes =
       lowered === undefined
         ? failedPrepareTakesSnapshot(text)
         : lowered.kind === "query" ||
-          lowered.kind === "modify" ||
-          (lowered.kind === "ddl" && lowered.followUp !== null);
+          (lowered.kind === "modify" && lowered.command !== "TRUNCATE") ||
+          (lowered.kind === "ddl" && lowered.command === "SELECT");
     if (takes) this.#takeSnapshot();
   }
 

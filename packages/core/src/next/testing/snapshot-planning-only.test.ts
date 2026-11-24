@@ -135,6 +135,30 @@ it("a prepare takes the snapshot exactly where PostgreSQL's Parse does", async (
     "SHOW search_path",
     // A raw syntax error: none.
     "SET",
+    // Neon's re-check of #59 (f361faf1). TRUNCATE is a utility statement: none at Parse.
+    "TRUNCATE t",
+    "TRUNCATE missing_table",
+    // CREATE TABLE AS in every form, lowered or not, and CREATE MATERIALIZED VIEW: analysed.
+    "CREATE TABLE z AS SELECT 1 WITH NO DATA",
+    "CREATE TABLE IF NOT EXISTS t AS SELECT 1",
+    "CREATE TABLE z AS SELECT missing_column FROM t",
+    "CREATE TEMP TABLE z AS SELECT 1",
+    "CREATE UNLOGGED TABLE z AS SELECT 1",
+    "CREATE GLOBAL TEMPORARY TABLE z (a) AS SELECT 1",
+    "CREATE MATERIALIZED VIEW mv AS SELECT 1",
+    "CREATE MATERIALIZED VIEW mv AS SELECT 1 WITH NO DATA",
+    // A table whose element list holds an AS is no CREATE TABLE AS.
+    "CREATE TABLE z (a integer GENERATED ALWAYS AS (1) STORED)",
+    // ... and when next/ cannot lower it (an unknown type), its failed prepare reads past CREATE.
+    "CREATE TABLE z (a integer GENERATED ALWAYS AS (1) STORED, b no_such_type)",
+    // Analysed at Parse: EXPLAIN, DECLARE, CALL (failing in next/ too). Not: DO, PREPARE.
+    "EXPLAIN SELECT 1",
+    "DECLARE c CURSOR FOR SELECT 1",
+    "CALL no_such()",
+    "DO $$ BEGIN END $$",
+    "PREPARE p AS SELECT 1",
+    // A keyword folds ASCII letters only: no statement in PostgreSQL, none in next/.
+    "ſelect 1",
   ]) {
     const postgres = await postgresParse(sql);
     const { port, header, took } = await session();

@@ -606,8 +606,10 @@ export const FTS_RENDERING_AUTHORITY = {
  * fixes a transaction's snapshot in next/ unless its first word starts a statement that takes
  * none (`SELEC 1` takes one; bare `SHOW` takes none); in PostgreSQL it takes none. So does a
  * syntax next/ accepts as an extension (`?` placeholders, MATCH ... AGAINST, `SELECT 1e`).
- * snapshot-corpus-pglite.test.ts checks every other statement of its seeded corpus agrees, and
- * reports how many take the snapshot through this divergence; there is no ceiling.
+ * Prepared, such text takes the snapshot when it starts like a statement PostgreSQL's Parse
+ * analyses (`failedPrepareTakesSnapshot`). snapshot-corpus-pglite.test.ts checks every other
+ * statement of its seeded corpus agrees, run and prepared, and reports how many take the snapshot
+ * through this divergence; there is no ceiling.
  */
 export const SYNTAX_ERROR_SNAPSHOT = {
   id: "syntax-error-snapshot",

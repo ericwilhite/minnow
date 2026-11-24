@@ -1,17 +1,17 @@
 /**
  * Whether a statement next/ could not lower takes its transaction's snapshot, decided from its
- * first words (owner/compose.ts `statementFailed`, `prepared`). A statement that lowers decides
- * by its planned kind instead (compose.ts `#guard`).
+ * first tokens (owner/compose.ts `statementFailed`, `prepared`). A statement that lowers decides
+ * by its planned kind instead (compose.ts `#guard`, `prepared`).
  *
  * PostgreSQL 18 takes a transaction's snapshot for a statement once its raw parse succeeds: at
  * parse analysis for the statements `analyze_requires_snapshot` accepts (queries, data changes,
- * EXPLAIN, DECLARE, CREATE TABLE AS, CALL), and when a utility statement runs for every other one
- * `PlannedStmtRequiresSnapshot` accepts (utility.c). next/'s parser reads a subset of
- * PostgreSQL's grammar, so its failure says nothing about PostgreSQL's raw parse: a failed
- * statement counts as raw-parsed, and its first word decides. A statement PostgreSQL rejects
- * before its snapshot (a raw syntax error, or several statements in one request) takes the
- * snapshot in next/ unless its first word is one of the no-snapshot words: the divergence
- * `syntax-error-snapshot` (testing/divergences.ts).
+ * EXPLAIN, DECLARE, CREATE TABLE AS, CREATE MATERIALIZED VIEW, CALL), and when a utility
+ * statement runs for every other one `PlannedStmtRequiresSnapshot` accepts (utility.c). next/'s
+ * parser reads a subset of PostgreSQL's grammar, so its failure says nothing about PostgreSQL's
+ * raw parse: a failed statement counts as raw-parsed, and its first tokens decide. A statement
+ * PostgreSQL rejects before its snapshot (a raw syntax error, or several statements in one
+ * request) takes the snapshot in next/ unless its first word starts a statement that takes none:
+ * the divergence `syntax-error-snapshot` (testing/divergences.ts).
  */
 
 /**
@@ -19,8 +19,8 @@
  * refuses: TransactionStmt (BEGIN, START, COMMIT, END, ROLLBACK, ABORT, SAVEPOINT, RELEASE,
  * PREPARE TRANSACTION, COMMIT PREPARED, ROLLBACK PREPARED), LockStmt, VariableSetStmt (SET,
  * RESET), VariableShowStmt, ConstraintsSetStmt (SET CONSTRAINTS), FetchStmt (FETCH, MOVE),
- * ListenStmt, NotifyStmt, UnlistenStmt and CheckPointStmt. PREPARE needs its second word:
- * `PREPARE name AS ...` takes one.
+ * ListenStmt, NotifyStmt, UnlistenStmt and CheckPointStmt. PREPARE is decided by its third
+ * token (`noSnapshotPrepare`).
  */
 const NO_SNAPSHOT_WORDS = new Set([
   "ABORT",
@@ -47,8 +47,8 @@ const NO_SNAPSHOT_WORDS = new Set([
  * The first words of the statements `analyze_requires_snapshot` (analyze.c,
  * `stmt_requires_parse_analysis`) accepts, which take the snapshot when an extended-protocol
  * Parse analyses them: SelectStmt (`(`, SELECT, VALUES, TABLE, WITH), InsertStmt, UpdateStmt,
- * DeleteStmt, MergeStmt, ExplainStmt, DeclareCursorStmt and CallStmt. CREATE TABLE AS is one
- * too, but its first word is CREATE, as every other CREATE's.
+ * DeleteStmt, MergeStmt, ExplainStmt, DeclareCursorStmt and CallStmt. CreateTableAsStmt starts
+ * with CREATE, as every CREATE does: `createTableAs` reads past it.
  */
 const ANALYZED_WORDS = new Set([
   "(",
@@ -65,77 +65,174 @@ const ANALYZED_WORDS = new Set([
   "WITH",
 ]);
 
+/** One token as PostgreSQL's scanner reads it, enough to tell statements apart by their start. */
+export interface LeadingToken {
+  /** `word`: an unquoted keyword or name, ASCII upper-cased as the scanner folds keywords;
+   * `string`: a string constant; `name`: a quoted identifier; `punct`: `(`, `)` or `;`. */
+  readonly kind: "word" | "string" | "name" | "punct" | "other";
+  readonly text: string;
+  /** Parenthesis depth before this token. */
+  readonly depth: number;
+}
+
 /**
  * Whether a statement that failed to lower takes the snapshot when it runs: it counts as
  * raw-parsed, and takes one unless its first word starts a statement that takes none. Text with
- * no first word (empty, only comments or semicolons) is an empty query: none.
+ * no first token (empty, only comments or semicolons) is an empty query: none.
  */
 export function failedStatementTakesSnapshot(text: string): boolean {
-  const [first, second] = leadingWords(text, 2);
+  const [first, second, third] = statementTokens(text, 3);
   if (first === undefined) return false;
-  if (first === "PREPARE") return second !== "TRANSACTION";
-  return !NO_SNAPSHOT_WORDS.has(first);
+  if (first.kind === "word" && first.text === "PREPARE") return !noSnapshotPrepare(second, third);
+  return !(first.kind === "word" && NO_SNAPSHOT_WORDS.has(first.text));
+}
+
+/**
+ * PREPARE TRANSACTION Sconst (TransactionStmt, no snapshot) against PrepareStmt (`PREPARE name
+ * [(types)] AS ...`, which takes one), told apart as gram.y does: TRANSACTION is an unreserved
+ * keyword, so a prepared statement may be named `transaction`; only the third token decides.
+ */
+function noSnapshotPrepare(second?: LeadingToken, third?: LeadingToken): boolean {
+  return second?.kind === "word" && second.text === "TRANSACTION" && third?.kind === "string";
 }
 
 /**
  * Whether a statement that failed to lower takes the snapshot when it is prepared (an
- * extended-protocol Parse): when its first word starts a statement PostgreSQL analyses at Parse.
+ * extended-protocol Parse): when it starts a statement PostgreSQL analyses at Parse.
  */
 export function failedPrepareTakesSnapshot(text: string): boolean {
-  const [first] = leadingWords(text, 1);
-  return first !== undefined && ANALYZED_WORDS.has(first);
+  const tokens = statementTokens(text, Infinity);
+  const first = tokens[0];
+  if (first === undefined) return false;
+  if (first.text === "(" && first.kind === "punct") return true;
+  if (first.kind !== "word") return false;
+  if (ANALYZED_WORDS.has(first.text)) return true;
+  return first.text === "CREATE" && createTableAs(tokens);
 }
 
 /**
- * The statement's first `count` words, upper-cased, as PostgreSQL's scanner reaches them:
- * whitespace, semicolons (empty statements), `--` comments ending at a line feed or a carriage
- * return, and nested block comments are skipped before the first word; whitespace and comments
- * between words. A leading parenthesis is the word `(`. Fewer words when the text has fewer,
- * or something else comes first (an unterminated comment ends the text).
+ * CREATE [ { TEMPORARY | TEMP } | { LOCAL | GLOBAL } { TEMPORARY | TEMP } | UNLOGGED ]
+ * { TABLE ... AS | MATERIALIZED VIEW } (gram.y CreateAsStmt, CreateMatViewStmt): a table is
+ * created from a query when an AS stands outside every parenthesis after TABLE (a CreateStmt's
+ * AS only appears inside its element list, as in GENERATED ALWAYS AS).
  */
-export function leadingWords(text: string, count: number): string[] {
-  const words: string[] = [];
+function createTableAs(tokens: readonly LeadingToken[]): boolean {
+  let at = 1;
+  const word = (index: number) => {
+    const token = tokens[index];
+    return token?.kind === "word" ? token.text : undefined;
+  };
+  if (word(at) === "LOCAL" || word(at) === "GLOBAL") at++;
+  if (word(at) === "TEMP" || word(at) === "TEMPORARY" || word(at) === "UNLOGGED") at++;
+  if (word(at) === "MATERIALIZED") return word(at + 1) === "VIEW";
+  if (word(at) !== "TABLE") return false;
+  for (let index = at + 1; index < tokens.length; index++) {
+    const token = tokens[index];
+    if (token?.depth === 0 && token.kind === "word" && token.text === "AS") return true;
+  }
+  return false;
+}
+
+/**
+ * The first statement's tokens, at most `count`: leading whitespace, semicolons (empty
+ * statements) and comments skipped (a `--` comment ends at a line feed or a carriage return;
+ * block comments nest), whitespace and comments between tokens; it ends at a top-level `;`.
+ * Unterminated text runs to the end.
+ */
+export function statementTokens(text: string, count: number): LeadingToken[] {
+  const tokens: LeadingToken[] = [];
   let index = 0;
-  const skip = (semicolons: boolean): void => {
+  let depth = 0;
+  const skip = (): void => {
     for (;;) {
-      const c = text[index];
-      if (c === undefined) return;
-      if (c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\f" || c === "\v")
-        index += 1;
-      else if (semicolons && c === ";") index += 1;
-      else if (c === "-" && text[index + 1] === "-") {
+      const c = text.charCodeAt(index);
+      // Space, tab, line feed, vertical tab, form feed, carriage return.
+      if (c === 32 || (c >= 9 && c <= 13)) index += 1;
+      else if (c === 45 && text.charCodeAt(index + 1) === 45) {
         index += 2;
         while (index < text.length && text[index] !== "\n" && text[index] !== "\r") index += 1;
-      } else if (c === "/" && text[index + 1] === "*") {
-        let depth = 0;
+      } else if (c === 47 && text.charCodeAt(index + 1) === 42) {
+        let nesting = 0;
         while (index < text.length) {
           if (text[index] === "/" && text[index + 1] === "*") {
-            depth += 1;
+            nesting += 1;
             index += 2;
           } else if (text[index] === "*" && text[index + 1] === "/") {
-            depth -= 1;
+            nesting -= 1;
             index += 2;
-            if (depth === 0) break;
+            if (nesting === 0) break;
           } else index += 1;
         }
       } else return;
     }
   };
-  skip(true);
-  while (words.length < count) {
-    if (text[index] === "(") {
-      words.push("(");
+  // Empty statements before the first.
+  for (skip(); text[index] === ";"; skip()) index += 1;
+  while (tokens.length < count && index < text.length) {
+    const start = index;
+    const c = text[index] ?? "";
+    let kind: LeadingToken["kind"] = "other";
+    if (c === "'") {
+      index = quoted(text, index, "'", false);
+      kind = "string";
+    } else if ((c === "E" || c === "e") && text[index + 1] === "'") {
+      index = quoted(text, index + 1, "'", true);
+      kind = "string";
+    } else if ((c === "U" || c === "u") && text[index + 1] === "&" && text[index + 2] === "'") {
+      index = quoted(text, index + 2, "'", false);
+      kind = "string";
+    } else if (c === '"') {
+      index = quoted(text, index, '"', false);
+      kind = "name";
+    } else if (c === "$" && !/[0-9]/u.test(text[index + 1] ?? "")) {
+      DOLLAR_TAG.lastIndex = index;
+      const tag = DOLLAR_TAG.exec(text)?.[0];
+      if (tag === undefined) index += 1;
+      else {
+        const close = text.indexOf(tag, index + tag.length);
+        index = close < 0 ? text.length : close + tag.length;
+        kind = "string";
+      }
+    } else if (c === "(" || c === ")" || c === ";") {
+      if (c === ";" && depth === 0) break;
       index += 1;
+      kind = "punct";
     } else {
-      const word = WORD.exec(text.slice(index))?.[0];
-      if (word === undefined) break;
-      words.push(word.toUpperCase());
-      index += word.length;
+      WORD.lastIndex = index;
+      const word = WORD.exec(text)?.[0];
+      if (word !== undefined) {
+        index += word.length;
+        kind = "word";
+      } else index += 1;
     }
-    skip(false);
+    const raw = text.slice(start, index);
+    tokens.push({ kind, text: kind === "word" ? asciiUpper(raw) : raw, depth });
+    if (raw === "(" && kind === "punct") depth += 1;
+    else if (raw === ")" && kind === "punct") depth = Math.max(0, depth - 1);
+    skip();
   }
-  return words;
+  return tokens;
 }
 
-/** An unquoted identifier or keyword (scan.l `identifier`: a letter, `_` or a non-ASCII character first). */
-const WORD = /^[A-Za-z_\u0080-￿][A-Za-z0-9_$\u0080-￿]*/u;
+/** The index past a quoted token opening at `from` (doubled quotes; backslash escapes in E''). */
+function quoted(text: string, from: number, quote: string, backslash: boolean): number {
+  let index = from + 1;
+  while (index < text.length) {
+    if (backslash && text[index] === "\\") index += 2;
+    else if (text[index] === quote && text[index + 1] === quote) index += 2;
+    else if (text[index] === quote) return index + 1;
+    else index += 1;
+  }
+  return text.length;
+}
+
+/** PostgreSQL folds only ASCII letters of a keyword (`ſelect` is no SELECT). */
+function asciiUpper(word: string): string {
+  return word.replace(/[a-z]+/gu, (letters) => letters.toUpperCase());
+}
+
+/** An unquoted keyword or name (scan.l `identifier`: a letter, `_` or a non-ASCII character
+ * first), read in place (sticky). */
+const WORD = /[A-Za-z_\u0080-\uffff][A-Za-z0-9_$\u0080-\uffff]*/uy;
+/** A dollar-quote tag (scan.l `dolqdelim`), read in place. */
+const DOLLAR_TAG = /\$(?:[A-Za-z_\u0080-\uffff][A-Za-z0-9_\u0080-\uffff]*)?\$/uy;

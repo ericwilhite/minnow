@@ -2141,6 +2141,10 @@ export const SNAPSHOT_CORPUS_REACH = [
   "neither takes it",
   "syntax error taken",
   "several statements taken",
+  "prepare: both take it",
+  "prepare: neither takes it",
+  "prepare: syntax error taken",
+  "prepare: several statements taken",
   "transaction control, not probed",
 ] as const;
 

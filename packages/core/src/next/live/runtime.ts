@@ -452,6 +452,10 @@ export class LiveRuntime {
           entry.session = this.engine.openSession("live", 0, `live:${String(++this.#id)}`);
           entry.ready = entry.session.begin(true, entry.abort.signal);
           void entry.ready.catch(() => undefined);
+          // A read-only transaction takes its snapshot at its first statement, which runs after
+          // an await (`#execute`): pin it here, before planning, so the cohort shares one state
+          // and each plan is lowered at its snapshot's catalog.
+          entry.session.pinSnapshot();
           entry.plan = entry.session.plan(entry.sql);
           if (entry.plan.kind !== "query") throw new TypeError("Live queries require SELECT");
           this.#dependencies(entry, entry.plan);

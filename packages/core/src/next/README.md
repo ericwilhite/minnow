@@ -3374,17 +3374,26 @@ not require a home cache directory.
   as raw-parsed: the front end reads a subset of PostgreSQL's grammar, so its failure says
   nothing about PostgreSQL's raw parse. Its first words decide (lower/snapshot-rule.ts, after
   whitespace, leading semicolons, nested block comments and `--` comments ending at `\n` or
-  `\r`): every statement takes it but those `PlannedStmtRequiresSnapshot` refuses (BEGIN, START,
-  COMMIT, END, ROLLBACK, ABORT, SAVEPOINT, RELEASE, PREPARE TRANSACTION, LOCK, SET, RESET, SHOW,
-  FETCH, MOVE, LISTEN, NOTIFY, UNLISTEN, CHECKPOINT). So a statement that fails analysis has
+  `\r`; keywords fold ASCII letters only): every statement takes it but those
+  `PlannedStmtRequiresSnapshot` refuses (BEGIN, START, COMMIT, END, ROLLBACK, ABORT, SAVEPOINT,
+  RELEASE, PREPARE TRANSACTION, LOCK, SET, RESET, SHOW, FETCH, MOVE, LISTEN, NOTIFY, UNLISTEN,
+  CHECKPOINT); PREPARE is decided by its third token, as gram.y does (`PREPARE TRANSACTION
+'gid'` against a statement named `transaction`). So a statement that fails analysis has
   taken it, and with it the isolation level (25001 after). A raw syntax error, or several
   statements in one request, takes it too unless its first word takes none, where PostgreSQL's
   takes none (divergence `syntax-error-snapshot`). A prepare request takes it where PostgreSQL's
-  extended-protocol Parse does (`EngineSession.prepared`): for a query, a data statement or
-  CREATE TABLE AS, parsed or failing analysis; a failed prepare leaves the transaction open where
-  PostgreSQL's aborts it (divergence `failed-prepare-keeps-transaction`).
+  extended-protocol Parse does (`EngineSession.prepared`, `analyze_requires_snapshot`): lowered,
+  for a query, a data change but TRUNCATE (a utility statement) and CREATE TABLE AS in every form
+  (its command tag, SELECT; with or without data, whether or not IF NOT EXISTS finds the table);
+  failed, by its first tokens (lower/snapshot-rule.ts `failedPrepareTakesSnapshot`: SELECT, WITH,
+  VALUES, TABLE, `(`, INSERT, UPDATE, DELETE, MERGE, EXPLAIN, DECLARE, CALL, and CREATE [TEMP |
+  UNLOGGED] TABLE with an AS outside every parenthesis, or CREATE MATERIALIZED VIEW). A failed
+  prepare leaves the transaction open where PostgreSQL's aborts it (divergence
+  `failed-prepare-keeps-transaction`). A live sweep pins each of its cohort's sessions before it
+  plans (`EngineSession.pinSnapshot`), so the cohort reads one committed state and each plan
+  runs at its snapshot's catalog.
   testing/snapshot-corpus-pglite.test.ts compares the decision with PostgreSQL's through the 25001
-  probe for every statement of a seeded corpus (the SQLLogicTest profile, the feature matrix, the
+  probe, run and prepared, for every statement of a seeded corpus (the SQLLogicTest profile, the feature matrix, the
   docs and console SQL, the simulator's statements, PostgreSQL's forms, the review forms, and
   mutations of them that keep the original spacing). A write it refuses takes it too (`#guard`).
   A row committed between BEGIN and that statement is seen; BEGIN, SAVEPOINT, RELEASE, ROLLBACK
