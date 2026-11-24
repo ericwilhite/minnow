@@ -2982,10 +2982,11 @@ export class TableWriterImpl implements TableWriter {
             resolved = false;
             if (found.length > 0) {
               const rowId = need(found[0]);
-              out.kinds[row] = this.statement.inserted(this.tableId, rowId)
-                ? ConflictKind.statement
-                : ConflictKind.existing;
-              out.locators[row] = view.locator(rowId);
+              // A row this statement wrote is not in the statement's view (it may lie in a
+              // memtable the view never had): it has no locator, and its kind decides alone.
+              const statement = this.statement.inserted(this.tableId, rowId);
+              out.kinds[row] = statement ? ConflictKind.statement : ConflictKind.existing;
+              out.locators[row] = statement ? -1 : view.locator(rowId);
               out.indexIds[row] = index.id;
               break;
             }
