@@ -362,8 +362,16 @@ for (const seed of seedsFor("next-publication-pressure", [0x9b11, 0x9b12]))
 
 /**
  * Astra's reproducer (#50 review): a flush's page-index growth was charged before its pin
- * funding, so a refused funding left that growth charged. Identical workloads, one with the
- * flush's first funding refused, must end with identical metadata holdings.
+ * funding, so a refused funding left that growth charged. After the workload, with or without
+ * the flush's first funding refused, the write path's metadata charge must be exactly what its
+ * state holds (write/engine.ts `residentMetadataBytes`: the root, the tables' directories and
+ * page indexes, the runs' resident parts) plus its one remaining pin, the current state's
+ * (storage/root-pins.ts `pinBytes`), as testing/native-write-pressure.test.ts checks its root
+ * funding. A charge the refusal left behind is the difference.
+ *
+ * Each run is checked against its own state, not the other run's: two identical workloads can
+ * place their blocks differently (when retired extents become reusable depends on timing), and
+ * the root's encoded extent offsets, and so its charge, then differ by a few bytes.
  */
 it("refunds a flush's page-index charge when its pin funding is refused", async () => {
   const run = async (refuse: boolean) => {
@@ -388,14 +396,22 @@ it("refunds a flush's page-index charge when its pin funding is refused", async 
         await core.execute(`INSERT INTO t VALUES (${String(i)}, ${String(i)})`);
       await core.harness.path.quiesce();
       if (seen.budget === null) throw new Error("no metadata was charged");
-      return { allocated: seen.budget.grant.allocated, refused };
+      const stats = core.harness.space.stats;
+      expect(stats.pinCount).toBe(1);
+      expect(stats.oldestPin?.label).toBe("current state");
+      return {
+        allocated: seen.budget.grant.allocated,
+        held: core.harness.path.residentMetadataBytes + pinBytes("current state"),
+        refused,
+      };
     } finally {
       MetadataBudget.prototype.allocate = allocate;
       await core.close();
     }
   };
   const base = await run(false);
+  expect(base.allocated, "without a refusal").toBe(base.held);
   const pressure = await run(true);
   expect(pressure.refused).toBeGreaterThan(0);
-  expect(pressure.allocated).toBe(base.allocated);
+  expect(pressure.allocated, "after a refused funding").toBe(pressure.held);
 });
