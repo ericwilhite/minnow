@@ -79,6 +79,12 @@ const sql = `SELECT to_json($1::float4)::text rj,to_jsonb($1::float4)::text rb,
  jsonb_build_object($1::float4,$2::float8)::text kb,
  json_build_object($1::float4,TRUE,$2::float8,FALSE)::text k`;
 
+/** The binary32 with bit pattern `word`. */
+const binary32 = (word: number): number => {
+  const view = new DataView(new ArrayBuffer(4));
+  view.setUint32(0, word);
+  return view.getFloat32(0);
+};
 const anchor = (r: number, d: number, family = 0): [Shape] => {
   const [b, c] = doubleWords(d);
   return [{ family, a: realBits(r), b, c, offset: 0, negative: false }];
@@ -104,6 +110,9 @@ const anchors: Array<[Shape]> = [
   anchor(0.125, 0.0625, 2),
   anchor(1, 1, 3),
   anchor(1, 1, 4),
+  // Review of #66: odd-mantissa binary32 whose shortest decimal rounds (in binary64) to an endpoint.
+  anchor(binary32(0x15ae43fd), 7.038530999999999e-26),
+  anchor(binary32(0x95ae43fd), -7.038530999999999e-26),
 ];
 it.each(seedsFor("next-json-float-bits", [0xb6ec, 0xb6ed]))(
   "keeps float4/float8 bits exact through scalar and array JSON (seed %i)",

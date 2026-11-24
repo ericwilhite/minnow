@@ -53,3 +53,21 @@ it.each(seedsFor("next-json-float-single-domain", [0xb6f0, 0xb6f1]))(
     );
   },
 );
+
+/** The binary32 with bit pattern `word`. */
+const f32 = (word: number): number => {
+  const view = new DataView(new ArrayBuffer(4));
+  view.setUint32(0, word);
+  return view.getFloat32(0);
+};
+
+// Review of #66 (2026-11-24): for 0x15ae43fd (odd mantissa) the 7-digit decimal 7.038531e-26 is
+// inside the rounding interval, but Number() rounds it to the upper endpoint, whose binary32 ties
+// to the even neighbour. The fast path skipped precision 7 instead of falling back and printed
+// 7.0385307e-26; PostgreSQL 18 prints 7.038531e-26 (json-float-pglite.test.ts anchors it).
+it("falls back at a rounded endpoint whatever the mantissa's parity", () => {
+  expect(jsonFloatText(f32(0x15ae43fd), true)).toBe("7.038531e-26");
+  expect(jsonFloatText(f32(0x95ae43fd), true)).toBe("-7.038531e-26");
+  // A double that is not a binary32 but stores as one prints the same.
+  expect(jsonFloatText(7.038530999999999e-26, true)).toBe("7.038531e-26");
+});

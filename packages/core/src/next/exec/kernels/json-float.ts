@@ -44,6 +44,8 @@ function exactFloatText(value: number, single: boolean): string {
     const word = bits.getUint32(0);
     fraction = BigInt(word & 0x7fffff);
     exponent = word >>> 23;
+    // An infinity has no digits; it would otherwise print as 2^128's.
+    if (exponent === 255) throw new RangeError(`No binary32 digits for ${String(value)}`);
     width = 23;
     bias = 127;
   } else {
@@ -138,8 +140,11 @@ export function jsonFloatText(value: number, single: boolean): string {
   for (let precision = 1; precision <= 9; precision++) {
     const text = magnitude.toPrecision(precision);
     const candidate = Number(text);
-    if (Math.fround(candidate) !== magnitude) continue;
-    if (!(candidate > lower && candidate < upper)) return exactFloatText(value, true);
+    // Number() is monotone and both endpoints are exact doubles: a candidate strictly outside
+    // the interval proves its decimal is outside too; one equal to an endpoint proves nothing
+    // (whatever the mantissa's parity), so it falls back.
+    if (candidate < lower || candidate > upper) continue;
+    if (candidate === lower || candidate === upper) return exactFloatText(value, true);
     const power = decimalPower(text, precision);
     const mantissa = (word & 0x7fffff) + (exponent === 0 ? 0 : 0x800000);
     const trailing = 31 - Math.clz32(mantissa & -mantissa);
