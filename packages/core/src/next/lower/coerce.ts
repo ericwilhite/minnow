@@ -333,7 +333,7 @@ export function comparisonType(
 }
 
 /** A Typed standing for a value of `type` (for `commonType`'s checks only). */
-function typedAs(type: PhysicalType): Typed {
+export function typedAs(type: PhysicalType): Typed {
   return {
     expr: { op: "const", value: null, type } as unknown as ScalarExpr,
     nullable: true,
@@ -374,66 +374,126 @@ function inconsistentParameter(values: readonly Typed[], parameters: ParameterTy
 /**
  * An ARRAY constructor's element type (PostgreSQL's transformArrayExpr: select_common_type over
  * its items, all untyped making text): "ARRAY types integer and boolean cannot be matched"
- * (42804, PostgreSQL's type names), and a parameter one item fixed to a type another item cannot
- * take is "inconsistent types deduced for parameter $n" (42P08), before any item is coerced.
+ * (42804, PostgreSQL's type names). A parameter still unresolved when its item was lowered is
+ * UNKNOWN there, whatever a later item fixes it to (`unresolved`); once the type is found, a
+ * parameter fixed to a type it cannot take is "inconsistent types deduced for parameter $n"
+ * (42P08). `unconvertible` lists, by item index, the items of the type's category it cannot be
+ * converted from (42846, raised in item order as PostgreSQL coerces them).
  */
 export function arrayElementType(
   items: readonly Typed[],
   parameters: ParameterTypes,
-): PhysicalType {
+  unresolved: ReadonlySet<Typed> = new Set(),
+): {
+  readonly type: PhysicalType;
+  /** The type whose name the result carries (`matchTypes`): the element in messages. */
+  readonly named: PhysicalType;
+  readonly unconvertible: ReadonlyMap<number, string>;
+} {
   // json and jsonb never convert to each other implicitly in PostgreSQL: the running type is the
-  // first one's (its own 42846 comes after, expressions.ts `arrayItems`), whatever next/'s
-  // implicit json -> jsonb would make it.
+  // first one's, whatever next/'s implicit json -> jsonb would make it, and the other kind is an
+  // item the type cannot be converted from.
   const firstJson = items.find(
     (item) => item.pending === undefined && item.expr.type.kind === "json",
   );
-  const typed =
-    firstJson === undefined
-      ? items
-      : items.map((item) =>
-          item.pending === undefined && item.expr.type.kind === "json"
-            ? typedAs(firstJson.expr.type)
-            : item,
+  const typed = items.map((item) =>
+    unresolved.has(item)
+      ? UNKNOWN
+      : firstJson !== undefined && item.pending === undefined && item.expr.type.kind === "json"
+        ? typedAs(firstJson.expr.type)
+        : item,
+  );
+  const common = matchTypes(typed, parameters, "ARRAY", operandName);
+  inconsistentParameter([...items, typedAs(common.type)], parameters);
+  const unconvertible = new Map(common.unconvertible);
+  if (firstJson !== undefined)
+    items.forEach((item, index) => {
+      if (
+        item.pending === undefined &&
+        item.expr.type.kind === "json" &&
+        isJsonb(item.expr.type) !== isJsonb(firstJson.expr.type)
+      )
+        unconvertible.set(
+          index,
+          `ARRAY could not convert type ${operandName(item.expr.type)} to ${operandName(firstJson.expr.type)}`,
         );
-  let element: PhysicalType;
-  try {
-    element = commonType(typed, parameters, "ARRAY", operandName);
-  } catch (error) {
-    if (error instanceof PlanningError && error.sqlState === "42804")
-      inconsistentParameter(items, parameters);
-    throw error;
-  }
-  inconsistentParameter([...items, typedAs(element)], parameters);
-  return element;
+    });
+  return { type: common.type, named: common.named, unconvertible };
 }
+
+/** Whether a json type is jsonb. */
+function isJsonb(type: PhysicalType): boolean {
+  return type.kind === "json" && type.binary;
+}
+
+/** An operand the common type ignores (an untyped literal: PostgreSQL's UNKNOWN). */
+const UNKNOWN: Typed = {
+  expr: { op: "literal", type: { kind: "text" } } as unknown as ScalarExpr,
+  nullable: true,
+  big: false,
+  pending: { kind: "null" },
+};
 
 /**
  * The common type of several values (PostgreSQL's UNION / CASE resolution): pending values
- * adopt it; all pending is text. Throws 42804 when two types cannot be matched.
+ * adopt it; all pending is text. Throws 42804 when two types cannot be matched, and 42846 when a
+ * value of the type's category cannot be converted to it (`matchTypes`).
  */
 export function commonType(
   values: readonly Typed[],
   parameters: ParameterTypes,
   what: string,
-  name: (type: PhysicalType) => string = typeName,
+  name: (type: PhysicalType) => string = operandName,
 ): PhysicalType {
+  const common = matchTypes(values, parameters, what, name);
+  const [first] = [...common.unconvertible.entries()].sort(([a], [b]) => a - b);
+  if (first !== undefined) throw new PlanningError(first[1], "42846");
+  return common.type;
+}
+
+/**
+ * PostgreSQL's select_common_type. A value of another category is 42804 ("types integer and
+ * boolean cannot be matched"; the running type keeps the first name of a type it widens without
+ * a modifier). One of the same category neither side converts to implicitly keeps the running
+ * type; it is unconvertible to the result (coerce_to_common_type's "could not convert type time
+ * without time zone to date", 42846), listed by index. Comparisons resolve an operator instead
+ * and are not bound by categories.
+ */
+function matchTypes(
+  values: readonly Typed[],
+  parameters: ParameterTypes,
+  what: string,
+  name: (type: PhysicalType) => string,
+): {
+  readonly type: PhysicalType;
+  readonly named: PhysicalType;
+  readonly unconvertible: ReadonlyMap<number, string>;
+} {
   let candidate: PhysicalType | null = null;
-  for (const value of values) {
+  let named: PhysicalType | null = null;
+  let candidateName = "";
+  const sameCategory: Array<{ index: number; type: PhysicalType }> = [];
+  for (const [index, value] of values.entries()) {
     if (value.pending !== undefined) {
       if (value.pending.kind === "param") {
         const fixed = parameters.type(value.pending.index);
         if (fixed === null) continue;
-        candidate ??= fixed;
+        if (candidate === null) {
+          candidate = named = fixed;
+          candidateName = name(fixed);
+        }
       }
       continue;
     }
     const type = value.expr.type;
     if (candidate === null) {
-      candidate = type;
+      candidate = named = type;
+      candidateName = name(type);
       continue;
     }
     if (samePhysicalType(candidate, type)) continue;
     if (sameBase(candidate, type)) {
+      // Without the modifier, under the first one's name (character varying beside character).
       candidate = baseType(type);
       continue;
     }
@@ -442,21 +502,38 @@ export function commonType(
     // operator's resolution may cross them (`time = interval` finds interval's `=`).
     const was = categoryOfType(candidate),
       now = categoryOfType(type);
-    if (what !== "comparison" && was !== null && now !== null && was !== now)
+    const comparison = what === "comparison";
+    if (!comparison && was !== null && now !== null && was !== now)
       throw new PlanningError(
-        `${what} types ${name(candidate)} and ${name(type)} cannot be matched`,
+        `${what} types ${candidateName} and ${name(type)} cannot be matched`,
         "42804",
       );
     const up = canImplicitlyCast(candidate, type);
     const down = canImplicitlyCast(type, candidate);
-    if (up && !down) candidate = type;
-    else if (!down)
+    if (up && !down) {
+      candidate = named = type;
+      candidateName = name(type);
+    } else if (!down) {
+      if (!comparison && was !== null && was === now) {
+        sameCategory.push({ index, type });
+        continue;
+      }
       throw new PlanningError(
-        `${what} types ${name(candidate)} and ${name(type)} cannot be matched`,
+        `${what} types ${candidateName} and ${name(type)} cannot be matched`,
         "42804",
       );
+    }
   }
-  return candidate ?? { kind: "text" };
+  const type = candidate ?? { kind: "text" };
+  const context = what === "CASE" ? "CASE/WHEN" : what;
+  const unconvertible = new Map<number, string>();
+  for (const item of sameCategory)
+    if (!canImplicitlyCast(item.type, type))
+      unconvertible.set(
+        item.index,
+        `${context} could not convert type ${name(item.type)} to ${candidateName}`,
+      );
+  return { type, named: named ?? type, unconvertible };
 }
 
 export interface Resolved {
@@ -492,7 +569,7 @@ function expand(overload: Overload, arity: number): ReadonlyArray<SqlType | "T" 
 function categoryOfType(type: PhysicalType): string | null {
   const sql = sqlTypeOf(type);
   if (sql === null) return null;
-  return sql === "json" || sql === "jsonb" ? "U" : categoryOf(sql);
+  return sql === "json" || sql === "jsonb" || sql === "uuid" ? "U" : categoryOf(sql);
 }
 
 function categoryOf(type: SqlType): string {

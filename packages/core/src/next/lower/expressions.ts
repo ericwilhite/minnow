@@ -38,6 +38,7 @@ import {
   type ParameterTypes,
   type Typed,
   arrayElementType,
+  typedAs,
 } from "./coerce.js";
 import { PlanningError, unsupported } from "./errors.js";
 import {
@@ -528,7 +529,13 @@ function hasCommonType(values: readonly Typed[], state: ExpressionState): boolea
     commonType(values, state.parameters, "IN");
     return true;
   } catch (error) {
-    if (error instanceof PlanningError && error.sqlState === "42804") return false;
+    // No common type: another category (42804), or one of its category it cannot be converted
+    // from (42846). PostgreSQL's IN list then compares item by item (transformAExprIn).
+    if (
+      error instanceof PlanningError &&
+      (error.sqlState === "42804" || error.sqlState === "42846")
+    )
+      return false;
     throw error;
   }
 }
@@ -538,11 +545,6 @@ function rewriteOf(expression: Expression): RewriteForm | undefined {
   return rewriteSource(expression);
 }
 
-/** Whether a typed json value is jsonb. */
-function isBinary(item: Typed | undefined): boolean {
-  return item?.expr.type.kind === "json" && item.expr.type.binary;
-}
-
 /** An untyped NULL literal (PostgreSQL's `exprIsNullConstant`): a typed one is a cast. */
 function isNullLiteral(expression: Expression): boolean {
   return expression.kind === "literal" && expression.value === null;
@@ -550,31 +552,26 @@ function isNullLiteral(expression: Expression): boolean {
 
 /**
  * An ARRAY constructor's items, built as PostgreSQL builds the array (transformArrayExpr): their
- * common type (all untyped is text; "ARRAY types numeric and boolean cannot be matched", 42804,
- * naming the running common type), each item coerced to it (an untyped literal that is no value
- * of it is its input error, 22P02; a parameter takes it). The comparison is then against that
- * element type: `i = ANY (ARRAY['1'])` is "integer = text" (42883).
+ * element type (`arrayElementType`), then each item coerced to it in order. An item of the
+ * type's category it cannot be converted from is 42846 there ("ARRAY could not convert type
+ * jsonb to json"), after any earlier item's own input error (22P02). Coerced to the element's
+ * base type, as a comparison's operands (`unify`): an untyped literal is never cut or rounded to
+ * a column's modifier (varchar(3), numeric(5,2)); typed items keep their own.
  */
-function arrayItems(items: readonly Typed[], state: ExpressionState): Typed[] {
-  const element = arrayElementType(items, state.parameters);
-  // json and jsonb in one ARRAY whose items otherwise match: PostgreSQL keeps the first one's
-  // type (neither converts to the other implicitly there) and refuses the other's conversion
-  // (42846). next/'s implicit json -> jsonb (divergence `json-to-jsonb-implicit-cast`) does not
-  // reach an ARRAY. An item of another type is the 42804 above, first.
-  const jsonKinds = items.filter(
-    (item) => item.pending === undefined && item.expr.type.kind === "json",
-  );
-  const [firstJson] = jsonKinds;
-  const other = jsonKinds.find((item) => isBinary(item) !== isBinary(firstJson));
-  if (firstJson !== undefined && other !== undefined)
-    throw new PlanningError(
-      `ARRAY could not convert type ${operandName(other.expr.type)} to ${operandName(firstJson.expr.type)}`,
-      "42846",
-    );
-  // The element's base type, as a comparison's (`unify`): an untyped literal is never cut or
-  // rounded to a column's modifier (varchar(3), numeric(5,2)); typed items keep their own.
+function arrayItems(
+  items: readonly Typed[],
+  state: ExpressionState,
+  unresolved: ReadonlySet<Typed>,
+): { readonly element: PhysicalType; readonly list: Typed[] } {
+  const { type, named, unconvertible } = arrayElementType(items, state.parameters, unresolved);
+  const element = type;
   const base = baseType(element);
-  return items.map((item) => coerce(item, base, "implicit", state.parameters));
+  const list = items.map((item, index) => {
+    const refused = unconvertible.get(index);
+    if (refused !== undefined) throw new PlanningError(refused, "42846");
+    return coerce(item, base, "implicit", state.parameters);
+  });
+  return { element: named, list };
 }
 
 const COMPARISONS: Readonly<Record<string, "=" | "<>" | "<" | "<=" | ">" | ">=">> = {
@@ -706,14 +703,26 @@ export function lowerCondition(
           `${operator} over ${right.kind === "subquery" ? "a subquery" : right.kind}`,
         );
       const arg = lowerExpression(left, scope, state);
-      const items = right.items.map((item) => lowerExpression(item, scope, state));
+      // A parameter still unresolved when its own item is lowered is UNKNOWN to an ARRAY's
+      // element type, whatever a later item fixes it to (`arrayElementType`).
+      const unresolved = new Set<Typed>();
+      const items = right.items.map((item) => {
+        const typed = lowerExpression(item, scope, state);
+        if (typed.pending?.kind === "param" && state.parameters.type(typed.pending.index) === null)
+          unresolved.add(typed);
+        return typed;
+      });
       const cmp = operator === "IN" ? "=" : "<>";
       // `x = ANY (ARRAY[...])` / `x <> ALL (ARRAY[...])`, which the front end writes as an IN /
       // NOT IN list (`rewrite`): PostgreSQL builds the array first, so its items need a common
       // type ("ARRAY types integer and boolean cannot be matched", 42804), and the test is one
       // operator over it; no per-item comparison.
       const array = rewriteOf(right) === "array";
-      const list = array ? arrayItems(items, state) : items;
+      const built = array ? arrayItems(items, state, unresolved) : null;
+      const list = built?.list ?? items;
+      // One operator against the array's element type: its refusal names that type (character
+      // varying), not an item's base (text).
+      if (built !== null) comparisonType([arg, typedAs(built.element)], state.parameters, cmp);
       // PostgreSQL (transformAExprIn): one comparison with the list in the list's common type;
       // without one, each item compared on its own, OR-ed (AND-ed for NOT IN) in list order, so
       // an item without an operator is that pair's 42883 ("operator does not exist").
@@ -1238,7 +1247,13 @@ export function lowerExpression(
         expression.otherwise === undefined
           ? null
           : lowerExpression(expression.otherwise, scope, state);
-      const results = unify(otherwise === null ? thens : [...thens, otherwise], state, "CASE");
+      // PostgreSQL resolves the ELSE result first (transformCaseExpr), then the THEN results.
+      const ordered = unify(otherwise === null ? thens : [otherwise, ...thens], state, "CASE");
+      const [resolvedElse] = ordered;
+      const results =
+        otherwise === null || resolvedElse === undefined
+          ? ordered
+          : [...ordered.slice(1), resolvedElse];
       const values = otherwise === null ? results : results.slice(0, -1);
       const last = otherwise === null ? null : (results.at(-1) ?? null);
       const type = results[0]?.expr.type ?? { kind: "text" };

@@ -286,8 +286,8 @@ async function compare(
     expect(actual.message, sql).toBe(expected.message);
   // ARRAY's matching and conversion refusals name PostgreSQL's types.
   if (
-    (expected.state === "42804" || expected.state === "42846") &&
-    expected.message.startsWith("ARRAY ")
+    (expected.state === "42804" && expected.message.startsWith("ARRAY ")) ||
+    expected.state === "42846"
   )
     expect(actual.message, sql).toBe(expected.message);
   if (rows && expected.state === "00000" && actual.rows !== undefined) {
@@ -474,6 +474,38 @@ it("answers every form Neon's round 3 of #63 (8ac4d272) named, as PostgreSQL doe
     "SELECT tm FROM t UNION SELECT iv FROM t",
     "SELECT CASE WHEN i = 1 THEN tm ELSE iv END FROM t",
     "SELECT 1 FROM t WHERE tm = iv",
+  ])
+    await compare(sql, undefined, true);
+});
+
+it("answers every form Neon's round 4 of #63 (9326c7a4) named, as PostgreSQL does", async () => {
+  for (const sql of [
+    // P2: a parameter unresolved when its item is lowered is UNKNOWN to the element type.
+    "SELECT id FROM t WHERE i = ANY (ARRAY[1, $1, ($1 = true)])",
+    "SELECT id FROM t WHERE i = ANY (ARRAY[$1, 1, ($1 = true)])",
+    "SELECT id FROM t WHERE i = ANY (ARRAY[tm, $1, ($1 = iv)])",
+    "SELECT id FROM t WHERE i = ANY (ARRAY[j, $1, ($1 = 1)])",
+    "SELECT id FROM t WHERE i = ANY (ARRAY[true, $1, ($1 = 1)])",
+    "SELECT id FROM t WHERE i = ANY (ARRAY[$1, true, ($1 = 1)])",
+    // P2: the array's element type in the operator's refusal; the first name kept.
+    "SELECT id FROM t WHERE i = ANY (ARRAY['1', v3]) ORDER BY id",
+    "SELECT id FROM t WHERE i <> ALL (ARRAY['1', v3]) ORDER BY id",
+    "SELECT id FROM t WHERE i = ANY (ARRAY['1', c3]) ORDER BY id",
+    "SELECT id FROM t WHERE i = ANY (ARRAY[vc, ch, i]) ORDER BY id",
+    "SELECT id FROM t WHERE i = ANY (ARRAY[ch, v3]) ORDER BY id",
+    // P2: one category, no cast either way: the conversion refusal (42846).
+    "SELECT 1 FROM t WHERE i = ANY (ARRAY[d, tm])",
+    "SELECT 1 FROM t WHERE i = ANY (ARRAY[tm, d])",
+    "SELECT 1 FROM t WHERE i = ANY (ARRAY[ts, tm])",
+    "SELECT 1 FROM t WHERE i = ANY (ARRAY[tz, tm])",
+    "SELECT 1 FROM t WHERE i = ANY (ARRAY[d, tm, 1])",
+    "SELECT 1 FROM t WHERE i = ANY (ARRAY[u, j])",
+    "SELECT 1 FROM t WHERE i = ANY (ARRAY[u, jb])",
+    "SELECT d FROM t UNION SELECT tm FROM t",
+    "SELECT CASE WHEN i = 1 THEN d ELSE tm END FROM t",
+    "SELECT 1 FROM t WHERE jb IN (u)",
+    // P3: items coerced in order: an earlier input error first.
+    "SELECT id FROM t WHERE i = ANY (ARRAY[j, 'x', jb])",
   ])
     await compare(sql, undefined, true);
 });
