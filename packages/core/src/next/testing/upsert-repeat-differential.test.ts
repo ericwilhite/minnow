@@ -104,13 +104,20 @@ it.each(seedsFor("next-upsert-repeat", [0x21000, 0x21001]))(
                     ? "DO UPDATE WHERE false"
                     : "DO NOTHING",
               );
+              // The SQLSTATE and PostgreSQL's message text, both.
               const actual = await outcome(
                 () => core.execute(sql),
-                (error) => (error as { sqlState?: unknown }).sqlState ?? String(error),
+                (error) => {
+                  const { sqlState, message } = error as { sqlState?: string; message?: string };
+                  return sqlState === undefined ? String(error) : `${sqlState} ${String(message)}`;
+                },
               );
               const expected = await outcome(
                 () => pg.query(sql),
-                (error) => (error as { code?: unknown }).code,
+                (error) => {
+                  const { code, message } = error as { code?: string; message?: string };
+                  return `${String(code)} ${String(message)}`;
+                },
               );
               expect(actual, sql).toEqual(expected);
               reach.reach(expected === null ? "accepted" : "21000");
