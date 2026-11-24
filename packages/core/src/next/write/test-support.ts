@@ -488,3 +488,50 @@ export function watchGrants(governor: MemoryGovernor, observe: (grant: Grant) =>
     return grants;
   };
 }
+
+/**
+ * Reports, without a timer, whether a native group admission waited in the governor. The
+ * governor serves a request that fits inside the call that queues it, and serves a queued one
+ * inside the release that makes room for it; it reports each grant as it makes it
+ * (`Governor.observeGrants`). So an admission labelled `label` whose grant was not reported by
+ * the time `admitGroup` returned is queued, and `onWait` runs for it with `queued()`, which
+ * stays true until its grant is reported. A caller that checks `queued()` after the code that
+ * queued it has run (a microtask later) learns whether it is still waiting behind another
+ * holder, as opposed to a release the caller itself was about to make. One admission of `label`
+ * at a time. Wraps the instance's `admitGroup`, as `watchGrants` does.
+ */
+export function onGroupWait(
+  governor: Governor,
+  label: string,
+  onWait: (queued: () => boolean) => void,
+): { readonly waits: number; readonly immediate: number } {
+  const counts = { waits: 0, immediate: 0 };
+  const admitGroup = governor.admitGroup.bind(governor);
+  governor.admitGroup = (options) => {
+    // A zero-total group is served at once and reports no grant.
+    if (options.label !== label || options.grants.every((part) => part.minimumBytes === 0))
+      return admitGroup(options);
+    const seen = { served: false };
+    const stop = governor.observeGrants((event) => {
+      if (event.label === label) seen.served = true;
+    });
+    let admitted: Promise<readonly Grant[]>;
+    try {
+      admitted = admitGroup(options);
+    } catch (error) {
+      stop();
+      throw error;
+    }
+    if (seen.served) {
+      stop();
+      counts.immediate++;
+      return admitted;
+    }
+    counts.waits++;
+    const settled = () => stop();
+    admitted.then(settled, settled);
+    onWait(() => !seen.served);
+    return admitted;
+  };
+  return counts;
+}

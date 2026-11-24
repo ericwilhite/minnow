@@ -13,7 +13,7 @@ import * as writers from "../page/writer.js";
 import { PIN_HEADER_BYTES } from "../storage/root-pins.js";
 import { ExtentListKeeper } from "../storage/extent-list.js";
 import { WriteCredits } from "../write/credits.js";
-import { autocommit, batch, rowsOf, texts } from "../write/test-support.js";
+import { autocommit, batch, onGroupWait, rowsOf, texts } from "../write/test-support.js";
 import { StorageCore } from "./storage-core.js";
 import { oracleRows } from "./differential-adapter.js";
 
@@ -107,7 +107,6 @@ for (const boundary of ["retirement", "group"] as const) {
           let held: Uint8Array | undefined;
           let resident: Uint8Array | undefined;
           let residentGrant: Grant | undefined;
-          let timer: ReturnType<typeof setTimeout> | undefined;
           const releaseReader = () => {
             if (held !== undefined) expect(held.at(-1)).toBe(7);
             held = undefined;
@@ -141,6 +140,17 @@ for (const boundary of ["retirement", "group"] as const) {
               resident = new Uint8Array(live).fill(13);
               reach.reach("resident metadata overlaps writer step");
               credits.reclaimMetadata();
+              // Fill the competing reader from every idle forecast. Growth nets the owner's
+              // accounts (write/credits.ts `#growTo`), so idle WAL and merge forecasts would
+              // fund the step without any wait and were never real pressure.
+              for (const account of [
+                credits.rows,
+                credits.metadata,
+                credits.commits,
+                credits.merge,
+              ])
+                if (account.held > account.allocated + account.loaned)
+                  account.release(account.held - account.allocated - account.loaned);
               const bytes = governor.capBytes - governor.reserveBytes - governor.usedBytes;
               expect(bytes).toBeGreaterThan(0);
               expect(reader.allocate(bytes)).toBe(true);
@@ -173,7 +183,7 @@ for (const boundary of ["retirement", "group"] as const) {
           });
           // A funded attempt may have published rather than aborted. Both retire
           // provisional ownership; open/publishing/indeterminate work may not wait
-          // for more credit. Release the competitor on the next real task.
+          // for more credit.
           // eslint-disable-next-line @typescript-eslint/unbound-method -- Rebound below.
           const grow = WriteCredits.prototype.growTo;
           const growth = vi.spyOn(WriteCredits.prototype, "growTo").mockImplementation(function (
@@ -186,9 +196,18 @@ for (const boundary of ["retirement", "group"] as const) {
               const stats = core.harness.space.stats;
               assertSettled(borrowed?.state, stats.writerBytes, stats.releasingBytes);
               reach.reach("admission after provisional settlement");
-              timer ??= setTimeout(releaseReader, 5);
             }
             return grow.call(this, grant, wanted, signal);
+          });
+          // The metadata growth queues behind the reader; only then is the reader released
+          // (no timer decides whether the writer waited).
+          let blocked = 0;
+          onGroupWait(governor, "complete grow write path metadata", (queued) => {
+            if (held === undefined) return;
+            queueMicrotask(() => {
+              if (queued() && held !== undefined) blocked++;
+              releaseReader();
+            });
           });
           let closed = false;
           let restored = false;
@@ -202,7 +221,6 @@ for (const boundary of ["retirement", "group"] as const) {
           };
           onTestFinished(async () => {
             armed = false;
-            if (timer !== undefined) clearTimeout(timer);
             releaseReader();
             reader?.close();
             restore();
@@ -231,6 +249,9 @@ for (const boundary of ["retirement", "group"] as const) {
             }
             reach.reach("six 1 MiB native commits");
             await core.harness.path.quiesce();
+            expect(blocked, "the writer's metadata growth waited for the reader").toBeGreaterThan(
+              0,
+            );
             releaseReader();
             const checkRootFunding = () => {
               expect(core.harness.space.stats.pinCount).toBe(1);
@@ -265,7 +286,6 @@ for (const boundary of ["retirement", "group"] as const) {
             reach.reach("32 MiB peak");
           } finally {
             armed = false;
-            if (timer !== undefined) clearTimeout(timer);
             releaseReader();
             reader?.close();
             restore();

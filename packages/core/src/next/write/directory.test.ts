@@ -4,7 +4,8 @@
  * when a deletion folds into one of its groups, retires exactly the directory extents no longer
  * used (the extent audit), and reopens with every row.
  */
-import { watchGrants } from "./test-support.js";
+import type { Grant } from "../memory/governor.js";
+import { onGroupWait, watchGrants } from "./test-support.js";
 import { PIN_HEADER_BYTES } from "../storage/root-pins.js";
 import { GroupDirectory } from "./groups.js";
 import { describe, expect, it } from "vitest";
@@ -116,7 +117,7 @@ describe("paged group directory", () => {
 });
 
 describe("resident directory memory (review B3-p2a-2 #1)", () => {
-  it("charges the directory a table keeps resident, and a cap too tight for it refuses the open", async () => {
+  it("charges the directory a table keeps resident, and an open that does not fit waits for a temporary holder", async () => {
     const harness = new Harness("relaxed", "memory", ROWS_PER_GROUP);
     // Every cache registered with the governor, so evictable bytes can be told from the rest.
     const caches: Array<{ readonly evictableBytes: number }> = [];
@@ -127,8 +128,11 @@ describe("resident directory memory (review B3-p2a-2 #1)", () => {
     };
     // The engine's resident-metadata grant, to check its charge is real (not only reported).
     const metadata: { grant: { readonly allocated: number } | null } = { grant: null };
+    // The harness's startup grant, which returns its idle credit once the write path is opening.
+    let startup: Grant | null = null;
     watchGrants(harness.governor, (grant) => {
       if (grant.label === "write path metadata") metadata.grant = grant;
+      if (grant.label === "startup") startup = grant;
     });
     const fixed = () =>
       harness.governor.usedBytes - caches.reduce((sum, cache) => sum + cache.evictableBytes, 0);
@@ -165,35 +169,55 @@ describe("resident directory memory (review B3-p2a-2 #1)", () => {
     expect(metadata.grant?.allocated).toBe(grown + snapshotCredit());
     await harness.close();
     const baseline = fixed();
-    path = await harness.open();
+    // What the open holds once its owner minimum is admitted and the harness's startup grant has
+    // returned its idle credit: storage's fixed holdings, the startup remainder and the owner's
+    // complete minimum. Later growth (the directory's charge beyond the metadata minimum, warm
+    // windows kept from free memory) is netted from the owner's own idle forecasts, so it is not
+    // room the open must find.
+    let needed = 0;
+    const stopWatching = harness.governor.observeGrants((event) => {
+      if (event.label !== "write owner minimum") return;
+      const held: Grant | null = startup;
+      const idle = held === null ? 0 : held.held - held.allocated - held.loaned;
+      needed = fixed() - baseline - idle;
+    });
+    try {
+      path = await harness.open();
+    } finally {
+      stopWatching();
+    }
+    expect(needed).toBeGreaterThan(0);
     const opened = path.residentMetadataBytes;
     // The same directory, charged again at open, before it was materialized.
     expect(opened).toBe(grown);
     expect(metadata.grant?.allocated).toBe(opened + snapshotCredit());
-    const used = fixed() - baseline;
     await harness.close();
-    // Ballast leaves room for everything the open needs except half the directory's charge.
     const governor = harness.governor;
     // Caches give way under pressure: only the fixed holdings count.
     const room = governor.capBytes - governor.reserveBytes - fixed();
+    // Ballast leaves room for everything the open must admit except half the directory's charge.
     const ballast = await governor.admit({
       label: "ballast",
-      minimumBytes: room - used + opened,
+      minimumBytes: room - needed + Math.floor(opened / 2),
       spillable: false,
     });
-    // PROPOSAL "One memory governor": temporary competing holdings wait, never refuse.
-    let released = false;
-    const release = setTimeout(() => {
-      ballast.close();
-      released = true;
-    }, 25);
+    // PROPOSAL "One memory governor": temporary competing holdings wait, never refuse. The
+    // ballast is released only once the open is queued behind it: still queued after the
+    // harness's own startup release, which runs in the same task (no timer decides that).
+    let blocked = 0;
+    const admissions = onGroupWait(governor, "write owner minimum", (queued) => {
+      queueMicrotask(() => {
+        if (queued()) blocked++;
+        ballast.close();
+      });
+    });
     try {
       path = await harness.open();
-      expect(released).toBe(true);
     } finally {
-      clearTimeout(release);
       ballast.close();
     }
+    expect(admissions.waits).toBe(1);
+    expect(blocked, "the open waited for the ballast").toBe(1);
     expect(path.residentMetadataBytes).toBe(opened);
     expect(metadata.grant?.allocated).toBe(opened + snapshotCredit());
     // Dropping the table returns its directory's charge (no older reader holds it).
