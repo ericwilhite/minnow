@@ -171,6 +171,8 @@ export class Harness {
   ownerHoldings: (() => number) | null = null;
   /** Called with the extent space before the write path opens over it (tests instrument reads). */
   onSpace: ((space: ExtentSpace) => void) | null = null;
+  /** The next open's signal (`EngineInput.options.signal`): cancels an open that waits. */
+  signal: AbortSignal | undefined = undefined;
   /** Wall time of the last open's two phases: the extent space (its walk), then the write path. */
   lastOpen = { spaceMs: 0, pathMs: 0 };
 
@@ -217,7 +219,10 @@ export class Harness {
         session,
         space: this.space,
         governor: this.governor,
-        options: { durability: this.durability },
+        options: {
+          durability: this.durability,
+          ...(this.signal === undefined ? {} : { signal: this.signal }),
+        },
         ...(this.extentDeltas === null ? {} : { extentDeltas: this.extentDeltas }),
         ...(this.ownerHoldings === null ? {} : { ownerHoldings: this.ownerHoldings }),
         tuning: {
@@ -248,11 +253,18 @@ export class Harness {
 
   /** Abandons the write path without closing it (no final header), then opens again. */
   async crash(): Promise<WritePathImpl> {
+    await this.abandon();
+    return this.open();
+  }
+
+  /** Abandons the write path as a crashed process does (no final header), leaving the store for
+   * any next opener (this harness, or `openNativeOwner` over `backend`). */
+  async abandon(): Promise<void> {
     await this.path.flush();
     WritePathImpl.abandonForCrash(this.path);
     await this.#release?.();
+    this.#release = null;
     if (this.backend instanceof SimBackend) this.backend.restart();
-    return this.open();
   }
 
   async close(): Promise<void> {

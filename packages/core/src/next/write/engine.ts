@@ -134,6 +134,7 @@ import {
 } from "../access/write-path.js";
 import { RequestLedger } from "../format/ledger.js";
 import {
+  LOG_HEADER_BYTES,
   LogCorruptionError,
   newestLogHeader,
   RECOVERY_SCAN_BYTES,
@@ -183,7 +184,7 @@ import { claimWriteOwner } from "./owner-claim.js";
 import { GroupWriter } from "../page/writer.js";
 import type { StoreSession } from "../storage/contract.js";
 import { ExtentListKeeper, type ExtentList } from "../storage/extent-list.js";
-import type { ExtentWriter } from "../storage/extents.js";
+import { ReadDeniedError, type ExtentWriter } from "../storage/extents.js";
 import type { StatValue } from "../types.js";
 import { layoutOf } from "../types.js";
 import type { Vector } from "../vector/vector.js";
@@ -211,6 +212,14 @@ import {
 } from "./catalog-storage.js";
 import { decodeCatalogParts } from "./catalog-stream.js";
 import { decodeColumn, isNullAt, MEMORY_CHUNK_ROWS } from "./columns.js";
+import {
+  emptyMemtableBytes,
+  keyBytes as keyBytesOf,
+  replayEntryBytes,
+  stepCharge,
+  tombstoneBytes,
+  type StepTable,
+} from "./step-charge.js";
 import { IDLE_FLUSH_MS, LogAppender, type LogPosition } from "./log.js";
 import { BlobCache, fullBlobKey } from "../format/blob-cache.js";
 import {
@@ -508,6 +517,30 @@ function tableStatistics(groupCount: number, totals: ReadonlyMap<number, Totals>
   return { groupCount, columns };
 }
 
+/** The commit credit recovery keeps: the log appender's header buffer, built when it ends. */
+const RECOVERY_COMMIT_BYTES = LOG_HEADER_BYTES + COMMIT_BUFFER_OVERHEAD;
+
+/**
+ * Opening needs more memory than the cap allows for the rows it must replay from the log: they
+ * stay in memory until recovery ends. The data is intact; a larger memory cap opens it. A typed
+ * memory refusal (53200), with a message that says what to do.
+ *
+ * `bytes` and `capacity` are the refused admission's (write/credits.ts `growTo`): everything the
+ * write path holds through that replay step plus the step, against the capacity it was measured
+ * in (the cap less its reserve, or the whole cap for progress). So `bytes > capacity`, and an open
+ * at any cap that leaves less than `bytes` for it is refused at the same step.
+ */
+export class ReplayMemoryError extends MemoryAdmissionError {
+  constructor(bytes: number, capacity: number) {
+    super("log replay", bytes, capacity);
+    const mib = (n: number) => (n / (1024 * 1024)).toFixed(1);
+    this.message =
+      `Opening this database needs at least ${mib(bytes)} MiB to replay its recently written ` +
+      `rows, more than its memory cap allows for them (${mib(capacity)} MiB). The data is intact; ` +
+      `open it with a larger memory cap.`;
+  }
+}
+
 export class WritePathImpl implements WritePath, EngineHooks {
   #ftsRenderer: FtsWriteRenderer | null = null;
   #ftsPending: { transaction: number; ref: BlobRef; lsn: number; invalidated: boolean } | null =
@@ -557,6 +590,9 @@ export class WritePathImpl implements WritePath, EngineHooks {
   readonly #arenaPool: ArenaPool;
   readonly #now: () => number;
   readonly #signal: AbortSignal | undefined;
+  /** What recovery's waits honour: the lifetime signal and, until the open returns, the open's
+   * own (`OpenWritePathInput.openSignal`). */
+  #recoverySignal: AbortSignal | undefined;
   #appender!: LogAppender;
   #catalog: Catalog;
   /** The catalog of the current root (as of its global LSN). */
@@ -830,6 +866,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#now = input.options.now ?? Date.now;
     this.#signal = input.options.signal;
     this.#signal?.addEventListener("abort", this.#abortCommit, { once: true });
+    this.#recoverySignal =
+      input.openSignal === undefined || input.openSignal === input.options.signal
+        ? input.options.signal
+        : input.options.signal === undefined
+          ? input.openSignal
+          : AbortSignal.any([input.options.signal, input.openSignal]);
     this.#root = root;
     this.#catalog = catalog;
     this.#baseCatalog = catalog;
@@ -961,8 +1003,14 @@ export class WritePathImpl implements WritePath, EngineHooks {
               // A refused metadata attempt's funded credit, until that attempt settles.
               engine.#metadataBudget.fundedBytes,
             ),
-            commits:
-              engine.#commitEncoding > 0 || (!engine.#recovering && engine.#appender.hasPendingWork)
+            // Recovery keeps what the log appender takes from the commit window when recovery
+            // ends (its header buffer) beside the buffers already allocated there: growth that
+            // waits during the open must not release it first (that left the appender's buffer
+            // unfunded). Only that: the rest of the window is idle until the first commit, and
+            // replay may need it.
+            commits: engine.#recovering
+              ? engine.#commitBuffers.grant.allocated + RECOVERY_COMMIT_BYTES
+              : engine.#commitEncoding > 0 || engine.#appender.hasPendingWork
                 ? COMMIT_MINIMUM_BYTES
                 : 0,
           },
@@ -1140,6 +1188,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
       await engine.#recover();
       await engine.#validateRunLimits();
       engine.#recovering = false;
+      // The open's own signal ends with the open: the path keeps only its lifetime signal.
+      engine.#recoverySignal = engine.#signal;
       // scanLogIncremental has returned its buffer. Its open-only reservation
       // cannot remain ahead of an independently admitted query after readiness.
       credits.retireRowsMinimum(MINIMUM_BYTES - RECOVERY_SCAN_BYTES);
@@ -1485,21 +1535,31 @@ export class WritePathImpl implements WritePath, EngineHooks {
         (effect, index) => effect.kind === "ftsMutation" && decisions[index] === true,
       )
     ) {
-      const mutations = this.#ensureFtsMutations();
-      const inlineReservation = await mutations.prepare(function* () {
-        for (let index = 0; index < body.effects.length; index++) {
-          if ((index & 1023) === 0) yield null;
-          const effect = body.effects[index];
-          if (effect?.kind !== "ftsMutation" || decisions[index] !== true) continue;
-          for (let prior = 0; prior < index; prior++) {
-            if ((prior & 1023) === 0) yield null;
-            const old = body.effects[prior];
-            if (old?.kind === "ftsMutation" && old.tableId === effect.tableId)
-              throw new LogCorruptionError("Duplicate FTS mutation in one commit");
-          }
-          yield effect;
-        }
-      }, this.#signal);
+      // Their metadata is admitted as recovery's (it waits, or refuses with 53200): replay runs
+      // beside other holders and queued admissions, where a bare charge can be refused.
+      const mutations = await this.#metadataRetry(
+        () => this.#ensureFtsMutations(),
+        this.#recoverySignal,
+      );
+      const signal = this.#signal;
+      const inlineReservation = await this.#metadataRetry(
+        () =>
+          mutations.prepare(function* () {
+            for (let index = 0; index < body.effects.length; index++) {
+              if ((index & 1023) === 0) yield null;
+              const effect = body.effects[index];
+              if (effect?.kind !== "ftsMutation" || decisions[index] !== true) continue;
+              for (let prior = 0; prior < index; prior++) {
+                if ((prior & 1023) === 0) yield null;
+                const old = body.effects[prior];
+                if (old?.kind === "ftsMutation" && old.tableId === effect.tableId)
+                  throw new LogCorruptionError("Duplicate FTS mutation in one commit");
+              }
+              yield effect;
+            }
+          }, signal),
+        this.#recoverySignal,
+      );
       mutations.commit(inlineReservation, lsn);
       await mutations.release(inlineReservation);
     }
@@ -1595,13 +1655,86 @@ export class WritePathImpl implements WritePath, EngineHooks {
           if (!deletions?.isDeleted(position))
             rowIds.push(table.rowId(segment.index * 65_536 + position));
       }
+      const step: StepTable = {
+        def,
+        invalid: (indexId) => this.#catalog.index(indexId)?.invalid === true,
+        live: () => memtable,
+        memtableRows: this.#memtableRows,
+        key: (vectors, columnId) =>
+          need(vectors[def.columns.findIndex((column) => column.id === columnId)]),
+      };
       for (let from = 0; from < rowIds.length; from += MEMORY_CHUNK_ROWS) {
         const ids = rowIds.slice(from, from + MEMORY_CHUNK_ROWS);
-        const vectors = await readRows(table, ids);
-        this.#putEntries(def, [index], memtable, vectors, null, ids, seq);
+        const vectors = await this.#replayRead(() => readRows(table, ids));
+        // The chunk's entries, from the values just read: the index's delta growth, the key
+        // batch that encodes them and their leaves.
+        const plan = { rows: null, from: 0, count: ids.length };
+        const keyBytes = keyBytesOf(step, vectors, plan, index.columnIds);
+        const bytes =
+          (memtable.deltas.get(index.id)?.appendBytes(ids.length, ids.length, keyBytes) ?? 0) +
+          replayEntryBytes({ ...step, def: { ...def, indexes: [index] } }, vectors, plan);
+        await this.#replayStep(bytes, () => {
+          this.#putEntries(def, [index], memtable, vectors, null, ids, seq);
+        });
       }
     } finally {
       snapshot.releaseInternal();
+    }
+  }
+
+  /**
+   * A read recovery makes from stored rows (an index backfill's), charged to the write path's row
+   * account: admitted as a replay step (`#replayStep`), with what a denied attempt said it needed
+   * added on each retry. A read keeps nothing until it returns, so a retry repeats it whole.
+   */
+  async #replayRead<T>(read: () => MaybePromise<T>): Promise<T> {
+    let bytes = 0;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.#replayStep(bytes, read);
+      } catch (error) {
+        if (!(error instanceof ReadDeniedError) || attempt >= 16) throw error;
+        bytes = Math.max(2 * bytes, bytes + error.bytes);
+      }
+    }
+  }
+
+  /**
+   * Runs one replay step that stores up to `bytes` more in the write path's row account (rows,
+   * tombstones, index entries, the reads that rebuild them). Replay cannot flush what it replays,
+   * so it admits the step first: from the row account's headroom or the owner's idle forecasts at
+   * once, else by waiting for another holder as the writer's own growth (cancellable through the
+   * open's signal). When the step could never fit beside what the write path holds, the open is
+   * refused (53200, `ReplayMemoryError`); the log is untouched and a larger cap opens it.
+   *
+   * The admitted bytes stay kept from reclaim until the step ends (`holdRowsWhileWaiting`, as
+   * `#waitForRows` keeps a waiting write's): a queued admission's reclaim could otherwise return
+   * them as soon as they are granted, and the growth would ask again forever. The state pin a step
+   * may publish (a new memtable) is prepaid as metadata headroom before it runs.
+   */
+  async #replayStep<T>(bytes: number, work: () => MaybePromise<T>): Promise<T> {
+    const signal = this.#recoverySignal;
+    signal?.throwIfAborted();
+    const keep = this.#credits.holdRowsWhileWaiting(bytes);
+    try {
+      try {
+        if (!this.#headroom(bytes))
+          await this.#credits.growTo(
+            this.#grant,
+            this.#grant.allocated + this.#grant.loaned + bytes,
+            signal,
+          );
+        const pin = this.#credits.prepareMetadata(REPLAY_PIN_BYTES, signal);
+        if (pin instanceof Promise) await pin;
+      } catch (error) {
+        if (error instanceof MemoryAdmissionError && !(error instanceof ReplayMemoryError))
+          throw new ReplayMemoryError(error.bytes, error.capacity);
+        throw error;
+      }
+      return await work();
+    } finally {
+      this.#credits.retireMetadataHeadroom(0);
+      keep();
     }
   }
 
@@ -1637,51 +1770,134 @@ export class WritePathImpl implements WritePath, EngineHooks {
                 ? missingVector(column, inserts.rowCount)
                 : need(columns[position]);
             });
+      // Replay stores rows as an insert does, so it admits what each step stores first
+      // (write/step-charge.ts): stored columns are the logged ones, keys the current catalog's.
+      const step: StepTable = {
+        def: { ...physicalDef, indexes: def.indexes },
+        invalid: (indexId) => this.#catalog.index(indexId)?.invalid === true,
+        live: () => state.view.memtables.at(-1),
+        memtableRows: this.#memtableRows,
+        key: (_, columnId) =>
+          need(indexed[def.columns.findIndex((column) => column.id === columnId)]),
+      };
+      const fresh: StepTable = { ...step, live: () => undefined };
       let done = 0;
       while (done < inserts.rowCount) {
-        let { memtable } = this.liveMemtable(effect.tableId, inserts.rowCount - done, physicalDef);
-        const logged = inserts.firstRowId + done;
-        // Staging moves the root's next row id past its rows; after a rollback the ids it used
-        // (never committed) may be used again by rows logged but not flushed. An empty memtable
-        // starts at the logged row then, never before what precedes it.
-        if (
-          memtable.rowCount === 0 &&
-          logged < memtable.firstRowId &&
-          logged >= this.#rowFloor(state, memtable)
-        )
-          memtable = this.#liveAt(state, logged, physicalDef);
-        // Row ids a rolled-back staging used and the next rows skipped: a forward gap.
-        if (memtable.firstRowId + memtable.rowCount < logged)
-          memtable = this.#liveAt(state, logged, physicalDef);
-        const next = memtable.firstRowId + memtable.rowCount;
-        if (next !== inserts.firstRowId + done)
-          throw new LogCorruptionError(
-            `Logged rows of table ${String(effect.tableId)} start at row ${String(inserts.firstRowId + done)}, not ${String(next)}`,
-          );
-        const take = Math.min(memtable.capacity, inserts.rowCount - done);
-        const before = memtable.rowCount;
-        memtable.append(columns, null, done, take);
-        memtable.mark(lsn);
-        const rowIds = Array.from({ length: take }, (_, k) => memtable.firstRowId + before + k);
-        const rows = Uint16Array.from({ length: take }, (_, k) => done + k);
-        this.#putEntries(def, def.indexes, memtable, indexed, rows, rowIds, lsn);
-        done += take;
+        const count = Math.min(MEMORY_CHUNK_ROWS, inserts.rowCount - done);
+        const plan = { rows: null, from: done, count };
+        // A step past a gap in row ids (a rolled-back staging's) opens a new memtable there
+        // (`#liveAt`) instead of growing the live one: admit whichever it may do.
+        const live = state.view.memtables.at(-1);
+        const continues =
+          live?.state === "live" && live.firstRowId + live.rowCount === inserts.firstRowId + done;
+        const bytes =
+          Math.max(
+            stepCharge(step, columns, plan),
+            continues ? 0 : stepCharge(fresh, columns, plan),
+          ) + replayEntryBytes(step, columns, plan);
+        done += await this.#replayStep(bytes, () =>
+          this.#replayInsertStep(
+            state,
+            effect,
+            physicalDef,
+            def,
+            columns,
+            indexed,
+            done,
+            count,
+            lsn,
+          ),
+        );
       }
     }
     const deletes = effect.deletes;
     if (deletes !== null) {
-      const live = this.liveMemtable(effect.tableId, 0).memtable;
       const ids = deletes.indexIds ?? def.indexes.map((index) => index.id);
-      deletes.rowIds.forEach((rowId, k) => {
-        const keys = deletes.keys[k] ?? [];
+      const step: StepTable = {
+        def,
+        invalid: (indexId) => this.#catalog.index(indexId)?.invalid === true,
+        live: () => state.view.memtables.at(-1),
+        memtableRows: this.#memtableRows,
+        key: () => {
+          throw new Error("Tombstones carry their keys");
+        },
+      };
+      for (let from = 0; from < deletes.rowIds.length; from += MEMORY_CHUNK_ROWS) {
+        const to = Math.min(deletes.rowIds.length, from + MEMORY_CHUNK_ROWS);
+        // Tombstones go to the newest memtable (one opens when none is live): admit each
+        // index's delta growth for this chunk's keys, and the memtable when it opens.
+        const live = state.view.memtables.at(-1);
+        const usable = live?.state === "live" && live.schemaVersion === def.schemaVersion;
+        let bytes = usable ? 0 : emptyMemtableBytes(step);
         ids.forEach((indexId, i) => {
-          const key = keys[i];
-          if (key === undefined || key.length === 0) return;
-          live.deltas.get(indexId)?.add(key, 0, key.length, rowId, lsn, true);
+          let entries = 0,
+            keyBytes = 0;
+          for (let k = from; k < to; k++) {
+            const key = deletes.keys[k]?.[i];
+            if (key === undefined || key.length === 0) continue;
+            entries++;
+            keyBytes += key.length;
+          }
+          bytes += tombstoneBytes(usable ? live.deltas.get(indexId) : undefined, entries, keyBytes);
         });
-        this.#markDeleted(state, rowId, lsn);
-      });
+        await this.#replayStep(bytes, () => {
+          const memtable = this.liveMemtable(effect.tableId, 0).memtable;
+          for (let k = from; k < to; k++) {
+            const rowId = need(deletes.rowIds[k]);
+            const keys = deletes.keys[k] ?? [];
+            ids.forEach((indexId, i) => {
+              const key = keys[i];
+              if (key === undefined || key.length === 0) return;
+              memtable.deltas.get(indexId)?.add(key, 0, key.length, rowId, lsn, true);
+            });
+            this.#markDeleted(state, rowId, lsn);
+          }
+        });
+      }
     }
+  }
+
+  /** One admitted step of a logged insert (`#replayRows`): the rows `done` … `done + count` of
+   * `columns`, into the live memtable (or a new one past a gap); returns how many it stored. */
+  #replayInsertStep(
+    state: TableState,
+    effect: Extract<BodyEffect, { kind: "rows" }>,
+    physicalDef: TableDef,
+    def: TableDef,
+    columns: readonly Vector[],
+    indexed: readonly Vector[],
+    done: number,
+    count: number,
+    lsn: number,
+  ): number {
+    const inserts = need(effect.inserts);
+    let { memtable } = this.liveMemtable(effect.tableId, count, physicalDef);
+    const logged = inserts.firstRowId + done;
+    // Staging moves the root's next row id past its rows; after a rollback the ids it used
+    // (never committed) may be used again by rows logged but not flushed. An empty memtable
+    // starts at the logged row then, never before what precedes it.
+    if (
+      memtable.rowCount === 0 &&
+      logged < memtable.firstRowId &&
+      logged >= this.#rowFloor(state, memtable)
+    )
+      memtable = this.#liveAt(state, logged, physicalDef);
+    // Row ids a rolled-back staging used and the next rows skipped: a forward gap.
+    if (memtable.firstRowId + memtable.rowCount < logged)
+      memtable = this.#liveAt(state, logged, physicalDef);
+    const next = memtable.firstRowId + memtable.rowCount;
+    if (next !== inserts.firstRowId + done)
+      throw new LogCorruptionError(
+        `Logged rows of table ${String(effect.tableId)} start at row ${String(inserts.firstRowId + done)}, not ${String(next)}`,
+      );
+    const take = Math.min(memtable.capacity, count);
+    const before = memtable.rowCount;
+    memtable.append(columns, null, done, take);
+    memtable.mark(lsn);
+    const rowIds = Array.from({ length: take }, (_, k) => memtable.firstRowId + before + k);
+    const rows = Uint16Array.from({ length: take }, (_, k) => done + k);
+    this.#putEntries(def, def.indexes, memtable, indexed, rows, rowIds, lsn);
+    return take;
   }
 
   /**
@@ -7237,6 +7453,8 @@ export class ExtentSinkError extends Error {
  * post-switch pin over its funding.
  */
 const STATE_PIN = "current state";
+/** The state pin a replay step may publish (a new memtable), prepaid before the step. */
+const REPLAY_PIN_BYTES = pinBytes(STATE_PIN);
 
 /** Read sites named on `ReadOptions.site` / `PeekOptions.site` (diagnostics and tests). */
 export const READ_SITES = {
