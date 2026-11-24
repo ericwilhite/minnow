@@ -67,7 +67,7 @@ import type { CommitRequest, Durability } from "../access/write-path.js";
 import type { SequenceSession } from "../exec/executor.js";
 import type { ResultFrame, ResultStream } from "../exec/result.js";
 import type { ReturnPool } from "../exec/return-pool.js";
-import type { PhysicalType } from "../types.js";
+import { samePhysicalType, type PhysicalType } from "../types.js";
 import type { ParameterizedPlan, ParameterizedText } from "../lower/parameterize.js";
 import type { WireInputColumn } from "./frame.js";
 import type { LedgerSession, OwnerLedger } from "./outcomes.js";
@@ -109,6 +109,14 @@ export interface RunContext {
   readonly windowBytes: number;
   /** Upper bound on rows per frame, or null. */
   readonly frameRows: number | null;
+  /**
+   * A prepared statement's: what its client was told at prepare (its result columns, its
+   * parameter types). A re-plan keeps the parameter types and must keep the columns.
+   */
+  readonly prepared?: {
+    readonly columns: readonly WireColumnMeta[];
+    readonly parameters: readonly PhysicalType[];
+  };
 }
 
 /** What a run reports; the server adds `replayed`, `closedEarly` and the session state. */
@@ -117,6 +125,9 @@ export type RunOutcome = Pick<StatementSummary, "command" | "rowCount" | "counts
 export interface Run {
   /** The executor's stream (B4), pulled by the server. Empty for statements without rows. */
   readonly results: ResultStream;
+  /** The columns of the plan it runs, when that may differ from its arrival plan's (an
+   * autocommit write re-planned on the catalog it runs on). Read once results flow. */
+  readonly columns?: readonly WireColumnMeta[] | undefined;
   /** Owner-facing: the terminal `done` may be sent (see "Completions"). */
   readonly done: Promise<RunOutcome>;
   /** After all frames return, fences result-grant/borrowed-IO cleanup. Live teardown awaits
@@ -164,7 +175,7 @@ export interface EngineSession {
    * plans against a transaction's uncommitted schema stay private to the session and are dropped
    * when the transaction ends or rolls back to a savepoint.
    */
-  plan(text: string): PlannedStatement;
+  plan(text: string, parameterTypes?: readonly PhysicalType[]): PlannedStatement;
   /**
    * An admitted statement failed to plan (`text`'s lowering threw): it takes the open
    * transaction's snapshot as PostgreSQL's would once the text raw-parsed, by its first words
@@ -261,6 +272,11 @@ export interface OwnerEngine {
   /** Parses, rewrites and lowers `text`, or returns the cached plan. Throws SQL errors. */
   plan(text: string): PlannedStatement;
   /**
+   * Resolves when the transaction holding the writer turn ends (rejects when `signal` aborts),
+   * or null when none holds it now.
+   */
+  writerTurnReleased?(signal: AbortSignal): Promise<void> | null;
+  /**
    * The write path's delivery rule (access/write-path.ts "Delivery"): null when everything up to
    * `lsn` is durable (or the mode is relaxed), else a promise for it. The server checks it per
    * frame before posting.
@@ -347,4 +363,36 @@ export class IdleTransactionTimer {
       this.#onExpire();
     }, this.#timeoutMs);
   }
+}
+
+/** Parameter types compared by value, as `sameColumns` compares result types. */
+export function sameParameters(a: readonly PhysicalType[], b: readonly PhysicalType[]): boolean {
+  return (
+    a.length === b.length &&
+    a.every((type, k) => {
+      const other = b.at(k);
+      return other !== undefined && samePhysicalType(type, other);
+    })
+  );
+}
+
+/**
+ * Whether two statements' result columns are the same result type, as PostgreSQL's prepared
+ * statement requires on re-analysis: names, types, SQL type names and renderings. Nullability is
+ * no part of it (a prepared statement survives SET NOT NULL); types compare by value.
+ */
+export function sameColumns(a: readonly WireColumnMeta[], b: readonly WireColumnMeta[]): boolean {
+  return (
+    a.length === b.length &&
+    a.every((column, k) => {
+      const other = b.at(k);
+      if (other === undefined) return false;
+      return (
+        column.name === other.name &&
+        samePhysicalType(column.type, other.type) &&
+        column.sqlType === other.sqlType &&
+        column.render === other.render
+      );
+    })
+  );
 }

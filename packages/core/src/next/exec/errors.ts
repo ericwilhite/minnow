@@ -50,10 +50,10 @@ export class PlanStaleError extends ExecutionError {
 }
 
 /**
- * A statement the owner re-planned (its plan was stale: another transaction's DDL committed
- * while it waited for the writer turn) would no longer match what its client was told when it
- * was planned: its result columns or parameter types. PostgreSQL refuses a cached plan the same
- * way ("cached plan must not change result type", 0A000). Nothing ran.
+ * A prepared statement the owner re-planned (another transaction's DDL committed since it was
+ * prepared) returns other result columns than its client was told at prepare. PostgreSQL
+ * refuses a cached plan the same way, on every execute ("cached plan must not change result
+ * type", 0A000). Nothing ran.
  */
 export class PlanShapeChangedError extends ExecutionError {
   constructor() {

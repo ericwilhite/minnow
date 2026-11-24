@@ -244,6 +244,13 @@ export interface WritePath {
   pin(options?: PinOptions): Snapshot;
   /** Waits for the writer slot (FIFO) and for backpressure. */
   begin(options?: BeginOptions): Promise<WriteTransaction>;
+  /** Writers waiting now: for the slot (`begin`) or for its holder to end (`whenTransactionEnds`). */
+  readonly waitingWriters?: number;
+  /** A transaction holds the writer slot now. */
+  readonly transactionOpen?: boolean;
+  /** Resolves when the transaction holding the writer slot ends (at once when none does);
+   * rejects with the signal's reason when it aborts first. */
+  whenTransactionEnds?(signal?: AbortSignal): Promise<void>;
   /** Resolves when every frame with LSN ≤ `lsn` is durable; null if that is already so. */
   durable(lsn: number): Promise<void> | null;
   /**

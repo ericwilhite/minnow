@@ -1,3 +1,5 @@
+import { sameColumns } from "./engine.js";
+import type { PhysicalType } from "../types.js";
 import { LiveRuntime } from "../live/runtime.js";
 import type { OwnerSnapshotOperations } from "./snapshot-connection.js";
 import { statementRuleReach } from "../exec/statement-reach.js";
@@ -195,22 +197,6 @@ type AutocommitBody = (
 
 type LoweredDdl = Extract<LoweredStatement, { kind: "ddl" }>;
 
-function sameColumns(a: readonly WireColumnMeta[], b: readonly WireColumnMeta[]): boolean {
-  return (
-    a.length === b.length &&
-    a.every((column, k) => {
-      const other = b.at(k);
-      return (
-        column.name === other?.name &&
-        column.type === other.type &&
-        column.nullable === other.nullable &&
-        column.sqlType === other.sqlType &&
-        column.render === other.render
-      );
-    })
-  );
-}
-
 function boundParameters(
   statement: PlannedStatement,
   params: readonly WireValue[],
@@ -258,7 +244,7 @@ function oneTextRow(column: WireColumnMeta, value: string): ResultStream {
  * first): it forwards to the execution's stream once attached.
  */
 class DeferredStream implements ResultStream {
-  readonly columns: readonly OutputColumn[];
+  readonly #columns: readonly OutputColumn[];
   #target: ResultStream | null = null;
   #failure: unknown = null;
   #failed = false;
@@ -266,7 +252,12 @@ class DeferredStream implements ResultStream {
   #waiting: Array<() => void> = [];
 
   constructor(columns: readonly OutputColumn[]) {
-    this.columns = columns;
+    this.#columns = columns;
+  }
+
+  /** The attached stream's columns (a re-planned statement's), else the ones it was made with. */
+  get columns(): readonly OutputColumn[] {
+    return this.#target?.columns ?? this.#columns;
   }
 
   /** Attaches the stream once; later calls are ignored. */
@@ -444,6 +435,12 @@ class ComposedEngine implements CatalogOwnerEngine {
     return this.#options.writePath.catalog.version;
   }
 
+  writerTurnReleased(signal: AbortSignal): Promise<void> | null {
+    const path = this.#options.writePath;
+    if (path.transactionOpen !== true || path.whenTransactionEnds === undefined) return null;
+    return path.whenTransactionEnds(signal);
+  }
+
   get ledger(): OwnerLedger {
     return this.#options.writePath.ledger;
   }
@@ -468,13 +465,22 @@ class ComposedEngine implements CatalogOwnerEngine {
     return ++this.#sessionId;
   }
 
-  #context(catalog: CatalogView): PlannerContext {
-    return { catalog, statistics: this.#statistics, costs: this.#options.costs ?? EXECUTOR_COSTS };
+  #context(catalog: CatalogView, parameterTypes?: readonly PhysicalType[]): PlannerContext {
+    return {
+      catalog,
+      statistics: this.#statistics,
+      costs: this.#options.costs ?? EXECUTOR_COSTS,
+      ...(parameterTypes === undefined ? {} : { parameterTypes }),
+    };
   }
 
   /** Lowers without caching: plans against uncommitted schema state (session-private). */
-  lower(text: string, catalog: CatalogView): PlannedStatement {
-    return toPlanned(this.#options.planner.lower(text, this.#context(catalog)));
+  lower(
+    text: string,
+    catalog: CatalogView,
+    parameterTypes?: readonly PhysicalType[],
+  ): PlannedStatement {
+    return toPlanned(this.#options.planner.lower(text, this.#context(catalog, parameterTypes)));
   }
 
   #drifted(statement: LoweredStatement): boolean {
@@ -486,8 +492,12 @@ class ComposedEngine implements CatalogOwnerEngine {
   }
 
   /** Public lowering results/markers use normalized keys; raw constants use full text only. */
-  plan(text: string, catalog: CatalogView = this.#options.writePath.catalog): PlannedStatement {
-    const context = this.#context(catalog);
+  plan(
+    text: string,
+    catalog: CatalogView = this.#options.writePath.catalog,
+    parameterTypes?: readonly PhysicalType[],
+  ): PlannedStatement {
+    const context = this.#context(catalog, parameterTypes);
     const prefix = `${String(catalog.version)}\u0000${JSON.stringify(context.parameterTypes ?? [])}\u0000`;
     const parameterized = this.#options.planner.parameterize(text);
     if (parameterized !== null) {
@@ -822,8 +832,13 @@ class ComposedSession implements EngineSession {
   }
 
   /** Plans only: a statement takes the snapshot when it runs (`#guard`, `statementFailed`). */
-  plan(text: string): PlannedStatement {
+  plan(text: string, parameterTypes?: readonly PhysicalType[]): PlannedStatement {
     const catalog = this.#catalog();
+    // A prepared statement re-planned keeps the parameter types its client binds with.
+    if (parameterTypes !== undefined)
+      return this.#tx === null || catalog.version === this.#writePath().catalog.version
+        ? this.#engine.plan(text, catalog, parameterTypes)
+        : this.#engine.lower(text, catalog, parameterTypes);
     // A transaction whose DDL moved its catalog past the committed one plans privately: another
     // transaction could reach the same version number with different contents.
     if (this.#tx === null || catalog.version === this.#writePath().catalog.version)
@@ -1100,6 +1115,10 @@ class ComposedSession implements EngineSession {
       get reachedCommit() {
         return run.reachedCommit;
       },
+      // Read live: an autocommit write re-planned on the catalog it runs on reports its plan's.
+      get columns() {
+        return run.columns;
+      },
     };
   }
 
@@ -1257,21 +1276,26 @@ class ComposedSession implements EngineSession {
     params: readonly WireValue[],
     context: RunContext,
   ): Run {
-    return this.#autocommit(
+    // The columns it reports: its arrival plan's, until the plan it runs replaces them.
+    let columns = statement.columns;
+    const run = this.#autocommit(
       statement.columns,
       (tx, stream) => {
-        const current = this.#replanned(statement, tx.catalog);
+        const current = this.#replanned(statement, tx.catalog, context.prepared);
+        columns = current.columns;
         const lowered = current.lowered;
-        if (lowered.kind === "ddl") return this.#ddlBody(lowered, context)(tx, stream);
+        if (lowered.kind === "ddl") return this.#ddlBody(lowered, context, tx);
         if (lowered.kind !== "modify")
           throw new TypeError("A write statement re-planned as another kind");
         const bound = boundParameters(current, params);
         return this.#native(lowered, tx.catalog)
-          ? this.#nativeBody(lowered, bound, context)(tx, stream)
-          : this.#modifyBody(lowered, bound, context)(tx, stream);
+          ? this.#nativeBody(lowered, bound, context, tx)
+          : this.#modifyBody(lowered, bound, context, tx, stream);
       },
       context,
     );
+    Object.defineProperty(run, "columns", { get: () => columns, enumerable: true });
+    return run;
   }
 
   /** The session's open read-write transaction (autocommit writes run through #autocommitWrite). */
@@ -1281,16 +1305,22 @@ class ComposedSession implements EngineSession {
     return this.#tx;
   }
 
-  /** `statement` as planned against `catalog`: itself when it was, else re-planned from its text. */
-  #replanned(statement: PlannedStatement, catalog: CatalogView): PlannedStatement {
+  /**
+   * `statement` as planned against `catalog`: itself when it was, else re-planned from its text.
+   * An unprepared statement re-plans freely: its client learns its columns with its result and
+   * binds its parameters after planning (PostgreSQL's simple protocol). A prepared one keeps the
+   * parameter types its client binds with, and its result columns must stay what its client was
+   * told at prepare: else PostgreSQL's 0A000 ("cached plan must not change result type").
+   */
+  #replanned(
+    statement: PlannedStatement,
+    catalog: CatalogView,
+    prepared: RunContext["prepared"],
+  ): PlannedStatement {
     if (statement.catalogVersion === catalog.version) return statement;
-    const current = this.#engine.plan(statement.text, catalog);
-    if (
-      current.kind !== statement.kind ||
-      !sameColumns(current.columns, statement.columns) ||
-      current.parameters.length !== statement.parameters.length ||
-      current.parameters.some((type, k) => type !== statement.parameters[k])
-    )
+    if (prepared === undefined) return this.#engine.plan(statement.text, catalog);
+    const current = this.#engine.plan(statement.text, catalog, prepared.parameters);
+    if (current.kind !== statement.kind || !sameColumns(current.columns, prepared.columns))
       throw new PlanShapeChangedError();
     return current;
   }
@@ -1344,8 +1374,10 @@ class ComposedSession implements EngineSession {
     lowered: LoweredModify,
     params: readonly WireValue[],
     context: RunContext,
-  ): AutocommitBody {
-    return (tx, stream) => {
+    tx: WriteTransaction,
+    stream: DeferredStream,
+  ): ReturnType<AutocommitBody> {
+    {
       if (lowered.plan.root.op !== "modify") throw new TypeError("Missing modification root");
       const rowRules = new StatementRules(
         tx.catalog,
@@ -1386,7 +1418,7 @@ class ComposedSession implements EngineSession {
           execution.cancel(reason);
         },
       };
-    };
+    }
   }
 
   /** Same SQL/session/commit boundary as ordinary modifications; no public guard override. */
@@ -1412,12 +1444,13 @@ class ComposedSession implements EngineSession {
     lowered: LoweredModify,
     params: readonly WireValue[],
     context: RunContext,
-  ): AutocommitBody {
-    return (tx) => ({
+    tx: WriteTransaction,
+  ): ReturnType<AutocommitBody> {
+    return {
       executed: this.#executeNative(lowered, params, context, tx),
       acknowledge: () => undefined,
       abort: () => undefined,
-    });
+    };
   }
 
   /** A native command (triggers, referential actions) on the transaction holding the turn. */
@@ -1522,8 +1555,12 @@ class ComposedSession implements EngineSession {
   }
 
   /** An autocommit DDL statement's body. */
-  #ddlBody(lowered: LoweredDdl, context: RunContext): AutocommitBody {
-    return (tx) => ({
+  #ddlBody(
+    lowered: LoweredDdl,
+    context: RunContext,
+    tx: WriteTransaction,
+  ): ReturnType<AutocommitBody> {
+    return {
       executed: this.#applyDdl(lowered, context, tx).then(() => ({
         command: lowered.command,
         rowCount: null,
@@ -1532,7 +1569,7 @@ class ComposedSession implements EngineSession {
       })),
       acknowledge: () => undefined,
       abort: () => undefined,
-    });
+    };
   }
 
   async #applyDdl(lowered: LoweredDdl, context: RunContext, tx: WriteTransaction): Promise<void> {
@@ -1549,7 +1586,9 @@ class ComposedSession implements EngineSession {
         throw error;
       }
       if (lowered.followUp !== null) {
-        const plannedFollowUp = this.plan(lowered.followUp);
+        // Against the transaction's catalog, which holds the table its change just made (an
+        // autocommit CREATE TABLE AS has no session transaction to plan in).
+        const plannedFollowUp = this.#engine.lower(lowered.followUp, tx.catalog);
         const followUp = plannedFollowUp.lowered;
         if (followUp.kind !== "modify") throw new TypeError("A DDL follow-up must be a write");
         if (followUp.plan.root.op !== "modify")
@@ -1572,8 +1611,10 @@ class ComposedSession implements EngineSession {
           { snapshot: null, statement: next, rowRules },
           "atExecuted",
         );
-        execution.results.cancel();
+        // Its results are none of this statement's: release them once it has run (cancelling
+        // first would cancel the run itself, 57014).
         await execution.executed;
+        execution.results.cancel();
       }
     }
   }

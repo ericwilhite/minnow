@@ -96,7 +96,13 @@ describe("owner auto-parameterized plan cache", () => {
       await c.query("DROP TABLE t");
       await c.query("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)");
       await c.query("INSERT INTO t VALUES (1, 11)");
-      expect((await c.execute(p.id)).rows()).toEqual([[1, 11]]);
+      // PostgreSQL 18 plancache.c (RevalidateCachedQuery), observed in PGlite 18.3: a prepared
+      // statement whose result columns changed (v: text to integer) is refused 0A000 on every
+      // execute; prepared again, it returns the new type.
+      await expect(c.execute(p.id)).rejects.toMatchObject({ sqlState: "0A000" });
+      await expect(c.execute(p.id)).rejects.toMatchObject({ sqlState: "0A000" });
+      const again = await c.prepare("SELECT id, v FROM t WHERE id = 1");
+      expect((await c.execute(again.id)).rows()).toEqual([[1, 11]]);
     } finally {
       await finish(h);
     }

@@ -3073,6 +3073,39 @@ export class WritePathImpl implements WritePath, EngineHooks {
     });
   }
 
+  /** Writers waiting now (`WritePath.waitingWriters`). */
+  get waitingWriters(): number {
+    return this.#queue.length + this.#transactionEnds.size;
+  }
+
+  /** A transaction holds the writer slot now (`WritePath.transactionOpen`). */
+  get transactionOpen(): boolean {
+    return this.#holder !== null;
+  }
+
+  readonly #transactionEnds = new Set<() => void>();
+  /** Resolves when the transaction holding the slot ends (`WritePath.whenTransactionEnds`). */
+  whenTransactionEnds(signal?: AbortSignal): Promise<void> {
+    if (this.#holder === null) return Promise.resolve();
+    return new Promise<void>((resolve, reject) => {
+      const ended = () => {
+        signal?.removeEventListener("abort", aborted);
+        resolve();
+      };
+      const aborted = () => {
+        this.#transactionEnds.delete(ended);
+        const reason: unknown = signal?.reason;
+        reject(reason instanceof Error ? reason : new Error("Aborted", { cause: reason }));
+      };
+      if (signal?.aborted === true) {
+        aborted();
+        return;
+      }
+      this.#transactionEnds.add(ended);
+      signal?.addEventListener("abort", aborted, { once: true });
+    });
+  }
+
   /** The writer slot is held (by a transaction or by maintenance). */
   get #slotBusy(): boolean {
     return this.#holder !== null || this.#maintenanceHolds || this.#claimed;
@@ -3196,6 +3229,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#credits.holderChain.transactionOpen = false;
     this.#reclaimable();
     this.#passSlot();
+    for (const ended of [...this.#transactionEnds]) {
+      this.#transactionEnds.delete(ended);
+      ended();
+    }
     // A frozen memtable may have waited for this writer's pending rows.
     if (this.#hasFrozen()) this.#scheduleFlush();
   }

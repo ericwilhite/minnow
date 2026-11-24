@@ -77,13 +77,22 @@ for (const seed of seedsFor("next-public-facade", [0xb738, 0xb739]))
             reach.reach("private preparation and owned transaction boundary");
             const tablePlan = await db.prepare("SELECT * FROM t ORDER BY id");
             await db.execute("ALTER TABLE t ADD COLUMN extra TEXT DEFAULT 'filled'");
-            const fresh = await tablePlan.query();
+            // PostgreSQL 18 plancache.c, observed in PGlite 18.3: a prepared statement whose
+            // result columns changed is refused 0A000 on every execute; prepared again, it
+            // returns the new columns.
+            await expect(tablePlan.query()).rejects.toMatchObject({ sqlState: "0A000" });
+            const staleCursor = tablePlan.cursor();
+            await expect(staleCursor.columns).rejects.toMatchObject({ sqlState: "0A000" });
+            await staleCursor.close();
+            tablePlan.close();
+            const refreshed = await db.prepare("SELECT * FROM t ORDER BY id");
+            const fresh = await refreshed.query();
             expect(fresh.columns.map((column) => column.name)).toEqual(["id", "n", "v", "extra"]);
             expect(fresh.tuples()).toEqual([
               [1, number, text, "filled"],
               [3, number, "d", "filled"],
             ]);
-            tablePlan.close();
+            refreshed.close();
             // Fence the prior frame release/unprepare before isolating prepared-cache charge.
             await db.catalog();
             reach.reach("prepared catalog invalidation");

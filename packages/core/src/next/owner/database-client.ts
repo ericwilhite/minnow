@@ -17,7 +17,7 @@ import type {
   SqlExecutor,
 } from "./api.js";
 import { resultColumn } from "./api.js";
-import { ProtocolClient } from "./client.js";
+import { ProtocolClient, preparedShape, type PreparedInfo } from "./client.js";
 import { callResult, callTask, type RequestBody } from "./client-call.js";
 import { clientCursor } from "./client-cursor.js";
 import { writeColumns } from "./client-input.js";
@@ -100,14 +100,15 @@ class ClientSql implements SqlExecutor {
     params: readonly Param[],
     options: CallOptions,
     queryOnly: boolean,
-    prepared: number | null = null,
+    prepared: PreparedInfo | null = null,
   ): Promise<Result<TRow>> {
     return this.request(
       {
         t: "statement",
         session: this.session,
         text: sql,
-        prepared,
+        prepared: prepared?.id ?? null,
+        ...(prepared === null ? {} : { preparedShape: preparedShape(prepared) }),
         knownColumnsVersion: -1,
         params,
         queryOnly,
@@ -135,7 +136,7 @@ class ClientSql implements SqlExecutor {
     sql: string,
     params: readonly Param[],
     options: CursorOptions,
-    prepared: number | null = null,
+    prepared: PreparedInfo | null = null,
   ): Cursor<TRow> {
     this.check();
     const signal = this.signal(options.signal);
@@ -179,15 +180,15 @@ class ClientSql implements SqlExecutor {
       parameters: info.parameters,
       query: async <TRow = Row>(params: readonly Param[] = [], call: CallOptions = {}) => {
         check();
-        return this.statement<TRow>(sql, params, call, true, info.id);
+        return this.statement<TRow>(sql, params, call, true, info);
       },
       execute: async <TRow = Row>(params: readonly Param[] = [], call: CallOptions = {}) => {
         check();
-        return this.statement<TRow>(sql, params, call, false, info.id);
+        return this.statement<TRow>(sql, params, call, false, info);
       },
       cursor: <TRow = Row>(params: readonly Param[] = [], call: CursorOptions = {}) => {
         check();
-        return this.openCursor<TRow>(sql, params, call, info.id);
+        return this.openCursor<TRow>(sql, params, call, info);
       },
       close: () => {
         if (closed) return;

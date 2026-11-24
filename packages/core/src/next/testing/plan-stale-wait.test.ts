@@ -14,20 +14,26 @@
  * the statement and executes it again (nothing ran)"), and PostgreSQL, which plans a statement
  * after taking its locks: B runs once A's transaction ends, against A's committed catalog. A new
  * index holds B's row (a unique one refuses a duplicate of it), a new trigger fires for it, and
- * after DROP TABLE B is refused 42P01 (relation does not exist). A re-plan that would change
- * what B's client was told (its result columns) is refused as PostgreSQL refuses a cached plan
- * whose result type changed (0A000, "cached plan must not change result type").
+ * after DROP TABLE B is refused 42P01 (relation does not exist). An unprepared B learns its
+ * columns with its result (the simple protocol): it is served with the new ones. A prepared B
+ * keeps the parameter types it was prepared with and is refused while its result columns differ,
+ * on every execute (plancache.c: 0A000, "cached plan must not change result type"). A B that
+ * names a column or a conflict target A is adding waits for A and is analysed on its catalog,
+ * as PostgreSQL's B waits for its lock on t; a table A created is not found (42P01) at once.
+ *
+ * Generated histories against PGlite: plan-stale-wait-pglite.test.ts.
  */
 import { afterEach, expect, it } from "vitest";
 import { chunkReads } from "../exec/scan.js";
 import { createLowerer } from "../lower/create.js";
 import { Governor } from "../memory/governor.js";
-import { ProtocolClient } from "../owner/client.js";
+import { ProtocolClient, preparedShape } from "../owner/client.js";
+import type { PreparedShape, WireValue } from "../owner/protocol.js";
 import { composeEngine } from "../owner/compose.js";
 import { OwnerServer } from "../owner/server.js";
 import { MemorySpillService } from "../spill/memory-spill.js";
 import { Harness } from "../write/test-support.js";
-import { PLAN_SHAPE_CHANGED_REFUSAL } from "./divergences.js";
+import { CancelledError } from "../owner/errors.js";
 
 afterEach(() => {
   Governor.stallAfterMs = null;
@@ -38,7 +44,16 @@ const describe = (error: unknown) =>
     ? `${error.name} ${(error as { sqlState?: string }).sqlState ?? ""} ${error.message}`
     : String(error);
 
-async function sessions(body: (a: ProtocolClient, b: ProtocolClient) => Promise<void>) {
+/** Resolves once `count` writers wait for the writer turn (observed, not timed). */
+async function untilWaiting(h: Harness, count = 1): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (h.path.waitingWriters < count) {
+    if (Date.now() > deadline) throw new Error("B never waited for the writer turn");
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+}
+
+async function sessions(body: (a: ProtocolClient, b: ProtocolClient, h: Harness) => Promise<void>) {
   Governor.stallAfterMs = 5_000;
   const h = new Harness("strict", "memory");
   const governor = new Governor(256 * (1 << 20));
@@ -69,7 +84,7 @@ async function sessions(body: (a: ProtocolClient, b: ProtocolClient) => Promise<
     await a.query("INSERT INTO t VALUES (1, 1, 'a'), (2, 2, 'a')");
     await a.query("CREATE TABLE audit (id integer PRIMARY KEY, n integer)");
     await a.query("INSERT INTO audit VALUES (1, 0)");
-    await body(a, b);
+    await body(a, b, h);
   } finally {
     for (const client of clients) client.close();
     const stop = server.quiesce("closing");
@@ -155,7 +170,7 @@ async function play(
   const w = WRITES[write];
   if (w === undefined) throw new Error(write);
   let observed = "";
-  await sessions(async (a, b) => {
+  await sessions(async (a, b, h) => {
     await a.query("BEGIN");
     for (const sql of statements) await a.query(sql);
     const send = () => {
@@ -168,7 +183,7 @@ async function play(
     };
     // Waiting: B is sent while A's transaction holds the writer turn. Alone: after A ended.
     const sent = waiting ? send() : null;
-    if (waiting) await new Promise((resolve) => setTimeout(resolve, 50));
+    if (sent !== null) await untilWaiting(h);
     await a.query(end);
     const { begin, outcome } = sent ?? send();
     await begin;
@@ -257,25 +272,255 @@ for (const ddl of Object.keys(DDL))
       for (const end of ["COMMIT", "ROLLBACK"] as const) await history(ddl, write, end);
   }, 120_000);
 
-it("refuses, typed and with nothing written, a re-plan that changes B's result columns", async () => {
-  // Divergence PLAN_SHAPE_CHANGED_REFUSAL (divergences.ts): PostgreSQL's simple protocol would
-  // describe the new shape; next/ told the client the old columns when it planned, so it refuses
-  // as PostgreSQL refuses a cached plan (0A000).
-  expect(PLAN_SHAPE_CHANGED_REFUSAL.id).toBe("plan-shape-changed-refusal");
-  await sessions(async (a, b) => {
+const outcome = (pending: Promise<unknown>) => pending.then(() => "served", describe);
+const settledYet = async (pending: Promise<string>) =>
+  Promise.race([pending, new Promise((resolve) => setTimeout(resolve, 20, "pending"))]);
+
+it("serves an unprepared write re-planned with other result columns with them", async () => {
+  await sessions(async (a, b, h) => {
     await a.query("BEGIN");
     await a.query("ALTER TABLE t ADD COLUMN c integer");
-    const outcome = b
-      .query("INSERT INTO t (id, k, v) VALUES (100, 7, 'b') RETURNING *")
-      .then(() => "served", describe);
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    const result = b.query("INSERT INTO t (id, k, v) VALUES (100, 7, 'b') RETURNING *");
+    await untilWaiting(h);
     await a.query("COMMIT");
-    expect(await outcome).toMatch(
-      /^PlanShapeChangedError 0A000 cached plan must not change result type/u,
+    const served = await result;
+    expect(served.columns.map((column) => column.name)).toEqual(["id", "k", "v", "c"]);
+    expect(served.rows()).toEqual([[100, 7, "b", null]]);
+  });
+}, 60_000);
+
+it("refuses a prepared write whose result columns changed on every execute, waiting or not", async () => {
+  await sessions(async (a, b, h) => {
+    const sql = "INSERT INTO t (id, k, v) VALUES ($1, 7, 'b') RETURNING *";
+    const handle = await b.prepare(sql);
+    await a.query("BEGIN");
+    await a.query("ALTER TABLE t ADD COLUMN c integer");
+    const queued = outcome(b.execute(handle.id, [100]));
+    await untilWaiting(h);
+    await a.query("COMMIT");
+    const refused = /^PlanShapeChangedError 0A000 cached plan must not change result type/u;
+    expect(await queued, "waiting for the turn").toMatch(refused);
+    expect(await outcome(b.execute(handle.id, [101])), "planned on arrival").toMatch(refused);
+    expect(await outcome(b.execute(handle.id, [102])), "again").toMatch(refused);
+    expect((await a.query("SELECT count(*) FROM t WHERE id >= 100")).rows()).toEqual([[0]]);
+    // Prepared again, it describes and returns the new columns.
+    b.unprepare(handle.id);
+    const again = await b.prepare(sql);
+    expect(again.columns.map((column) => column.name)).toEqual(["id", "k", "v", "c"]);
+    expect((await b.execute(again.id, [100])).rows()).toEqual([[100, 7, "b", null]]);
+  });
+}, 60_000);
+
+it("re-plans a prepared write with the parameter types it was prepared with", async () => {
+  await sessions(async (a, b, h) => {
+    // $1 is text (v's type) when prepared; v becomes an integer. PostgreSQL keeps $1 text, and
+    // text is not assignable to integer: 42804. Sent unprepared, $1 would be an integer.
+    const handle = await b.prepare("UPDATE t SET v = $1 WHERE id = 1");
+    expect(handle.parameters.map((type) => type.kind)).toEqual(["text"]);
+    await a.query("BEGIN");
+    await a.query("DROP TABLE t");
+    await a.query("CREATE TABLE t (id integer PRIMARY KEY, k integer, v integer)");
+    await a.query("INSERT INTO t VALUES (1, 1, 0)");
+    const queued = outcome(b.execute(handle.id, ["9"]));
+    await untilWaiting(h);
+    await a.query("COMMIT");
+    expect(await queued).toMatch(/ 42804 /u);
+    expect(await outcome(b.execute(handle.id, ["9"]))).toMatch(/ 42804 /u);
+    expect((await a.query("SELECT v FROM t")).rows()).toEqual([[0]]);
+  });
+}, 60_000);
+
+it("serves a prepared write whose columns only changed nullability", async () => {
+  await sessions(async (a, b, h) => {
+    const handle = await b.prepare("INSERT INTO t (id, k, v) VALUES ($1, 7, 'b') RETURNING *");
+    await a.query("BEGIN");
+    await a.query("DROP TABLE t");
+    await a.query("CREATE TABLE t (id integer PRIMARY KEY, k integer NOT NULL, v text)");
+    const queued = b.execute(handle.id, [100]);
+    await untilWaiting(h);
+    await a.query("COMMIT");
+    expect((await queued).rows()).toEqual([[100, 7, "b"]]);
+  });
+}, 60_000);
+
+/**
+ * A handle the owner no longer holds (evicted from a bounded cache, or a new connection) plans its
+ * fallback text as the handle would: with the parameter types and against the result columns its
+ * client was told at prepare (`StatementRequest.preparedShape`), as PostgreSQL's plancache does
+ * for the statement it still holds.
+ */
+async function fallback(client: ProtocolClient, sql: string, params: readonly WireValue[] = []) {
+  const handle = await client.prepare(sql);
+  // The owner drops the handle; the client still holds what it was told.
+  client.unprepare(handle.id);
+  const run = (
+    values: readonly WireValue[] = params,
+    shape: PreparedShape | null = preparedShape(handle),
+  ) =>
+    outcome(
+      client.send({
+        t: "statement",
+        session: 0,
+        text: sql,
+        prepared: handle.id,
+        ...(shape === null ? {} : { preparedShape: shape }),
+        knownColumnsVersion: -1,
+        params: values,
+        result: { windowBytes: 1 << 20, frameRows: null, wantRows: true },
+      }).promise,
     );
+  return { handle, run };
+}
+
+it("refuses a prepared fallback whose result columns changed, waiting or not", async () => {
+  await sessions(async (a, b, h) => {
+    const refused = /^PlanShapeChangedError 0A000 cached plan must not change result type/u;
+    const read = await fallback(b, "SELECT * FROM t ORDER BY id");
+    const write = await fallback(
+      b,
+      "INSERT INTO t (id, k, v) VALUES ($1, 7, 'b') RETURNING *",
+      [100],
+    );
+    expect(await read.run(), "unchanged").toBe("served");
+    await a.query("BEGIN");
+    await a.query("ALTER TABLE t ADD COLUMN c integer");
+    const queued = write.run();
+    await untilWaiting(h);
+    await a.query("COMMIT");
+    expect(await queued, "waiting for the turn").toMatch(refused);
+    expect(await write.run([101]), "planned on arrival").toMatch(refused);
+    expect(await read.run(), "a query").toMatch(refused);
+    expect(await read.run(), "again").toMatch(refused);
+    expect((await a.query("SELECT count(*) FROM t WHERE id >= 100")).rows()).toEqual([[0]]);
+    // Without what its client was told, a fallback cannot keep the rule: refused, nothing ran.
+    expect(await write.run([102], null)).toMatch(/^ProtocolError .*shape its client was told/u);
+    expect((await a.query("SELECT count(*) FROM t WHERE id >= 100")).rows()).toEqual([[0]]);
+  });
+}, 60_000);
+
+it("plans a prepared fallback with the parameter types it was prepared with", async () => {
+  await sessions(async (a, b) => {
+    // As "re-plans a prepared write with the parameter types it was prepared with": $1 stays text.
+    const update = await fallback(b, "UPDATE t SET v = $1 WHERE id = 1", ["9"]);
+    expect(update.handle.parameters.map((type) => type.kind)).toEqual(["text"]);
+    const insert = await fallback(b, "INSERT INTO t (id, k) VALUES ($1, 7) RETURNING *", [100]);
+    await a.query("DROP TABLE t");
+    await a.query("CREATE TABLE t (id integer PRIMARY KEY, k integer, v integer)");
+    await a.query("INSERT INTO t VALUES (1, 1, 0)");
+    expect(await update.run()).toMatch(/ 42804 /u);
+    expect((await a.query("SELECT v FROM t")).rows()).toEqual([[0]]);
+    // v's type changed, so the INSERT's result columns did too.
+    expect(await insert.run()).toMatch(/ 0A000 /u);
+    expect((await a.query("SELECT count(*) FROM t")).rows()).toEqual([[1]]);
+  });
+}, 60_000);
+
+it("serves a prepared fallback whose columns only changed nullability", async () => {
+  await sessions(async (a, b) => {
+    const insert = await fallback(
+      b,
+      "INSERT INTO t (id, k, v) VALUES ($1, 7, 'b') RETURNING *",
+      [100],
+    );
+    await a.query("DROP TABLE t");
+    await a.query("CREATE TABLE t (id integer PRIMARY KEY, k integer NOT NULL, v text)");
+    expect(await insert.run()).toBe("served");
+    expect((await a.query("SELECT id, k, v FROM t")).rows()).toEqual([[100, 7, "b"]]);
+  });
+}, 60_000);
+
+it("plans a write that names a column A is adding once A ends", async () => {
+  for (const end of ["COMMIT", "ROLLBACK"] as const)
+    await sessions(async (a, b, h) => {
+      await a.query("BEGIN");
+      await a.query("ALTER TABLE t ADD COLUMN c integer");
+      const pending = outcome(b.query("INSERT INTO t (id, k, v, c) VALUES (100, 7, 'b', 5)"));
+      await untilWaiting(h);
+      expect(await settledYet(pending), `${end}: B waits for A`).toBe("pending");
+      await a.query(end);
+      if (end === "COMMIT") {
+        expect(await pending).toBe("served");
+        expect((await a.query("SELECT c FROM t WHERE id = 100")).rows()).toEqual([[5]]);
+      } else expect(await pending).toMatch(/^PlanningError 42703 /u);
+    });
+}, 60_000);
+
+it("plans an upsert whose conflict target A is creating once A ends", async () => {
+  await sessions(async (a, b, h) => {
+    await a.query("BEGIN");
+    await a.query("CREATE UNIQUE INDEX t_k ON t (k)");
+    const pending = outcome(
+      b.query("INSERT INTO t (id, k, v) VALUES (100, 1, 'b') ON CONFLICT (k) DO NOTHING"),
+    );
+    await untilWaiting(h);
+    expect(await settledYet(pending)).toBe("pending");
+    await a.query("COMMIT");
+    expect(await pending).toBe("served");
+    expect((await a.query("SELECT count(*) FROM t")).rows()).toEqual([[2]]);
+  });
+}, 60_000);
+
+it("refuses at once a write to a table A created and has not committed (42P01)", async () => {
+  await sessions(async (a, b, h) => {
+    await a.query("BEGIN");
+    await a.query("CREATE TABLE u (id integer PRIMARY KEY)");
+    // PostgreSQL does not find the table, so there is no lock to wait on.
+    const pending = outcome(b.query("INSERT INTO u VALUES (1)"));
+    const first = await Promise.race([
+      pending,
+      untilWaiting(h).then(
+        () => "waiting for A",
+        () => "never waited",
+      ),
+    ]);
+    expect(first).toMatch(/^PlanningError 42P01 /u);
+    await a.query("COMMIT");
+    await b.query("INSERT INTO u VALUES (1)");
+  });
+}, 60_000);
+
+it("cancels a write waiting for A to end before it plans", async () => {
+  await sessions(async (a, b, h) => {
+    await a.query("BEGIN");
+    await a.query("ALTER TABLE t ADD COLUMN c integer");
+    const abort = new AbortController();
+    const pending = b
+      .query("INSERT INTO t (id, k, v, c) VALUES (100, 7, 'b', 5)", [], { signal: abort.signal })
+      .then(() => "served", describe);
+    await untilWaiting(h);
+    // The client answers with the signal's reason once the owner answered it cancelled.
+    abort.abort(new CancelledError());
+    expect(await pending).toMatch(/^CancelledError 57014 /u);
+    expect(h.path.waitingWriters).toBe(0);
+    await a.query("COMMIT");
     expect((await a.query("SELECT count(*) FROM t WHERE id = 100")).rows()).toEqual([[0]]);
-    // Sent again, it is planned on the new catalog and served with the new shape.
-    const again = await b.query("INSERT INTO t (id, k, v) VALUES (100, 7, 'b') RETURNING *");
-    expect(again.rows()).toEqual([[100, 7, "b", null]]);
+  });
+}, 60_000);
+
+it("creates a table from a query (CREATE TABLE … AS), autocommit, waiting and in a transaction", async () => {
+  await sessions(async (a, b, h) => {
+    await b.query("CREATE TABLE t2 AS SELECT id, k FROM t");
+    expect((await a.query("SELECT * FROM t2 ORDER BY id")).rows()).toEqual([
+      [1, 1],
+      [2, 2],
+    ]);
+    await b.query("BEGIN");
+    await b.query("CREATE TABLE t3 AS SELECT id FROM t WHERE id = 2");
+    expect((await b.query("SELECT * FROM t3")).rows()).toEqual([[2]]);
+    await b.query("COMMIT");
+    expect((await a.query("SELECT * FROM t3")).rows()).toEqual([[2]]);
+    // Waiting behind A's ADD COLUMN, it is planned on the catalog A committed.
+    await a.query("BEGIN");
+    await a.query("ALTER TABLE t ADD COLUMN c integer");
+    const pending = outcome(b.query("CREATE TABLE t4 AS SELECT * FROM t"));
+    await untilWaiting(h);
+    await a.query("COMMIT");
+    expect(await pending).toBe("served");
+    const t4 = await a.query("SELECT * FROM t4 ORDER BY id");
+    expect(t4.columns.map((column) => column.name)).toEqual(["id", "k", "v", "c"]);
+    expect(t4.rows()).toEqual([
+      [1, 1, "a", null],
+      [2, 2, "a", null],
+    ]);
   });
 }, 60_000);

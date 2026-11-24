@@ -632,21 +632,3 @@ export const FAILED_PREPARE_KEEPS_TRANSACTION = {
   authority:
     "PostgreSQL exec_parse_message: an error during Parse aborts the transaction (25P02 after), observed in PGlite",
 } as const;
-
-/**
- * An autocommit write planned before another transaction's DDL committed, and re-planned once it
- * holds the writer turn (owner/compose.ts `#autocommitWrite`), whose result columns or parameter
- * types then differ from those its client was told (`INSERT … RETURNING *` after `ADD COLUMN`):
- * next/ refuses it with `PlanShapeChangedError` (0A000) and writes nothing; sent again, it is
- * planned on the new catalog. PostgreSQL's simple protocol plans after taking its locks and would
- * describe the new shape. next/'s owner sends the columns from the plan it made on arrival, so it
- * refuses as PostgreSQL refuses a cached plan whose result type changed. Asserted by
- * plan-stale-wait.test.ts.
- */
-export const PLAN_SHAPE_CHANGED_REFUSAL = {
-  id: "plan-shape-changed-refusal",
-  ruling:
-    "lead 2026-11-24: accepted as documented; the owner reports the arrival plan's columns, and changing them needs a server change",
-  authority:
-    'PostgreSQL plancache.c refuses a cached plan whose result type changed with 0A000 "cached plan must not change result type"; for the simple protocol PostgreSQL plans after its locks and returns the new shape',
-} as const;
