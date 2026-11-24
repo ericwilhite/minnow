@@ -89,13 +89,19 @@ function row(command: CommandToken, id: number, event: WriteEvent = "insert"): A
   };
 }
 
+/**
+ * Accepted rows whose records exceed the fixed metadata (the directory's resident leaves and the
+ * command controls) by 1.2x to 2.4x, so they must spill: the range follows the fixed limit.
+ */
+const MIN_ROWS = Math.ceil((1.2 * (REGISTRY_DIRECTORY_BYTES + registryCommandBytes(3))) / 128);
+
 it.each(seedsFor("next-registry-commands", [0xb5e5]))(
   "checkpoints only newly accepted command work at bounded metadata seed %i",
   async (seed) => {
     const reach = createReach("native command registry", REGISTRY_COMMAND_REACH);
     await fc.assert(
       fc.asyncProperty(
-        fc.integer({ min: 320, max: 640 }),
+        fc.integer({ min: MIN_ROWS, max: 2 * MIN_ROWS }),
         fc.integer({ min: 1, max: 4 }),
         fc.constantFrom(1, 2 ** 52),
         async (count, actions, base) => {
@@ -252,8 +258,8 @@ it.each(seedsFor("next-registry-commands", [0xb5e5]))(
         seed,
         numRuns: 8,
         examples: [
-          [320, 3, 1],
-          [640, 4, 2 ** 52],
+          [MIN_ROWS, 3, 1],
+          [2 * MIN_ROWS, 4, 2 ** 52],
         ],
       },
     );
