@@ -197,6 +197,8 @@ describe("R23.2/R23.3: finish runs in task-yielding slices", () => {
     make: (ctx: Awaited<ReturnType<typeof context>>["context"], sink: Operator) => Operator;
     rows: () => Row[];
     slack?: number;
+    /** Its output is one push: its boundaries are the merge's, made due before finish. */
+    oneOutput?: true;
   }> = [
     {
       name: "resident sort (review probe)",
@@ -244,6 +246,7 @@ describe("R23.2/R23.3: finish runs in task-yielding slices", () => {
         ),
       rows: () => Array.from({ length: 200_000 }, (_, i) => [(i * 7919) % 200_000, "x".repeat(20)]),
       slack: 4 << 20,
+      oneOutput: true,
     },
     {
       name: "resident group top-k",
@@ -269,36 +272,55 @@ describe("R23.2/R23.3: finish runs in task-yielding slices", () => {
         Array.from({ length: 30_000 }, (_, i) => [JSON.stringify({ k: (i * 7919) % 30_000 })]),
     },
   ];
+  /** A whole slice of synchronous work: the worker's task is due after it. */
+  const spinSlice = () => {
+    const start = performance.now();
+    while (performance.now() - start <= YIELD_INTERVAL_MS);
+  };
+  /**
+   * Queues a zero-delay timer, then finishes. The sink's first push takes a whole slice of
+   * synchronous work (for a one-push output, the work before finish does), so the timer and the
+   * worker's task are both due there, whatever the clock read when finish began. The operator's
+   * next boundary must then yield a real task, and a task yield runs every timer due before it
+   * (task.ts `createYieldTask`). An operator that chains its output through resolved promises
+   * without yielding (R23.4) completes with the timer still queued.
+   */
+  async function timerBeforeFinish(
+    op: Operator,
+    sink: Operator & { readonly pushes: number; readonly finished: boolean },
+    oneOutput: boolean,
+  ) {
+    const push = sink.push.bind(sink);
+    sink.push = (batch, transfer) => {
+      if (sink.pushes === 0 && !oneOutput) spinSlice();
+      return push(batch, transfer);
+    };
+    let serviced = false;
+    const timer = setTimeout(() => {
+      serviced = true;
+    }, 0);
+    if (oneOutput) spinSlice();
+    await op.finish();
+    clearTimeout(timer);
+    if (!oneOutput) expect(sink.pushes, "a boundary follows the first push").toBeGreaterThan(1);
+    expect(serviced).toBe(true);
+    expect(sink.finished).toBe(true);
+  }
   for (const c of cases)
     it(`a zero-delay timer runs before finish completes: ${c.name}, downstream blocked with a resolved ready (R23.4)`, async () => {
       const { context: ctx } = await context(c.types, c.slack);
       const sink = new ResolvedBlockSink();
       const op = c.make(ctx, sink);
       await pushAll(op, c.types, c.rows());
-      let serviced = false;
-      const timer = setTimeout(() => {
-        serviced = true;
-      }, 0);
-      await op.finish();
-      clearTimeout(timer);
-      expect(serviced).toBe(true);
-      expect(sink.finished).toBe(true);
+      await timerBeforeFinish(op, sink, c.oneOutput === true);
     }, 60_000);
   for (const c of cases)
     it(`a zero-delay timer runs before finish completes: ${c.name}`, async () => {
       const { context: ctx } = await context(c.types, c.slack);
       const sink = new CollectSink();
       const op = c.make(ctx, sink);
-      const rows = c.rows();
-      await pushAll(op, c.types, rows);
-      let serviced = false;
-      const timer = setTimeout(() => {
-        serviced = true;
-      }, 0);
-      await op.finish();
-      clearTimeout(timer);
-      expect(serviced).toBe(true);
-      expect(sink.finished).toBe(true);
+      await pushAll(op, c.types, c.rows());
+      await timerBeforeFinish(op, sink, c.oneOutput === true);
     }, 60_000);
 });
 

@@ -1773,8 +1773,10 @@ and the owner import it directly.
   earlier. Operators pace their own output the same way: a slice ends only at a task yield, not
   when downstream backpressure resolves at once. `pipeline-yield.test.ts` checks the yield on an
   event loop that always runs messages first, and `browser-tests/next-yield.spec.ts` in real
-  Chromium, Firefox and WebKit (where message-only yields serviced no timer at all). Node's
-  `setImmediate` already follows the timers phase.
+  Chromium, Firefox and WebKit (where message-only yields serviced no timer at all). On Node a
+  yield is two chained `setImmediate`s: an immediate queued from a message or timer callback runs
+  before the timers and messages that came due meanwhile, so the second makes the work resume only
+  after a full loop turn.
 - `abort` releases grants, spill files and transferred batches.
 - The driver adds no cancellation machinery without a signal, and with one each wait removes its
   listener, so a long stream retains nothing per batch.

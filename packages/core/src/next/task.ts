@@ -73,8 +73,12 @@ export const TIMER_TURN_MS = 50;
 /**
  * A `yieldTask` over `host`. The returned Promise resolves in a later **task** (macrotask), never
  * a microtask:
- * - **Node** (`setImmediate`): the check phase follows the timers phase on every loop iteration,
- *   so due timers and pending I/O run before the work resumes.
+ * - **Node** (`setImmediate`, twice): an immediate runs in the check phase of the loop turn it
+ *   was queued in, so one queued from the poll phase (a `MessagePort` message: the owner's
+ *   dispatch) or from the timers phase runs before the next timers and poll phases. The yield
+ *   queues a second immediate from the first, which is always in the check phase: the work resumes
+ *   only after a full turn, so every timer due and every message delivered by then has run. One
+ *   extra turn costs about 15 µs per yield.
  * - **Browsers and workers**: one shared `MessageChannel` message (no 4 ms timer clamp), except
  *   that once `TIMER_TURN_MS` has passed without a timer turn the yield is `setTimeout(…, 0)`.
  *   A user agent may service message tasks ahead of timers indefinitely (WebKit was seen to;
@@ -99,7 +103,7 @@ export function createYieldTask(host: TaskHost): () => Promise<void> {
         resolved();
       };
       if (immediate !== undefined) {
-        immediate(resolve);
+        immediate(() => immediate(resolve));
         return;
       }
       const Channel = host.MessageChannel;

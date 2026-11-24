@@ -12,8 +12,9 @@
  *   pipeline whose sources and sinks are ready runs synchronously, and `drive` itself returns
  *   `undefined` (not a Promise) when the whole pipeline finished without waiting: a cached point
  *   read completes inside the call (exec/executor.ts "Running").
- * - Long synchronous work yields to the event loop with a **task** (`yieldTask`: `setImmediate`
- *   where it exists, else a `MessageChannel` message with a `setTimeout` timer turn at least every
+ * - Long synchronous work yields to the event loop with a **task** (`yieldTask`: two chained
+ *   `setImmediate`s where it exists, so the work resumes after a full loop turn, else a
+ *   `MessageChannel` message with a `setTimeout` timer turn at least every
  *   `TIMER_TURN_MS`; never a resolved Promise, which would only run microtasks) at a batch
  *   boundary once `YIELD_INTERVAL_MS` has passed since the task began: one clock per worker
  *   (`TaskClock`, ruling R23.5), stamped when a yield resolves and at the owner's task entries.

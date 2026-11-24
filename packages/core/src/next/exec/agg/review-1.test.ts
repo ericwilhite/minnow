@@ -23,7 +23,7 @@ import {
   valueAt,
 } from "../kernels/test-support.js";
 import { IDENTITY, OutputArena } from "../kernels/vectors.js";
-import type { Operator, PushResult } from "../pipeline.js";
+import { yieldTask, type Operator, type PushResult } from "../pipeline.js";
 import { AggregateOperator, type AggregateOptions } from "./aggregate.js";
 import { Charged, GroupTable } from "./groups.js";
 import { accumulatorFor } from "./states.js";
@@ -284,7 +284,8 @@ describe("review B4-p2b-1", () => {
     const result = op.finish();
     expect(result).toBeInstanceOf(Promise);
     const before = batches;
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    // A task yield of our own, queued after the finish's: the finish has resumed by its end.
+    await yieldTask();
     expect(timerRan).toBe(true);
     expect(batches).toBeGreaterThan(before);
     const reason = new Error("cancelled");

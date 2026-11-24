@@ -7,7 +7,13 @@
  * slice of becoming due, however long the query runs.
  */
 import { describe, expect, it } from "vitest";
-import { TIMER_TURN_MS, YIELD_INTERVAL_MS, createYieldTask, type TaskHost } from "./pipeline.js";
+import {
+  TIMER_TURN_MS,
+  YIELD_INTERVAL_MS,
+  createYieldTask,
+  yieldTask,
+  type TaskHost,
+} from "./pipeline.js";
 
 /** A virtual-time event loop: messages first (FIFO), then due timers (by due time, FIFO). */
 class ModelLoop {
@@ -101,7 +107,7 @@ describe("yieldTask takes timer turns where messages could starve timers", () =>
     expect(loop.messagesRun).toBeGreaterThan(900);
   });
 
-  it("uses setImmediate where it exists (Node: timers run first in each loop turn)", async () => {
+  it("uses two chained immediates where setImmediate exists (Node)", async () => {
     let immediates = 0;
     let timeouts = 0;
     const yieldTask = createYieldTask({
@@ -117,6 +123,55 @@ describe("yieldTask takes timer turns where messages could starve timers", () =>
     });
     await yieldTask();
     await yieldTask();
-    expect([immediates, timeouts]).toEqual([2, 0]);
+    expect([immediates, timeouts]).toEqual([4, 0]);
   });
+});
+
+/**
+ * Node's real event loop. Law (task.ts `createYieldTask`, ruling R23): when a yield resumes, every
+ * timer due and every message delivered before it has run. An immediate runs in the check phase of
+ * the turn it was queued in, so a single one queued from a message (the owner's dispatch: the poll
+ * phase) or a timer callback resumes the work before them.
+ */
+describe("on Node, a yield resumes after the timers and messages due before it", () => {
+  const spin = (ms: number) => {
+    const start = performance.now();
+    while (performance.now() - start < ms);
+  };
+  const entries = {
+    "a message callback (poll phase)": () =>
+      new Promise<void>((resolve) => {
+        const { port1, port2 } = new MessageChannel();
+        port1.onmessage = () => {
+          port1.close();
+          resolve();
+        };
+        port2.postMessage(null);
+      }),
+    "a timer callback": () => new Promise<void>((resolve) => setTimeout(resolve, 0)),
+    "an immediate (check phase)": () => new Promise<void>((resolve) => setImmediate(resolve)),
+  };
+  for (const [entry, enter] of Object.entries(entries))
+    it(`from ${entry}`, async () => {
+      const seen: string[] = [];
+      for (let round = 0; round < 20; round++) {
+        await enter();
+        // A holder: the callbacks' writes are invisible to narrowing.
+        const ran = { timer: false, message: false };
+        setTimeout(() => (ran.timer = true), 0);
+        const { port1, port2 } = new MessageChannel();
+        port1.onmessage = () => {
+          ran.message = true;
+          port1.close();
+        };
+        port2.postMessage(null);
+        // Synchronous work past the timer's 1 ms: both are due before the yield.
+        spin(3);
+        await yieldTask();
+        seen.push(
+          `timer ${ran.timer ? "ran" : "waited"}, message ${ran.message ? "ran" : "waited"}`,
+        );
+      }
+      expect(new Set(seen)).toEqual(new Set(["timer ran, message ran"]));
+    });
 });
