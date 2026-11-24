@@ -65,7 +65,10 @@ const SQL_ENGINE_MODULES =
 // Copy-meter hooks for metered native trigger preparation (inert in this engine), including
 // grouping-set metering and linear-time integer and datetime typing: 1,182,025 raw / 354,678 gzip. Raise raw
 // once by 1.75 KiB and gzip by 768.
-const COMPLETE_ENTRY_RAW_BUDGET = 1154.5 * 1024;
+// #63 PostgreSQL SQLSTATE parity in the shared front end (rewrite and negation side tables, NOT
+// BETWEEN as PostgreSQL writes it): rebased on 6e73cd77 its round 4 measured 1,182,347 raw (139
+// over), round 5 1,182,427. Raise raw once by 512; gzip and isolation caps stay.
+const COMPLETE_ENTRY_RAW_BUDGET = 1155 * 1024;
 const COMPLETE_ENTRY_GZIP_BUDGET = 346.5 * 1024;
 // The engine with the larger durable adapter, OPFS.
 // JSON_TABLE metadata: 1,585,069 raw / 458,168 gzip bytes; counterfactual
@@ -89,7 +92,9 @@ const COMPLETE_ENTRY_GZIP_BUDGET = 346.5 * 1024;
 // Native display-label provenance (PostgreSQL duplicate labels): 1,592,412 raw / 460,959 gzip.
 // Raise raw once by 512 and gzip by 128; no next/ or test input is reachable.
 // Copy-meter hooks and linear typing: 1,594,462 raw / 461,614 gzip. Raise raw once by 1.75 KiB, gzip by 768.
-const ENGINE_WITH_OPFS_RAW_BUDGET = 1557.25 * 1024;
+// #63 SQLSTATE parity: round 4 rebased on 6e73cd77 1,594,786 raw (162 over), round 5
+// 1,594,866. Raise raw once by 512; gzip stays.
+const ENGINE_WITH_OPFS_RAW_BUDGET = 1557.75 * 1024;
 const ENGINE_WITH_OPFS_GZIP_BUDGET = 451 * 1024;
 // The IndexedDB-only worker entry: the whole engine, the host, and one adapter, bundled without
 // code splitting the way Vite's default iife worker format does.

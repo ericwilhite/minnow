@@ -1,4 +1,9 @@
-import { copyJsonCall, jsonCallSource, rowFieldSource } from "./json-call-sources.js";
+import {
+  copyJsonCall,
+  jsonCallSource,
+  rememberNegation,
+  rowFieldSource,
+} from "./json-call-sources.js";
 import { encodeQueryIdentity } from "./query-identity.js";
 import { dateIsoString } from "../date-value.js";
 import { crossJoinPlan } from "../plan/model.js";
@@ -897,12 +902,16 @@ function negated(expression: Expression): Expression | undefined {
   if (expression.kind !== "condition") return undefined;
   const complement = complementaryOperators.get(expression.operator);
   if (complement === undefined) return undefined;
-  return {
+  const rewritten: Expression = {
     ...expression,
     operator: complement,
     left: simplifyNegations(expression.left),
     right: simplifyNegations(expression.right),
   };
+  // next/ resolves the operator as written (PostgreSQL names it in its errors): the written
+  // condition rides along in a side table, only under compileWithDeclaredTypes.
+  if (declaredTypesActive()) rememberNegation(rewritten, expression);
+  return rewritten;
 }
 
 function simplifyNegations(expression: Expression): Expression {
@@ -956,12 +965,14 @@ function expandPredicate(predicate: Predicate, output: Predicate[]): void {
     return;
   }
   if (inner.kind === "condition") {
-    output.push({
+    const condition: Predicate = {
       left: inner.left,
       operator: inner.operator,
       right: inner.right,
       ...(inner.escape === undefined ? {} : { escape: inner.escape }),
-    });
+    };
+    copyJsonCall(inner, condition);
+    output.push(condition);
     return;
   }
   output.push(predicate);

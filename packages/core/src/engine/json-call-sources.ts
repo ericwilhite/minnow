@@ -9,6 +9,7 @@ interface Provenance {
   readonly field?: RowField;
   readonly row?: string;
   readonly rewrite?: RewriteForm;
+  readonly negation?: object;
 }
 /**
  * The PostgreSQL form the front end rewrote a node from, for next/'s lowering: `truth` for the
@@ -54,6 +55,17 @@ export function rewriteSource(value: object): RewriteForm | undefined {
 }
 export function rememberRewrite(value: object, form: RewriteForm): void {
   remember(value, { rewrite: form });
+}
+/**
+ * The condition as written before the negation pass replaced `NOT (x op y)` by `x op' y`
+ * (engine/optimizer.ts `negated`): PostgreSQL resolves the operator as written, so next/'s
+ * lowering resolves this one first and its errors name it. A side table, as `rewriteSource`.
+ */
+export function negationSource(value: object): object | undefined {
+  return get(value)?.negation;
+}
+export function rememberNegation(value: object, written: object): void {
+  remember(value, { negation: written });
 }
 /** Clone hooks preserve call identity, record labels and exact field bindings together. */
 export function copyJsonCall(source: object, target: object): void {

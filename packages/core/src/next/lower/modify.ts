@@ -27,7 +27,7 @@ import { coerce, settle, type Typed } from "./coerce.js";
 import { PlanningError, unsupported } from "./errors.js";
 import {
   asBool,
-  lowerCondition,
+  lowerPredicate,
   lowerExpression,
   type ExpressionState,
   type Scope,
@@ -489,17 +489,7 @@ function targetRows(
   if (read === undefined)
     throw new PlanningError(`relation "${table.name}" is not a table`, "42809");
   const where = [...predicates, ...(sources?.predicates ?? [])].map((predicate) =>
-    asBool(
-      lowerCondition(
-        predicate.operator,
-        predicate.left,
-        predicate.right,
-        predicate.escape,
-        from.scope,
-        builder.state,
-      ),
-      builder.state,
-    ),
+    asBool(lowerPredicate(predicate, from.scope, builder.state), builder.state),
   );
   return {
     from,

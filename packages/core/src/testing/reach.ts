@@ -2179,6 +2179,11 @@ export const OPERATOR_SQLSTATE_REACH = [
   "executed",
   "refused at execution",
   "untyped input refused",
+  // #63 round 5: NOT around a predicate (the 0.x negation pass rewrites it; errors name the
+  // operator as written), and IN lists mixing columns with constants (transformAExprIn).
+  "negated",
+  "negated refusal",
+  "columns beside constants",
 ] as const;
 
 /** PG per-attribute mode transitions, statement attempts, savepoints and transaction cleanup. */

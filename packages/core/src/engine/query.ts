@@ -11966,22 +11966,33 @@ class Parser {
       this.#keyword("AND");
       const upper = this.#additive();
       // BETWEEN is inclusive-range sugar; the AND here binds at comparison level by the grammar.
+      // NOT BETWEEN is PostgreSQL's `a < x OR a > y` (transformAExprBetween), not NOT over the
+      // range: the same rows, and the operators PostgreSQL's errors name.
       const rangeOver = (low: Expression, high: Expression): Expression => ({
         kind: "logical",
-        operator: "and",
-        left: { kind: "condition", operator: ">=", left: copyLowered(left), right: low },
-        right: { kind: "condition", operator: "<=", left: copyLowered(left), right: high },
+        operator: negated ? "or" : "and",
+        left: {
+          kind: "condition",
+          operator: negated ? "<" : ">=",
+          left: copyLowered(left),
+          right: low,
+        },
+        right: {
+          kind: "condition",
+          operator: negated ? ">" : "<=",
+          left: copyLowered(left),
+          right: high,
+        },
       });
-      // SYMMETRIC also accepts the bounds reversed.
-      const range: Expression = symmetric
+      // SYMMETRIC also accepts the bounds reversed (NOT: outside both orders).
+      return symmetric
         ? {
             kind: "logical",
-            operator: "or",
+            operator: negated ? "and" : "or",
             left: rangeOver(lower, upper),
             right: rangeOver(copyLowered(upper), copyLowered(lower)),
           }
         : rangeOver(lower, upper);
-      return negated ? { kind: "not", operand: range } : range;
     }
     if (this.#isKeyword("IN")) {
       this.#keyword("IN");

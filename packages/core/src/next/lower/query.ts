@@ -15,9 +15,10 @@ import { encodeQueryIdentity } from "../../engine/query-identity.js";
 import type { CompiledQuery, Expression } from "../../plan/model.js";
 import { canImplicitlyCast, coerce, settle, type Typed } from "./coerce.js";
 import { PlanningError, unsupported } from "./errors.js";
+import { nullLiteral } from "./literals.js";
 import {
   asBool,
-  lowerCondition,
+  lowerPredicate,
   lowerExpression,
   lowerJsonValue,
   type Collated,
@@ -688,6 +689,7 @@ export function lowerBlock(
   block: CompiledQuery,
   builder: PlanBuilder,
   outer?: OuterResolver,
+  options?: { readonly setOperand?: boolean },
 ): LoweredRel & { readonly pointRead?: boolean } {
   builder.catalogDeclarations?.(block, outer);
   builder.rowLocking = strongestRowLock([builder.rowLocking, block.rowLocking]);
@@ -701,17 +703,7 @@ export function lowerBlock(
   const source = from.scope;
   const select = expandWildcards(block.select, from);
   const conjuncts = block.predicates.map((predicate) =>
-    asBool(
-      lowerCondition(
-        predicate.operator,
-        predicate.left,
-        predicate.right,
-        predicate.escape,
-        source,
-        state,
-      ),
-      state,
-    ),
+    asBool(lowerPredicate(predicate, source, state), state),
   );
   const grouped =
     block.groupBy.length > 0 ||
@@ -720,23 +712,28 @@ export function lowerBlock(
   const grouping = grouped ? new Grouping(block.groupBy, source, builder) : null;
   const outputScope = grouping?.scope() ?? source;
   const having = block.having.map((predicate) =>
-    asBool(
-      lowerCondition(
-        predicate.operator,
-        predicate.left,
-        predicate.right,
-        predicate.escape,
-        outputScope,
-        state,
-      ),
-      state,
-    ),
+    asBool(lowerPredicate(predicate, outputScope, state), state),
   );
   const raw = select.map((item) => lowerJsonValue(item.expression, outputScope, state));
-  const items: Collated[] = raw.map((typed) => settle(typed, builder.parameters));
-  // Unknown-typed constants a set operation still resolves (placeholders keep their own rule).
-  const pending = raw.map((typed) =>
-    typed.pending?.kind === "null" || typed.pending?.kind === "text" ? typed : undefined,
+  // A set operation's member leaves its untyped `$n` unknown, as PostgreSQL's leaves do: the set
+  // operation's column matching types it (`SELECT $1 UNION SELECT 1.5` is numeric), so it is
+  // neither settled to text here nor fixed before the other members are lowered.
+  const unknown = raw.map(
+    (typed) =>
+      options?.setOperand === true &&
+      typed.pending?.kind === "param" &&
+      builder.parameters.type(typed.pending.index) === null,
+  );
+  const items: Collated[] = raw.map((typed, index) =>
+    unknown[index] === true
+      ? { expr: nullLiteral({ kind: "text" }), nullable: true, big: false }
+      : settle(typed, builder.parameters),
+  );
+  // Unknown-typed constants and parameters a set operation still resolves.
+  const pending = raw.map((typed, index) =>
+    typed.pending?.kind === "null" || typed.pending?.kind === "text" || unknown[index] === true
+      ? typed
+      : undefined,
   );
   const names = select.map((item) => item.alias);
   // ORDER BY: an output column by name, else an expression over the block's rows (hidden).

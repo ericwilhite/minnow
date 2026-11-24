@@ -51,6 +51,15 @@ const SETUP = [
   "INSERT INTO t VALUES (1, 1, 1, true, '1', DATE '2020-01-01', TIMESTAMP '2020-01-01 00:00:00', 1, 1, NULL, '1', '1', 1, 1, NULL, NULL, NULL, NULL, NULL, '1', '1', 1.5)",
   "INSERT INTO t VALUES (2, 2, 3, false, 'a', DATE '2020-01-02', TIMESTAMP '2020-01-02 12:00:00', 2.5, 2.5, NULL, 'a', 'a', 2, 2.5, NULL, NULL, NULL, NULL, NULL, 'abc', 'a', 2.25)",
   "INSERT INTO t VALUES (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
+  // #63 round 5 (P1): a numeric one past 2^53 beside the bigint 2^53 and a NULL float8. An IN
+  // list compared in its common type (float8) finds `n IN (g, f)` true here; PostgreSQL compares
+  // n with g as numeric (false), then with f (NULL).
+  // Round 5 (P3): two enum types, one category (E) neither converts to.
+  "CREATE TYPE mood AS ENUM ('a', 'b')",
+  "CREATE TYPE mood2 AS ENUM ('a', 'c')",
+  "CREATE TABLE te (id integer PRIMARY KEY, e mood, e2 mood2)",
+  "INSERT INTO te VALUES (1, 'a', 'a')",
+  "INSERT INTO t VALUES (4, NULL, 9007199254740992, NULL, NULL, NULL, NULL, 9007199254740993, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
 ];
 
 const OPERATORS = ["=", "<>", "<", "<=", ">", ">="] as const;
@@ -134,6 +143,22 @@ function statement(form: Form, operator: Operator, l: string, rs: readonly strin
     case "similar to":
       return `SELECT 1 FROM t WHERE ${l} SIMILAR TO ${r}`;
   }
+}
+
+/**
+ * `sql` with its predicate under NOT (#63 round 5): the WHERE condition, a join's ON condition or
+ * a CHECK. The 0.x negation pass rewrites `NOT (x op y)` into `x op' y` before next/ lowers it;
+ * PostgreSQL resolves the operator written, so its errors name that one. Null for a form with no
+ * predicate to negate (CASE, NULLIF).
+ */
+function negate(sql: string): string | null {
+  const where = /^(.* WHERE )(.*?)( ORDER BY id)?$/u.exec(sql);
+  if (where !== null) return `${where[1] ?? ""}NOT (${where[2] ?? ""})${where[3] ?? ""}`;
+  const on = /^(.* ON )(.*)$/u.exec(sql);
+  if (on !== null) return `${on[1] ?? ""}NOT (${on[2] ?? ""})`;
+  const check = /^(.* CHECK \()(.*)(\)\))$/u.exec(sql);
+  if (check !== null) return `${check[1] ?? ""}NOT (${check[2] ?? ""})${check[3] ?? ""}`;
+  return null;
 }
 
 /** A column of `t` under an alias; an untyped left operand stays as written. */
@@ -247,14 +272,17 @@ function lowered(sql: string, rows: boolean): Outcome {
 }
 
 /** Compares the SQLSTATE, the message where PostgreSQL finds no operator, and with `rows` the
- * rows when both succeed. */
+ * rows when both succeed; with `messages`, every refusal's message too. */
 async function compare(
   sql: string,
   reach?: ReturnType<typeof createReach>,
   rows = false,
+  messages = false,
 ): Promise<void> {
   const expected = await authority(sql);
   let actual = lowered(sql, rows);
+  if (messages && expected.state !== "00000")
+    expect(`${actual.state} ${actual.message}`, sql).toBe(`${expected.state} ${expected.message}`);
   // A value PostgreSQL refuses while it analyses (an untyped '1' as a timestamptz, 22007),
   // next/ refuses when it runs the statement: the outcome is compared, not its stage.
   if (actual.state === "00000" && expected.state !== "00000" && sql.startsWith("SELECT")) {
@@ -510,6 +538,107 @@ it("answers every form Neon's round 4 of #63 (9326c7a4) named, as PostgreSQL doe
     await compare(sql, undefined, true);
 });
 
+it("answers every form the round 4 review of #63 (74b63d1d) named, as PostgreSQL does", async () => {
+  // Every refusal's message is compared, not only its SQLSTATE.
+  for (const sql of [
+    // P1: an IN list's columns are compared one by one, never in the list's common type
+    // (transformAExprIn): row 4 holds numeric 2^53 + 1 beside bigint 2^53 and a NULL float8.
+    "SELECT id FROM t WHERE n IN (g, f) ORDER BY id",
+    "SELECT id, n IN (g, f) FROM t ORDER BY id",
+    "SELECT id FROM t WHERE g IN (n, f) ORDER BY id",
+    "SELECT id FROM t WHERE n NOT IN (g, f) ORDER BY id",
+    "SELECT id FROM t WHERE '1' IN ('12345', b) ORDER BY id",
+    "SELECT id FROM t WHERE '1' IN (i, '1.2345') ORDER BY id",
+    "SELECT id FROM t WHERE n IN (g, 9007199254740993, 1) ORDER BY id",
+    "SELECT id FROM t WHERE $1 IN ($2, i) ORDER BY id",
+    // P2: json in an IN list names its common type, json.
+    "SELECT id FROM t WHERE j IN ('1', '1') ORDER BY id",
+    "SELECT id FROM t WHERE j NOT IN ('1', '1', i) ORDER BY id",
+    "SELECT id FROM t WHERE j IN (NULL, NULL) ORDER BY id",
+    "SELECT 1 FROM t WHERE j IN ($1, $2)",
+    // P2: under NOT, the operator as written.
+    "SELECT 1 FROM t WHERE NOT (i = s)",
+    "SELECT 1 FROM t WHERE NOT (i < s)",
+    "SELECT 1 FROM t WHERE NOT (i IN (1, true))",
+    "SELECT 1 FROM t WHERE NOT (i NOT IN (1, true))",
+    "SELECT 1 FROM t WHERE NOT (i IN (s))",
+    "SELECT 1 FROM t WHERE NOT (i = ANY (ARRAY['1', v3]))",
+    "SELECT 1 FROM t WHERE NOT (i <> ALL (ARRAY['1', v3]))",
+    "SELECT 1 FROM t WHERE NOT (i BETWEEN 1 AND true)",
+    "SELECT 1 FROM t WHERE NOT (i NOT BETWEEN tm AND tm)",
+    "SELECT 1 FROM t WHERE NOT (i NOT BETWEEN SYMMETRIC 1 AND true)",
+    "SELECT id FROM t WHERE NOT (i LIKE '1')",
+    "SELECT 1 FROM t WHERE NOT (i IS TRUE)",
+    "SELECT 1 FROM t WHERE NOT (i IS NOT FALSE)",
+    "SELECT 1 FROM t WHERE NOT (i = 1 AND i = s)",
+    "SELECT 1 FROM t AS a JOIN t AS b ON NOT (a.i = b.s)",
+    "SELECT 1 FROM t GROUP BY i HAVING NOT (i = 'x'::text)",
+    // P2: 42P08 needs the exact type deduced, not a cast to it.
+    "SELECT id FROM t WHERE n = ANY (ARRAY[$1, 1.5, ($1 + 1)])",
+    "SELECT id FROM t WHERE n IN ($1, 1.5, ($1 + 1))",
+    "SELECT id FROM t WHERE $1 IN (1.5, ($1 + 1))",
+    "SELECT id FROM t WHERE i = ANY (ARRAY[$1, g, ($1 + 1)])",
+    // P2: an untyped $n is unknown in COALESCE, GREATEST, LEAST, CASE and UNION too.
+    "SELECT COALESCE($1, ($1 = 1))",
+    "SELECT GREATEST($1, ($1 = 1))",
+    "SELECT LEAST($1, ($1 = 1))",
+    "SELECT COALESCE($1, 1.5, ($1 + 1))",
+    "SELECT CASE WHEN true THEN $1 ELSE ($1 = 1) END",
+    "SELECT CASE WHEN true THEN $1 WHEN false THEN 1.5 ELSE ($1 + 1) END",
+    "SELECT $1 UNION SELECT ($1 = 1)",
+    // P3: input errors in item order, before a later item's conversion refusal.
+    "SELECT id FROM t WHERE i = ANY (ARRAY[u, 'x', j])",
+    "SELECT id FROM t WHERE b = ANY (ARRAY['t', 1])",
+    "SELECT id FROM t WHERE 'x' IN (s, i) ORDER BY id",
+    // P3: PostgreSQL's names for the construct.
+    "SELECT COALESCE(i, true) FROM t",
+    "SELECT GREATEST(i, true) FROM t",
+    "SELECT LEAST(d, tm) FROM t",
+    "SELECT tm FROM t UNION ALL SELECT iv FROM t",
+    "SELECT i FROM t INTERSECT ALL SELECT b FROM t",
+    "SELECT i FROM t EXCEPT ALL SELECT b FROM t",
+    "VALUES (1), (true)",
+    "SELECT * FROM (VALUES (1, 'a'), (true, 'b')) v(x, y)",
+    "VALUES (DATE '2020-01-01'), (TIME '10:00')",
+    "VALUES (1), ('x')",
+    // P3: enums are category E; two of them are 42846.
+    "SELECT e FROM te UNION SELECT e2 FROM te",
+    "SELECT CASE WHEN id = 1 THEN e ELSE e2 END FROM te",
+    "SELECT COALESCE(e, e2) FROM te",
+    "SELECT 1 FROM te WHERE 1 = ANY (ARRAY[e, e2])",
+    // P3: json beside jsonb is 42846 outside ARRAY too.
+    "SELECT GREATEST(j, jb) FROM t",
+    "SELECT GREATEST(jb, j) FROM t",
+    "SELECT COALESCE(j, jb) FROM t",
+    "SELECT COALESCE(jb, j) FROM t",
+    "SELECT j FROM t UNION ALL SELECT jb FROM t",
+    // A comparison takes numeric, not the column's numeric(5,2) (row 4's bigint overflows it).
+    "SELECT id FROM t WHERE NULLIF(n52, g) IS NULL ORDER BY id",
+    "SELECT id FROM t WHERE n52 = g ORDER BY id",
+    "SELECT id FROM t WHERE n52 IN (1000, 2000) ORDER BY id",
+  ])
+    await compare(sql, undefined, true, true);
+});
+
+it("types a set operation's untyped parameter from its partner, as PostgreSQL does", async () => {
+  // Round 5 (P2): PostgreSQL leaves a set operation member's $n unknown until the columns are
+  // matched, so the statements run (each compared with bound values).
+  for (const [sql, params] of [
+    ["SELECT $1 UNION SELECT 1.5", ["1"]],
+    ["SELECT * FROM (VALUES ($1), (1)) v(x)", ["2"]],
+    ["SELECT * FROM (VALUES ($1), (true)) v(x)", ["t"]],
+    ["SELECT $1, $2 UNION ALL SELECT 1, 'a'", ["2", "b"]],
+  ] as const) {
+    const expected = (await pg.query<Record<string, unknown>>(sql, [...params])).rows.map((row) =>
+      Object.values(row).map((value) => (typeof value === "string" ? value : String(value))),
+    );
+    const actual = next
+      .execute(sql, [...params])
+      .map((row) => Object.values(row).map((value) => String(value)));
+    expect(actual, sql).toEqual(expected);
+  }
+});
+
 it("keeps 42804 where PostgreSQL matches result types (UNION, CASE results)", async () => {
   for (const sql of [
     "SELECT i FROM t UNION SELECT b FROM t",
@@ -540,11 +669,14 @@ for (const seed of seedsFor("next-operator-sqlstate", [0x6501, 0x6502]))
               weight: 6,
               arbitrary: fc.constantFrom(...TYPES).map((type) => COLUMNS[type] as string),
             },
-            { weight: 1, arbitrary: fc.constantFrom<string>(...UNTYPED) },
+            // Round 5: two in eight, so lists mixing columns and constants are common.
+            { weight: 2, arbitrary: fc.constantFrom<string>(...UNTYPED) },
           ),
           { minLength: 1, maxLength: 3 },
         ),
-        async (form, operator, left, rights) => {
+        // Round 5: the predicate under NOT, a third of the time.
+        fc.integer({ min: 0, max: 2 }).map((n) => n === 0),
+        async (form, operator, left, rights, not) => {
           reach.beginHistory();
           const list =
             form === "in list" ||
@@ -557,9 +689,24 @@ for (const seed of seedsFor("next-operator-sqlstate", [0x6501, 0x6502]))
           // text; next/'s front end desugars CASE x WHEN v before lowering sees the test.
           if (untyped && form === "case when") return;
           if (untyped) reach.reach("untyped left");
-          if (rights.some((right) => (UNTYPED as readonly string[]).includes(right)))
-            reach.reach("untyped right");
-          await compare(statement(form, operator, left, rights), reach, list);
+          const literals = rights.filter((right) => (UNTYPED as readonly string[]).includes(right));
+          if (literals.length > 0) reach.reach("untyped right");
+          if (
+            (form === "in list" || form === "not in list") &&
+            literals.length >= 2 &&
+            literals.length < rights.length
+          )
+            reach.reach("columns beside constants");
+          const sql = statement(form, operator, left, rights);
+          const negated = not ? negate(sql) : null;
+          if (negated !== null) {
+            reach.reach("negated");
+            await compare(negated, reach, list);
+            // Agreed (compare throws otherwise) where PostgreSQL names the operator it lacks.
+            if ((await authority(negated)).state === "42883") reach.reach("negated refusal");
+            return;
+          }
+          await compare(sql, reach, list);
         },
       ),
       { seed, numRuns: 400 },

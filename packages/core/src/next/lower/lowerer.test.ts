@@ -121,7 +121,7 @@ describe("DDL", () => {
   it("type-checks a default at CREATE time", () => {
     const { run } = database();
     expect(() => run("CREATE TABLE t (a INTEGER DEFAULT 'abc')")).toThrow(
-      "invalid input syntax for type int4",
+      "invalid input syntax for type integer",
     );
     expect(
       run("CREATE TABLE t (a INTEGER DEFAULT 7, b TEXT DEFAULT 'x', c TIMESTAMPTZ DEFAULT now())"),
