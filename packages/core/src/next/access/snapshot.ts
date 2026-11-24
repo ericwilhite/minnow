@@ -117,6 +117,7 @@ import type { VarlenBuilder } from "../vector/varlen.js";
 import type { FlatVector, Selection, Vector } from "../vector/vector.js";
 import type { CatalogView, ColumnDef } from "./catalog.js";
 import type { IndexReader, MaybePromise } from "./key-index.js";
+import type { ReaderMemo } from "./reader-memo.js";
 import type { ByteBudget, SpaceReader } from "./space.js";
 
 /** Largest LSN; LSNs are safe integers below the pending range. */
@@ -288,6 +289,10 @@ export interface MemoryReadContext {
   /** A one-pass read (exec/table-scan.ts `directoryOnce`): it borrows cached metadata and admits
    * none of what it parses (page/reader.ts `ChunkReadOptions.once`). */
   readonly once?: boolean;
+  /** A statement-owned memo of opened published readers for repeated point reads
+   * (access/reader-memo.ts). `signal` must be the memo's own signal (`===`): a memo read builds
+   * no per-read composite, so it cannot honour another one. */
+  readonly readers?: ReaderMemo;
 }
 
 export interface MemoryReadRequest {

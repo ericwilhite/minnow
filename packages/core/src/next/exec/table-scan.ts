@@ -329,6 +329,22 @@ class ScanMemory implements TargetMemory, ByteBudget {
     this.reserve = 0;
     return true;
   }
+  /**
+   * Optional room (format/manifest-codec.ts `OptionalParseBudget`), forwarded: a cached root probe
+   * through the scan's memory must not raise the owner's mandatory requirement (a sizing pass's
+   * `required`, read-step `sourceBudget`'s refused watermark).
+   */
+  optionalAllocate(bytes: number): boolean {
+    if (bytes <= this.reserve) {
+      this.reserve -= bytes;
+      return true;
+    }
+    const owner = this.budget as ByteBudget & { optionalAllocate?(bytes: number): boolean };
+    const more = bytes - this.reserve;
+    if (!(owner.optionalAllocate?.(more) ?? owner.allocate(more))) return false;
+    this.reserve = 0;
+    return true;
+  }
   free(bytes: number): void {
     this.budget.free(bytes);
   }
@@ -1589,8 +1605,9 @@ export class TableScan implements BatchSource {
 
 /**
  * The reason a scan's own reads are cancelled with when it is aborted or closed. One shared
- * `AbortError`: a point fetch opens and closes a scan per row (ON CONFLICT DO UPDATE), and a
- * reasonless `abort()` builds a new DOMException, with its stack, every time.
+ * `AbortError`: one-row scans (an ON CONFLICT fetch of a group segment's row, exec/point-fetch.ts)
+ * open and close a scan per row, and a reasonless `abort()` builds a new DOMException, with its
+ * stack, every time.
  */
 const SCAN_ABORTED = new DOMException("The table scan was aborted", "AbortError");
 
