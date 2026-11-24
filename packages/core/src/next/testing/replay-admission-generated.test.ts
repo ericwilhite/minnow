@@ -9,6 +9,14 @@
  * a lower bound of what the open needs; never an untyped failure or a livelock. A refused,
  * cancelled or crashed open leaves the log as it was: every committed row opens at a larger cap.
  *
+ * Reopens when it fits (review of #70): N is what the open needs, not a multiple of it. An
+ * unpressured open at 256 MiB measures the exact peak: N's own sum (`WriteCredits.growTo`) with
+ * what replay actually allocates in place of each step's charge. Every refusal's N is within that
+ * peak (`within`: a tenth more), and an open at the smallest cap whose ordinary capacity holds
+ * that much is never a replay refusal (it opens, or the owner's fixed minimum is refused). Two tails aim at a charge past what replay allocates: one value of 12 to 15 MiB (one
+ * resize of a fresh arena), and a small row after a memtable filled by rows or bytes (the full
+ * memtable's arena is never grown).
+ *
  * Tails are written through a `Harness` whose flushes never publish (`beforeFlushPublish`), so the
  * rows stay in the log, then abandoned as a crashed process abandons them. The native open runs on
  * its own governor; the test reaches that governor only to add a competing holder or a queued
@@ -19,10 +27,12 @@ import { expect, it, onTestFinished, vi } from "vitest";
 import { createReach, REPLAY_ADMISSION_REACH } from "../../testing/reach.js";
 import { seedsFor } from "../../testing/seeds.js";
 import { Governor, type Grant } from "../memory/governor.js";
+import { MemoryAdmissionError } from "../memory-values.js";
 import { openNativeOwner, type NativeOwner } from "../owner/native-boot.js";
 import type { SimBackend } from "../storage/sim-disk.js";
 import { yieldTask } from "../task.js";
 import { need } from "../write/bytes.js";
+import { WriteCredits } from "../write/credits.js";
 import { ReplayMemoryError } from "../write/engine.js";
 import {
   autocommit,
@@ -44,7 +54,7 @@ const MiB = 1 << 20;
 /** The replay's row growth (write/credits.ts `growTo` on the write path's row account). */
 const GROWTH = "complete grow write path";
 
-const SHAPES = ["rows", "wide", "commit", "deletes", "index", "gap"] as const;
+const SHAPES = ["rows", "wide", "commit", "deletes", "index", "gap", "huge", "afterFull"] as const;
 type Shape = (typeof SHAPES)[number];
 type Pressure = "none" | "holder" | "queued";
 type Outcome = "complete" | "cancel" | "crash";
@@ -56,6 +66,8 @@ interface Case {
   readonly capMiB: number;
   readonly pressure: Pressure;
   readonly outcome: Outcome;
+  /** The "huge" tail's one value (MiB); 14 when absent. */
+  readonly valueMiB?: number;
 }
 
 type Reach = ReturnType<typeof createReach<(typeof REPLAY_ADMISSION_REACH)[number]>>;
@@ -72,7 +84,14 @@ const value = (id: number, bytes: number) => String(id).padEnd(bytes, "x");
 async function writeTail(c: Case, reach: Reach) {
   let holding = false;
   // Small memtables where the shape needs freezes before its tail (row limits; bytes stay below).
-  const memtableRows = c.shape === "gap" ? 8 : c.shape === "deletes" ? 64 : undefined;
+  const memtableRows =
+    c.shape === "gap"
+      ? 8
+      : c.shape === "deletes"
+        ? 64
+        : c.shape === "afterFull" && !c.large
+          ? 4
+          : undefined;
   const h = new Harness("strict", "sim", memtableRows, undefined, {
     beforeFlushPublish: () => (holding ? new Promise<never>(() => undefined) : Promise.resolve()),
     logRecycleBytes: 1 << 30,
@@ -210,6 +229,25 @@ async function writeTail(c: Case, reach: Reach) {
       holding = true;
       for (let k = 0; k < 5; k++) await insert(t, [k], c.large ? 1536 * 1024 : 256 * 1024);
       if (path.maintenance.stagingRollbacks > 0) reach.reach("staged rollback gap tail");
+      break;
+    }
+    case "huge": {
+      // One value past the 8 MiB memtable bytes: its fresh arena resizes once, to 16 MiB.
+      const t = await create("h");
+      holding = true;
+      await insert(t, [1], (c.valueMiB ?? 14) * MiB);
+      reach.reach("huge value tail");
+      break;
+    }
+    case "afterFull": {
+      // A memtable full by bytes (one 8 MiB value) or by rows (four 1 MiB values, four rows per
+      // memtable), its last arena exactly full; then a one-byte row, which opens a new memtable.
+      const t = await create("f");
+      holding = true;
+      if (c.large) await insert(t, [1], 8 * MiB);
+      else for (let id = 1; id <= 4; id++) await insert(t, [id], MiB);
+      await insert(t, [100], 1);
+      reach.reach("row after a full memtable");
       break;
     }
   }
@@ -357,6 +395,93 @@ const ordinary = (capBytes: number) => {
   return governor.capBytes - governor.reserveBytes;
 };
 
+/** The write owner's accounts (write/credits.ts): what a replay refusal's N sums. */
+const WRITE_ACCOUNTS = new Set([
+  "write path",
+  "write path metadata",
+  "write commit buffers",
+  "write merge credit",
+]);
+
+/**
+ * The exact peak of an unpressured open at 256 MiB, as N counts it but with what replay actually
+ * allocates in place of each step's charge: the most the write owner's accounts allocate at once
+ * (their `allocated` and loans, not the credit they hold), plus the owner's mandatory holdings
+ * every growth counts (`WriteCredits.ownerHoldingsBytes`: the fixed cache floor and the space's
+ * permanent bytes). Accounts are read through the test-build holdings hook: a grant holds before
+ * it allocates, so its first change of holdings comes before its first allocation.
+ */
+async function exactPeak(h: Harness): Promise<number> {
+  let now = 0,
+    peak = 0,
+    owner = 0,
+    governor: Governor | null = null;
+  const seen = new WeakSet<Grant>();
+  const previous = Governor.observeHoldings;
+  Governor.observeHoldings = (grant, delta) => {
+    previous?.(grant, delta);
+    const observed = grant as Grant & { allocated: number; governor: Governor; label: string };
+    if (seen.has(grant) || !WRITE_ACCOUNTS.has(observed.label)) return;
+    seen.add(grant);
+    // The first write account's governor is the native owner's (the harness's own is not used).
+    governor ??= observed.governor;
+    if (observed.governor !== governor) return;
+    let value = observed.allocated;
+    now += value;
+    peak = Math.max(peak, now);
+    Object.defineProperty(observed, "allocated", {
+      configurable: true,
+      enumerable: true,
+      get: () => value,
+      set: (bytes: number) => {
+        now += bytes - value;
+        value = bytes;
+        peak = Math.max(peak, now + loans());
+      },
+    });
+  };
+  const accounts: Grant[] = [];
+  const loans = () => accounts.reduce((sum, grant) => sum + grant.loaned, 0);
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- called with its receiver below
+  const prepare = WriteCredits.prototype.prepareMetadata;
+  const spy = vi.spyOn(WriteCredits.prototype, "prepareMetadata").mockImplementation(function (
+    this: WriteCredits,
+    ...args: Parameters<WriteCredits["prepareMetadata"]>
+  ) {
+    owner = Math.max(owner, this.ownerHoldingsBytes);
+    for (const grant of [this.rows, this.metadata, this.commits, this.merge])
+      if (!accounts.includes(grant)) accounts.push(grant);
+    return prepare.apply(this, args);
+  });
+  try {
+    const opened = await nativeOpen(h, 256, "none", (release) => {
+      release();
+    });
+    await opened.settle();
+    await need(opened.owner).close();
+    return peak + owner;
+  } finally {
+    spy.mockRestore();
+    Governor.observeHoldings = previous;
+  }
+}
+
+/**
+ * The most N may be for an open whose exact peak is `exact`: a tenth more. A step is charged
+ * before it allocates, from bounds that cannot all be exact: the key batch an index backfill
+ * encodes into is charged at twice its buffer, and leaves at a split of every leaf the entries may
+ * reach. At these tails that leaves N at most 7% above the exact peak (an index backfill of 4 KiB
+ * keys; deletes 0.3%); the charges this suite found ran 35% to 95% above it.
+ */
+const within = (exact: number) => exact + exact / 10;
+
+/** The smallest whole-MiB cap whose ordinary capacity holds `bytes`. */
+const fitCap = (bytes: number) => {
+  let capMiB = Math.max(1, Math.ceil(bytes / MiB));
+  while (ordinary(capMiB * MiB) < bytes) capMiB++;
+  return capMiB;
+};
+
 const EXAMPLES: Array<[Case]> = [
   // The review's P0: a queued admission while the replay grows (a livelock before).
   [{ shape: "rows", large: true, capMiB: 256, pressure: "queued", outcome: "complete" }],
@@ -368,6 +493,10 @@ const EXAMPLES: Array<[Case]> = [
   [{ shape: "commit", large: true, capMiB: 96, pressure: "holder", outcome: "cancel" }],
   [{ shape: "rows", large: true, capMiB: 96, pressure: "holder", outcome: "crash" }],
   [{ shape: "rows", large: true, capMiB: 32, pressure: "none", outcome: "complete" }],
+  // The second review's P1s: one 14 MiB value at 32 MiB (refused asking 31.9 MiB; it peaks at
+  // about 17 MiB), and a one-byte row after an 8 MiB value at 28 MiB (refused asking 28 MiB).
+  [{ shape: "huge", large: true, capMiB: 32, pressure: "none", outcome: "complete", valueMiB: 14 }],
+  [{ shape: "afterFull", large: true, capMiB: 32, pressure: "none", outcome: "complete" }],
 ];
 
 const caseArb: fc.Arbitrary<Case> = fc.record({
@@ -376,6 +505,7 @@ const caseArb: fc.Arbitrary<Case> = fc.record({
   capMiB: fc.constantFrom(32, 48, 96, 256),
   pressure: fc.constantFrom<Pressure>("none", "holder", "queued"),
   outcome: fc.constantFrom<Outcome>("complete", "cancel", "crash"),
+  valueMiB: fc.constantFrom(12, 14, 15),
 });
 
 for (const seed of seedsFor("next-replay-admission", [0x70, 0x71]))
@@ -385,6 +515,7 @@ for (const seed of seedsFor("next-replay-admission", [0x70, 0x71]))
       fc.asyncProperty(caseArb, async (c) => {
         reach.beginHistory();
         const { h, model } = await writeTail(c, reach);
+        const exact = await exactPeak(h);
         const controller = new AbortController();
         // A holder: the callback's write is invisible to narrowing.
         const crash = { done: false, backstop: false };
@@ -444,6 +575,10 @@ for (const seed of seedsFor("next-replay-admission", [0x70, 0x71]))
           expect(refused.bytes, "N exceeds the capacity it was refused at").toBeGreaterThan(
             refused.capacity,
           );
+          expect(refused.bytes, "N is within the exact peak of the open").toBeLessThanOrEqual(
+            within(exact),
+          );
+          reach.reach("refusal within the exact peak");
           expect(refused.message).toMatch(
             /^Opening this database needs at least [\d.]+ MiB to replay its recently written rows, more than its memory cap allows for them \([\d.]+ MiB\)\. The data is intact; open it with a larger memory cap\.$/,
           );
@@ -465,6 +600,27 @@ for (const seed of seedsFor("next-replay-admission", [0x70, 0x71]))
             ).toBeInstanceOf(ReplayMemoryError);
             reach.reach("refusal is a lower bound");
           }
+        }
+        // Reopens when it fits: at the smallest cap whose ordinary capacity holds the exact peak
+        // and at which the owner's fixed minimum is admitted, it opens (a replay refusal there
+        // would ask more than the open needs).
+        for (let capMiB = fitCap(within(exact)); ; capMiB++) {
+          const fit = await nativeOpen(h, capMiB, "none", (release) => {
+            release();
+          });
+          await fit.settle();
+          if (fit.owner !== null) {
+            await fit.owner.close();
+            reach.reach("opened at the exact fit");
+            break;
+          }
+          expect(
+            fit.error,
+            `${c.shape} at ${String(capMiB)} MiB holds its exact peak (${String(exact)} B)`,
+          ).not.toBeInstanceOf(ReplayMemoryError);
+          // Below the owner's fixed minimum: the boot is refused before any replay.
+          expect(fit.error, "only the owner's fixed minimum").toBeInstanceOf(MemoryAdmissionError);
+          expect(capMiB, "the owner's minimum is admitted below 64 MiB").toBeLessThan(64);
         }
         // The log as it was: a generous open finds every committed row.
         await checkRows(h, model);
@@ -508,3 +664,34 @@ it("replays one 9 MiB value at a 28 MiB cap", async () => {
   await owner.close();
   await checkRows(h, model);
 }, 120_000);
+
+/**
+ * The second review of #70: two tails that fit were refused. One 14 MiB value replays into one
+ * 16 MiB arena; it was charged twice the value (28 MiB) and refused at 32 MiB, asking 31.9 MiB.
+ * A one-byte row after an 8 MiB value (a memtable full by bytes, its arena exactly full) was
+ * charged a doubling of that arena, which only a row stored there makes, and refused at 28 MiB,
+ * asking 28 MiB. Both open at those caps, within the cap less its reserve.
+ */
+for (const [name, c] of [
+  ["one 14 MiB value at a 32 MiB cap", { shape: "huge", large: true, capMiB: 32, valueMiB: 14 }],
+  [
+    "a one-byte row after a full memtable at a 28 MiB cap",
+    { shape: "afterFull", large: true, capMiB: 28 },
+  ],
+] as const)
+  it(`replays ${name}`, async () => {
+    const reach = createReach("replay admission (pinned)", REPLAY_ADMISSION_REACH);
+    reach.beginHistory();
+    const { h, model } = await writeTail({ ...c, pressure: "none", outcome: "complete" }, reach);
+    const opened = await nativeOpen(h, c.capMiB, "none", (release) => {
+      release();
+    });
+    expect(opened.error, "the open completes").toBeNull();
+    const owner = need(opened.owner);
+    expect(owner.governor.peakBytes).toBeLessThanOrEqual(
+      owner.governor.capBytes - owner.governor.reserveBytes,
+    );
+    await opened.settle();
+    await owner.close();
+    await checkRows(h, model);
+  }, 120_000);

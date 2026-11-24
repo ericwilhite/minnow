@@ -13900,6 +13900,8 @@ export const REPLAY_ADMISSION_REACH = [
   "delete-only tail",
   "index backfill tail",
   "staged rollback gap tail",
+  "huge value tail",
+  "row after a full memtable",
   "replay waited",
   "opened beside a temporary holder",
   "opened beside a queued admission",
@@ -13908,4 +13910,6 @@ export const REPLAY_ADMISSION_REACH = [
   "cancelled mid-wait",
   "crashed mid-wait",
   "every committed row after",
+  "opened at the exact fit",
+  "refusal within the exact peak",
 ] as const;

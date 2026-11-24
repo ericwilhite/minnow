@@ -194,12 +194,20 @@ from reclaim until the step ends, as a waiting write's do, so a queued admission
 take them back while the step is granted. The state pin a step may publish and replayed FTS
 mutation tracking are metadata admitted the same way. A step that could never fit refuses the
 open with `ReplayMemoryError` (53200) naming the refused requirement and the capacity it was
-measured against, leaving the log as it was. While recovering, the commit account keeps only the
-log appender's header beside what it has allocated (the appender is built when recovery ends).
+measured against, leaving the log as it was. Replay steps are charged what they store, not a
+multiple of it (`StepTable.replay`): one row's fresh arena is its one resize, a memtable that does
+not take the step's rows (full, or of another schema) grows nothing, and index keys are their
+encoded bytes (each value plus its escaped 0x00 bytes). Live inserts keep the wider bounds: their
+slack also covers admitted rows reclaimed before a step stores them and the rollback pin no step
+charges, which exact charges expose there. While recovering, the commit account keeps only the log appender's header
+beside what it has allocated (the appender is built when recovery ends).
 `testing/replay-admission-generated.test.ts` generates tails (multi-row, one large value, one
-commit past 2,048 rows, deletes only, an index rebuild, a staged rollback's gap) × caps ×
-competition (a temporary holder, a queued admission) × outcomes (complete, cancel, crash while
-waiting) through `openNativeOwner`; `write/recovery-replay-admission.test.ts` and
+value of 12-15 MiB, a small row after a full memtable, one commit past 2,048 rows, deletes only,
+an index rebuild, a staged rollback's gap) × caps × competition (a temporary holder, a queued
+admission) × outcomes (complete, cancel, crash while waiting) through `openNativeOwner`, and checks
+that each opens when it fits: every refusal's requirement is within a tenth of the open's exact
+peak (what its accounts allocate, plus the owner's mandatory holdings), and the smallest cap that
+holds that much and the owner's minimum opens; `write/recovery-replay-admission.test.ts` and
 `write/recovery-commit-floor.test.ts` pin the wait, the refusal and a cancelled open.
 
 Extent-list preparation and `GroupWriter` page buffers use that metadata budget too:

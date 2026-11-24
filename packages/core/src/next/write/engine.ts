@@ -1660,6 +1660,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         invalid: (indexId) => this.#catalog.index(indexId)?.invalid === true,
         live: () => memtable,
         memtableRows: this.#memtableRows,
+        replay: true,
         key: (vectors, columnId) =>
           need(vectors[def.columns.findIndex((column) => column.id === columnId)]),
       };
@@ -1777,6 +1778,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         invalid: (indexId) => this.#catalog.index(indexId)?.invalid === true,
         live: () => state.view.memtables.at(-1),
         memtableRows: this.#memtableRows,
+        replay: true,
         key: (_, columnId) =>
           need(indexed[def.columns.findIndex((column) => column.id === columnId)]),
       };
@@ -1818,6 +1820,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         invalid: (indexId) => this.#catalog.index(indexId)?.invalid === true,
         live: () => state.view.memtables.at(-1),
         memtableRows: this.#memtableRows,
+        replay: true,
         key: () => {
           throw new Error("Tombstones carry their keys");
         },

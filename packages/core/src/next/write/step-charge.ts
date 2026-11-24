@@ -34,6 +34,14 @@ export interface StepTable {
   live(): Memtable | undefined;
   /** The memtable row limit a new memtable takes, when configured. */
   readonly memtableRows: number | undefined;
+  /**
+   * Log replay (write/engine.ts `#replayRows`, `#backfill`): charged what the step stores. A
+   * replay step runs alone and holds its admitted rows and metadata until it has stored them
+   * (`#replayStep`). A live insert keeps the wider bounds (2 × input for a fresh arena or a key,
+   * growth against any live memtable): their slack also covers admitted rows reclaimed before
+   * the step stores them and the rollback pin no step charges, which exact charges expose.
+   */
+  readonly replay?: boolean;
   /** The input vector of a key column. */
   key(input: readonly Vector[], columnId: number): Vector;
 }
@@ -60,6 +68,27 @@ export function inputBytes(vector: Vector, plan: RowPlan): number {
       (slot.flat.data.offsets[slot.index + 1] ?? 0) - (slot.flat.data.offsets[slot.index] ?? 0);
   }
   return bytes;
+}
+
+/**
+ * Whether the live memtable takes a step's rows at all, as `liveMemtable` decides: a live
+ * memtable of the table's schema that is not full (by rows or bytes). Otherwise every row of the
+ * step goes to a new memtable, and the live one's arenas, key deltas and leaves grow by nothing.
+ */
+export function takesRows(t: StepTable, live: Memtable | undefined): live is Memtable {
+  return live?.state === "live" && live.schemaVersion === t.def.schemaVersion && !live.full;
+}
+
+/**
+ * The arena a fresh chunk grows to for one row of `data` bytes: one resize, from its first 256
+ * bytes (counted in `newChunkBytes`) straight to the power of two the row needs
+ * (`ColumnChunk.#putBytes`); the 256 bytes are given back once it is copied.
+ */
+export function oneRowArenaBytes(data: number): number {
+  if (data <= 256) return 0;
+  let size = 512;
+  while (size < data) size *= 2;
+  return size;
 }
 
 /**
@@ -105,12 +134,7 @@ export function opening(t: StepTable, input: readonly Vector[], plan: RowPlan): 
   const live = t.live();
   let bytes = 0,
     rest = plan.count;
-  if (
-    live?.state === "live" &&
-    live.schemaVersion === t.def.schemaVersion &&
-    !live.full &&
-    rest > 0
-  ) {
+  if (takesRows(t, live) && rest > 0) {
     const take = Math.min(rest, live.capacity);
     const first = Math.floor(live.rowCount / MEMORY_CHUNK_ROWS),
       last = Math.floor((live.rowCount + take - 1) / MEMORY_CHUNK_ROWS),
@@ -134,9 +158,11 @@ export function opening(t: StepTable, input: readonly Vector[], plan: RowPlan): 
  * - **Rows into chunks the live memtable already has** (`#intoLiveChunks`): exactly what they
  *   allocate there, the arenas' growth with the resize overlap (`#growth`) and each chunk's
  *   lazy arrays (`ColumnChunk.lazyBytes`).
- * - **Otherwise:** what the step opens (`#opening`), plus the larger of `2 × input` (a fresh
- *   arena: the next power of two at most doubles the value) and the live arenas' growth.
- *   Before, both were charged (their sum), 2.0-3.0× what the step allocates.
+ * - **Otherwise:** what the step opens (`#opening`), plus the larger of the fresh arenas and the
+ *   live arenas' growth. A fresh arena takes `2 × input` (the next power of two at most doubles
+ *   the value); a replayed one-row step, exactly its one resize (`oneRowArenaBytes`: a 14 MiB
+ *   value takes 16 MiB, not 28). Before, both were charged (their sum), 2.0-3.0× what the step
+ *   allocates.
  * Both add the key deltas' growth (`#deltaGrowth`). Native capacity growth is paid before the
  * append; a frozen or staged memtable's arenas count nothing here, so the next small batch
  * never waits for a stale multi-MiB growth.
@@ -148,11 +174,14 @@ export function stepCharge(t: StepTable, columns: readonly Vector[], plan: RowPl
     for (const list of live.chunks) lazy += list.at(-1)?.lazyBytes ?? 0;
     return growth(t, columns, plan) + lazy + deltaGrowth(t, columns, plan);
   }
-  let input = 0;
-  for (const vector of columns) input += inputBytes(vector, plan);
+  let fresh = 0;
+  for (const vector of columns) {
+    const data = inputBytes(vector, plan);
+    fresh += plan.count === 1 && t.replay === true ? oneRowArenaBytes(data) : 2 * data;
+  }
   return (
     opening(t, columns, plan) +
-    Math.max(2 * input, growth(t, columns, plan)) +
+    Math.max(fresh, growth(t, columns, plan)) +
     deltaGrowth(t, columns, plan)
   );
 }
@@ -175,7 +204,41 @@ export function rowMetadata(t: StepTable, columns: readonly Vector[], plan: RowP
   return plan.count * (16 * columns.length + 96 * t.def.indexes.length + FTS_ROW_UNDO_BYTES);
 }
 
-/** Each index's key bytes for the step's rows (fixed per-key room plus twice the input). */
+/**
+ * A key column's varlen bytes as the key encoding writes them: each value, plus one byte for each
+ * 0x00 it escapes (keys/key-encoding.ts `KeyWriter.escaped`, which counts them the same way).
+ * A live insert charges twice the value, as if every byte were 0x00; for text keys that is about
+ * twice their size, and the key deltas' doubling makes it up to three times what they take.
+ */
+export function keyInputBytes(vector: Vector, plan: RowPlan): number {
+  const count = (bytes: Uint8Array, start: number, end: number) => {
+    let zeros = 0;
+    for (let at = start; at < end; at++) if (bytes[at] === 0) zeros++;
+    return end - start + zeros;
+  };
+  if (vector.form === "flat" && vector.data.layout === "varlen" && plan.rows === null)
+    return count(
+      vector.data.bytes,
+      vector.data.offsets[plan.from] ?? 0,
+      vector.data.offsets[plan.from + plan.count] ?? 0,
+    );
+  if (layoutOf(vector.type) !== "varlen") return 0;
+  const slot: { flat: FlatVector | null; index: number } = { flat: null, index: -1 };
+  let bytes = 0;
+  for (let i = plan.from; i < plan.from + plan.count; i++) {
+    sourceSlot(vector, plan.rows === null ? i : (plan.rows[i] ?? 0), slot);
+    if (slot.index < 0 || slot.flat.data.layout !== "varlen") continue;
+    const data = slot.flat.data;
+    bytes += count(data.bytes, data.offsets[slot.index] ?? 0, data.offsets[slot.index + 1] ?? 0);
+  }
+  return bytes;
+}
+
+/**
+ * Each index's key bytes for the step's rows: a fixed room per key and column (its markers, the
+ * escaped value's two-byte terminator, a fixed-width value) plus its varlen bytes: as encoded
+ * for replay (`keyInputBytes`), twice them for a live insert.
+ */
 export function keyBytes(
   t: StepTable,
   columns: readonly Vector[],
@@ -183,7 +246,11 @@ export function keyBytes(
   columnIds: readonly number[],
 ): number {
   let wanted = 32 * plan.count * columnIds.length;
-  for (const id of columnIds) wanted += 2 * inputBytes(t.key(columns, id), plan);
+  for (const id of columnIds)
+    wanted +=
+      t.replay === true
+        ? keyInputBytes(t.key(columns, id), plan)
+        : 2 * inputBytes(t.key(columns, id), plan);
   return wanted;
 }
 
@@ -191,7 +258,8 @@ export function keyBytes(
  * memtable's deltas are in `#opening`. */
 export function deltaGrowth(t: StepTable, columns: readonly Vector[], plan: RowPlan): number {
   const live = t.live();
-  if (live?.state !== "live") return 0;
+  if (live === undefined || (t.replay === true ? !takesRows(t, live) : live.state !== "live"))
+    return 0;
   let bytes = 0;
   for (const index of t.def.indexes) {
     if (t.invalid(index.id)) continue;
@@ -209,11 +277,16 @@ export function deltaGrowth(t: StepTable, columns: readonly Vector[], plan: RowP
  * old one. An arena the step finds is already charged, so one resize adds the new size; a
  * batch that resizes the same arena again holds the previous new arena (charged in this step)
  * beside the next one, at most half of it: `max(0, size / 2 − current)` more. Plus each
- * index's key room.
+ * index's key room. For replay, nothing when no row reaches the last chunk: the live memtable
+ * does not take the rows (`takesRows`: a full one's arena may be exactly full, and a doubling of
+ * it is never made), or its last chunk has no row left.
  */
 export function growth(t: StepTable, columns: readonly Vector[], plan: RowPlan): number {
   const live = t.live();
-  if (live?.state !== "live") return 0;
+  if (t.replay === true) {
+    if (!takesRows(t, live)) return 0;
+    if (live.rowCount >= (live.chunks[0]?.length ?? 0) * MEMORY_CHUNK_ROWS) return 0;
+  } else if (live?.state !== "live") return 0;
   let bytes = 0;
   for (let c = 0; c < columns.length; c++) {
     const chunk = live.chunks[c]?.at(-1),
@@ -288,7 +361,11 @@ export function replayEntryBytes(t: StepTable, columns: readonly Vector[], plan:
       BATCH_TARGET_BYTES + indexMaximumKeyBytes(index, t.def),
     );
     batch = Math.max(batch, 2 * held);
-    leaves += leafBytes(plan.count, t.live()?.deltas.get(index.id)?.entryCount ?? 0);
+    const live = t.live();
+    leaves += leafBytes(
+      plan.count,
+      takesRows(t, live) ? (live.deltas.get(index.id)?.entryCount ?? 0) : 0,
+    );
   }
   return KEY_BATCH_BYTES + batch + 8 * (plan.count + 1) + leaves + 64 + 8 * t.def.columns.length;
 }
