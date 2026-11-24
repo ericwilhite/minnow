@@ -831,11 +831,18 @@ export class QueryRuntime {
         ? Math.max(
             this.#resultWindow(),
             this.#resultOwnedMinimum
-              ? this.#resultStep(
+              ? // The owned value's own room beside the modification's spool, which shares
+                // this credit: the value is allocated from it whole (result-sink.ts
+                // `allocateOwnedResult`), never admitted later.
+                this.#resultStep(
                   binding.logicalBytes ?? binding.bytes,
                   binding.largestSlot,
                   binding.slotBytes,
-                ) + resultFrameMetadataBytes(this.plan.columns.length)
+                ) +
+                  resultFrameMetadataBytes(this.plan.columns.length) +
+                  (this.#spools() && this.plan.root.op === "modify"
+                    ? modifySpoolBytes(this.plan.root.input.output.length)
+                    : 0)
               : emittedRow === null
                 ? 0
                 : Math.max(MAX_BLOB_BYTES, emittedRow),

@@ -13891,3 +13891,14 @@ export const EXPRESSION_BOUND_CENSUS_REACH = [
   "negative numeric",
   "scale above precision",
 ] as const;
+
+/** next/testing/string-agg-sizing.test.ts: string_agg's bound, admission and typed refusal. */
+export const STRING_AGG_SIZING_REACH = [
+  "bound checked",
+  "served alone",
+  "served beside a held read",
+  "refused typed",
+  "insert",
+  "select",
+  "separator",
+] as const;

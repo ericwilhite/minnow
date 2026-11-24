@@ -16,8 +16,8 @@ export class ResultBuffers {
   ) {
     if (!Number.isSafeInteger(bytes) || bytes < 0)
       throw new RangeError("Invalid result allocation");
-    // A result value larger than its admission (an aggregate's, such as `string_agg`'s, is not
-    // sized from its inputs yet): the typed memory refusal (53200), never an untyped error.
+    // A result value larger than its admission (an aggregate's whose rows the plan does not
+    // bound, such as `string_agg` over a table): the typed memory refusal (53200), never untyped.
     if (!budget.allocate(bytes))
       throw new MemoryAdmissionError(
         `${budget.label} result-owned buffers`,

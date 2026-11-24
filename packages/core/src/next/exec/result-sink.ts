@@ -1,7 +1,13 @@
 import { DeferredGrant } from "./deferred-grant.js";
 /** Owned, compact result frames. Borrowed input is copied; authorized dedicated input stays charged through frame credit. */
 import type { MaybePromise } from "../access/key-index.js";
-import { OBJECT_OVERHEAD_BYTES, bigintBytes, type Grant, type Loan } from "../memory/governor.js";
+import {
+  OBJECT_OVERHEAD_BYTES,
+  MemoryAdmissionError,
+  bigintBytes,
+  type Grant,
+  type Loan,
+} from "../memory/governor.js";
 import { type PhysicalType } from "../types.js";
 import { BATCH_ROWS, type Batch, type FlatVector } from "../vector/vector.js";
 import {
@@ -123,20 +129,25 @@ export class ResultSink implements Operator {
     for (;;) {
       this.#check();
       if (this.#budgetSuspended) throw new TypeError("Result allocation between phases");
-      if (this.grant.held - this.grant.allocated - this.grant.loaned >= bytes) {
-        const owned = new ResultBuffers(this.grant, bytes, () =>
-          this.#ownedAllocations.delete(owned),
-        );
-        this.#ownedAllocations.add(owned);
-        return owned;
-      }
+      const free = this.grant.held - this.grant.allocated - this.grant.loaned;
+      if (free >= bytes) return this.#owned(bytes);
+      // Beyond what the statement was admitted (an aggregate value the plan does not bound, or
+      // one larger than its bound's lanes): the typed memory refusal, never an untyped error.
       if (this.#frames.size === 0)
-        throw new Error("Result-owned allocation exceeds its admitted delivery minimum");
+        throw new MemoryAdmissionError(`${this.grant.label} result-owned value`, bytes, free);
       await abortable(
         new Promise<void>((resolve) => this.#creditWaiters.add(resolve)),
         this.#abort.signal,
       );
     }
+  }
+
+  #owned(bytes: number): ResultBuffers {
+    const owned = new ResultBuffers(this.grant, bytes, () => {
+      this.#ownedAllocations.delete(owned);
+    });
+    this.#ownedAllocations.add(owned);
+    return owned;
   }
 
   get ownsPartialResult(): boolean {

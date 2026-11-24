@@ -1,6 +1,7 @@
 /** Per-value admission provenance. Unknown expanding expressions retain the legacy recipe.
  * Walks only plan metadata: no evaluation, caller-value reads or JSON/data allocation. */
 import { constantNull, constantBool } from "./expression-reach.js";
+import { int64At } from "../vector/int64.js";
 import type { ReadBound } from "../page/read-bounds.js";
 import type { Rel, ScalarExpr } from "../ir/ir.js";
 /** Progress may be only its floor for inline/dictionary pages. The separately
@@ -142,9 +143,11 @@ export function columnInputBytes(
       const key = rel.groupBy[column];
       if (key !== undefined) return columnInputBytes(rel.input, key, sizes, coefficient);
       const call = rel.aggregates[column - rel.groupBy.length];
-      return call && ["min", "max"].includes(call.fn) && call.args[0]
-        ? expressionInputBytes(call.args[0], rel.input, sizes, coefficient)
-        : null;
+      if (call && ["min", "max"].includes(call.fn) && call.args[0])
+        return expressionInputBytes(call.args[0], rel.input, sizes, coefficient);
+      if (call?.fn === "string_agg")
+        return stringAggBytes(call.args, rel.input, sizes, coefficient);
+      return null;
     }
     case "setOp":
       return maximum(
@@ -208,4 +211,77 @@ export function projectedInputBytes(
   sizes: InputSizes,
 ): number | null {
   return sum(exprs.map((expr) => expressionInputBytes(expr, input, sizes)));
+}
+
+/**
+ * `string_agg(value, separator)`'s value bytes: at most one value and one separator per input
+ * row (PostgreSQL appends the separator before every value but the first), so its group's rows
+ * times their sum, where the plan bounds the rows (`rowBound`). Otherwise unknown.
+ */
+function stringAggBytes(
+  args: readonly ScalarExpr[],
+  input: Rel,
+  sizes: InputSizes,
+  coefficient: number,
+): number | null {
+  const [value, separator] = args;
+  if (value === undefined || separator === undefined) return null;
+  const rows = rowBound(input);
+  if (rows === null) return null;
+  const each = sum([
+    expressionInputBytes(value, input, sizes, coefficient),
+    expressionInputBytes(separator, input, sizes, coefficient),
+  ]);
+  return each === null ? null : rows * each;
+}
+
+/** An integer literal's value (through casts between integer types), or null. */
+function constantInteger(expr: ScalarExpr): number | null {
+  if (expr.op === "cast")
+    return ["int16", "int32", "int64"].includes(expr.input.type.kind)
+      ? constantInteger(expr.input)
+      : null;
+  if (expr.op !== "literal" || constantNull(expr) !== false) return null;
+  const data = expr.value.data;
+  if (data.layout === "i32") return data.values[0] ?? null;
+  if (data.layout === "int64") {
+    const value = Number(int64At(data.values, 0));
+    return Number.isSafeInteger(value) ? value : null;
+  }
+  return null;
+}
+
+/**
+ * The most rows `rel` can produce, where its plan alone proves it: VALUES, an integer
+ * `generate_series` with constant arguments, a constant LIMIT, an aggregate without grouping,
+ * and the operators that never add rows to their inputs'. Null when unknown (a table, a
+ * parameter): sizing then keeps its unknown recipe.
+ */
+export function rowBound(rel: Rel): number | null {
+  switch (rel.op) {
+    case "values":
+      return rel.rows.length;
+    case "series": {
+      const exprs = rel.input.op === "values" ? rel.input.rows[0] : undefined;
+      if (rel.kind !== "integer" || exprs?.length !== 3) return null;
+      const [start, stop, step] = exprs.map(constantInteger);
+      if (start == null || stop == null || step == null || step === 0) return null;
+      return Math.max(0, Math.floor((stop - start) / step) + 1);
+    }
+    case "limit": {
+      const input = rowBound(rel.input);
+      const limit = rel.limit?.kind === "const" ? rel.limit.value : null;
+      return limit === null ? input : input === null ? limit : Math.min(limit, input);
+    }
+    case "aggregate":
+      return rel.groupBy.length === 0 && rel.groupingSets === null ? 1 : rowBound(rel.input);
+    case "project":
+    case "filter":
+    case "sort":
+    case "distinct":
+    case "window":
+      return rowBound(rel.input);
+    default:
+      return null;
+  }
 }

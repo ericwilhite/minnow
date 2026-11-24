@@ -5,9 +5,9 @@
  * Astra's review of #53: `INSERT INTO t SELECT 11, string_agg($1, ''), 'x' FROM
  * generate_series(1, 11)` with a 1,000,000-character parameter, at 64 MiB beside another
  * connection's held read, threw the untyped "Result-owned buffers exceed their complete
- * admission" (exec/result-buffer.ts). `string_agg`'s value is not yet sized from its inputs (the
- * sum of its inputs and separators, with a row-count bound: its own measured change); until
- * then its result allocation beyond the admission is refused typed.
+ * admission" (exec/result-buffer.ts). `string_agg`'s value is now bounded where the plan bounds
+ * its rows and funded beside the modification's spool (testing/string-agg-sizing.test.ts); a
+ * value beyond the admission is still refused typed, and so is a row the write path refuses.
  *
  * Law (next/memory/README.md): every memory refusal is `MemoryAdmissionError` (SQLSTATE 53200);
  * PostgreSQL statement atomicity: a refused statement writes nothing.
