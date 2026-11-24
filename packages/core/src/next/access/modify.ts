@@ -185,7 +185,8 @@ export const ConflictKind = {
   /** A row that existed before this statement holds it: `locators[k]` (DO UPDATE / DO NOTHING). */
   existing: 1,
   /**
-   * A row this statement wrote holds it: `locators[k]`. DO UPDATE must raise
+   * A row this statement wrote holds it. It is not in the statement's view, so it has no locator:
+   * `locators[k]` is -1 and the kind decides alone. DO UPDATE must raise
    * `CardinalityViolationError`; DO NOTHING skips.
    */
   statement: 2,
@@ -359,15 +360,25 @@ export class CheckViolationError extends ConstraintError {
   }
 }
 
-/** 21000: a statement would update or delete one row twice (MERGE, ON CONFLICT DO UPDATE). */
+/**
+ * 21000: a statement would update or delete one row twice (MERGE, ON CONFLICT DO UPDATE). Given
+ * the command, the message is PostgreSQL's ("ON CONFLICT DO UPDATE command cannot affect row a
+ * second time").
+ */
 export class CardinalityViolationError extends ConstraintError {
   readonly code = "MINNOW_CARDINALITY_VIOLATION";
   readonly sqlState = "21000";
   constructor(
     tableId: number,
     readonly row: number,
+    command?: "ON CONFLICT DO UPDATE" | "MERGE",
   ) {
-    super("A command cannot affect a row a second time", tableId);
+    super(
+      command === undefined
+        ? "A command cannot affect a row a second time"
+        : `${command} command cannot affect row a second time`,
+      tableId,
+    );
     this.name = "CardinalityViolationError";
   }
 }

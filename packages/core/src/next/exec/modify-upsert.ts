@@ -176,7 +176,7 @@ export class UpsertWriter implements Operator {
           continue;
         }
         if (kind === ConflictKind.statement || kind === ConflictKind.batch)
-          throw new CardinalityViolationError(this.table.id, row);
+          throw new CardinalityViolationError(this.table.id, row, "ON CONFLICT DO UPDATE");
         const locator = this.#conflicts.locators[0] ?? -1;
         await this.#fetch(locator);
         const current = this.#old.vectors();

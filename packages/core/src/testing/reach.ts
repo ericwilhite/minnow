@@ -7962,6 +7962,21 @@ export const MIXED_SOURCE_RECIPE_REACH = [
   "all credit returned",
 ] as const;
 
+/** testing/upsert-repeat-differential.test.ts: a key proposed twice in one ON CONFLICT statement. */
+export const UPSERT_REPEAT_REACH = [
+  "repeat in VALUES",
+  "repeat in INSERT SELECT",
+  "empty table",
+  "prefilled table",
+  "repeated existing key",
+  "repeated new key",
+  "DO UPDATE",
+  "DO UPDATE WHERE false",
+  "DO NOTHING",
+  "21000",
+  "accepted",
+] as const;
+
 export const MODIFY_UPSERT_REACH = [
   "without RETURNING",
   "proposed NOT NULL before conflict",
