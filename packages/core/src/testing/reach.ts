@@ -2110,7 +2110,8 @@ export const ROW_WAIT_RECLAIM_REACH = [
   "waited for rows",
   "written",
   "refused typed",
-  "read back through SQL",
+  "read a written wide row back through SQL",
+  "read back through SQL after a refusal",
 ] as const;
 
 /** PG per-attribute mode transitions, statement attempts, savepoints and transaction cleanup. */

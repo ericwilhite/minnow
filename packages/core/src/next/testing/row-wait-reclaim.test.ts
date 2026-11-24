@@ -79,8 +79,8 @@ async function history(
       return false;
     };
     if (await outcome("UPDATE t SET v = $1", "a".repeat(first))) v1 = "a".repeat(first);
-    if (await outcome("UPDATE t SET v = $1 WHERE id = 1", "b".repeat(second)))
-      v1 = "b".repeat(second);
+    const lastWritten = await outcome("UPDATE t SET v = $1 WHERE id = 1", "b".repeat(second));
+    if (lastWritten) v1 = "b".repeat(second);
     expect(admissions, `${context}: the waits make progress`).toBeLessThanOrEqual(SPIN);
     // Statement atomicity: what was written is there, and nothing of a refused statement.
     // Through SQL (#52 sizes a read by key to the row it fetches, so it is served at these
@@ -91,16 +91,22 @@ async function history(
     );
     if (!(typeof read === "object" && read !== null && "batches" in read))
       throw new Error(`${context}: the read by key is served: ${String(read)}`);
-    const served = oracleRows(read as Parameters<typeof oracleRows>[0])[0]?.v;
-    expect(served === v1, `${context}: SELECT shows the last written value`).toBe(true);
-    reach?.reach("read back through SQL");
+    const rows = oracleRows(read as Parameters<typeof oracleRows>[0]);
+    expect(rows, `${context}: SELECT finds exactly one row 1`).toHaveLength(1);
+    expect(rows[0]?.v === v1, `${context}: SELECT shows the last written value`).toBe(true);
+    reach?.reach(
+      lastWritten
+        ? "read a written wide row back through SQL"
+        : "read back through SQL after a refusal",
+    );
     const path = core.harness.path;
     const table = path.catalog.tableByName("t")?.id;
     if (table === undefined) throw new Error("table t");
     const view = path.pin();
     try {
-      const v = (await rowsOf(view, table)).find((row) => Number(row[0]) === 1)?.[1];
-      expect(v === v1, `${context}: row 1 holds the last written value`).toBe(true);
+      const ones = (await rowsOf(view, table)).filter((row) => Number(row[0]) === 1);
+      expect(ones, `${context}: the write path holds exactly one row 1`).toHaveLength(1);
+      expect(ones[0]?.[1] === v1, `${context}: row 1 holds the last written value`).toBe(true);
     } finally {
       view.release();
     }
