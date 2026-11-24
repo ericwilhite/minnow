@@ -261,21 +261,44 @@ function repeatedDefault(def: ColumnDef, state: ExpressionState): Typed {
   return typed;
 }
 
+/**
+ * PostgreSQL's INSERT targets (transformInsertStmt, transformInsertRow): without a column list,
+ * the table's columns in order, as many as each row supplies (the rest take their defaults, a
+ * generated column its expression); with one, exactly the listed columns. More expressions than
+ * targets, or fewer than an explicit list, is 42601; so are VALUES lists of different lengths.
+ */
+function insertTargets(
+  table: TableDef,
+  explicit: readonly ColumnDef[] | null,
+  widths: readonly number[],
+): readonly ColumnDef[] {
+  const all = explicit ?? table.columns;
+  const first = widths[0] ?? all.length;
+  for (const [k, width] of widths.entries()) {
+    if (k > 0 && width !== first)
+      throw new PlanningError("VALUES lists must all be the same length", "42601");
+    if (width > all.length)
+      throw new PlanningError("INSERT has more expressions than target columns", "42601");
+    if (explicit !== null && width < all.length)
+      throw new PlanningError("INSERT has more target columns than expressions", "42601");
+  }
+  return all.slice(0, first);
+}
+
 export function lowerInsert(statement: Insert, builder: PlanBuilder): LoweredWrite {
   const table = targetTable(statement.table, builder);
-  const names =
-    statement.columns.length > 0 ? statement.columns : table.columns.map((def) => def.name);
-  const targets = names.map((name) => columnNamed(table, name));
-  if (new Set(targets.map((def) => def.id)).size !== targets.length)
+  const explicit =
+    statement.columns.length > 0 ? statement.columns.map((name) => columnNamed(table, name)) : null;
+  if (explicit !== null && new Set(explicit.map((def) => def.id)).size !== explicit.length)
     throw new PlanningError("column specified more than once", "42701");
   const state = builder.state;
   const noColumns: Scope = { column: () => undefined };
   let rows: Rel;
   let supplied: (def: ColumnDef) => Typed | undefined;
+  let targets: readonly ColumnDef[];
   if (statement.query !== undefined) {
     const query = lowerBlock(prepareQuery(statement.query, builder.catalog), builder);
-    if (query.columns.length !== targets.length)
-      throw new PlanningError("INSERT has more target columns than expressions", "42601");
+    targets = insertTargets(table, explicit, [query.columns.length]);
     rows = query.rel;
     supplied = (def) => {
       const position = targets.indexOf(def);
@@ -295,15 +318,16 @@ export function lowerInsert(statement: Insert, builder: PlanBuilder): LoweredWri
   } else {
     const valueRows: ReadonlyArray<readonly InsertValue[]> =
       statement.defaultValues === true
-        ? [targets.map(() => ({ default: true as const }))]
+        ? [(explicit ?? table.columns).map(() => ({ default: true as const }))]
         : statement.rows;
+    const columns = insertTargets(
+      table,
+      explicit,
+      valueRows.map((row) => row.length),
+    );
+    targets = columns;
     const cells = valueRows.map((row) => {
-      if (row.length !== targets.length)
-        throw new PlanningError(
-          `INSERT has more ${row.length > targets.length ? "expressions" : "target columns"} than ${row.length > targets.length ? "target columns" : "expressions"}`,
-          "42601",
-        );
-      return targets.map((def, index): Typed => {
+      return columns.map((def, index): Typed => {
         const value = row[index] ?? null;
         if (isDefaultInsertValue(value)) return repeatedDefault(def, state);
         if (def.generatedSql !== null || def.identityAlways === true)
@@ -905,16 +929,17 @@ export function lowerMerge(statement: Merge, builder: PlanBuilder): LoweredWrite
         },
       };
     }
-    const names =
+    const targets = insertTargets(
+      table,
       branch.action.columns.length > 0
-        ? branch.action.columns
-        : table.columns.map((def) => def.name);
+        ? branch.action.columns.map((name) => columnNamed(table, name))
+        : null,
+      [branch.action.values.length],
+    );
     const supplied = new Map<number, Typed>();
-    for (const [index, name] of names.entries()) {
-      const def = columnNamed(table, name);
+    for (const [index, def] of targets.entries()) {
       const expression = branch.action.values[index];
-      if (expression === undefined)
-        throw new PlanningError("INSERT has more target columns than expressions", "42601");
+      if (expression === undefined) throw new TypeError("A MERGE INSERT target has no value");
       if (
         (def.generatedSql !== null || def.identityAlways === true) &&
         !isUpdateDefaultAssignment(expression)

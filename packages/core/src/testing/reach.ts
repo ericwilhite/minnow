@@ -13838,3 +13838,24 @@ export const EXPRESSION_BOUND_CENSUS_REACH = [
   "negative numeric",
   "scale above precision",
 ] as const;
+
+/** next/testing/insert-targets-pglite.test.ts: INSERT targets against PostgreSQL. */
+export const INSERT_TARGETS_REACH = [
+  "no list, fewer values",
+  "no list, more values",
+  "explicit list mismatch",
+  "ragged values",
+  "default keyword",
+  "default values",
+  "insert select",
+  "merge insert",
+  "generated column omitted",
+  "generated column supplied",
+  "identity always",
+  "identity by default",
+  "served",
+  "refused 42601",
+  "refused 428C9",
+  "engine compared",
+  "engine limit met",
+] as const;
