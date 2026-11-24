@@ -392,6 +392,12 @@ export interface OpenWritePathInput {
   readonly options: WritePathOptions;
   /** Ruling R25: told each publication's extent delta (see `PublishDelta`). */
   readonly extentDeltas?: ExtentDeltaSink;
+  /**
+   * The open's own cancellation (the owner open's signal): aborting it stops recovery where it
+   * waits for memory (log replay and its metadata). It is not kept once the open returns;
+   * `options.signal` is the write path's lifetime signal.
+   */
+  readonly openSignal?: AbortSignal;
 }
 
 /**

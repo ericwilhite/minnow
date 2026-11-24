@@ -9,6 +9,7 @@ import type { TableDef } from "../access/catalog.js";
 import { layoutOf } from "../types.js";
 import { BATCH_TARGET_BYTES, type FlatVector, type Vector } from "../vector/vector.js";
 import { MEMORY_CHUNK_ROWS, newChunkBytes, sourceSlot } from "./columns.js";
+import { indexMaximumKeyBytes } from "./index-limits.js";
 import { freshDeltaAppendBytes, KEY_DELTA_INITIAL_BYTES } from "./key-hash.js";
 import type { Memtable } from "./memtable.js";
 import { need } from "./bytes.js";
@@ -78,12 +79,13 @@ export function opening(t: StepTable, input: readonly Vector[], plan: RowPlan): 
     varlen++;
     // The chunk's 256-byte arena may double several times within the step: its final size
     // and the replaced half beside it (as in `#growth`), beyond the `2 × input` the estimate
-    // already counts for these bytes.
+    // already counts for these bytes. One row resizes it once, to the size it needs
+    // (`ColumnChunk.#putBytes`): no replaced half then.
     const data = inputBytes(need(input[c]), plan);
     if (data > 256) {
       let size = 512;
       while (size < data) size *= 2;
-      chunkSet += Math.max(0, size + size / 2 - 256 - 2 * data);
+      chunkSet += Math.max(0, size + (plan.count > 1 ? size / 2 : 0) - 256 - 2 * data);
     }
   }
   // A new memtable's key deltas start empty: their growth for the rows it may take.
@@ -248,4 +250,77 @@ export function estimate(t: StepTable, columns: readonly Vector[], plan: RowPlan
   let bytes = opening(t, columns, plan) + rowMetadata(t, columns, plan);
   for (const vector of columns) bytes += 2 * inputBytes(vector, plan);
   return bytes;
+}
+
+/** What a `KeyBatch` takes when it is made (keys/key-encoding.ts): its 4 KiB writer, 65 offsets. */
+export const KEY_BATCH_BYTES = 4096 + 4 * 65;
+
+/**
+ * Ordered-entry leaves (write/ordered-entries.ts) that `entries` new entries may open beside
+ * `existing` ones. A leaf holds 64 entries in 320 bytes and a full one splits in half, so a new
+ * entry may split whichever leaf it lands in: at most one new leaf per new entry, and at most a
+ * split of every existing leaf (each at least half full) plus a leaf per 32 new entries. The leaf
+ * list doubles as it grows (its new array beside the old).
+ */
+export function leafBytes(entries: number, existing = 0): number {
+  if (entries === 0) return 0;
+  const before = Math.ceil(existing / 32);
+  const added = Math.min(entries, before + Math.ceil(entries / 32)) + 1;
+  return added * 320 + 64 + 16 * (before + added);
+}
+
+/**
+ * What a replayed step allocates beside `stepCharge` (write/engine.ts `#replayRows`): the key
+ * batch that encodes its index entries (made per step: its first buffers, then a key buffer of at
+ * most its target or one larger key, with the replaced half while it grows, and its offsets),
+ * each index's ordered-entry leaves, and a new memtable's copy of an older schema's column list.
+ * The live writer reuses its own key batch and charges these in its per-row metadata, which
+ * replay does not otherwise charge (it keeps no undo).
+ */
+export function replayEntryBytes(t: StepTable, columns: readonly Vector[], plan: RowPlan): number {
+  let batch = 0,
+    leaves = 0;
+  for (const index of t.def.indexes) {
+    if (t.invalid(index.id)) continue;
+    // The batch's key buffer stops at its target, except that one larger key is held alone.
+    const held = Math.min(
+      keyBytes(t, columns, plan, index.columnIds),
+      BATCH_TARGET_BYTES + indexMaximumKeyBytes(index, t.def),
+    );
+    batch = Math.max(batch, 2 * held);
+    leaves += leafBytes(plan.count, t.live()?.deltas.get(index.id)?.entryCount ?? 0);
+  }
+  return KEY_BATCH_BYTES + batch + 8 * (plan.count + 1) + leaves + 64 + 8 * t.def.columns.length;
+}
+
+/** What a memtable opened for tombstones alone takes (`liveMemtable(table, 0)` with no live
+ * memtable): its key deltas' first arrays and its per-column summaries. */
+export function emptyMemtableBytes(t: StepTable): number {
+  let varlen = 0;
+  for (const column of t.def.columns) if (layoutOf(column.type) === "varlen") varlen++;
+  return (
+    t.def.indexes.length * KEY_DELTA_INITIAL_BYTES +
+    t.def.columns.length * 4 +
+    2 * 8 * varlen * Math.ceil((t.memtableRows ?? MEMORY_CHUNK_ROWS) / MEMORY_CHUNK_ROWS)
+  );
+}
+
+/** Tombstones for `entries` rows whose keys total `keyBytes`, added to `delta` (or to a new
+ * memtable's empty delta), with their leaves. */
+export function tombstoneBytes(
+  delta:
+    | {
+        readonly entryCount: number;
+        appendBytes(keys: number, entries: number, keyBytes: number): number;
+      }
+    | undefined,
+  entries: number,
+  keyBytes: number,
+): number {
+  if (entries === 0) return 0;
+  return (
+    (delta?.appendBytes(entries, entries, keyBytes) ??
+      freshDeltaAppendBytes(entries, entries, keyBytes)) +
+    leafBytes(entries, delta?.entryCount ?? 0)
+  );
 }

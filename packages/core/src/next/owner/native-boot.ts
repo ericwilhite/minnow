@@ -130,6 +130,9 @@ async function openResources(
       space,
       governor,
       options: { durability: options.durability ?? "strict" },
+      // The open's signal cancels recovery where it waits (log replay); it is not the write
+      // path's lifetime signal.
+      ...(options.signal === undefined ? {} : { openSignal: options.signal }),
     });
     startup.release(startup.held - startup.allocated - startup.loaned);
     const openedPath = await opening;

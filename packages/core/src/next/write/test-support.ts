@@ -253,11 +253,18 @@ export class Harness {
 
   /** Abandons the write path without closing it (no final header), then opens again. */
   async crash(): Promise<WritePathImpl> {
+    await this.abandon();
+    return this.open();
+  }
+
+  /** Abandons the write path as a crashed process does (no final header), leaving the store for
+   * any next opener (this harness, or `openNativeOwner` over `backend`). */
+  async abandon(): Promise<void> {
     await this.path.flush();
     WritePathImpl.abandonForCrash(this.path);
     await this.#release?.();
+    this.#release = null;
     if (this.backend instanceof SimBackend) this.backend.restart();
-    return this.open();
   }
 
   async close(): Promise<void> {

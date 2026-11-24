@@ -176,8 +176,11 @@ it("refuses an open whose replay can never fit the cap (53200), then opens at a 
   expect(refused).toBeInstanceOf(ReplayMemoryError);
   expect(refused).toMatchObject({ sqlState: "53200", code: "MINNOW_MEMORY_ADMISSION" });
   expect((refused as Error).message).toMatch(
-    /^Opening this database replays at least [\d.]+ MiB of recently written rows, more than the memory cap allows \([\d.]+ MiB\)\. The data is intact; open it with a larger memory cap\.$/,
+    /^Opening this database needs at least [\d.]+ MiB to replay its recently written rows, more than its memory cap allows for them \([\d.]+ MiB\)\. The data is intact; open it with a larger memory cap\.$/,
   );
+  // What it needs is more than what it was measured against (review of #70: it said less).
+  const { bytes, capacity } = refused as ReplayMemoryError;
+  expect(bytes).toBeGreaterThan(capacity);
   expect(small.usedBytes, "the refused open holds nothing").toBe(0);
   const large = freshGovernor(h);
   try {

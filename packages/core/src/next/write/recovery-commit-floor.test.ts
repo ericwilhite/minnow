@@ -1,6 +1,6 @@
 /**
  * An open whose growth waits for a temporary holder completes; it never fails because the wait
- * gave away the commit window the log appender is built from.
+ * gave away the commit credit the log appender is built from (its header buffer).
  *
  * Law: the governor contract (memory/governor.ts rules 2/4/5/7, PROPOSAL "One memory governor"):
  * below the cap, work completes, waits (cancellably) for temporary holdings, or is refused with a
@@ -9,7 +9,9 @@
  * headroom, `#prepareMinimum`) first released the window's idle credit (write/credits.ts
  * `#growTo`: "Dormant row, WAL, metadata and merge forecasts are all revocable"). Recovery then
  * built the log appender, whose header buffer comes from that window, and the open failed with
- * "Bounded commit-buffer minimum was exhausted".
+ * "Bounded commit-buffer minimum was exhausted". Recovery now keeps that buffer's credit beside
+ * the commit account's allocations, and only that (review of #70, P3: keeping the whole 6 MiB
+ * window took room replay may need).
  *
  * The open is made to need 12 MiB of metadata headroom (as a database with a large resident
  * directory does) by asking `prepareMetadata` for it, while a temporary reader holds all other

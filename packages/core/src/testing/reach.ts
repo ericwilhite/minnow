@@ -13891,3 +13891,21 @@ export const EXPRESSION_BOUND_CENSUS_REACH = [
   "negative numeric",
   "scale above precision",
 ] as const;
+
+/** next/testing/replay-admission-generated.test.ts: crash tails replayed through the native open. */
+export const REPLAY_ADMISSION_REACH = [
+  "multi-row tail",
+  "large value tail",
+  "multi-step commit tail",
+  "delete-only tail",
+  "index backfill tail",
+  "staged rollback gap tail",
+  "replay waited",
+  "opened beside a temporary holder",
+  "opened beside a queued admission",
+  "refused 53200",
+  "refusal is a lower bound",
+  "cancelled mid-wait",
+  "crashed mid-wait",
+  "every committed row after",
+] as const;

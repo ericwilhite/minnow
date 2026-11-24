@@ -182,14 +182,25 @@ of a query's independently admitted minimum. `write/recovery-credit.test.ts` and
 `testing/native-recovery-credit.test.ts` generate in-flight reads with real competing
 buffers, prepared rows, exact reopen/continued writes and zero final charge.
 
-Replay stores the log tail's rows in memtables it cannot flush before recovery ends, so it
-admits each step of at most 2,048 rows first, with the insert path's own step charge
-(`write/step-charge.ts`): from the row account's headroom or the owner's idle forecasts, else by
-waiting (holder growth, cancellable through the open's signal). A tail that could never fit
-at the cap refuses the open with `ReplayMemoryError` (53200), leaving the log as it was. While
-recovering, the commit window keeps its minimum: the log appender recovery builds takes its
-header from it. `write/recovery-replay-admission.test.ts` and
-`write/recovery-commit-floor.test.ts` cover the wait, the refusal and a cancelled open.
+Replay stores the log tail in memtables it cannot flush before recovery ends, so it admits each
+step first (`#replayStep`): an insert step of at most 2,048 rows with the insert path's own step
+charge (`write/step-charge.ts`) plus what replay allocates beside it (its key batch, ordered-entry
+leaves, a copied column list; sized as a new memtable past a row-id gap), a chunk of at most
+2,048 deletes with its tombstones' delta growth, and an index rebuild's reads and entries chunk by
+chunk. Each is admitted from the row account's headroom or the owner's idle forecasts, else by
+waiting as the writer's own growth, cancellable through the open's signal
+(`OpenWritePathInput.openSignal`, which `openNativeOwner` passes); the admitted bytes stay held
+from reclaim until the step ends, as a waiting write's do, so a queued admission's reclaim cannot
+take them back while the step is granted. The state pin a step may publish and replayed FTS
+mutation tracking are metadata admitted the same way. A step that could never fit refuses the
+open with `ReplayMemoryError` (53200) naming the refused requirement and the capacity it was
+measured against, leaving the log as it was. While recovering, the commit account keeps only the
+log appender's header beside what it has allocated (the appender is built when recovery ends).
+`testing/replay-admission-generated.test.ts` generates tails (multi-row, one large value, one
+commit past 2,048 rows, deletes only, an index rebuild, a staged rollback's gap) × caps ×
+competition (a temporary holder, a queued admission) × outcomes (complete, cancel, crash while
+waiting) through `openNativeOwner`; `write/recovery-replay-admission.test.ts` and
+`write/recovery-commit-floor.test.ts` pin the wait, the refusal and a cancelled open.
 
 Extent-list preparation and `GroupWriter` page buffers use that metadata budget too:
 reclaimed idle row credit is never mistaken for prepaid publication workspace. Only the
