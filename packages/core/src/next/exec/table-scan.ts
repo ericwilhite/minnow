@@ -1605,8 +1605,9 @@ export class TableScan implements BatchSource {
 
 /**
  * The reason a scan's own reads are cancelled with when it is aborted or closed. One shared
- * `AbortError`: a point fetch opens and closes a scan per row (ON CONFLICT DO UPDATE), and a
- * reasonless `abort()` builds a new DOMException, with its stack, every time.
+ * `AbortError`: one-row scans (an ON CONFLICT fetch of a group segment's row, exec/point-fetch.ts)
+ * open and close a scan per row, and a reasonless `abort()` builds a new DOMException, with its
+ * stack, every time.
  */
 const SCAN_ABORTED = new DOMException("The table scan was aborted", "AbortError");
 

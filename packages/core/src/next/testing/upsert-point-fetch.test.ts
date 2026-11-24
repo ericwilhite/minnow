@@ -27,8 +27,18 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-/** The statement's fetcher, captured at its first fetch. `each` runs before every fetch. */
-function captureFetcher(each?: (fetcher: PointFetcher, call: number) => void): () => PointFetcher {
+/**
+ * The statement's fetcher, captured at its first fetch. `each` runs before every fetch. No flush
+ * publishes before the statement's first fetch (`table` holds them): the statement's snapshot sees
+ * every conflicting row in a memtable. At that fetch the flushes are let go and the write path is
+ * quiesced, so every memtable holding a conflicting row (all are frozen) is published under the
+ * statement's older snapshot, which reads it re-pointed to its group (write/memtable.ts
+ * "Lifecycle"). Every fetch then reads a published memtable through the memo.
+ */
+function captureFetcher(
+  core: Table,
+  each?: (fetcher: PointFetcher, call: number) => void,
+): () => PointFetcher {
   let fetcher: PointFetcher | undefined,
     calls = 0;
   // eslint-disable-next-line @typescript-eslint/unbound-method -- called with its receiver below
@@ -39,8 +49,14 @@ function captureFetcher(each?: (fetcher: PointFetcher, call: number) => void): (
   ) {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- the spied method's receiver is the fetcher under test
     fetcher ??= this;
-    each?.(this, ++calls);
-    return fetch.apply(this, args);
+    const call = ++calls;
+    const run = () => {
+      each?.(this, call);
+      return fetch.apply(this, args);
+    };
+    if (call !== 1) return run();
+    core.publish();
+    return core.harness.path.quiesce().then(run);
   });
   return () => {
     if (fetcher === undefined) throw new Error("the statement fetched no conflicting row");
@@ -48,12 +64,24 @@ function captureFetcher(each?: (fetcher: PointFetcher, call: number) => void): (
   };
 }
 
-async function table(rows: number): Promise<StorageCore> {
-  const core = await new StorageCore(MEMTABLE_ROWS).open();
+type Table = StorageCore & { readonly publish: () => void };
+
+/**
+ * `rows` conflicting rows (v = id) and one more, so every memtable holding them is frozen. Their
+ * flushes publish only once `publish` is called (engine.ts `beforeFlushPublish`).
+ */
+async function table(rows: number): Promise<Table> {
+  let publish: () => void = () => undefined;
+  const held = new Promise<void>((resolve) => {
+    publish = resolve;
+  });
+  const core = await new StorageCore(MEMTABLE_ROWS, { beforeFlushPublish: () => held }).open();
   await core.execute("CREATE TABLE s(id INTEGER PRIMARY KEY, v INTEGER)");
-  await core.execute(`INSERT INTO s SELECT g, g FROM generate_series(1, ${String(rows)}) g`);
-  return core;
+  await core.execute(`INSERT INTO s SELECT g, g FROM generate_series(1, ${String(rows + 1)}) g`);
+  return Object.assign(core, { publish });
 }
+/** The sum of v as inserted: ids 1 … rows + 1. */
+const inserted = (rows: number) => ((rows + 1) * (rows + 2)) / 2;
 
 async function sumOfV(core: StorageCore): Promise<number> {
   const result = await core.execute("SELECT sum(v) AS total FROM s");
@@ -69,7 +97,7 @@ it("does the same work per conflicting row at N and 2N rows", async () => {
   for (const rows of [2 * MEMTABLE_ROWS, 4 * MEMTABLE_ROWS]) {
     const core = await table(rows);
     try {
-      const fetcher = captureFetcher();
+      const fetcher = captureFetcher(core);
       let composites = 0;
       const any = AbortSignal.any.bind(AbortSignal);
       vi.spyOn(AbortSignal, "any").mockImplementation((signals) => {
@@ -80,19 +108,15 @@ it("does the same work per conflicting row at N and 2N rows", async () => {
       vi.restoreAllMocks();
       const { memoryFetches, declines, memo } = fetcher();
       // Every row was arbitrated and updated once: v = id + 1.
-      expect(await sumOfV(core)).toBe((rows * (rows + 1)) / 2 + rows);
+      expect(await sumOfV(core)).toBe(inserted(rows) + rows);
       expect(memoryFetches, "one fetch per conflicting row").toBe(rows);
       expect(declines).toBe(0);
+      // Every row is read from a published memtable (`captureFetcher`): each read goes through
+      // the memo, which opens once per memtable root and reuses it for every other read.
       const reads = memo.opens + memo.reuses;
-      expect(reads, "no fetch reads more than its rows' columns").toBeLessThanOrEqual(
-        READS_PER_FETCH * rows,
-      );
-      expect(memo.reuses, "fetches reuse the memo's readers").toBeGreaterThanOrEqual(
-        (READS_PER_FETCH / 2) * rows,
-      );
-      // One entry per published memtable root (and at most one replaced on re-publication).
-      expect(memo.opens, "the memo opens per published root, not per row").toBeLessThanOrEqual(
-        rows / MEMTABLE_ROWS + 2,
+      expect(reads, "each fetch reads its row's columns once each").toBe(READS_PER_FETCH * rows);
+      expect(memo.opens, "the memo opens per published root, not per row").toBe(
+        rows / MEMTABLE_ROWS,
       );
       expect(composites, "composite signals are per memo entry, not per read").toBeLessThanOrEqual(
         2 * memo.opens + 8,
@@ -107,8 +131,9 @@ it("does the same work per conflicting row at N and 2N rows", async () => {
   }
   const [n, twice] = measured;
   if (n === undefined || twice === undefined) throw new Error("two sizes");
-  // Rows × 2 → reads × 2, up to the opens that replace a published root.
-  expect(Math.abs(twice.reads - 2 * n.reads)).toBeLessThanOrEqual(twice.opens + n.opens);
+  // Rows × 2 → reads × 2, and opens × 2.
+  expect(twice.reads).toBe(2 * n.reads);
+  expect(twice.opens).toBe(2 * n.opens);
 }, 120_000);
 
 it("releases the memo when a row's update fails mid-statement", async () => {
@@ -116,7 +141,7 @@ it("releases the memo when a row's update fails mid-statement", async () => {
     failing = MEMTABLE_ROWS + 7;
   const core = await table(rows);
   try {
-    const fetcher = captureFetcher();
+    const fetcher = captureFetcher(core);
     // Division by zero at one conflicting row, after the memo holds a published root.
     await expect(
       core.execute(upsert(rows, `s.v + 1 / (s.id - ${String(failing)})`)),
@@ -128,7 +153,7 @@ it("releases the memo when a row's update fails mid-statement", async () => {
     expect(memo.held, "an error gives back everything the memo held").toBe(0);
     // The statement rolled back: every v is as inserted.
     vi.restoreAllMocks();
-    expect(await sumOfV(core)).toBe((rows * (rows + 1)) / 2);
+    expect(await sumOfV(core)).toBe(inserted(rows));
   } finally {
     await core.close();
   }
@@ -142,7 +167,7 @@ it("releases the memo when the statement is aborted between fetches", async () =
   try {
     const controller = new AbortController();
     let heldAtAbort = 0;
-    const fetcher = captureFetcher((current, call) => {
+    const fetcher = captureFetcher(core, (current, call) => {
       if (call !== abortAt) return;
       heldAtAbort = current.memo.held;
       controller.abort(new Error("cancelled by the test"));
@@ -153,7 +178,7 @@ it("releases the memo when the statement is aborted between fetches", async () =
     expect(memo.closed, "the statement closed its memo").toBe(true);
     expect(memo.held, "an abort gives back everything the memo held").toBe(0);
     vi.restoreAllMocks();
-    expect(await sumOfV(core)).toBe((rows * (rows + 1)) / 2);
+    expect(await sumOfV(core)).toBe(inserted(rows));
   } finally {
     await core.close();
   }
@@ -166,7 +191,7 @@ it("declines a memo its budget refuses and reads every row without it", async ()
   try {
     let refused = 0;
     // Fault injection: from the first fetch on, the memo's budget refuses every byte.
-    const fetcher = captureFetcher((current, call) => {
+    const fetcher = captureFetcher(core, (current, call) => {
       if (call !== 1) return;
       Object.defineProperty(current.memo, "budget", {
         value: {
@@ -186,7 +211,7 @@ it("declines a memo its budget refuses and reads every row without it", async ()
     expect(memo.opens).toBe(1);
     expect(memoryFetches).toBe(rows);
     vi.restoreAllMocks();
-    expect(await sumOfV(core)).toBe((rows * (rows + 1)) / 2 + rows);
+    expect(await sumOfV(core)).toBe(inserted(rows) + rows);
   } finally {
     await core.close();
   }

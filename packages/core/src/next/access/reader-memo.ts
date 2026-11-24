@@ -49,16 +49,24 @@ export class ReaderMemo {
   /** Entries closed because their root, segment or snapshot changed, or on decline. */
   invalidations = 0;
   #held = 0;
-  /** Charged for every byte an entry holds, before it is allocated (the owner's budget, counted). */
-  readonly budget: ByteBudget;
+  /** Charged for every byte an entry holds, before it is allocated (the owner's budget, counted).
+   * Optional room is forwarded as optional (format/manifest-codec.ts `OptionalParseBudget`). */
+  readonly budget: ByteBudget & { optionalAllocate(bytes: number): boolean };
   constructor(
     owner: ByteBudget,
     /** The statement's signal; it must cover the signal of every read that uses the memo. */
     readonly signal: AbortSignal,
   ) {
+    const optional = owner as ByteBudget & { optionalAllocate?(bytes: number): boolean };
     this.budget = {
       allocate: (bytes) => {
         if (!owner.allocate(bytes)) return false;
+        this.#held += bytes;
+        return true;
+      },
+      // Optional room (format/manifest-codec.ts `OptionalParseBudget`), forwarded to the owner.
+      optionalAllocate: (bytes: number) => {
+        if (!(optional.optionalAllocate?.(bytes) ?? owner.allocate(bytes))) return false;
         this.#held += bytes;
         return true;
       },

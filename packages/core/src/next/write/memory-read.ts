@@ -24,8 +24,10 @@ import {
 import {
   isValidatedGroupRoot,
   optionalParseAllocation,
+  ParseBudgetError,
   parseCharge,
   selectGroupRootColumns,
+  type OptionalParseBudget,
 } from "../format/manifest-codec.js";
 import {
   PageEncoding,
@@ -43,6 +45,7 @@ import {
 } from "../page/reader.js";
 import type { CompiledPredicate } from "../page/predicate.js";
 import { scratchBytes as predicateScratchBytes } from "../page/select.js";
+import { ReadDeniedError } from "../storage/extents.js";
 import { GZIP_MAX_PAGE_BYTES } from "../page/gzip.js";
 import { allocateData, type FlatVector, type VectorData } from "../vector/vector.js";
 import type { PhysicalType } from "../types.js";
@@ -93,6 +96,41 @@ function nullsOf(reader: ChunkReader): CompiledPredicate | null {
 type OpenedReader = ChunkReader | { missing: FlatVector };
 
 /**
+ * The one page a memo's reader keeps loaded (-1: none). A memo keeps its readers open across
+ * reads, so a reader must not keep every page it ever loaded: each load of another page releases
+ * the kept one first. Readers outside a memo are not listed: they release as before and close.
+ */
+const keptPages = new WeakMap<ChunkReader, { page: number }>();
+
+/** Loads `page` on `reader`, keeping at most one page loaded on a memo's reader. */
+function* loadPage(
+  reader: ChunkReader,
+  page: number,
+  check: () => void,
+): Generator<Promise<unknown>, void, unknown> {
+  const kept = keptPages.get(reader);
+  if (kept !== undefined) {
+    if (kept.page === page) return;
+    if (kept.page >= 0) reader.release([kept.page]);
+    kept.page = -1;
+  }
+  yield* wait(reader.load([page]));
+  check();
+  if (kept !== undefined) kept.page = page;
+}
+
+/** Releases `page` unless `reader` is a memo's, which keeps it for the next read. */
+function releasePage(reader: ChunkReader, page: number): void {
+  if (!keptPages.has(reader)) reader.release([page]);
+}
+
+/** A refusal of memory the read needs (as opposed to a corruption, abort or release). */
+const isBudgetRefusal = (error: unknown): boolean =>
+  error instanceof PageBudgetError ||
+  error instanceof ReadDeniedError ||
+  error instanceof ParseBudgetError;
+
+/**
  * One memo entry (access/reader-memo.ts): the published group root of one memory segment and the
  * chunk readers opened on it, kept across that segment's reads while its root stays the same.
  * Everything it holds is charged to the memo's budget through `budget`, which records a refusal so
@@ -104,12 +142,15 @@ class PublishedReaders implements ReaderMemoEntry {
   readonly pages: SpaceReader;
   readonly signal: AbortSignal;
   readonly budget: ByteBudget;
-  /** Bytes the memo's budget refused (0: none). */
+  /** Bytes the memo's budget refused during the current read (0: none). */
   refused = 0;
   #root: Held<GroupRoot> | null = null;
   readonly #stop = new AbortController();
   #unwatch: (() => void) | null;
   #closed = false;
+  /** Reads using the entry now. Its snapshot watch (which keeps the snapshot's pins) is given up
+   * only once it is closed and they have all left: storage I/O may still be in flight. */
+  #inFlight = 0;
   constructor(
     readonly owner: MemoryReads,
     readonly ref: BlobRef,
@@ -118,16 +159,22 @@ class PublishedReaders implements ReaderMemoEntry {
     readonly caches: MetadataCaches | undefined,
   ) {
     const source = owner.source;
-    this.budget = {
+    const memoBudget = memo.budget as OptionalParseBudget;
+    const budget: OptionalParseBudget = {
       allocate: (bytes) => {
         if (memo.budget.allocate(bytes)) return true;
         this.refused = Math.max(this.refused, bytes);
         return false;
       },
+      // An optional probe (a cached root view) that does not fit is no refusal: the read falls
+      // back to the ordinary decode (format/manifest-codec.ts `OptionalParseBudget`).
+      optionalAllocate: (bytes) =>
+        memoBudget.optionalAllocate?.(bytes) ?? memo.budget.allocate(bytes),
       free: (bytes) => {
         memo.budget.free(bytes);
       },
     };
+    this.budget = budget;
     this.signal = AbortSignal.any([memo.signal, this.#stop.signal]);
     const check = (): void => {
       source.check();
@@ -153,12 +200,48 @@ class PublishedReaders implements ReaderMemoEntry {
           throw error;
         }
       },
+      // Parsed page descriptors ride on the cache entry (page/reader.ts `#parse`).
+      ...(base.parsed === undefined
+        ? {}
+        : {
+            parsed: (blob: BlobRef) => {
+              check();
+              return base.parsed?.(blob) ?? null;
+            },
+          }),
+      ...(base.attach === undefined
+        ? {}
+        : {
+            attach: (blob: BlobRef, parsed: object, bytes: number, of: Uint8Array) => {
+              check();
+              return base.attach?.(blob, parsed, bytes, of) ?? false;
+            },
+          }),
     };
     this.#unwatch = source.watch(() => {
       this.#stop.abort();
       if (memo.entry(owner) === this) memo.invalidate();
       else this.close();
     });
+  }
+
+  /** A read begins using the entry: a new attempt, so no refusal yet. */
+  enter(): void {
+    this.#inFlight += 1;
+    this.refused = 0;
+  }
+
+  /** A read has left the entry (settled): a closed entry now gives up its snapshot watch. */
+  leave(): void {
+    this.#inFlight -= 1;
+    if (this.#closed) this.#unwatchDrained();
+  }
+
+  #unwatchDrained(): void {
+    if (this.#inFlight > 0) return;
+    const unwatch = this.#unwatch;
+    this.#unwatch = null;
+    unwatch?.();
   }
 
   /** The same published root, still open: the entry's readers are current. */
@@ -204,23 +287,28 @@ class PublishedReaders implements ReaderMemoEntry {
         check();
         throw new TypeError("A closed reader memo entry cannot open readers");
       }
+      keptPages.set(reader, { page: -1 });
     }
     this.readers.set(columnId, reader);
     return reader;
   }
 
+  /**
+   * Gives back what the entry holds and cancels its I/O. A read still in flight sees the abort,
+   * its loads reject once their I/O returns (the reader gives back what they read), and the
+   * snapshot watch, which keeps the snapshot's pins, goes only when it has left.
+   */
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
+    this.#stop.abort();
     try {
       for (const reader of this.readers.values()) if (!("missing" in reader)) reader.close();
       this.readers.clear();
       this.#root?.release();
       this.#root = null;
     } finally {
-      const unwatch = this.#unwatch;
-      this.#unwatch = null;
-      unwatch?.();
+      this.#unwatchDrained();
     }
   }
 }
@@ -360,8 +448,13 @@ export class MemoryReads {
     work: (ctx: RoutedRead, check: () => void) => Generator<Promise<unknown>, T, unknown>,
   ): MaybePromise<T> {
     context.signal.throwIfAborted();
-    if (!context.budget.allocate(1024)) throw new PageBudgetError(1024);
     const memo = context.readers;
+    // The memo reads under its own signal (`MemoryReadContext.readers`), and keeps what it reads.
+    if (memo !== undefined && context.signal !== memo.signal)
+      throw new TypeError("A memo read must use its memo's signal");
+    if (memo !== undefined && context.once === true)
+      throw new TypeError("A one-pass read cannot keep readers in a memo");
+    if (!context.budget.allocate(1024)) throw new PageBudgetError(1024);
     if (memo !== undefined) {
       // A memo read reads its pages through the memo's entry, which watches the snapshot under
       // the memo's signal (covering this read's). No per-read composite signal or watch: a
@@ -511,6 +604,7 @@ export class MemoryReads {
       memo.install(entry);
     }
     if (!(entry instanceof PublishedReaders)) throw new TypeError("Foreign reader memo entry");
+    entry.enter();
     try {
       const reader = yield* entry.reader(columnId, check);
       check();
@@ -519,9 +613,11 @@ export class MemoryReads {
       const refused = entry.refused;
       if (memo.entry(this) === entry) memo.invalidate();
       else entry.close();
-      if (refused > 0 && !(error instanceof MemoDeclinedError))
-        throw new MemoDeclinedError(refused);
+      // Only the memo's own budget refusing memory declines it; any other failure is reported.
+      if (refused > 0 && isBudgetRefusal(error)) throw new MemoDeclinedError(refused);
       throw error;
+    } finally {
+      entry.leave();
     }
   }
 
@@ -627,8 +723,7 @@ export class MemoryReads {
       const [first, end] = reader.pagesInRange(from, from + rows);
       for (let page = first; page < end; page++) {
         yield* pause(check);
-        yield* wait(reader.load([page]));
-        check();
+        yield* loadPage(reader, page, check);
         const entry = reader.directory.pages[page];
         if (entry === undefined) throw new RangeError("Missing memory page");
         if ((entry.encoding & PageEncoding.gzip) !== 0)
@@ -646,7 +741,7 @@ export class MemoryReads {
           row++
         )
           each(row - from, reader.varlenBytes(row, row + 1));
-        reader.release([page]);
+        releasePage(reader, page);
       }
       return gzip;
     });
@@ -788,6 +883,8 @@ export class MemoryReads {
         yield* pause(check);
       }
       const widths = new Float64Array(rows);
+      // Per varlen column, the one row's bytes when the request is for one row.
+      const single = new Map<number, number>();
       let gzip = 0,
         rowBytes = 0,
         offsetBytes = 0;
@@ -803,6 +900,7 @@ export class MemoryReads {
             gzip,
             yield* this.#lengths(id, request, rows, context, check, (row, bytes) => {
               widths[row] = (widths[row] ?? 0) + bytes;
+              if (rows === 1) single.set(id, bytes);
             }),
           );
         // Fixed columns still need their format envelope, including recovered gzip pages.
@@ -850,7 +948,10 @@ export class MemoryReads {
         const type = this.source.column(id)?.type;
         if (type === undefined) throw new RangeError("Missing memory column");
         let bytes = 0;
-        if (layoutOf(type) === "varlen")
+        // A one-row hint (a point read) already has its row's widths from the first pass.
+        const known = rows === 1 && count === 1 ? single.get(id) : undefined;
+        if (known !== undefined) bytes = known;
+        else if (layoutOf(type) === "varlen")
           yield* this.#lengths(id, request, count, context, check, (_, n) => {
             bytes += n;
           });
@@ -976,9 +1077,8 @@ export class MemoryReads {
             const row = first + start + written;
             const [nextPage] = reader.pagesInRange(row, row + 1);
             if (page !== nextPage) {
-              if (page >= 0) reader.release([page]);
-              yield* wait(reader.load([nextPage]));
-              check();
+              if (page >= 0) releasePage(reader, page);
+              yield* loadPage(reader, nextPage, check);
               page = nextPage;
             }
             if (layoutOf(type) !== "varlen") {

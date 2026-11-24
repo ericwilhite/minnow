@@ -1565,14 +1565,18 @@ and the owner import it directly.
   row with one point fetcher per statement (`exec/point-fetch.ts`): the segment's bounded
   `readHint`/`chunk`, not a one-row scan. Its `ReaderMemo` (`access/reader-memo.ts`, passed as
   `MemoryReadContext.readers`) keeps the group root and column readers of the published memtable
-  it last read, so consecutive rows of one memtable cost a page decode each. An entry is reused only
-  for the same segment and the same published root (full blob identity), so a publication or a
-  re-staging between two reads opens new readers; the snapshot's pin keeps the old root's blobs
-  readable through merges and flushes; the snapshot's release closes it. The memo is charged to
-  the statement's grant (outside the pool's step room, so it never holds a progress loan open) and
-  given back at statement end, on abort and on error; a refused charge declines the memo and the
-  statement reads on without it. Memo reads build no per-read composite signal: one per point read
-  on the statement's long-lived signal made Node's dependent cleanup quadratic in rows.
+  it last read, each reader with at most one page loaded (the one it read last), so consecutive
+  rows of one page cost no load and rows of another page one load per column. An entry is reused
+  only for the same segment and the same published root (full blob identity), so a publication or
+  a re-staging between two reads opens new readers; the snapshot's pin keeps the old root's blobs
+  readable through merges and flushes; the snapshot's release closes it, cancelling its I/O, and
+  the snapshot's pins stay until a read in flight has drained. The memo is charged to the
+  statement's grant (outside the pool's step room, so it never holds a progress loan open) and
+  given back at statement end, on abort and on error; only the memo's own budget refusing memory
+  declines it (the statement then reads on without it), and an optional probe it cannot fund is
+  no refusal. Memo reads build no per-read composite signal: one per point read on the
+  statement's long-lived signal made Node's dependent cleanup quadratic in rows. A memo read must
+  use the memo's signal and cannot be a one-pass read.
 - **Retention is bounded.** A reader borrows at most one chunk per memory segment. A frozen memtable
   stays resident (capped, writers wait past the cap) only until its flush publishes; then its
   readers are re-pointed to the published group under a pin taken during that publication, and
