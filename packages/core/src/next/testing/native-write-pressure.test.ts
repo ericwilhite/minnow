@@ -13,6 +13,8 @@ import * as writers from "../page/writer.js";
 import { PIN_HEADER_BYTES } from "../storage/root-pins.js";
 import { ExtentListKeeper } from "../storage/extent-list.js";
 import { WriteCredits } from "../write/credits.js";
+import { taskClock } from "../exec/pipeline.js";
+import { LogAppender } from "../write/log.js";
 import { autocommit, batch, onGroupWait, rowsOf, texts } from "../write/test-support.js";
 import { StorageCore } from "./storage-core.js";
 import { oracleRows } from "./differential-adapter.js";
@@ -88,217 +90,298 @@ for (const seed of seedsFor("next-native-write-settlement", [47249, 47250]))
 
 const population = Array.from({ length: 12 }, (_, i) => 8814 + i);
 const seeds = seedsFor("next-native-write-pressure", population);
-for (const boundary of ["retirement", "group"] as const) {
+const BOUNDARIES = ["retirement", "group"] as const;
+
+/**
+ * Six 1 MiB native inserts. Idle row credit is reclaimed at every `boundary` of their flush, and
+ * at the first one a competing reader takes every idle byte the write owner may give up (never a
+ * running commit's window) and all free room; it takes newly idle credit again whenever the
+ * flush's metadata growth is about to wait. `forceYields`: every task-clock check yields while a
+ * commit encodes (`taskClock.due()`, the review's repro of #64 P1), so the concurrent flush can
+ * reach its boundary, and the reader arrive, inside a commit's encoding.
+ */
+function sixInserts(boundary: (typeof BOUNDARIES)[number], forceYields: boolean) {
+  return async (yields: boolean[]) => {
+    const reach = createReach(`native ${boundary} pressure`, NATIVE_WRITE_PRESSURE_REACH);
+    reach.beginHistory();
+    const core = new StorageCore(6);
+    const governor = new Governor(32 << 20);
+    Object.defineProperty(core.harness, "governor", { value: governor });
+    let credits: WriteCredits | undefined;
+    let armed = false;
+    let borrowed: ExtentWriter | undefined;
+    let reclaims = 0;
+    let reader: Grant | undefined;
+    let held: Uint8Array | undefined;
+    // Credit the reader took after its first fill (newly idle owner credit).
+    const more: Uint8Array[] = [];
+    let resident: Uint8Array | undefined;
+    let residentGrant: Grant | undefined;
+    const releaseReader = () => {
+      if (held !== undefined) expect(held.at(-1)).toBe(7);
+      held = undefined;
+      for (const buffer of more.splice(0)) expect(buffer.at(-1)).toBe(7);
+      if (resident !== undefined) expect(resident.at(-1)).toBe(13);
+      const residentBytes = resident?.byteLength ?? 0;
+      resident = undefined;
+      if (residentBytes > 0) residentGrant?.free(residentBytes);
+      residentGrant = undefined;
+      if (reader !== undefined && reader.allocated > 0) reader.free(reader.allocated);
+      if (reader !== undefined && reader.held > 0) reader.release(reader.held);
+    };
+    // While a commit encodes (after its window is prepared, before its frames are appended),
+    // every task-clock check yields (`forceYields`): the flush then reaches its boundaries
+    // inside the encoding (review of #64, P1).
+    let encoding = false;
+    let pressed = false;
+    const clockDue = taskClock.due.bind(taskClock);
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- Rebound below.
+    const prepareCommit = WriteCredits.prototype.prepareCommit;
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- Rebound below.
+    const appendStream = LogAppender.prototype.appendStream;
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- Rebound below.
+    const append = LogAppender.prototype.append;
+    const forced = forceYields
+      ? [
+          vi.spyOn(taskClock, "due").mockImplementation(() => encoding || clockDue()),
+          vi.spyOn(WriteCredits.prototype, "prepareCommit").mockImplementation(function (
+            this: WriteCredits,
+            ...args
+          ) {
+            const ready = prepareCommit.apply(this, args);
+            // Only the six inserts' commits (`armed`), not the table's creation.
+            const begin = () => {
+              encoding = armed;
+            };
+            if (ready instanceof Promise) return ready.then(begin);
+            begin();
+            return ready;
+          }),
+          // A streamed commit appends its frames here, a small one through `append`.
+          vi.spyOn(LogAppender.prototype, "appendStream").mockImplementation(function (
+            this: LogAppender,
+            ...args
+          ) {
+            encoding = false;
+            return appendStream.apply(this, args);
+          }),
+          vi.spyOn(LogAppender.prototype, "append").mockImplementation(function (
+            this: LogAppender,
+            ...args
+          ) {
+            encoding = false;
+            return append.apply(this, args);
+          }),
+        ]
+      : [];
+    const open = WriteCredits.open.bind(WriteCredits);
+    const opened = vi.spyOn(WriteCredits, "open").mockImplementation(async (...args) => {
+      credits = await open(...args);
+      return credits;
+    });
+    // Start a real competing reader at a generated writer boundary. It owns real
+    // buffers until its task completes; native retries must first unwind their work.
+    const reclaim = (writer: ExtentWriter) => {
+      if (!armed || credits === undefined) return;
+      borrowed = writer;
+      credits.reclaimRows();
+      reach.reach("idle row credit reclaimed");
+      if (reader !== undefined && !pressed) {
+        pressed = true;
+        // Model other resident native metadata overlapping the prepaid step.
+        // These are real charged bytes, not a lowered cap or a fake denial.
+        residentGrant = credits.metadata;
+        const live = residentGrant.held - residentGrant.allocated - 4096;
+        expect(live).toBeGreaterThan(0);
+        expect(residentGrant.allocate(live)).toBe(true);
+        resident = new Uint8Array(live).fill(13);
+        reach.reach("resident metadata overlaps writer step");
+        credits.reclaimMetadata();
+        // Fill the competing reader from every idle forecast the owner may give up. Growth
+        // nets the owner's accounts (write/credits.ts `#growTo`), so idle WAL and merge
+        // forecasts would fund the step without any wait and were never real pressure. A
+        // running commit keeps its window (`#commitFloor`), as does the prepaid step.
+        credits.reclaimIdleForecasts();
+        // The step's metadata headroom left above stays: the running flush's floor keeps it.
+        expect(
+          credits.metadata.held - credits.metadata.allocated,
+          "the writer step keeps its metadata headroom",
+        ).toBeGreaterThanOrEqual(4096);
+        // A commit still encoding keeps its window; nothing else of it is idle.
+        if (encoding)
+          expect(credits.commits.held, "the encoding commit keeps its window").toBeGreaterThan(
+            credits.commits.allocated + credits.commits.loaned,
+          );
+        const bytes = governor.capBytes - governor.reserveBytes - governor.usedBytes;
+        expect(bytes).toBeGreaterThan(0);
+        expect(reader.allocate(bytes)).toBe(true);
+        held = new Uint8Array(bytes).fill(7);
+        reach.reach("competing reader owns real bytes");
+      }
+      reclaims++;
+    };
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- Rebound below.
+    const prepare = ExtentListKeeper.prototype.prepare;
+    const keeper = vi.spyOn(ExtentListKeeper.prototype, "prepare").mockImplementation(function (
+      this: ExtentListKeeper,
+      ...args
+    ) {
+      if (boundary === "retirement") reclaim(args[1].writer);
+      return prepare.apply(this, args);
+    });
+    const OriginalWriter = writers.GroupWriter;
+    const group = vi.spyOn(writers, "GroupWriter").mockImplementation(function (options) {
+      if (boundary === "group") reclaim(options.writer);
+      const rowBytes = credits?.rows.allocated;
+      const writer = new OriginalWriter(options);
+      // The active primary row step may retain prepaid idle credit. Page buffers
+      // must not consume that reservation, even if this particular step still fits.
+      expect(
+        credits?.rows.allocated,
+        "page workspace must not consume the row account",
+      ).toBeLessThanOrEqual(rowBytes ?? 0);
+      expect(writer.retainedBytes).toBeGreaterThan(0);
+      return writer;
+    });
+    // A funded attempt may have published rather than aborted. Both retire
+    // provisional ownership; open/publishing/indeterminate work may not wait
+    // for more credit.
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- Rebound below.
+    const grow = WriteCredits.prototype.growTo;
+    const growth = vi.spyOn(WriteCredits.prototype, "growTo").mockImplementation(function (
+      this: WriteCredits,
+      grant,
+      wanted,
+      signal,
+    ) {
+      if (held !== undefined && grant === this.metadata && wanted > grant.held) {
+        const stats = core.harness.space.stats;
+        assertSettled(borrowed?.state, stats.writerBytes, stats.releasingBytes);
+        reach.reach("admission after provisional settlement");
+        // The reader takes what became idle since its fill (a commit that ended returns
+        // its window), as any competing holder would take free room.
+        this.reclaimIdleForecasts();
+        const free = governor.capBytes - governor.reserveBytes - governor.usedBytes;
+        if (free > 0 && reader?.allocate(free) === true) more.push(new Uint8Array(free).fill(7));
+      }
+      return grow.call(this, grant, wanted, signal);
+    });
+    // The metadata growth queues behind the reader; only then is the reader released
+    // (no timer decides whether the writer waited).
+    let blocked = 0;
+    onGroupWait(governor, "complete grow write path metadata", () => {
+      if (held === undefined) return;
+      blocked++;
+      releaseReader();
+    });
+    let closed = false;
+    let restored = false;
+    const restore = () => {
+      if (restored) return;
+      restored = true;
+      for (const spy of forced) spy.mockRestore();
+      opened.mockRestore();
+      keeper.mockRestore();
+      group.mockRestore();
+      growth.mockRestore();
+    };
+    onTestFinished(async () => {
+      armed = false;
+      releaseReader();
+      reader?.close();
+      restore();
+      if (!closed) await core.close();
+    });
+    try {
+      await core.open();
+      await core.execute("CREATE TABLE pressure(v TEXT)");
+      const empty = await core.execute("SELECT v FROM pressure");
+      if (!("batches" in empty)) throw new Error("expected an empty SELECT result");
+      expect(oracleRows(empty)).toEqual([]);
+      reader = await governor.admit({
+        label: "concurrent pressure reader",
+        minimumBytes: 0,
+        spillable: true,
+      });
+      const table = core.harness.path.catalog.tableByName("pressure");
+      if (table === undefined) throw new Error("missing pressure table");
+      armed = true;
+      const payload = "x".repeat(1 << 20);
+      for (let i = 0; i < 6; i++) {
+        try {
+          await autocommit(core.harness.path, (statement) =>
+            statement.table(table.id).insert(batch(texts([payload])), null),
+          );
+        } finally {
+          encoding = false;
+        }
+        if (yields[i]) await new Promise<void>((resolve) => queueMicrotask(resolve));
+      }
+      reach.reach("six 1 MiB native commits");
+      await core.harness.path.quiesce();
+      expect(blocked, "the writer's metadata growth waited for the reader").toBeGreaterThan(0);
+      releaseReader();
+      const checkRootFunding = () => {
+        expect(core.harness.space.stats.pinCount).toBe(1);
+        const label = core.harness.space.stats.oldestPin?.label;
+        expect(label).toBe("current state");
+        expect(credits?.metadata.allocated).toBe(
+          core.harness.path.residentMetadataBytes + PIN_HEADER_BYTES + 2 * "current state".length,
+        );
+      };
+      checkRootFunding();
+      expect(credits?.metadata.held, "completed phase returns metadata workspace").toBe(
+        credits?.metadata.allocated,
+      );
+      reach.reach("completed metadata workspace returned");
+      armed = false;
+      await core.harness.reopen();
+      checkRootFunding();
+      reach.reach("one funded root list through reopen");
+      const view = core.harness.path.pin();
+      try {
+        expect(await rowsOf(view, table.id)).toEqual(Array.from({ length: 6 }, () => [payload]));
+      } finally {
+        view.release();
+      }
+      reach.reach("exact durable rows");
+      expect(reclaims).toBeGreaterThan(0);
+      expect(governor.peakBytes).toBeLessThanOrEqual(governor.capBytes);
+      reach.reach("32 MiB peak");
+    } finally {
+      armed = false;
+      releaseReader();
+      reader?.close();
+      restore();
+      await core.close();
+      closed = true;
+    }
+    expect(governor.usedBytes).toBe(0);
+    reach.reach("zero final charge");
+    reach.assertReached();
+  };
+}
+
+for (const boundary of BOUNDARIES)
   it.each(seeds)(
     `completes six 1 MiB native inserts after ${boundary} reclaim (seed %i)`,
     async (seed) => {
       await fc.assert(
-        fc.asyncProperty(fc.array(fc.boolean(), { minLength: 6, maxLength: 6 }), async (yields) => {
-          const reach = createReach(`native ${boundary} pressure`, NATIVE_WRITE_PRESSURE_REACH);
-          reach.beginHistory();
-          const core = new StorageCore(6);
-          const governor = new Governor(32 << 20);
-          Object.defineProperty(core.harness, "governor", { value: governor });
-          let credits: WriteCredits | undefined;
-          let armed = false;
-          let borrowed: ExtentWriter | undefined;
-          let reclaims = 0;
-          let reader: Grant | undefined;
-          let held: Uint8Array | undefined;
-          let resident: Uint8Array | undefined;
-          let residentGrant: Grant | undefined;
-          const releaseReader = () => {
-            if (held !== undefined) expect(held.at(-1)).toBe(7);
-            held = undefined;
-            if (resident !== undefined) expect(resident.at(-1)).toBe(13);
-            const residentBytes = resident?.byteLength ?? 0;
-            resident = undefined;
-            if (residentBytes > 0) residentGrant?.free(residentBytes);
-            residentGrant = undefined;
-            if (reader !== undefined && reader.allocated > 0) reader.free(reader.allocated);
-            if (reader !== undefined && reader.held > 0) reader.release(reader.held);
-          };
-          const open = WriteCredits.open.bind(WriteCredits);
-          const opened = vi.spyOn(WriteCredits, "open").mockImplementation(async (...args) => {
-            credits = await open(...args);
-            return credits;
-          });
-          // Start a real competing reader at a generated writer boundary. It owns real
-          // buffers until its task completes; native retries must first unwind their work.
-          const reclaim = (writer: ExtentWriter) => {
-            if (!armed || credits === undefined) return;
-            borrowed = writer;
-            credits.reclaimRows();
-            reach.reach("idle row credit reclaimed");
-            if (reader !== undefined && reclaims === 0) {
-              // Model other resident native metadata overlapping the prepaid step.
-              // These are real charged bytes, not a lowered cap or a fake denial.
-              residentGrant = credits.metadata;
-              const live = residentGrant.held - residentGrant.allocated - 4096;
-              expect(live).toBeGreaterThan(0);
-              expect(residentGrant.allocate(live)).toBe(true);
-              resident = new Uint8Array(live).fill(13);
-              reach.reach("resident metadata overlaps writer step");
-              credits.reclaimMetadata();
-              // Fill the competing reader from every idle forecast. Growth nets the owner's
-              // accounts (write/credits.ts `#growTo`), so idle WAL and merge forecasts would
-              // fund the step without any wait and were never real pressure.
-              for (const account of [
-                credits.rows,
-                credits.metadata,
-                credits.commits,
-                credits.merge,
-              ])
-                if (account.held > account.allocated + account.loaned)
-                  account.release(account.held - account.allocated - account.loaned);
-              const bytes = governor.capBytes - governor.reserveBytes - governor.usedBytes;
-              expect(bytes).toBeGreaterThan(0);
-              expect(reader.allocate(bytes)).toBe(true);
-              held = new Uint8Array(bytes).fill(7);
-              reach.reach("competing reader owns real bytes");
-            }
-            reclaims++;
-          };
-          // eslint-disable-next-line @typescript-eslint/unbound-method -- Rebound below.
-          const prepare = ExtentListKeeper.prototype.prepare;
-          const keeper = vi
-            .spyOn(ExtentListKeeper.prototype, "prepare")
-            .mockImplementation(function (this: ExtentListKeeper, ...args) {
-              if (boundary === "retirement") reclaim(args[1].writer);
-              return prepare.apply(this, args);
-            });
-          const OriginalWriter = writers.GroupWriter;
-          const group = vi.spyOn(writers, "GroupWriter").mockImplementation(function (options) {
-            if (boundary === "group") reclaim(options.writer);
-            const rowBytes = credits?.rows.allocated;
-            const writer = new OriginalWriter(options);
-            // The active primary row step may retain prepaid idle credit. Page buffers
-            // must not consume that reservation, even if this particular step still fits.
-            expect(
-              credits?.rows.allocated,
-              "page workspace must not consume the row account",
-            ).toBeLessThanOrEqual(rowBytes ?? 0);
-            expect(writer.retainedBytes).toBeGreaterThan(0);
-            return writer;
-          });
-          // A funded attempt may have published rather than aborted. Both retire
-          // provisional ownership; open/publishing/indeterminate work may not wait
-          // for more credit.
-          // eslint-disable-next-line @typescript-eslint/unbound-method -- Rebound below.
-          const grow = WriteCredits.prototype.growTo;
-          const growth = vi.spyOn(WriteCredits.prototype, "growTo").mockImplementation(function (
-            this: WriteCredits,
-            grant,
-            wanted,
-            signal,
-          ) {
-            if (held !== undefined && grant === this.metadata && wanted > grant.held) {
-              const stats = core.harness.space.stats;
-              assertSettled(borrowed?.state, stats.writerBytes, stats.releasingBytes);
-              reach.reach("admission after provisional settlement");
-            }
-            return grow.call(this, grant, wanted, signal);
-          });
-          // The metadata growth queues behind the reader; only then is the reader released
-          // (no timer decides whether the writer waited).
-          let blocked = 0;
-          onGroupWait(governor, "complete grow write path metadata", (queued) => {
-            if (held === undefined) return;
-            queueMicrotask(() => {
-              if (queued() && held !== undefined) blocked++;
-              releaseReader();
-            });
-          });
-          let closed = false;
-          let restored = false;
-          const restore = () => {
-            if (restored) return;
-            restored = true;
-            opened.mockRestore();
-            keeper.mockRestore();
-            group.mockRestore();
-            growth.mockRestore();
-          };
-          onTestFinished(async () => {
-            armed = false;
-            releaseReader();
-            reader?.close();
-            restore();
-            if (!closed) await core.close();
-          });
-          try {
-            await core.open();
-            await core.execute("CREATE TABLE pressure(v TEXT)");
-            const empty = await core.execute("SELECT v FROM pressure");
-            if (!("batches" in empty)) throw new Error("expected an empty SELECT result");
-            expect(oracleRows(empty)).toEqual([]);
-            reader = await governor.admit({
-              label: "concurrent pressure reader",
-              minimumBytes: 0,
-              spillable: true,
-            });
-            const table = core.harness.path.catalog.tableByName("pressure");
-            if (table === undefined) throw new Error("missing pressure table");
-            armed = true;
-            const payload = "x".repeat(1 << 20);
-            for (let i = 0; i < 6; i++) {
-              await autocommit(core.harness.path, (statement) =>
-                statement.table(table.id).insert(batch(texts([payload])), null),
-              );
-              if (yields[i]) await new Promise<void>((resolve) => queueMicrotask(resolve));
-            }
-            reach.reach("six 1 MiB native commits");
-            await core.harness.path.quiesce();
-            expect(blocked, "the writer's metadata growth waited for the reader").toBeGreaterThan(
-              0,
-            );
-            releaseReader();
-            const checkRootFunding = () => {
-              expect(core.harness.space.stats.pinCount).toBe(1);
-              const label = core.harness.space.stats.oldestPin?.label;
-              expect(label).toBe("current state");
-              expect(credits?.metadata.allocated).toBe(
-                core.harness.path.residentMetadataBytes +
-                  PIN_HEADER_BYTES +
-                  2 * "current state".length,
-              );
-            };
-            checkRootFunding();
-            expect(credits?.metadata.held, "completed phase returns metadata workspace").toBe(
-              credits?.metadata.allocated,
-            );
-            reach.reach("completed metadata workspace returned");
-            armed = false;
-            await core.harness.reopen();
-            checkRootFunding();
-            reach.reach("one funded root list through reopen");
-            const view = core.harness.path.pin();
-            try {
-              expect(await rowsOf(view, table.id)).toEqual(
-                Array.from({ length: 6 }, () => [payload]),
-              );
-            } finally {
-              view.release();
-            }
-            reach.reach("exact durable rows");
-            expect(reclaims).toBeGreaterThan(0);
-            expect(governor.peakBytes).toBeLessThanOrEqual(governor.capBytes);
-            reach.reach("32 MiB peak");
-          } finally {
-            armed = false;
-            releaseReader();
-            reader?.close();
-            restore();
-            await core.close();
-            closed = true;
-          }
-          expect(governor.usedBytes).toBe(0);
-          reach.reach("zero final charge");
-          reach.assertReached();
-        }),
+        fc.asyncProperty(
+          fc.array(fc.boolean(), { minLength: 6, maxLength: 6 }),
+          sixInserts(boundary, false),
+        ),
         { seed, numRuns: 1, endOnFailure: true },
       );
     },
     60000,
   );
-}
+
+// Review of #64 (P1): with yields at every task-clock check inside each commit's encoding, the
+// flush's retirement boundary can fall inside the fifth commit's encoding. The reader then must
+// not take that commit's window, and the flush's metadata growth still waits for the reader. A
+// group writer is built while the flush writes its groups, before it publishes, so the group
+// boundary does not meet that interleaving.
+it("completes six 1 MiB native inserts after retirement reclaim inside a commit's encoding", async () => {
+  await sixInserts("retirement", true)([false, false, false, false, false, false]);
+}, 60000);

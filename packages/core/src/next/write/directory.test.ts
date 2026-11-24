@@ -204,20 +204,16 @@ describe("resident directory memory (review B3-p2a-2 #1)", () => {
     // PROPOSAL "One memory governor": temporary competing holdings wait, never refuse. The
     // ballast is released only once the open is queued behind it: still queued after the
     // harness's own startup release, which runs in the same task (no timer decides that).
-    let blocked = 0;
-    const admissions = onGroupWait(governor, "write owner minimum", (queued) => {
-      queueMicrotask(() => {
-        if (queued()) blocked++;
-        ballast.close();
-      });
+    const admissions = onGroupWait(governor, "write owner minimum", () => {
+      ballast.close();
     });
     try {
       path = await harness.open();
     } finally {
       ballast.close();
     }
-    expect(admissions.waits).toBe(1);
-    expect(blocked, "the open waited for the ballast").toBe(1);
+    expect(admissions.waits, "the open waited for the ballast").toBe(1);
+    expect(admissions.immediate + admissions.refused).toBe(0);
     expect(path.residentMetadataBytes).toBe(opened);
     expect(metadata.grant?.allocated).toBe(opened + snapshotCredit());
     // Dropping the table returns its directory's charge (no older reader holds it).

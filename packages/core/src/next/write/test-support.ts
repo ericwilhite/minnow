@@ -490,47 +490,49 @@ export function watchGrants(governor: MemoryGovernor, observe: (grant: Grant) =>
 }
 
 /**
- * Reports, without a timer, whether a native group admission waited in the governor. The
- * governor serves a request that fits inside the call that queues it, and serves a queued one
- * inside the release that makes room for it; it reports each grant as it makes it
- * (`Governor.observeGrants`). So an admission labelled `label` whose grant was not reported by
- * the time `admitGroup` returned is queued, and `onWait` runs for it with `queued()`, which
- * stays true until its grant is reported. A caller that checks `queued()` after the code that
- * queued it has run (a microtask later) learns whether it is still waiting behind another
- * holder, as opposed to a release the caller itself was about to make. One admission of `label`
- * at a time. Wraps the instance's `admitGroup`, as `watchGrants` does.
+ * Reports, without a timer, whether a native group admission waited in the governor behind
+ * another holder. The governor serves a request that fits inside the call that queues it, and a
+ * queued one inside the release that makes room for it, and reports each grant as it makes it
+ * (`Governor.observeGrants`; a group is served from the admission or holder queue). Each
+ * admission labelled `label` is classified one microtask after it was made, once the code that
+ * made it has run (a release that code itself makes, such as the harness returning its startup
+ * credit, comes first):
+ * - `immediate`: its grant was reported by then;
+ * - `refused`: it settled without a grant by then (`admitGroup` is async, so a refusal is a
+ *   rejected promise, never a throw);
+ * - `waits`: still queued; `onWait` then runs (the place to release the competing holder).
+ * One admission of `label` at a time. Wraps the instance's `admitGroup`, as `watchGrants` does.
  */
 export function onGroupWait(
   governor: Governor,
   label: string,
-  onWait: (queued: () => boolean) => void,
-): { readonly waits: number; readonly immediate: number } {
-  const counts = { waits: 0, immediate: 0 };
+  onWait: () => void,
+): { readonly waits: number; readonly immediate: number; readonly refused: number } {
+  const counts = { waits: 0, immediate: 0, refused: 0 };
   const admitGroup = governor.admitGroup.bind(governor);
   governor.admitGroup = (options) => {
     // A zero-total group is served at once and reports no grant.
     if (options.label !== label || options.grants.every((part) => part.minimumBytes === 0))
       return admitGroup(options);
-    const seen = { served: false };
+    const seen = { served: false, done: false };
     const stop = governor.observeGrants((event) => {
-      if (event.label === label) seen.served = true;
+      if (event.label === label && (event.source === "admission" || event.source === "holder"))
+        seen.served = true;
     });
-    let admitted: Promise<readonly Grant[]>;
-    try {
-      admitted = admitGroup(options);
-    } catch (error) {
+    const admitted = admitGroup(options);
+    const settle = () => {
+      seen.done = true;
       stop();
-      throw error;
-    }
-    if (seen.served) {
-      stop();
-      counts.immediate++;
-      return admitted;
-    }
-    counts.waits++;
-    const settled = () => stop();
-    admitted.then(settled, settled);
-    onWait(() => !seen.served);
+    };
+    admitted.then(settle, settle);
+    queueMicrotask(() => {
+      if (seen.served) counts.immediate++;
+      else if (seen.done) counts.refused++;
+      else {
+        counts.waits++;
+        onWait();
+      }
+    });
     return admitted;
   };
   return counts;
