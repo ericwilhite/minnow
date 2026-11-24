@@ -4,7 +4,7 @@
  */
 import type { Grant, HolderChain, MemoryGovernor, WaitingHoldings } from "../memory/governor.js";
 import { RETRY_GUARD_LIMIT, retryGuard } from "../memory/retry-guard.js";
-import { GrantClosedError, MemoryAdmissionError, type QueuedWork } from "../memory/governor.js";
+import { GrantClosedError, MemoryAdmissionError } from "../memory/governor.js";
 import type { MaybePromise } from "../access/key-index.js";
 import { releaseIdle } from "./budget.js";
 
@@ -245,8 +245,8 @@ export class WriteCredits {
    * The bytes this owner's growth waits for in the governor, by whether it may use the progress
    * reserve (`#growTo`: a merge's credit, a
    * flush's or merge's metadata, a native step), 0 when none waits. Holder growth is served
-   * before any admission: a statement holding the writer turn waits behind it
-   * (`LentHoldings.queued`).
+   * before any admission: a statement holding the writer turn waits behind it (the governor's
+   * `servableNow` runs that queue). Each item leaves with its request (`onLeave`).
    */
   get queuedGrowth(): { readonly ordinary: number; readonly progress: number } {
     let ordinary = 0,
@@ -256,11 +256,6 @@ export class WriteCredits {
       else ordinary += item.ask;
     return { ordinary, progress };
   }
-  /** The owner's own work waiting in the governor now (`LentHoldings.work`): each item leaves in
-   * the drain that serves it (`onServed`), never a microtask later. */
-  get queuedWork(): readonly QueuedWork[] {
-    return [...this.#queuedWork];
-  }
   readonly #queuedListeners = new Set<() => void>();
   /** Calls `listener` whenever the owner's work queues growth in the governor; returns the
    * unsubscription. */
@@ -268,9 +263,10 @@ export class WriteCredits {
     this.#queuedListeners.add(listener);
     return () => this.#queuedListeners.delete(listener);
   }
-  /** The owner's work queued as holder growth (`queuedWork`): ordinary growth may not use the
-   * progress reserve (`includesProgress`); progress growth may. */
-  readonly #queuedWork = new Set<QueuedWork>();
+  /** The owner's work queued as holder growth (`queuedGrowth`): ordinary growth may not use the
+   * progress reserve (`includesProgress`); progress growth may. Each item leaves in the drain
+   * step in which its request leaves the governor's queue (`onLeave`), never a microtask later. */
+  readonly #queuedWork = new Set<{ readonly ask: number; readonly progress: boolean }>();
 
   get hasMergeStep(): boolean {
     return this.#mergeFloor !== 0 || this.#mergeActive !== null;
@@ -774,13 +770,7 @@ export class WriteCredits {
       // instead: the governor bounds it by them, and it is not growth queued ahead of it.
       const queued =
         holdings === undefined ? parts.reduce((sum, part) => sum + part.minimumBytes, 0) : 0;
-      // The credit this work holds and returns once it is served and finishes: the accounts it
-      // grows (`servableNow`'s safety order).
-      const item: QueuedWork = {
-        ask: queued,
-        progress: includesProgress,
-        held: () => accounts.reduce((sum, account) => sum + account.held, 0),
-      };
+      const item = { ask: queued, progress: includesProgress };
       const leave = () => this.#queuedWork.delete(item);
       if (queued > 0) {
         this.#queuedWork.add(item);
@@ -798,7 +788,10 @@ export class WriteCredits {
           grants: parts,
           ...(holdings === undefined ? {} : { holdings }),
           signal: stop,
-          onServed: leave,
+          // Once served and finished, this work returns what its accounts hold (`servableNow`
+          // credits each account once across the owner's queued work).
+          returns: () => accounts,
+          onLeave: leave,
         });
       } finally {
         leave();

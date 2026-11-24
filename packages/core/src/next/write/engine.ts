@@ -853,10 +853,15 @@ export class WritePathImpl implements WritePath, EngineHooks {
       budget: grant,
       // A reader closing can release what only older readers kept (a dropped table's memtables,
       // retired run readers): wake reclaim for it, as any transition that frees credit does.
-      readers: new ReaderRegistry(() => {
-        this.#nativeProgress();
-        this.#reclaimable();
-      }),
+      readers: new ReaderRegistry(
+        () => {
+          this.#nativeProgress();
+          this.#reclaimable();
+        },
+        // What readers keep from release changed (one closed, or a hold was added): a waiting
+        // request's bound changed with it, whatever the writer is doing (`#readersChanged`).
+        () => this.#readersChanged(),
+      ),
       pinState: (state, label) => this.#pinState(state, label),
       blockedStateBytes: (states) => this.#blockedStateBytes(states),
       runReader: (ref) => this.#runReader(ref),
@@ -2169,6 +2174,19 @@ export class WritePathImpl implements WritePath, EngineHooks {
     });
   }
 
+  /** Deferred like `#reclaimable`, but not gated on the writer's own work: a reader's pins are
+   * not the writer's, so a running flush or merge must not hold back the queue's new answer
+   * (served at last, or refused at once). */
+  #readersWake = false;
+  #readersChanged(): void {
+    if (this.#readersWake) return;
+    this.#readersWake = true;
+    queueMicrotask(() => {
+      this.#readersWake = false;
+      if (!this.#closed) this.#credits.notifyReclaimable();
+    });
+  }
+
   #canRetireIdleForecasts(): boolean {
     // This is a phase boundary, not a guess that a pending writer will soon finish.
     // A queued/retrying preparation must either recheck its own admission or keep
@@ -2765,6 +2783,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
    */
   #blockedStateBytes(states: Iterable<WriteState>): number {
     const current = this.#state;
+    // Pins of the current state keep nothing a reader returns: no directory scan for them.
+    const pinned: WriteState[] = [];
+    for (const state of states)
+      if (state !== current && this.#statePins.has(state)) pinned.push(state);
+    if (pinned.length === 0) return 0;
     const currentDirs = new Set<object>();
     const currentChunks = new Set<object>();
     for (const view of current.tables.values()) {
@@ -2778,8 +2801,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
       seen.add(object);
       bytes += charge;
     };
-    for (const state of states) {
-      if (state === current) continue;
+    for (const state of pinned) {
       const held = this.#statePins.get(state);
       if (held === undefined) continue;
       count(held.pin, held.pin.bytes ?? 0);
@@ -3286,7 +3308,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const credits = this.#credits;
     return {
       grants: credits.grants(),
-      retained: () => {
+      retained: (pinned) => {
         const queued = credits.queuedGrowth;
         if (queued.ordinary + queued.progress === 0)
           return credits.retainedWhileOpen(
@@ -3304,9 +3326,10 @@ export class WritePathImpl implements WritePath, EngineHooks {
         for (const grant of credits.grants()) held += grant.held;
         const lifetimeInGrants =
           this.#lifetimeBytes() - FIXED_CACHE_BYTES - this.#space.stats.permanentBytes;
-        return Math.max(0, held - lifetimeInGrants);
+        // What the statement's snapshots pin (retired memtables, run readers, superseded state)
+        // is charged to these grants too: the statement counts it already.
+        return Math.max(0, held - lifetimeInGrants - pinned);
       },
-      work: () => credits.queuedWork,
     };
   }
 

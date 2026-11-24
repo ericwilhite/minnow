@@ -65,7 +65,7 @@ it("refuses a request that never fits beside the writer while a recycle waits fo
       await new Promise((resolve) => setTimeout(resolve, 30));
       // Queued behind the turn, it does not suspend what the writer keeps: its holdings still
       // count, so the bound stays below the usable capacity.
-      expect(lent.retained()).toBeGreaterThan(0);
+      expect(lent.retained(0)).toBeGreaterThan(0);
       const bound = governor.servableNow(holdings, true);
       expect(bound).toBeLessThan(governor.usableCapacity(true));
       const cancel = new AbortController();

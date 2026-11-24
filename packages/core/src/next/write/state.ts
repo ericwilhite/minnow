@@ -110,7 +110,17 @@ export class ReaderRegistry {
     readonly bytes: (() => number) | undefined;
   }> = [];
 
-  constructor(readonly changed?: () => void) {}
+  /**
+   * `changed` on any change (a reader opened or closed, a hold added); `released` when what live
+   * readers keep from release changed (a hold added, or a reader closed while holds exist): a
+   * waiting request's bound (`blockedBytes`) and its holders' reclaim move with it. With no hold,
+   * a reader's close keeps nothing back that it did not free itself: no wake (point reads open and
+   * close a reader per statement).
+   */
+  constructor(
+    readonly changed?: () => void,
+    readonly released?: () => void,
+  ) {}
 
   open(): number {
     const id = this.#next++;
@@ -121,8 +131,10 @@ export class ReaderRegistry {
 
   close(id: number): void {
     if (!this.#live.delete(id)) return;
+    const held = this.#pins.length > 0;
     this.#drain();
     this.changed?.();
+    if (held) this.released?.();
   }
 
   get count(): number {
@@ -136,7 +148,10 @@ export class ReaderRegistry {
     this.#drain();
     // Kept: what live readers block grew, so a waiting request's bound changed (it may now be
     // refused, or another request served); wake the owner as any change of holdings does.
-    if (this.#pins.length > 0) this.changed?.();
+    if (this.#pins.length > 0) {
+      this.changed?.();
+      this.released?.();
+    }
   }
 
   /**

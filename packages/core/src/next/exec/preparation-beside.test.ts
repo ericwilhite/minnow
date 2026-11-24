@@ -13,7 +13,7 @@
  * otherwise it waits for finite holders and is served.
  */
 import { expect, it } from "vitest";
-import { Governor } from "../memory/governor.js";
+import { Governor, type Grant } from "../memory/governor.js";
 import { preparationGovernor } from "./preparation.js";
 
 const MiB = 1 << 20;
@@ -88,4 +88,94 @@ it("waits for a finite holder when it fits beside the statement, and is served",
     statement.close();
     preparation.close();
   }
+});
+
+/** "served" (its grants closed at once), else the error's message. */
+const settle = (request: Promise<Grant | readonly Grant[]>) =>
+  request.then(
+    (granted) => {
+      const grants: readonly Grant[] = "close" in granted ? [granted] : granted;
+      for (const grant of grants) grant.close();
+      return "served";
+    },
+    (error: unknown) => (error as Error).message,
+  );
+const turn = () =>
+  new Promise<"pending">((resolve) =>
+    setImmediate(() => {
+      resolve("pending");
+    }),
+  );
+
+it("keeps a bounded preparation admission in the holder queue it names (holdsCredit)", async () => {
+  // #71 review P2: the bounded path dropped `holdsCredit`, so a holder's follow-up queued as a
+  // new admission behind ordinary admissions its own release had to serve.
+  const governor = new Governor(16 * MiB);
+  const running = await governor.admit({
+    label: "running holder",
+    minimumBytes: 11 * MiB,
+    spillable: false,
+  });
+  const chain = governor.openHolderChain("writer", "writer");
+  const preparation = preparationGovernor(governor, "query#1");
+  if (preparation === null) throw new Error("the reference governor has a preparation facade");
+  preparation.besides(() => ({ grants: [running] }));
+  const stop = new AbortController();
+  // A new admission that waits at the head of the admission queue (3 MiB free, it asks 5).
+  const first = settle(
+    governor.admitGroup({
+      label: "new admission",
+      grants: [{ label: "new admission", minimumBytes: 5 * MiB, spillable: false }],
+      signal: stop.signal,
+    }),
+  );
+  const followUp = settle(
+    preparation.admit({
+      label: "holder follow-up",
+      minimumBytes: 3 * MiB,
+      spillable: false,
+      holdsCredit: chain,
+      signal: stop.signal,
+    }),
+  );
+  expect(await Promise.race([followUp, turn()]), "served ahead of the new admission").toBe(
+    "served",
+  );
+  stop.abort(new Error("done"));
+  expect(await first).toBe("done");
+  preparation.close();
+  running.close();
+  chain.close();
+  expect(governor.usedBytes).toBe(0);
+});
+
+it("returns a preparation admission cancelled between its service and its adoption", async () => {
+  // #71 review P3: served, then cancelled before the facade adopted it, the 5 MiB grant still went
+  // to the caller that had stopped waiting.
+  const governor = new Governor(16 * MiB);
+  const blocker = await governor.admit({
+    label: "blocker",
+    minimumBytes: 13 * MiB,
+    spillable: false,
+  });
+  const preparation = preparationGovernor(governor, "query#1");
+  if (preparation === null) throw new Error("the reference governor has a preparation facade");
+  preparation.besides(() => ({ grants: [] }));
+  const stop = new AbortController();
+  const asked = settle(
+    preparation.admit({
+      label: "preparation",
+      minimumBytes: 5 * MiB,
+      spillable: false,
+      signal: stop.signal,
+    }),
+  );
+  blocker.close();
+  // Served in that drain; the cancel lands before the facade's adoption runs.
+  queueMicrotask(() => {
+    stop.abort(new Error("stopped"));
+  });
+  expect(await asked).toBe("stopped");
+  expect(governor.usedBytes).toBe(0);
+  preparation.close();
 });

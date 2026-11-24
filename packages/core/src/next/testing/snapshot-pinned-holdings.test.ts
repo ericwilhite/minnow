@@ -12,8 +12,9 @@
  * Law (GOVERNOR-WAIT-POLICY point 5, next/memory/README.md): a request is refused (typed 53200)
  * before it waits when it could never be served beside what its own statement keeps held while
  * it waits; what other holders keep is finite, and is waited for.
- * - Only this snapshot: counted (`Snapshot.exclusiveBytes`, `WaitingHoldings.pinned`).
- * - Also another live, older snapshot: not counted; the request waits for that one to close.
+ * - Kept from release while this snapshot is open: counted (`Snapshot.blockedBytes`,
+ *   `WaitingHoldings.pinned`), whichever other snapshots keep it too (a hold returns only once
+ *   every reader older than it closes).
  */
 import { afterEach, expect, it } from "vitest";
 import { Governor } from "../memory/governor.js";

@@ -12,7 +12,7 @@
  * Law (GOVERNOR-WAIT-POLICY point 5, next/memory/README.md): a request that could never be served
  * beside what its statement keeps while it waits is refused with 53200 before it waits. Growth
  * the writer queues ahead of the statement that cannot fit beside the statement's holdings blocks
- * every request of it (`LentHoldings.queued`).
+ * every request of it (`servableNow` runs the holder queue ahead of the request).
  */
 import { afterEach, expect, it } from "vitest";
 import { Governor, type Grant } from "../memory/governor.js";
@@ -49,7 +49,7 @@ afterEach(() => {
 });
 
 /** One history; returns the growth the merge waited in the governor for. */
-async function history(second: "free" | "reclaim"): Promise<readonly string[]> {
+async function history(second: "free" | "reclaim", pin = false): Promise<readonly string[]> {
   Governor.stallAfterMs = 4_000;
   // Merges run only when asked (`runMaintenance`): this one starts once the statement holds memory.
   const h = new Harness("strict", "memory", 2, undefined, { merges: { mode: "manual", fanIn: 2 } });
@@ -62,6 +62,7 @@ async function history(second: "free" | "reclaim"): Promise<readonly string[]> {
   };
   const path: WritePathImpl = await h.open();
   const held: Grant[] = [];
+  let view: ReturnType<WritePathImpl["pin"]> | null = null;
   try {
     let t = 0;
     await autocommit(path, async (s) => {
@@ -74,6 +75,9 @@ async function history(second: "free" | "reclaim"): Promise<readonly string[]> {
         ).id ?? 0;
     });
     let id = 0;
+    // A reader older than the flushes below: the memtables they publish stay charged to the
+    // writer's rows for it (held until it closes).
+    view = pin ? path.pin() : null;
     // Two level-0 runs: a merge is due.
     for (let k = 0; k < 6; k++)
       await autocommit(path, (s) =>
@@ -122,6 +126,16 @@ async function history(second: "free" | "reclaim"): Promise<readonly string[]> {
         await new Promise((resolve) => setTimeout(resolve, 10));
       expect(waits, "the merge waits in the governor").not.toEqual([]);
       expect(await within(merge, 200), "the merge waits for its credit").toBe(PENDING);
+      if (view !== null) {
+        // #71 review P1: what the reader pins lies inside the writer's grants, which the writer
+        // keeps whole while its growth is queued. The statement counts the pin and what the
+        // writer keeps beyond it (`LentHoldings.retained(pinned)`): together, each byte once.
+        const pinned = view.blockedBytes();
+        expect(pinned, "the reader keeps flushed rows from release").toBeGreaterThan(0);
+        const whole = lent.retained(0);
+        expect(pinned, "inside what the writer keeps").toBeLessThanOrEqual(whole);
+        expect(lent.retained(pinned) + pinned).toBe(whole);
+      }
       // Decided before any wait: the merge, served first, can never be served beside the
       // statement's memory, and nor can anything the statement asks.
       const request = governor
@@ -153,6 +167,7 @@ async function history(second: "free" | "reclaim"): Promise<readonly string[]> {
     expect(path.failure).toBeNull();
     return waits;
   } finally {
+    view?.release();
     await h.close();
   }
 }
@@ -163,4 +178,8 @@ it("refuses a statement's request typed while the writer's growth waits for memo
   // both.
   expect(await history("reclaim")).toContain("complete grow write path metadata");
   expect((await history("free")).length).toBeGreaterThan(0);
+}, 120_000);
+
+it("counts what the statement's reader pins once beside the writer's queued growth", async () => {
+  expect((await history("free", true)).length).toBeGreaterThan(0);
 }, 120_000);
