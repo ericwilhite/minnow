@@ -1,4 +1,11 @@
-import { jsonCallSource, rowFieldSource, rowObjectSource } from "../../engine/json-call-sources.js";
+import {
+  jsonCallSource,
+  negationSource,
+  rewriteSource,
+  rowFieldSource,
+  rowObjectSource,
+  type RewriteForm,
+} from "../../engine/json-call-sources.js";
 import { isDatePart } from "../../engine/date-part-sources.js";
 import { identifierSource } from "../../engine/identifier-sources.js";
 /**
@@ -24,10 +31,16 @@ import {
   baseType,
   coerce,
   commonType,
+  comparisonType,
+  nameOf,
+  operandName,
   resolveFunction,
   settle,
   type ParameterTypes,
   type Typed,
+  arrayElementType,
+  listCommonType,
+  typedAs,
 } from "./coerce.js";
 import { PlanningError, unsupported } from "./errors.js";
 import {
@@ -52,6 +65,8 @@ export type SubqueryRequest =
       readonly test: Collated;
       readonly cmp: "=" | "<>" | "<" | "<=" | ">" | ">=";
       readonly quantifier: "any" | "all";
+      /** The operator PostgreSQL's 42883 names: NOT IN (subquery) is NOT (x = ANY (subquery)). */
+      readonly named?: "=";
     };
 
 /** How names (and, in a grouped block, whole expressions) resolve. */
@@ -106,10 +121,13 @@ function requestSubquery(request: SubqueryRequest, scope: Scope, state: Expressi
 }
 
 const QUANTIFIED: Readonly<
-  Record<string, { cmp: "=" | "<>" | "<" | "<=" | ">" | ">="; quantifier: "any" | "all" }>
+  Record<
+    string,
+    { cmp: "=" | "<>" | "<" | "<=" | ">" | ">="; quantifier: "any" | "all"; named?: "=" }
+  >
 > = {
   IN: { cmp: "=", quantifier: "any" },
-  "NOT IN": { cmp: "<>", quantifier: "all" },
+  "NOT IN": { cmp: "<>", quantifier: "all", named: "=" },
   "= ANY": { cmp: "=", quantifier: "any" },
   "!= ANY": { cmp: "<>", quantifier: "any" },
   "<> ANY": { cmp: "<>", quantifier: "any" },
@@ -427,7 +445,7 @@ function nullIf(args: readonly Typed[], state: ExpressionState): Typed {
   const [first, second] = args;
   if (first === undefined || second === undefined || args.length !== 2)
     throw new PlanningError("nullif takes two arguments", "42883");
-  const common = commonType(args, state.parameters, "NULLIF");
+  const common = comparisonType(args, state.parameters, "=");
   const a = settle(first, state.parameters);
   const b = settle(second, state.parameters);
   const left = a.pending === undefined ? sqlTypeOf(a.expr.type) : null;
@@ -499,9 +517,46 @@ function unify(
   what: string,
   compared = false,
 ): Typed[] {
-  const common = commonType(values, state.parameters, what);
+  // Comparison operands name PostgreSQL's operator in their refusal (42883); `what` is it.
+  const common = compared
+    ? comparisonType(values, state.parameters, what)
+    : commonType(values, what);
   const type = compared ? baseType(common) : common;
   return values.map((value) => coerce(value, type, "implicit", state.parameters));
+}
+
+/** The form the front end rewrote an operand from (engine/json-call-sources.ts `RewriteForm`). */
+function rewriteOf(expression: Expression): RewriteForm | undefined {
+  return rewriteSource(expression);
+}
+
+/** An untyped NULL literal (PostgreSQL's `exprIsNullConstant`): a typed one is a cast. */
+function isNullLiteral(expression: Expression): boolean {
+  return expression.kind === "literal" && expression.value === null;
+}
+
+/**
+ * An ARRAY constructor's items, built as PostgreSQL builds the array (transformArrayExpr): their
+ * element type (`arrayElementType`), then each item coerced to it in order. An item of the
+ * type's category it cannot be converted from is 42846 there ("ARRAY could not convert type
+ * jsonb to json"), after any earlier item's own input error (22P02). Coerced to the element's
+ * base type, as a comparison's operands (`unify`): an untyped literal is never cut or rounded to
+ * a column's modifier (varchar(3), numeric(5,2)); typed items keep their own.
+ */
+function arrayItems(
+  items: readonly Typed[],
+  state: ExpressionState,
+  unresolved: ReadonlySet<Typed>,
+): { readonly element: PhysicalType; readonly list: Typed[] } {
+  const { type, named, unconvertible } = arrayElementType(items, state.parameters, unresolved);
+  const element = type;
+  const base = baseType(element);
+  const list = items.map((item, index) => {
+    const refused = unconvertible.get(index);
+    if (refused !== undefined) throw new PlanningError(refused, "42846");
+    return coerce(item, base, "implicit", state.parameters);
+  });
+  return { element: named, list };
 }
 
 const COMPARISONS: Readonly<Record<string, "=" | "<>" | "<" | "<=" | ">" | ">=">> = {
@@ -513,6 +568,39 @@ const COMPARISONS: Readonly<Record<string, "=" | "<>" | "<" | "<=" | ">" | ">=">
   ">": ">",
   ">=": ">=",
 };
+
+/**
+ * A front-end condition node (an expression's, or a WHERE / HAVING / ON predicate) as a bool
+ * expression. Where the 0.x negation pass rewrote `NOT (x op y)` into `x op' y`
+ * (`negationSource`), the condition as written is resolved first: PostgreSQL resolves the
+ * operator written, so its errors name it ("integer = text" under NOT, not "integer <> text"),
+ * in its order (`NOT (i BETWEEN 1 AND true)` fails at `<=`). Its result is dropped; the rewritten
+ * form, the same types and parameters, is what runs. Not when the written form holds a subquery:
+ * resolving it twice would plan the subquery twice.
+ */
+export function lowerPredicate(
+  node: {
+    readonly operator: PredicateOperator;
+    readonly left: Expression;
+    readonly right: Expression;
+    readonly escape?: string | undefined;
+  },
+  scope: Scope,
+  state: ExpressionState,
+): Typed {
+  const written = negationSource(node) as Extract<Expression, { kind: "condition" }> | undefined;
+  if (written !== undefined && !holdsSubquery(written)) lowerPredicate(written, scope, state);
+  return lowerCondition(node.operator, node.left, node.right, node.escape, scope, state);
+}
+
+/** Whether an AST value holds a subquery or EXISTS anywhere below it. */
+function holdsSubquery(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  if (Array.isArray(value)) return value.some(holdsSubquery);
+  const kind = (value as { readonly kind?: unknown }).kind;
+  if (kind === "subquery" || kind === "exists") return true;
+  return Object.values(value).some(holdsSubquery);
+}
 
 /** A front-end condition (`left operator right`) as a bool expression. */
 export function lowerCondition(
@@ -536,7 +624,7 @@ export function lowerCondition(
   if (cmp !== undefined) {
     const l = lowerExpression(left, scope, state);
     const r = lowerExpression(right, scope, state);
-    const [a, b] = unify([l, r], state, "comparison", true) as [Typed, Typed];
+    const [a, b] = unify([l, r], state, cmp, true) as [Typed, Typed];
     return {
       expr: {
         op: "compare",
@@ -562,12 +650,43 @@ export function lowerCondition(
     }
     case "IS DISTINCT FROM":
     case "IS NOT DISTINCT FROM": {
-      const [a, b] = unify(
-        [lowerExpression(left, scope, state), lowerExpression(right, scope, state)],
-        state,
-        "IS DISTINCT FROM",
-        true,
-      ) as [Typed, Typed];
+      // PostgreSQL (transformAExprDistinct): against an untyped NULL literal, either side (the
+      // right first), it is IS [NOT] NULL of the other operand, with no operator to find
+      // (`j IS DISTINCT FROM NULL` for json, which has no `=`). A typed NULL (`NULL::json`) is no
+      // NULL literal.
+      const nullSide = isNullLiteral(right) ? left : isNullLiteral(left) ? right : null;
+      if (nullSide !== null) {
+        const arg = settle(lowerExpression(nullSide, scope, state), state.parameters);
+        return {
+          expr: {
+            op: "isNull",
+            negated: operator === "IS DISTINCT FROM",
+            arg: arg.expr,
+            type: BOOL,
+          },
+          nullable: false,
+          big: false,
+        };
+      }
+      const l = lowerExpression(left, scope, state);
+      // `x IS [NOT] TRUE|FALSE`, which the front end writes as IS [NOT] DISTINCT FROM a boolean
+      // (`rewrite`): PostgreSQL requires a boolean argument (42804), before any operator.
+      if (
+        rewriteOf(right) === "truth" &&
+        l.pending === undefined &&
+        l.expr.type.kind !== BOOL.kind
+      ) {
+        const truth = right.kind === "literal" && right.value === true ? "TRUE" : "FALSE";
+        const not = operator === "IS DISTINCT FROM" ? "NOT " : "";
+        throw new PlanningError(
+          `argument of IS ${not}${truth} must be type boolean, not type ${operandName(l.expr.type)}`,
+          "42804",
+        );
+      }
+      const [a, b] = unify([l, lowerExpression(right, scope, state)], state, "=", true) as [
+        Typed,
+        Typed,
+      ];
       return {
         expr: {
           op: "distinctFrom",
@@ -602,8 +721,28 @@ export function lowerCondition(
           `${operator} over ${right.kind === "subquery" ? "a subquery" : right.kind}`,
         );
       const arg = lowerExpression(left, scope, state);
-      const items = right.items.map((item) => lowerExpression(item, scope, state));
-      const [first, ...rest] = unify([arg, ...items], state, "IN", true);
+      // A parameter still unresolved when its own item is lowered is UNKNOWN to an ARRAY's
+      // element type, whatever a later item fixes it to (`arrayElementType`).
+      const unresolved = new Set<Typed>();
+      const items = right.items.map((item) => {
+        const typed = lowerExpression(item, scope, state);
+        if (typed.pending?.kind === "param" && state.parameters.type(typed.pending.index) === null)
+          unresolved.add(typed);
+        return typed;
+      });
+      const cmp = operator === "IN" ? "=" : "<>";
+      // `x = ANY (ARRAY[...])` / `x <> ALL (ARRAY[...])`, which the front end writes as an IN /
+      // NOT IN list (`rewrite`): PostgreSQL builds the array first, so its items need a common
+      // type ("ARRAY types integer and boolean cannot be matched", 42804), and the test is one
+      // operator over it; no per-item comparison.
+      const array = rewriteOf(right) === "array";
+      const built = array ? arrayItems(items, state, unresolved) : null;
+      const list = built?.list ?? items;
+      // One operator against the array's element type: its refusal names that type (character
+      // varying), not an item's base (text).
+      if (built !== null) comparisonType([arg, typedAs(built.element)], state.parameters, cmp);
+      if (!array) return lowerInList(arg, items, operator, state);
+      const [first, ...rest] = unify([arg, ...list], state, cmp, true);
       if (first === undefined) throw new PlanningError("IN needs a value", "42601");
       return {
         expr: {
@@ -625,13 +764,28 @@ export function lowerCondition(
     case "SIMILAR TO":
     case "NOT SIMILAR TO": {
       const text: PhysicalType = { kind: "text" };
-      const arg = coerce(lowerExpression(left, scope, state), text, "implicit", state.parameters);
-      const pattern = coerce(
-        lowerExpression(right, scope, state),
-        text,
-        "implicit",
-        state.parameters,
-      );
+      const l = lowerExpression(left, scope, state);
+      const r = lowerExpression(right, scope, state);
+      let arg: Typed, pattern: Typed;
+      try {
+        arg = coerce(l, text, "implicit", state.parameters);
+        pattern = coerce(r, text, "implicit", state.parameters);
+      } catch (error) {
+        // PostgreSQL resolves LIKE, ILIKE and SIMILAR TO as operators (~~, ~~*, ~ over
+        // similar_to_escape's text): a non-text operand is "operator does not exist" (42883).
+        if (!(error instanceof PlanningError) || error.sqlState !== "42804") throw error;
+        const similar = operator.endsWith("SIMILAR TO");
+        const symbol =
+          (operator.startsWith("NOT ") ? "!" : "") +
+          (similar ? "~" : operator.endsWith("ILIKE") ? "~~*" : "~~");
+        // SIMILAR TO compares with similar_to_escape's result, which is text.
+        const rightName =
+          similar && (r.pending !== undefined || r.expr.type.kind === "text") ? "text" : nameOf(r);
+        throw new PlanningError(
+          `operator does not exist: ${nameOf(l)} ${symbol} ${rightName}`,
+          "42883",
+        );
+      }
       return {
         expr: {
           op: "like",
@@ -1047,14 +1201,7 @@ export function lowerExpression(
     case "call":
       return lowerCall(expression, scope, state);
     case "condition":
-      return lowerCondition(
-        expression.operator,
-        expression.left,
-        expression.right,
-        expression.escape,
-        scope,
-        state,
-      );
+      return lowerPredicate(expression, scope, state);
     case "logical": {
       const args: ScalarExpr[] = [];
       let nullable = false;
@@ -1088,7 +1235,13 @@ export function lowerExpression(
         expression.otherwise === undefined
           ? null
           : lowerExpression(expression.otherwise, scope, state);
-      const results = unify(otherwise === null ? thens : [...thens, otherwise], state, "CASE");
+      // PostgreSQL resolves the ELSE result first (transformCaseExpr), then the THEN results.
+      const ordered = unify(otherwise === null ? thens : [otherwise, ...thens], state, "CASE");
+      const [resolvedElse] = ordered;
+      const results =
+        otherwise === null || resolvedElse === undefined
+          ? ordered
+          : [...ordered.slice(1), resolvedElse];
       const values = otherwise === null ? results : results.slice(0, -1);
       const last = otherwise === null ? null : (results.at(-1) ?? null);
       const type = results[0]?.expr.type ?? { kind: "text" };
@@ -1124,3 +1277,112 @@ export function lowerExpression(
       throw unsupported("fullTextSearch", "full-text search in this scope");
   }
 }
+
+/**
+ * `arg [NOT] IN (items)` as PostgreSQL's transformAExprIn builds it. The items that reference no
+ * column of this query (constants, parameters, expressions of them) become one `= ANY` (`<> ALL`)
+ * over their and `arg`'s common type when there are two or more and one exists (select_common_type
+ * without a context: `listCommonType`); each item coerced to it in order. Every other item is
+ * compared with `arg` on its own, in list order, by its own operator: a column is never compared
+ * in the list's common type (`n IN (g, f)` compares numeric with bigint, then with float8), and an
+ * untyped item beside it never takes another item's type (`'1' IN ('12345', b)`). The results are
+ * OR-ed (AND-ed for NOT IN), the array's first.
+ */
+function lowerInList(
+  arg: Typed,
+  items: readonly Typed[],
+  operator: "IN" | "NOT IN",
+  state: ExpressionState,
+): Typed {
+  const cmp = operator === "IN" ? "=" : "<>";
+  // One item is its own pair, by its own operator (`j IN ('x')` names json = unknown); it and an
+  // empty caller-sized list keep the list node.
+  if (items.length <= 1) {
+    const typed = unify([arg, ...items], state, cmp, true);
+    const [first, ...rest] = typed;
+    if (first === undefined) throw new PlanningError("IN needs a value", "42601");
+    return {
+      expr: {
+        op: "inList",
+        negated: operator === "NOT IN",
+        arg: first.expr,
+        list: rest.map((item) => item.expr),
+        collation: collationOf([arg, ...items]),
+        type: BOOL,
+      },
+      nullable: typed.some((item) => item.nullable),
+      big: false,
+    };
+  }
+  const constants: Typed[] = [],
+    columns: Typed[] = [];
+  for (const item of items) (referencesColumn(item.expr) ? columns : constants).push(item);
+  const common = constants.length > 1 ? listCommonType([arg, ...constants]) : null;
+  const terms: Typed[] = [];
+  if (common !== null) {
+    const coerced = constants.map((item) => coerce(item, common, "implicit", state.parameters));
+    const type = comparisonType([arg, typedAs(common)], state.parameters, cmp);
+    const left = coerce(arg, type, "implicit", state.parameters);
+    const list = coerced.map((item) => coerce(item, type, "implicit", state.parameters));
+    terms.push({
+      expr: {
+        op: "inList",
+        negated: operator === "NOT IN",
+        arg: left.expr,
+        list: list.map((item) => item.expr),
+        collation: collationOf([arg, ...constants]),
+        type: BOOL,
+      },
+      nullable: left.nullable || list.some((item) => item.nullable),
+      big: false,
+    });
+  }
+  for (const item of common === null ? items : columns) {
+    const [a, b] = unify([arg, item], state, cmp, true) as [Typed, Typed];
+    terms.push({
+      expr: {
+        op: "compare",
+        cmp,
+        left: a.expr,
+        right: b.expr,
+        collation: collationOf([arg, item]),
+        type: BOOL,
+      },
+      nullable: a.nullable || b.nullable,
+      big: false,
+    });
+  }
+  const [only] = terms;
+  if (terms.length === 1 && only !== undefined) return only;
+  return {
+    expr: {
+      op: operator === "IN" ? "or" : "and",
+      args: terms.map((term) => term.expr),
+      type: BOOL,
+    },
+    nullable: terms.some((term) => term.nullable),
+    big: false,
+  };
+}
+
+/** Whether `expr` references a column of this query's input (contain_vars_of_level 0). */
+function referencesColumn(expr: ScalarExpr): boolean {
+  if (expr.op === "column") return true;
+  for (const value of Object.values(expr) as unknown[]) {
+    if (isScalar(value)) {
+      if (referencesColumn(value)) return true;
+    } else if (Array.isArray(value)) {
+      for (const element of value as unknown[]) {
+        if (isScalar(element) && referencesColumn(element)) return true;
+        if (isBranch(element) && (referencesColumn(element.when) || referencesColumn(element.then)))
+          return true;
+      }
+    }
+  }
+  return false;
+}
+
+const isScalar = (value: unknown): value is ScalarExpr =>
+  typeof value === "object" && value !== null && "op" in value && "type" in value;
+const isBranch = (value: unknown): value is { when: ScalarExpr; then: ScalarExpr } =>
+  typeof value === "object" && value !== null && "when" in value && "then" in value;

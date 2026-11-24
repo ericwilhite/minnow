@@ -45,12 +45,13 @@ import { DUAL_TABLE } from "../../engine/query.js";
 import type { CompiledQuery, Expression, JoinPlan, TableSource } from "../../plan/model.js";
 import { isCrossJoinPlan } from "../../plan/model.js";
 import { accessPath, selectivityOf } from "./access-path.js";
-import { baseType, coerce, commonType, settle, type Typed } from "./coerce.js";
+import { baseType, coerce, commonType, comparisonType, settle, type Typed } from "./coerce.js";
 import { PlanningError, unsupported } from "./errors.js";
 import {
   asBool,
   callFunction,
   lowerCondition,
+  lowerPredicate,
   lowerExpression,
   type Scope,
   type Collated,
@@ -98,6 +99,8 @@ export type BlockLowerer = (
   block: CompiledQuery,
   builder: PlanBuilder,
   outer?: OuterResolver,
+  /** A set operation's member: its untyped `$n` stay unknown for the column matching. */
+  options?: { readonly setOperand?: boolean },
 ) => LoweredRel;
 
 /** A relation of the join tree: its columns' virtual indexes (`layout`) and estimate. */
@@ -520,7 +523,11 @@ export function lowerFrom(
         big: innerColumn.big,
       };
       const type = baseType(
-        commonType([request.test, innerTyped], builder.parameters, "subquery comparison"),
+        comparisonType(
+          [request.test, innerTyped],
+          builder.parameters,
+          request.named ?? request.cmp,
+        ),
       );
       const test = coerce(request.test, type, "implicit", builder.parameters);
       const cast = coerce(innerTyped, type, "implicit", builder.parameters);
@@ -663,17 +670,7 @@ export function lowerFrom(
     });
     const state = builder.state;
     const where = block.predicates.map((predicate) =>
-      asBool(
-        lowerCondition(
-          predicate.operator,
-          predicate.left,
-          predicate.right,
-          predicate.escape,
-          inner.scope,
-          state,
-        ),
-        state,
-      ),
+      asBool(lowerPredicate(predicate, inner.scope, state), state),
     );
     const selected = block.select[0];
     if (selected === undefined) return null;
@@ -686,7 +683,9 @@ export function lowerFrom(
       [...sourcesOf(expr)].every((source) => !innerSources.has(source));
     const innerOnly = (expr: ScalarExpr) => subset(sourcesOf(expr), innerSources);
     if (!innerOnly(tested.expr) || !outerOnly(request.test.expr)) return null;
-    const type = baseType(commonType([request.test, tested], builder.parameters, "IN"));
+    const type = baseType(
+      comparisonType([request.test, tested], builder.parameters, request.named ?? request.cmp),
+    );
     const probeKey = coerce(request.test, type, "implicit", builder.parameters);
     const buildKey = coerce(tested, type, "implicit", builder.parameters);
     const collation = request.test.collation ?? (tested as Collated).collation ?? null;
@@ -1470,7 +1469,12 @@ export function lowerSetOperation(
   lowerInner: BlockLowerer,
   outer: OuterResolver | undefined,
 ): LoweredRel {
-  const [first, ...rest] = union.blocks.map((block) => lowerInner(block, builder, outer));
+  const [first, ...rest] = union.blocks.map((block) =>
+    lowerInner(block, builder, outer, { setOperand: true }),
+  );
+  // VALUES (…), (…) is a UNION ALL of one-row members to the front end; PostgreSQL's messages
+  // name it VALUES. A set operation's name drops ALL ("UNION types integer and boolean …").
+  const values = union.blocks.every((block) => block.sql === "(values)");
   if (first === undefined) throw new PlanningError("empty set operation", "XX000");
   let acc: LoweredRel = first;
   for (const [index, next] of rest.entries()) {
@@ -1500,8 +1504,9 @@ export function lowerSetOperation(
       )
     )
       throw unsupported("setOp", "EXCEPT blank-padded CHAR equality");
+    const context = values ? "VALUES" : (op.split(" ")[0] ?? op).toUpperCase();
     const types = acc.columns.map((_, position) =>
-      commonType([side(acc, position), side(next, position)], builder.parameters, op.toUpperCase()),
+      commonType([side(acc, position), side(next, position)], context),
     );
     const conform = (input: LoweredRel): LoweredRel => {
       const casts = input.columns.map((_, position) =>

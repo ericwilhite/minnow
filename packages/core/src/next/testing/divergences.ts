@@ -632,3 +632,31 @@ export const FAILED_PREPARE_KEEPS_TRANSACTION = {
   authority:
     "PostgreSQL exec_parse_message: an error during Parse aborts the transaction (25P02 after), observed in PGlite",
 } as const;
+
+/**
+ * Found by #63's generator (Neon's review), not changed by it: a simple CASE whose test is an
+ * untyped literal (`CASE '1' WHEN i THEN 1 END`, `CASE NULL WHEN 1 ...`) is typed text by
+ * PostgreSQL's transformCaseExpr, so a non-text WHEN is "operator does not exist: text =
+ * integer" (42883). The shared front end desugars CASE x WHEN v into `x = v` before next/'s
+ * lowering sees the test, which then takes the WHEN value's type and runs. Fixing it needs the
+ * desugar to mark its test (engine/query.ts, the 0.x bundles).
+ */
+export const SIMPLE_CASE_UNTYPED_TEST = {
+  id: "simple-case-untyped-test",
+  ruling: "lead 2026-11-23 (#63 review): register; not widened into #63",
+  authority: "PostgreSQL transformCaseExpr: an unknown-type CASE test is coerced to text (PGlite)",
+} as const;
+
+/**
+ * Found by #63's review (Neon), narrowed by it: next/'s coercion has an implicit json -> jsonb
+ * cast (ir/functions.ts IMPLICIT_CASTS, used by lower/coerce.ts) PostgreSQL does not.
+ * Comparisons over json are refused as PostgreSQL does (42883, `comparisonType`), and every
+ * common type refuses json beside jsonb (42846, lower/coerce.ts `resultCast`: UNION, VALUES,
+ * CASE, COALESCE, GREATEST, LEAST, ARRAY). The cast itself, which a function argument may still
+ * take, is a follow-up.
+ */
+export const JSON_TO_JSONB_IMPLICIT_CAST = {
+  id: "json-to-jsonb-implicit-cast",
+  ruling: "lead 2026-11-23 (#63 review): register and list as a follow-up",
+  authority: "PostgreSQL pg_cast: json -> jsonb is an assignment/explicit cast only (PGlite 42846)",
+} as const;

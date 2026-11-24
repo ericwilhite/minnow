@@ -3507,7 +3507,29 @@ not require a home cache directory.
   lower each text itself and cache that plan under the text, never under the key. A literal
   point-read loop over 10,000 keys lowers once.
 - Every failure is a `PlanningError` with PostgreSQL's SQLSTATE (42601 syntax, 42P01 relation,
-  42703 column, 42883 function, 42704 type, …) or an `UnsupportedPlanError` (0A000). Front-end
+  42703 column, 42883 function or operator, 42704 type, …) or an `UnsupportedPlanError` (0A000).
+  Comparing types without a comparison operator is 42883 "operator does not exist: integer =
+  boolean" in every comparison form (`comparisonType`); mismatched UNION columns and CASE
+  results are 42804, as in PostgreSQL. An IN list is built as PostgreSQL's `transformAExprIn`
+  builds it (`lowerInList`): its items that reference no column (constants, parameters) are one
+  `= ANY` over their and the left side's common type when there are two or more and one exists;
+  every other item, a column above all, is compared with the left side on its own, by its own
+  operator (`n IN (g, f)` compares numeric with bigint, then with float8), OR-ed (AND-ed with
+  `<>` for NOT IN) in list order. Common types (`matchTypes`) treat an untyped `$n` lowered
+  before its type was deduced as unknown, enums as category E and json beside jsonb as
+  unconvertible (42846); an untyped `$n` coerced to another type than the one deduced since is
+  42P08, even where a cast exists. Set operations keep a member's untyped `$n` unknown until
+  their columns are matched, and name themselves as PostgreSQL does (VALUES; UNION, INTERSECT,
+  EXCEPT without ALL; COALESCE, GREATEST, LEAST in upper case). Three rewrites of the shared
+  front end are recorded in a side table, never on the AST (engine/json-call-sources.ts):
+  `x IS [NOT] TRUE|FALSE` (written as IS [NOT] DISTINCT FROM a boolean) keeps PostgreSQL's
+  42804 "argument of IS TRUE must be type boolean"; `x = ANY | <> ALL (ARRAY[...])` (written as
+  an IN / NOT IN list) keeps the array's common-type 42804 and is one comparison, never per item;
+  and the 0.x negation pass's `NOT (x op y)` → `x op' y` keeps the condition as written
+  (`negationSource`), which lowering resolves first (`lowerPredicate`), so its errors name the
+  operator written. LIKE, ILIKE and SIMILAR TO over a non-text operand are 42883 (`~~`, `~~*`,
+  `~`); json has no comparison operator (42883 at lowering). Divergences
+  `simple-case-untyped-test` and `json-to-jsonb-implicit-cast` (testing/divergences.ts). Front-end
   errors are translated by message (`frontEndError`), keeping the parse position and the
   original as `cause`. The messages it depends on are pinned (`testing/front-end-states.test.ts`:
   a snapshot of every mapped front-end message, and per pattern a PGlite-checked statement).

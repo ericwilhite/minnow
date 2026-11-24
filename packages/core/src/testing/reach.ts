@@ -2167,6 +2167,25 @@ export const READ_ONLY_SNAPSHOT_TIMING_REACH = [
   "isolation fixed by a failed statement",
 ] as const;
 
+/** A comparison of two typed columns, refused for a missing operator or compared (operator-sqlstate-pglite). */
+export const OPERATOR_SQLSTATE_REACH = [
+  "no operator",
+  "compared",
+  "multi-item list",
+  "rows compared",
+  "kept 42804",
+  "untyped left",
+  "untyped right",
+  "executed",
+  "refused at execution",
+  "untyped input refused",
+  // #63 round 5: NOT around a predicate (the 0.x negation pass rewrites it; errors name the
+  // operator as written), and IN lists mixing columns with constants (transformAExprIn).
+  "negated",
+  "negated refusal",
+  "columns beside constants",
+] as const;
+
 /** PG per-attribute mode transitions, statement attempts, savepoints and transaction cleanup. */
 export const OWNER_TRANSACTION_MODE_STATES = [
   "read-only begin",

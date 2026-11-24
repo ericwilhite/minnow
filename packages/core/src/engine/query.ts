@@ -30,6 +30,7 @@ import {
   rememberRowField,
   rowFieldSource,
   rememberRowObject,
+  rememberRewrite,
 } from "./json-call-sources.js";
 import { rememberDatePart, copyDatePart, isDatePart } from "./date-part-sources.js";
 import {
@@ -4620,7 +4621,11 @@ export function mapChildExpressions(
     copyDatePart(expression, mapped);
     return mapped;
   }
-  if (expression.kind === "list") return { ...expression, items: expression.items.map(map) };
+  if (expression.kind === "list") {
+    const mapped: Expression = { ...expression, items: expression.items.map(map) };
+    copyJsonCall(expression, mapped);
+    return mapped;
+  }
   if (expression.kind === "case") {
     return {
       ...expression,
@@ -7579,6 +7584,8 @@ function quantifiedArrayCondition(
 ): Expression {
   if (array.kind === "call" && array.name === "ARRAY") {
     const right: Expression = { kind: "list", items: array.arguments };
+    // next/'s lowering keeps PostgreSQL's ARRAY typing for the list (a side table, json-call-sources.ts).
+    if (recordDeclaredTypes) rememberRewrite(right, "array");
     if (operator === "=" && !all) return { kind: "condition", operator: "IN", left, right };
     if ((operator === "<>" || operator === "!=") && all) {
       return { kind: "condition", operator: "NOT IN", left, right };
@@ -11904,11 +11911,14 @@ class Parser {
       if (this.#isKeyword("TRUE") || this.#isKeyword("FALSE")) {
         const truth = this.#isKeyword("TRUE");
         this.#keyword(truth ? "TRUE" : "FALSE");
+        const right: Expression = { kind: "literal", value: truth };
+        // next/'s lowering names PostgreSQL's IS TRUE errors (a side table, json-call-sources.ts).
+        if (recordDeclaredTypes) rememberRewrite(right, "truth");
         return {
           kind: "condition",
           operator: negatedIs ? "IS DISTINCT FROM" : "IS NOT DISTINCT FROM",
           left,
-          right: { kind: "literal", value: truth },
+          right,
         };
       }
       if (this.#isKeyword("UNKNOWN")) {
@@ -11956,22 +11966,33 @@ class Parser {
       this.#keyword("AND");
       const upper = this.#additive();
       // BETWEEN is inclusive-range sugar; the AND here binds at comparison level by the grammar.
+      // NOT BETWEEN is PostgreSQL's `a < x OR a > y` (transformAExprBetween), not NOT over the
+      // range: the same rows, and the operators PostgreSQL's errors name.
       const rangeOver = (low: Expression, high: Expression): Expression => ({
         kind: "logical",
-        operator: "and",
-        left: { kind: "condition", operator: ">=", left: copyLowered(left), right: low },
-        right: { kind: "condition", operator: "<=", left: copyLowered(left), right: high },
+        operator: negated ? "or" : "and",
+        left: {
+          kind: "condition",
+          operator: negated ? "<" : ">=",
+          left: copyLowered(left),
+          right: low,
+        },
+        right: {
+          kind: "condition",
+          operator: negated ? ">" : "<=",
+          left: copyLowered(left),
+          right: high,
+        },
       });
-      // SYMMETRIC also accepts the bounds reversed.
-      const range: Expression = symmetric
+      // SYMMETRIC also accepts the bounds reversed (NOT: outside both orders).
+      return symmetric
         ? {
             kind: "logical",
-            operator: "or",
+            operator: negated ? "and" : "or",
             left: rangeOver(lower, upper),
             right: rangeOver(copyLowered(upper), copyLowered(lower)),
           }
         : rangeOver(lower, upper);
-      return negated ? { kind: "not", operand: range } : range;
     }
     if (this.#isKeyword("IN")) {
       this.#keyword("IN");

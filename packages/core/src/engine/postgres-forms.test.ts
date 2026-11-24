@@ -213,6 +213,21 @@ describe("ANY and ALL over an array parameter", () => {
   });
 });
 
+describe("= ANY over an ARRAY constructor", () => {
+  it("groups as the IN list it is, in both directions (next/'s rewrite marks stay off the AST)", async () => {
+    // Neon's re-check of #63 (a1f129e4): an enumerable mark on the list node entered the query
+    // identity, so GROUP BY no longer matched the select list (42803). PostgreSQL: one
+    // ScalarArrayOpExpr; both statements return the two groups.
+    const db = await database();
+    await db.execute("INSERT INTO items (id, grp) VALUES (1, 'a'), (2, 'b'), (3, 'c')");
+    for (const sql of [
+      "SELECT (id IN (1, 2)) AS hit FROM items GROUP BY (id = ANY (ARRAY[1, 2])) ORDER BY 1",
+      "SELECT (id = ANY (ARRAY[1, 2])) AS hit FROM items GROUP BY (id IN (1, 2)) ORDER BY 1",
+    ])
+      expect((await db.query(sql)).rows, sql).toEqual([{ hit: false }, { hit: true }]);
+  });
+});
+
 describe("GENERATE_SERIES", () => {
   it("produces exactly the rows of the recursive form that defines it", () => {
     for (const sql of [
