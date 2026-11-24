@@ -44,6 +44,8 @@ function exactFloatText(value: number, single: boolean): string {
     const word = bits.getUint32(0);
     fraction = BigInt(word & 0x7fffff);
     exponent = word >>> 23;
+    // An infinity has no digits; it would otherwise print as 2^128's.
+    if (exponent === 255) throw new RangeError(`No binary32 digits for ${String(value)}`);
     width = 23;
     bias = 127;
   } else {
@@ -63,14 +65,21 @@ function exactFloatText(value: number, single: boolean): string {
   const numeratorScale = binaryPower >= 0 ? 1n << BigInt(binaryPower) : 1n;
   const denominator = binaryPower < 0 ? 1n << BigInt(-binaryPower) : 1n;
   const exact = center * numeratorScale;
+  // Zero has no decimal exponent: the search below would never end (a double below the
+  // smallest binary32 subnormal, if a caller passed one unrounded).
+  if (exact === 0n)
+    throw new RangeError(`No ${single ? "binary32" : "binary64"} digits for ${String(value)}`);
   let decimalExponent = Math.floor(Math.log10(magnitude));
   const comparePower = (power: number): bigint =>
     power >= 0
       ? exact - denominator * 10n ** BigInt(power)
       : exact * 10n ** BigInt(-power) - denominator;
-  // log10 is only an estimate near decimal powers. Correct it using the exact ratio.
-  while (comparePower(decimalExponent) < 0n) decimalExponent--;
-  while (comparePower(decimalExponent + 1) >= 0n) decimalExponent++;
+  // log10 is only an estimate near decimal powers. Correct it using the exact ratio: a step or
+  // two for any finite nonzero value (binary64's decimal exponents lie within [-324, 308]).
+  while (comparePower(decimalExponent) < 0n)
+    if (--decimalExponent < -400) throw new RangeError(`No decimal exponent for ${String(value)}`);
+  while (comparePower(decimalExponent + 1) >= 0n)
+    if (++decimalExponent > 400) throw new RangeError(`No decimal exponent for ${String(value)}`);
   for (let digits = 1; digits <= (single ? 9 : 17); digits++) {
     const power = decimalExponent - digits + 1;
     const scale = power < 0 ? 10n ** BigInt(-power) : 1n;
@@ -93,7 +102,11 @@ function exactFloatText(value: number, single: boolean): string {
   throw new Error("No shortest float inside its binary rounding interval");
 }
 
-/** V8's shortest binary64 conversion also chooses nearest digits and even decimal ties.
+/** PostgreSQL's float8 (or, with `single`, float4) output of `value`. With `single` the value
+ * printed is the binary32 it is stored as (`Math.fround`), whatever double is passed; every
+ * call returns.
+ *
+ * V8's shortest binary64 conversion also chooses nearest digits and even decimal ties.
  * Below 2^53 a shortest decimal cannot be a binary midpoint: fractional midpoints
  * need more significant digits than their neighbour, and integer midpoints start
  * above the safe-integer range. Above that bound retain the exact open-interval proof.
@@ -102,6 +115,9 @@ function exactFloatText(value: number, single: boolean): string {
  * back. Power-of-two asymmetric intervals and near decimal ties also fall back.
  */
 export function jsonFloatText(value: number, single: boolean): string {
+  // Single precision prints the binary32 the value is stored as: a double outside its range
+  // is 0 or an infinity there (and never reaches the digit search, which has none for zero).
+  if (single) value = Math.fround(value);
   if (value === 0) return Object.is(value, -0) ? "-0" : "0";
   if (!Number.isFinite(value)) return String(value);
   const magnitude = Math.abs(value);
@@ -124,8 +140,11 @@ export function jsonFloatText(value: number, single: boolean): string {
   for (let precision = 1; precision <= 9; precision++) {
     const text = magnitude.toPrecision(precision);
     const candidate = Number(text);
-    if (Math.fround(candidate) !== magnitude) continue;
-    if (!(candidate > lower && candidate < upper)) return exactFloatText(value, true);
+    // Number() is monotone and both endpoints are exact doubles: a candidate strictly outside
+    // the interval proves its decimal is outside too; one equal to an endpoint proves nothing
+    // (whatever the mantissa's parity), so it falls back.
+    if (candidate < lower || candidate > upper) continue;
+    if (candidate === lower || candidate === upper) return exactFloatText(value, true);
     const power = decimalPower(text, precision);
     const mantissa = (word & 0x7fffff) + (exponent === 0 ? 0 : 0x800000);
     const trailing = 31 - Math.clz32(mantissa & -mantissa);
