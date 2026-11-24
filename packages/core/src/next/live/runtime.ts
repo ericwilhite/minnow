@@ -188,6 +188,15 @@ export class LiveRuntime {
     }, options.pollIntervalMs ?? 1000);
     (this.#poll as unknown as { unref?: () => void }).unref?.();
   }
+  /**
+   * The newest commit LSN whose notification this runtime has consumed. The feed publishes a
+   * commit's LSN at once (`ChangeFeed.probe()`) and dispatches its notification on a later task,
+   * so the two are equal only once the runtime has heard of every commit (tests wait for that
+   * before they attribute a delivery to a later transaction).
+   */
+  get seenLsn(): number {
+    return this.#seen;
+  }
   get stats() {
     let dirty = 0,
       running = 0,

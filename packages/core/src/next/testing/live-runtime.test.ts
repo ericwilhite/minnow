@@ -75,6 +75,13 @@ describe("native live-query runtime and MessageChannel transport", () => {
         return observed;
       }
       async function settled() {
+        // A commit's notification reaches the runtime on a later task than the COMMIT reply
+        // (access/changes.ts `notify`). Until it has, the runtime looks idle and a delivery for
+        // that commit can still come: wait for it before reading the runtime's state.
+        await until(() => {
+          const runtime = active.engine.live;
+          return runtime === undefined || runtime.seenLsn === runtime.feed.probe();
+        });
         await until(() => {
           const stats = active.engine.live?.stats;
           return (
