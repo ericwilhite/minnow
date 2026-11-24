@@ -1,4 +1,10 @@
-import { jsonCallSource, rowFieldSource, rowObjectSource } from "../../engine/json-call-sources.js";
+import {
+  jsonCallSource,
+  rewriteSource,
+  rowFieldSource,
+  rowObjectSource,
+  type RewriteForm,
+} from "../../engine/json-call-sources.js";
 import { isDatePart } from "../../engine/date-part-sources.js";
 import { identifierSource } from "../../engine/identifier-sources.js";
 /**
@@ -526,26 +532,44 @@ function hasCommonType(values: readonly Typed[], state: ExpressionState): boolea
   }
 }
 
-/** The form the front end rewrote an operand from (engine/query.ts sets it, untyped): `truth`
- * for IS [NOT] TRUE|FALSE's boolean, `array` for `= ANY` / `<> ALL` over an ARRAY constructor. */
-function rewriteOf(expression: Expression): string | undefined {
-  return (expression as { readonly rewrite?: string }).rewrite;
+/** The form the front end rewrote an operand from (engine/json-call-sources.ts `RewriteForm`). */
+function rewriteOf(expression: Expression): RewriteForm | undefined {
+  return rewriteSource(expression);
 }
 
-/** An ARRAY constructor's items have a common type, or PostgreSQL's 42804 naming the first two
- * that cannot be matched. */
-function arrayType(items: readonly Typed[], state: ExpressionState): void {
-  const typed = items.filter((item) => item.pending === undefined);
-  typed.forEach((item, k) => {
-    if (k === 0 || hasCommonType(typed.slice(0, k + 1), state)) return;
-    const earlier = typed.slice(0, k);
-    const first = earlier.find((other) => !hasCommonType([other, item], state)) ?? earlier[0];
-    if (first === undefined) return;
+/** Whether a typed json value is jsonb. */
+function isBinary(item: Typed | undefined): boolean {
+  return item?.expr.type.kind === "json" && item.expr.type.binary;
+}
+
+/** An untyped NULL literal (PostgreSQL's `exprIsNullConstant`): a typed one is a cast. */
+function isNullLiteral(expression: Expression): boolean {
+  return expression.kind === "literal" && expression.value === null;
+}
+
+/**
+ * An ARRAY constructor's items, built as PostgreSQL builds the array (transformArrayExpr): their
+ * common type (all untyped is text; "ARRAY types numeric and boolean cannot be matched", 42804,
+ * naming the running common type), each item coerced to it (an untyped literal that is no value
+ * of it is its input error, 22P02; a parameter takes it). The comparison is then against that
+ * element type: `i = ANY (ARRAY['1'])` is "integer = text" (42883).
+ */
+function arrayItems(items: readonly Typed[], state: ExpressionState): Typed[] {
+  // json and jsonb in one ARRAY: PostgreSQL keeps the first one's type (neither converts to the
+  // other implicitly there) and refuses the other's conversion (42846). next/'s implicit
+  // json -> jsonb (divergence `json-to-jsonb-implicit-cast`) does not reach an ARRAY.
+  const jsonKinds = items.filter(
+    (item) => item.pending === undefined && item.expr.type.kind === "json",
+  );
+  const [firstJson] = jsonKinds;
+  const other = jsonKinds.find((item) => isBinary(item) !== isBinary(firstJson));
+  if (firstJson !== undefined && other !== undefined)
     throw new PlanningError(
-      `ARRAY types ${operandName(first.expr.type)} and ${operandName(item.expr.type)} cannot be matched`,
-      "42804",
+      `ARRAY could not convert type ${operandName(other.expr.type)} to ${operandName(firstJson.expr.type)}`,
+      "42846",
     );
-  });
+  const element = commonType(items, state.parameters, "ARRAY");
+  return items.map((item) => coerce(item, element, "implicit", state.parameters));
 }
 
 const COMPARISONS: Readonly<Record<string, "=" | "<>" | "<" | "<=" | ">" | ">=">> = {
@@ -606,6 +630,24 @@ export function lowerCondition(
     }
     case "IS DISTINCT FROM":
     case "IS NOT DISTINCT FROM": {
+      // PostgreSQL (transformAExprDistinct): against an untyped NULL literal, either side (the
+      // right first), it is IS [NOT] NULL of the other operand, with no operator to find
+      // (`j IS DISTINCT FROM NULL` for json, which has no `=`). A typed NULL (`NULL::json`) is no
+      // NULL literal.
+      const nullSide = isNullLiteral(right) ? left : isNullLiteral(left) ? right : null;
+      if (nullSide !== null) {
+        const arg = settle(lowerExpression(nullSide, scope, state), state.parameters);
+        return {
+          expr: {
+            op: "isNull",
+            negated: operator === "IS DISTINCT FROM",
+            arg: arg.expr,
+            type: BOOL,
+          },
+          nullable: false,
+          big: false,
+        };
+      }
       const l = lowerExpression(left, scope, state);
       // `x IS [NOT] TRUE|FALSE`, which the front end writes as IS [NOT] DISTINCT FROM a boolean
       // (`rewrite`): PostgreSQL requires a boolean argument (42804), before any operator.
@@ -665,11 +707,12 @@ export function lowerCondition(
       // NOT IN list (`rewrite`): PostgreSQL builds the array first, so its items need a common
       // type ("ARRAY types integer and boolean cannot be matched", 42804), and the test is one
       // operator over it; no per-item comparison.
-      if (rewriteOf(right) === "array") arrayType(items, state);
+      const array = rewriteOf(right) === "array";
+      const list = array ? arrayItems(items, state) : items;
       // PostgreSQL (transformAExprIn): one comparison with the list in the list's common type;
       // without one, each item compared on its own, OR-ed (AND-ed for NOT IN) in list order, so
       // an item without an operator is that pair's 42883 ("operator does not exist").
-      if (rewriteOf(right) !== "array" && !hasCommonType([arg, ...items], state)) {
+      if (!array && !hasCommonType([arg, ...items], state)) {
         const each = items.map((item) => {
           const [a, b] = unify([arg, item], state, cmp, true) as [Typed, Typed];
           return {
@@ -690,7 +733,7 @@ export function lowerCondition(
           big: false,
         };
       }
-      const [first, ...rest] = unify([arg, ...items], state, cmp, true);
+      const [first, ...rest] = unify([arg, ...list], state, cmp, true);
       if (first === undefined) throw new PlanningError("IN needs a value", "42601");
       return {
         expr: {

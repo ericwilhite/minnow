@@ -919,7 +919,9 @@ function simplifyNegations(expression: Expression): Expression {
     };
   }
   if (expression.kind === "list") {
-    return { ...expression, items: expression.items.map(simplifyNegations) };
+    const list: Expression = { kind: "list", items: expression.items.map(simplifyNegations) };
+    copyJsonCall(expression, list);
+    return list;
   }
   if (expression.kind === "case") {
     return {
@@ -3502,7 +3504,9 @@ function foldExpression(expression: Expression): Expression {
     return rewritten;
   }
   if (expression.kind === "list") {
-    return { ...expression, items: expression.items.map(foldExpression) };
+    const folded: Expression = { ...expression, items: expression.items.map(foldExpression) };
+    copyJsonCall(expression, folded);
+    return folded;
   }
   if (expression.kind === "window") {
     return {
@@ -3699,7 +3703,9 @@ function rewriteForInner(
       if (rewritten === undefined) return undefined;
       rewrittenItems.push(rewritten);
     }
-    return { ...expression, items: rewrittenItems };
+    const rewritten: Expression = { ...expression, items: rewrittenItems };
+    copyJsonCall(expression, rewritten);
+    return rewritten;
   }
   if (expression.kind === "condition" || expression.kind === "logical") {
     const left = rewriteForInner(expression.left, source, derived, singleSource);

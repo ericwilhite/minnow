@@ -649,9 +649,11 @@ export const SIMPLE_CASE_UNTYPED_TEST = {
 
 /**
  * Found by #63's review (Neon), not changed by it: next/'s coercion has an implicit json -> jsonb
- * cast (lower/coerce.ts IMPLICIT_CASTS) PostgreSQL does not, so `SELECT j FROM t UNION SELECT
- * jb FROM t` is accepted where PostgreSQL refuses it (42846). Comparisons over json are refused
- * as PostgreSQL does (42883, `comparisonType`); the cast itself is a follow-up.
+ * cast (ir/functions.ts IMPLICIT_CASTS, used by lower/coerce.ts) PostgreSQL does not, so
+ * `SELECT j FROM t UNION SELECT jb FROM t` is accepted where PostgreSQL refuses it (42846).
+ * Comparisons over json are refused as PostgreSQL does (42883, `comparisonType`), and so is
+ * json beside jsonb in one ARRAY constructor (42846, lower/expressions.ts `arrayItems`); the cast
+ * itself is a follow-up.
  */
 export const JSON_TO_JSONB_IMPLICIT_CAST = {
   id: "json-to-jsonb-implicit-cast",

@@ -555,6 +555,10 @@ export function resolveFunction(
   );
   if (generic !== undefined) {
     const type = commonType(args, parameters, fn);
+    // GREATEST and LEAST compare their arguments: json has no comparison (PostgreSQL, at
+    // analysis: "could not identify a comparison function for type json", 42883).
+    if ((fn === "greatest" || fn === "least") && type.kind === "json" && !type.binary)
+      throw new PlanningError("could not identify a comparison function for type json", "42883");
     return { fn, args: args.map(() => type), result: type };
   }
   if (kinds.includes(null))

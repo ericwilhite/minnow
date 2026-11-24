@@ -8,7 +8,15 @@ interface Provenance {
   readonly name?: string;
   readonly field?: RowField;
   readonly row?: string;
+  readonly rewrite?: RewriteForm;
 }
+/**
+ * The PostgreSQL form the front end rewrote a node from, for next/'s lowering: `truth` for the
+ * boolean of IS [NOT] TRUE|FALSE (written as IS [NOT] DISTINCT FROM it), `array` for the list
+ * of `= ANY` / `<> ALL` over an ARRAY constructor (written as IN / NOT IN). A side table, never a
+ * property: the AST's own keys (its query identity, 0.x's plans) stay unchanged.
+ */
+export type RewriteForm = "truth" | "array";
 const sources = new WeakMap<object, Provenance>();
 let present = false;
 const get = (value: object): Provenance | undefined => (present ? sources.get(value) : undefined);
@@ -40,6 +48,12 @@ export function rowObjectSource(value: object): string | undefined {
 }
 export function rememberRowObject(value: object, qualifier: string): void {
   remember(value, { row: qualifier });
+}
+export function rewriteSource(value: object): RewriteForm | undefined {
+  return get(value)?.rewrite;
+}
+export function rememberRewrite(value: object, form: RewriteForm): void {
+  remember(value, { rewrite: form });
 }
 /** Clone hooks preserve call identity, record labels and exact field bindings together. */
 export function copyJsonCall(source: object, target: object): void {

@@ -260,13 +260,17 @@ async function compare(
   // '1' as input of another operand's type (22007, "invalid input syntax"), it does so while it
   // analyses; next/ checks such a literal only when it runs it as a cast from text, which its
   // executor does not run yet (0A000, "casts from text come with the text kernels", #58's
-  // scope), and may meet another operand's error first. The outcome is not compared.
+  // scope), and may meet another operand's error first. Which refusal is not compared; that
+  // next/ refuses is (lowering or execution that accepts it would be wrong).
   if (
     expected.state.startsWith("22") &&
     expected.message.startsWith("invalid input syntax") &&
     sql.includes("'1'")
-  )
+  ) {
+    expect(actual.state, `${sql}: refused (PostgreSQL: ${expected.message})`).not.toBe("00000");
+    reach?.reach("untyped input refused");
     return;
+  }
   expect(actual.state, `${sql}: ${actual.message} (PostgreSQL: ${expected.message})`).toBe(
     expected.state,
   );
@@ -389,6 +393,45 @@ it("answers every form Neon's review of #63 named, as PostgreSQL does", async ()
     await compare(sql);
 });
 
+it("answers every form Neon's re-check of #63 (a1f129e4) named, as PostgreSQL does", async () => {
+  for (const sql of [
+    // P1: against an untyped NULL, IS [NOT] DISTINCT FROM is IS [NOT] NULL (no operator).
+    "SELECT id FROM t WHERE j IS DISTINCT FROM NULL ORDER BY id",
+    "SELECT id FROM t WHERE j IS NOT DISTINCT FROM NULL ORDER BY id",
+    "SELECT id FROM t WHERE NULL IS DISTINCT FROM j ORDER BY id",
+    "SELECT id FROM t WHERE NULL IS NOT DISTINCT FROM j ORDER BY id",
+    "SELECT id FROM t WHERE i IS DISTINCT FROM NULL ORDER BY id",
+    "SELECT NULL IS DISTINCT FROM NULL",
+    // ... but a typed NULL is an operand: json has no = (42883).
+    "SELECT id FROM t WHERE j IS DISTINCT FROM NULL::json ORDER BY id",
+    // P2: the ARRAY is built first: its element type, its items coerced to it.
+    "SELECT id FROM t WHERE i = ANY (ARRAY['1', '2']) ORDER BY id",
+    "SELECT id FROM t WHERE i <> ALL (ARRAY['1', '2']) ORDER BY id",
+    "SELECT id FROM t WHERE i = ANY (ARRAY[NULL, NULL]) ORDER BY id",
+    "SELECT id FROM t WHERE i = ANY (ARRAY[NULL, '1']) ORDER BY id",
+    "SELECT id FROM t WHERE b = ANY (ARRAY['1', '2']) ORDER BY id",
+    "SELECT id FROM t WHERE s = ANY (ARRAY[1, 'x']) ORDER BY id",
+    "SELECT id FROM t WHERE i = ANY (ARRAY['x', true]) ORDER BY id",
+    "SELECT id FROM t WHERE i = ANY (ARRAY[$1, ($1 = true)])",
+    "SELECT id FROM t WHERE i = ANY (ARRAY[1, 1.5, true])",
+    "SELECT id FROM t WHERE j = ANY (ARRAY[NULL, NULL])",
+    "SELECT id FROM t WHERE i = ANY (ARRAY[1, '2']) ORDER BY id",
+    "SELECT id FROM t WHERE s = ANY (ARRAY['a', NULL]) ORDER BY id",
+    // P2: = ANY (ARRAY[...]) and IN (...) are one expression to GROUP BY (no AST mark leaks
+    // into the query identity).
+    "SELECT (i IN (1, 2)) FROM t GROUP BY (i = ANY (ARRAY[1, 2])) ORDER BY 1",
+    "SELECT (i = ANY (ARRAY[1, 2])) FROM t GROUP BY (i IN (1, 2)) ORDER BY 1",
+    // P3: json and jsonb in one ARRAY (42846, the first item's type kept).
+    "SELECT id FROM t WHERE i = ANY (ARRAY[j, jb])",
+    "SELECT id FROM t WHERE i = ANY (ARRAY[jb, j])",
+    // P3: GREATEST and LEAST compare: json has no comparison function (42883).
+    "SELECT GREATEST(j, j) FROM t",
+    "SELECT LEAST(j, j) FROM t",
+    "SELECT GREATEST(jb, jb) FROM t",
+  ])
+    await compare(sql, undefined, true);
+});
+
 it("keeps 42804 where PostgreSQL matches result types (UNION, CASE results)", async () => {
   for (const sql of [
     "SELECT i FROM t UNION SELECT b FROM t",
@@ -412,7 +455,17 @@ for (const seed of seedsFor("next-operator-sqlstate", [0x6501, 0x6502]))
           },
           { weight: 1, arbitrary: fc.constantFrom<string>(...UNTYPED) },
         ),
-        fc.array(fc.constantFrom(...TYPES), { minLength: 1, maxLength: 3 }),
+        // Right operands: columns, or an untyped literal (NULL or '1') on that side too.
+        fc.array(
+          fc.oneof(
+            {
+              weight: 6,
+              arbitrary: fc.constantFrom(...TYPES).map((type) => COLUMNS[type] as string),
+            },
+            { weight: 1, arbitrary: fc.constantFrom<string>(...UNTYPED) },
+          ),
+          { minLength: 1, maxLength: 3 },
+        ),
         async (form, operator, left, rights) => {
           reach.beginHistory();
           const list =
@@ -426,16 +479,9 @@ for (const seed of seedsFor("next-operator-sqlstate", [0x6501, 0x6502]))
           // text; next/'s front end desugars CASE x WHEN v before lowering sees the test.
           if (untyped && form === "case when") return;
           if (untyped) reach.reach("untyped left");
-          await compare(
-            statement(
-              form,
-              operator,
-              left,
-              rights.map((type) => COLUMNS[type]),
-            ),
-            reach,
-            list,
-          );
+          if (rights.some((right) => (UNTYPED as readonly string[]).includes(right)))
+            reach.reach("untyped right");
+          await compare(statement(form, operator, left, rights), reach, list);
         },
       ),
       { seed, numRuns: 400 },

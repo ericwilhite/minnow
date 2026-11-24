@@ -30,6 +30,7 @@ import {
   rememberRowField,
   rowFieldSource,
   rememberRowObject,
+  rememberRewrite,
 } from "./json-call-sources.js";
 import { rememberDatePart, copyDatePart, isDatePart } from "./date-part-sources.js";
 import {
@@ -4620,7 +4621,11 @@ export function mapChildExpressions(
     copyDatePart(expression, mapped);
     return mapped;
   }
-  if (expression.kind === "list") return { ...expression, items: expression.items.map(map) };
+  if (expression.kind === "list") {
+    const mapped: Expression = { ...expression, items: expression.items.map(map) };
+    copyJsonCall(expression, mapped);
+    return mapped;
+  }
   if (expression.kind === "case") {
     return {
       ...expression,
@@ -7578,8 +7583,9 @@ function quantifiedArrayCondition(
   array: Expression,
 ): Expression {
   if (array.kind === "call" && array.name === "ARRAY") {
-    // `rewrite` (untyped) keeps PostgreSQL's ARRAY typing in next/'s lowering of the list.
-    const right = { kind: "list", items: array.arguments, rewrite: "array" } as Expression;
+    const right: Expression = { kind: "list", items: array.arguments };
+    // next/'s lowering keeps PostgreSQL's ARRAY typing for the list (a side table, json-call-sources.ts).
+    if (recordDeclaredTypes) rememberRewrite(right, "array");
     if (operator === "=" && !all) return { kind: "condition", operator: "IN", left, right };
     if ((operator === "<>" || operator === "!=") && all) {
       return { kind: "condition", operator: "NOT IN", left, right };
@@ -11905,12 +11911,14 @@ class Parser {
       if (this.#isKeyword("TRUE") || this.#isKeyword("FALSE")) {
         const truth = this.#isKeyword("TRUE");
         this.#keyword(truth ? "TRUE" : "FALSE");
-        // `rewrite` (untyped) lets next/'s lowering name PostgreSQL's IS TRUE errors.
+        const right: Expression = { kind: "literal", value: truth };
+        // next/'s lowering names PostgreSQL's IS TRUE errors (a side table, json-call-sources.ts).
+        if (recordDeclaredTypes) rememberRewrite(right, "truth");
         return {
           kind: "condition",
           operator: negatedIs ? "IS DISTINCT FROM" : "IS NOT DISTINCT FROM",
           left,
-          right: { kind: "literal", value: truth, rewrite: "truth" } as Expression,
+          right,
         };
       }
       if (this.#isKeyword("UNKNOWN")) {

@@ -2175,8 +2175,10 @@ export const OPERATOR_SQLSTATE_REACH = [
   "rows compared",
   "kept 42804",
   "untyped left",
+  "untyped right",
   "executed",
   "refused at execution",
+  "untyped input refused",
 ] as const;
 
 /** PG per-attribute mode transitions, statement attempts, savepoints and transaction cleanup. */
