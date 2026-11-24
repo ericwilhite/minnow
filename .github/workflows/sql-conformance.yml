@@ -123,6 +123,10 @@ jobs:
           node-version: 24
           cache: npm
       - run: bash scripts/ci-install.sh
+      # Some soaked suites import the built packages (packages/kysely/next imports core/dist), so
+      # build them first, as the unit-test jobs do. Without it every scheduled soak since 5fa5fbb5
+      # failed at next-native-kysely-live with ERR_MODULE_NOT_FOUND, skipping every suite after it.
+      - run: npm run test:prepare
       # Merge tests replay every recorded regression seed. This scheduled frontier deliberately
       # tries seeds that are not in that corpus yet across SQL semantics, mutation semantics,
       # differential execution, cross-client simulation, and both compaction state machines.
