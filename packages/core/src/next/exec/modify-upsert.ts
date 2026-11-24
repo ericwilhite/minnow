@@ -1,4 +1,5 @@
 /** One proposal at a time: arbitrate against prior writes before evaluating EXCLUDED. */
+import { readRefusal } from "../page/read-refusal.js";
 import type { TableDef } from "../access/catalog.js";
 import { CardinalityViolationError, ConflictKind, type Statement } from "../access/modify.js";
 import type { TableSnapshot } from "../access/snapshot.js";
@@ -124,6 +125,15 @@ export class UpsertWriter implements Operator {
     return this.#pending;
   }
   async #fetch(locator: number): Promise<void> {
+    try {
+      await this.#fetchRow(locator);
+    } catch (error) {
+      // The conflicting row is a write-path read: refused typed (write/bytes.ts).
+      throw readRefusal(error);
+    }
+  }
+
+  async #fetchRow(locator: number): Promise<void> {
     const snapshot = this.statement.view;
     const original = (this.#table ??= await snapshot.table(this.table.id, { budget: this.pool }));
     const source = original.segments[locatorSegment(locator)];

@@ -9,6 +9,7 @@ export { utf8Length } from "../utf8.js";
 import { DURABLE_CODECS, requireTag } from "../durable-format.js";
 import { StoreCorruptionError } from "../storage/contract.js";
 import { MemoryAdmissionError } from "../memory-values.js";
+import { readRefusal } from "../page/read-refusal.js";
 import { SMALL_COMMIT_BYTES, StreamCommit, type BufferAllocator } from "./commit-buffers.js";
 
 /** `value`, which the caller knows is present (a broken invariant is a `TypeError`, not data). */
@@ -59,11 +60,17 @@ export class MemtableMemoryError extends Error {
  * memory refusal every other admission reports (`MemoryAdmissionError`: code
  * `MINNOW_MEMORY_ADMISSION`, SQLSTATE 53200, PostgreSQL's out_of_memory). It is raised before
  * the memtable allocation it refused, so the failed statement rolls back with nothing written.
+ *
+ * So does a read the write path's own budget could not hold (page/read-refusal.ts): the old rows
+ * an UPDATE or DELETE reads, index runs, deletion bitmaps, group roots, the scans of foreign-key
+ * and ALTER checks. Interim (lead decision on #65): such a read is not funded, and does not wait,
+ * so under memory pressure a statement is refused there, possibly below the cap, never with the
+ * reader's internal error. Funding write-path reads before they allocate is a follow-up.
  */
 export function memoryRefusal(error: unknown): unknown {
   return error instanceof MemtableMemoryError
     ? new MemoryAdmissionError("write path memtable", error.bytes, error.available)
-    : error;
+    : readRefusal(error);
 }
 
 /** Charges `bytes` to `charge` before an allocation, or throws `MemtableMemoryError`. */

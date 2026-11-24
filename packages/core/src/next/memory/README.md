@@ -229,6 +229,15 @@ background merge that meets one fails the write path with it. The guarded loops:
   sources, native defaults);
 - a query's preparation restarts.
 
+A write statement's own reads of stored data (old rows, index runs, deletion bitmaps, group
+roots, the scans of foreign-key and ALTER checks, an upsert's conflicting row) are charged to the
+write path's grant and are not yet sized or funded before they run. When the grant has no room,
+the reader's refusal (`ReadDeniedError`, `PageBudgetError`, `ParseBudgetError`) is typed at the
+statement boundary as 53200 naming the read (page/read-refusal.ts, write/bytes.ts
+`memoryRefusal`). Interim limit: such a statement can be refused below the cap where it would fit
+if it waited; it never waits there, so it never holds credit while queued. Funding those reads
+first is the follow-up "write-path read funding".
+
 A loop that waits on real tasks (`ByteBudget`'s grow fallback) is left to the stall guard, and so
 is the space's background reclaim, whose rounds each do reclaim work that others' writes request.
 

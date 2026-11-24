@@ -2105,6 +2105,23 @@ export const WRITABLE_TRANSACTION_READ_REACH = [
   "after a write in the transaction",
 ] as const;
 
+/** A write statement's own reads beside held flushes and reads (write-path-read-refusal). */
+export const WRITE_PATH_READ_REFUSAL_REACH = [
+  "completed",
+  "refused typed",
+  "refused at a write-path read",
+  "flush held",
+  "read held",
+  "setup refused",
+  "delete range",
+  "delete one",
+  "rekey",
+  "shrink",
+  "upsert",
+  "create index",
+  "delete cascade",
+] as const;
+
 /** A write step waiting for rows, decided without spinning (row-wait-reclaim). */
 export const ROW_WAIT_RECLAIM_REACH = ["waited for rows", "written", "refused typed"] as const;
 
