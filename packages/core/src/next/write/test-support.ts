@@ -490,18 +490,29 @@ export function watchGrants(governor: MemoryGovernor, observe: (grant: Grant) =>
 }
 
 /**
+ * Microtask turns `onGroupWait` lets pass before it counts an unsettled admission as a wait. A
+ * refusal is a rejected promise that reaches the caller only after the governor's own `await`
+ * and one more for each async wrapper between them (`watchGrants` adds one); this is well above
+ * any stack of wrappers these tests compose.
+ */
+const GROUP_WAIT_TURNS = 16;
+
+/**
  * Reports, without a timer, whether a native group admission waited in the governor behind
  * another holder. The governor serves a request that fits inside the call that queues it, and a
  * queued one inside the release that makes room for it, and reports each grant as it makes it
  * (`Governor.observeGrants`; a group is served from the admission or holder queue). Each
- * admission labelled `label` is classified one microtask after it was made, once the code that
- * made it has run (a release that code itself makes, such as the harness returning its startup
- * credit, comes first):
- * - `immediate`: its grant was reported by then;
- * - `refused`: it settled without a grant by then (`admitGroup` is async, so a refusal is a
- *   rejected promise, never a throw);
- * - `waits`: still queued; `onWait` then runs (the place to release the competing holder).
- * One admission of `label` at a time. Wraps the instance's `admitGroup`, as `watchGrants` does.
+ * admission labelled `label` is counted once:
+ * - `immediate`: its grant was reported by the end of the task that made it (a release that task
+ *   itself makes, such as the harness returning its startup credit, comes first);
+ * - `refused`: it settled without a grant. `admitGroup` is async, so a refusal is a rejected
+ *   promise, never a throw, and it may reach this wrapper several microtask turns later (from
+ *   inside the governor's queue, through async wrappers such as `watchGrants`). The handlers that
+ *   count it are attached before the caller's, so the caller sees the count when it resumes;
+ * - `waits`: neither, after `GROUP_WAIT_TURNS` microtask turns; `onWait` then runs (the place to
+ *   release the competing holder). A grant served later, by another release, is a wait too.
+ * One admission of `label` at a time. Wraps the instance's `admitGroup`, as `watchGrants` does,
+ * and may wrap it in either order.
  */
 export function onGroupWait(
   governor: Governor,
@@ -514,25 +525,45 @@ export function onGroupWait(
     // A zero-total group is served at once and reports no grant.
     if (options.label !== label || options.grants.every((part) => part.minimumBytes === 0))
       return admitGroup(options);
-    const seen = { served: false, done: false };
+    let served = false,
+      taskEnded = false,
+      classified = false;
     const stop = governor.observeGrants((event) => {
       if (event.label === label && (event.source === "admission" || event.source === "holder"))
-        seen.served = true;
+        served = true;
     });
-    const admitted = admitGroup(options);
-    const settle = () => {
-      seen.done = true;
-      stop();
+    const count = (kind: keyof typeof counts) => {
+      if (classified) return;
+      classified = true;
+      counts[kind]++;
+      if (kind === "waits") onWait();
     };
-    admitted.then(settle, settle);
+    const admitted = admitGroup(options);
+    // Attached before the caller's handlers: a settlement is counted before the caller resumes.
+    admitted.then(
+      () => {
+        stop();
+        // Before the end of the caller's task (an inner promise already settled): immediate.
+        // After it, unless counted immediate there: served later, by another release.
+        count(taskEnded ? "waits" : "immediate");
+      },
+      () => {
+        stop();
+        count("refused");
+      },
+    );
+    // The end of the caller's task: served by then is immediate.
     queueMicrotask(() => {
-      if (seen.served) counts.immediate++;
-      else if (seen.done) counts.refused++;
-      else {
-        counts.waits++;
-        onWait();
-      }
+      taskEnded = true;
+      if (served) count("immediate");
     });
+    let turns = GROUP_WAIT_TURNS;
+    const fallback = () => {
+      if (classified) return;
+      if (--turns > 0) queueMicrotask(fallback);
+      else count("waits");
+    };
+    queueMicrotask(fallback);
     return admitted;
   };
   return counts;
