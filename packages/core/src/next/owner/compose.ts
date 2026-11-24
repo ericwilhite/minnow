@@ -1,3 +1,5 @@
+import { sameColumns } from "./engine.js";
+import type { PhysicalType } from "../types.js";
 import { LiveRuntime } from "../live/runtime.js";
 import type { OwnerSnapshotOperations } from "./snapshot-connection.js";
 import { statementRuleReach } from "../exec/statement-reach.js";
@@ -68,6 +70,7 @@ import {
 } from "../exec/executor.js";
 import { createExecutor } from "../exec/create.js";
 import { compileTableRules } from "../exec/rules.js";
+import { PlanShapeChangedError } from "../exec/errors.js";
 import { ResultChannel, type ResultFrame, type ResultStream } from "../exec/result.js";
 import type { ChunkReads } from "../exec/scan.js";
 import type { ExecutorCosts } from "../ir/costs.js";
@@ -177,6 +180,23 @@ type CachedPlan =
       readonly template: ParameterizedPlan;
       readonly planned: PlannedStatement;
     };
+/** An autocommit write's body: starts the statement on the transaction holding the writer turn. */
+type AutocommitBody = (
+  tx: WriteTransaction,
+  stream: DeferredStream,
+) => {
+  readonly executed: Promise<{
+    command: string;
+    rowCount: number | null;
+    counts: Record<string, number> | null;
+    tables: readonly number[];
+  }>;
+  readonly acknowledge: () => void;
+  readonly abort: (reason: unknown) => void;
+};
+
+type LoweredDdl = Extract<LoweredStatement, { kind: "ddl" }>;
+
 function boundParameters(
   statement: PlannedStatement,
   params: readonly WireValue[],
@@ -224,7 +244,7 @@ function oneTextRow(column: WireColumnMeta, value: string): ResultStream {
  * first): it forwards to the execution's stream once attached.
  */
 class DeferredStream implements ResultStream {
-  readonly columns: readonly OutputColumn[];
+  readonly #columns: readonly OutputColumn[];
   #target: ResultStream | null = null;
   #failure: unknown = null;
   #failed = false;
@@ -232,7 +252,12 @@ class DeferredStream implements ResultStream {
   #waiting: Array<() => void> = [];
 
   constructor(columns: readonly OutputColumn[]) {
-    this.columns = columns;
+    this.#columns = columns;
+  }
+
+  /** The attached stream's columns (a re-planned statement's), else the ones it was made with. */
+  get columns(): readonly OutputColumn[] {
+    return this.#target?.columns ?? this.#columns;
   }
 
   /** Attaches the stream once; later calls are ignored. */
@@ -410,6 +435,11 @@ class ComposedEngine implements CatalogOwnerEngine {
     return this.#options.writePath.catalog.version;
   }
 
+  catalogMayChangeBeforeTurn(): boolean {
+    const path = this.#options.writePath;
+    return path.holderMovedCatalog === true || (path.waitingWriters ?? 0) > 0;
+  }
+
   get ledger(): OwnerLedger {
     return this.#options.writePath.ledger;
   }
@@ -434,13 +464,22 @@ class ComposedEngine implements CatalogOwnerEngine {
     return ++this.#sessionId;
   }
 
-  #context(catalog: CatalogView): PlannerContext {
-    return { catalog, statistics: this.#statistics, costs: this.#options.costs ?? EXECUTOR_COSTS };
+  #context(catalog: CatalogView, parameterTypes?: readonly PhysicalType[]): PlannerContext {
+    return {
+      catalog,
+      statistics: this.#statistics,
+      costs: this.#options.costs ?? EXECUTOR_COSTS,
+      ...(parameterTypes === undefined ? {} : { parameterTypes }),
+    };
   }
 
   /** Lowers without caching: plans against uncommitted schema state (session-private). */
-  lower(text: string, catalog: CatalogView): PlannedStatement {
-    return toPlanned(this.#options.planner.lower(text, this.#context(catalog)));
+  lower(
+    text: string,
+    catalog: CatalogView,
+    parameterTypes?: readonly PhysicalType[],
+  ): PlannedStatement {
+    return toPlanned(this.#options.planner.lower(text, this.#context(catalog, parameterTypes)));
   }
 
   #drifted(statement: LoweredStatement): boolean {
@@ -452,8 +491,12 @@ class ComposedEngine implements CatalogOwnerEngine {
   }
 
   /** Public lowering results/markers use normalized keys; raw constants use full text only. */
-  plan(text: string, catalog: CatalogView = this.#options.writePath.catalog): PlannedStatement {
-    const context = this.#context(catalog);
+  plan(
+    text: string,
+    catalog: CatalogView = this.#options.writePath.catalog,
+    parameterTypes?: readonly PhysicalType[],
+  ): PlannedStatement {
+    const context = this.#context(catalog, parameterTypes);
     const prefix = `${String(catalog.version)}\u0000${JSON.stringify(context.parameterTypes ?? [])}\u0000`;
     const parameterized = this.#options.planner.parameterize(text);
     if (parameterized !== null) {
@@ -788,8 +831,13 @@ class ComposedSession implements EngineSession {
   }
 
   /** Plans only: a statement takes the snapshot when it runs (`#guard`, `statementFailed`). */
-  plan(text: string): PlannedStatement {
+  plan(text: string, parameterTypes?: readonly PhysicalType[]): PlannedStatement {
     const catalog = this.#catalog();
+    // A prepared statement re-planned keeps the parameter types its client binds with.
+    if (parameterTypes !== undefined)
+      return this.#tx === null || catalog.version === this.#writePath().catalog.version
+        ? this.#engine.plan(text, catalog, parameterTypes)
+        : this.#engine.lower(text, catalog, parameterTypes);
     // A transaction whose DDL moved its catalog past the committed one plans privately: another
     // transaction could reach the same version number with different contents.
     if (this.#tx === null || catalog.version === this.#writePath().catalog.version)
@@ -1066,6 +1114,10 @@ class ComposedSession implements EngineSession {
       get reachedCommit() {
         return run.reachedCommit;
       },
+      // Read live: an autocommit write re-planned on the catalog it runs on reports its plan's.
+      get columns() {
+        return run.columns;
+      },
     };
   }
 
@@ -1075,6 +1127,11 @@ class ComposedSession implements EngineSession {
     const lowered = statement.lowered;
     if (this.#state === "open" && (lowered.kind === "modify" || lowered.kind === "ddl"))
       this.#hasWrites = true;
+    if (
+      (lowered.kind === "modify" || lowered.kind === "ddl") &&
+      !(this.#state === "open" && this.#tx !== null)
+    )
+      return this.#autocommitWrite(statement, params, context);
     switch (lowered.kind) {
       case "query":
         return this.#query(lowered, boundParameters(statement, params), context);
@@ -1196,19 +1253,155 @@ class ComposedSession implements EngineSession {
     };
   }
 
-  #modify(lowered: LoweredModify, params: readonly WireValue[], context: RunContext): Run {
+  /** Whether `lowered` runs on the native command path (triggers, referential actions). */
+  #native(lowered: LoweredModify, catalog: CatalogView): boolean {
     const root = lowered.plan.root;
-    if (root.op === "modify" && nativeTriggerFiringEnabled()) {
-      const reach = statementRuleReach(
-        this.#tx?.catalog ?? this.#writePath().catalog,
-        root.tableId,
-        root,
+    if (root.op !== "modify" || !nativeTriggerFiringEnabled()) return false;
+    const reach = statementRuleReach(catalog, root.tableId, root);
+    return reach.triggers || reach.unsupportedReferentialActions;
+  }
+
+  /**
+   * An autocommit write (a modification or DDL outside a transaction). It is planned when it
+   * arrives, but it runs once it holds the writer turn, which may be after another
+   * transaction's DDL committed: it then runs against the catalog it executes on, re-planned
+   * from its text, as PostgreSQL plans a statement after taking its locks (a dropped table is
+   * 42P01, a new index takes its row). Never PlanStaleError (exec/errors.ts: the owner
+   * re-plans; nothing ran). A re-plan that changes what the client was told (result columns,
+   * parameter types) is refused as PostgreSQL refuses it for a cached plan (0A000).
+   */
+  #autocommitWrite(
+    statement: PlannedStatement,
+    params: readonly WireValue[],
+    context: RunContext,
+  ): Run {
+    // The columns it reports: its arrival plan's, until the plan it runs replaces them.
+    let columns = statement.columns;
+    const run = this.#autocommit(
+      statement.columns,
+      (tx, stream) => {
+        const current = this.#replanned(statement, tx.catalog, context.prepared);
+        columns = current.columns;
+        const lowered = current.lowered;
+        if (lowered.kind === "ddl") return this.#ddlBody(lowered, context, tx);
+        if (lowered.kind !== "modify")
+          throw new TypeError("A write statement re-planned as another kind");
+        const bound = boundParameters(current, params);
+        return this.#native(lowered, tx.catalog)
+          ? this.#nativeBody(lowered, bound, context, tx)
+          : this.#modifyBody(lowered, bound, context, tx, stream);
+      },
+      context,
+    );
+    Object.defineProperty(run, "columns", { get: () => columns, enumerable: true });
+    return run;
+  }
+
+  runOnTurn(text: string, params: readonly WireValue[], context: RunContext): Run {
+    if (this.#state !== "idle")
+      throw new TypeError("Only an autocommit write is planned on its turn");
+    let columns: readonly WireColumnMeta[] = [];
+    const run = this.#autocommit(
+      columns,
+      (tx, stream) => {
+        // Planned now, on the catalog it runs on: its answer when this fails (42703, 42P10).
+        const current = this.#engine.plan(text, tx.catalog);
+        columns = current.columns;
+        const lowered = current.lowered;
+        if (lowered.kind === "ddl") return this.#ddlBody(lowered, context, tx);
+        if (lowered.kind !== "modify")
+          throw new TypeError("A statement planned on its turn is not a write");
+        const bound = boundParameters(current, params);
+        return this.#native(lowered, tx.catalog)
+          ? this.#nativeBody(lowered, bound, context, tx)
+          : this.#modifyBody(lowered, bound, context, tx, stream);
+      },
+      context,
+    );
+    Object.defineProperty(run, "columns", { get: () => columns, enumerable: true });
+    return run;
+  }
+
+  /** The session's open read-write transaction (autocommit writes run through #autocommitWrite). */
+  #openTransaction(): WriteTransaction {
+    if (this.#state !== "open" || this.#tx === null)
+      throw new TypeError("A write outside a transaction runs as an autocommit write");
+    return this.#tx;
+  }
+
+  /**
+   * `statement` as planned against `catalog`: itself when it was, else re-planned from its text.
+   * An unprepared statement re-plans freely: its client learns its columns with its result and
+   * binds its parameters after planning (PostgreSQL's simple protocol). A prepared one keeps the
+   * parameter types its client binds with, and its result columns must stay what its client was
+   * told at prepare: else PostgreSQL's 0A000 ("cached plan must not change result type").
+   */
+  #replanned(
+    statement: PlannedStatement,
+    catalog: CatalogView,
+    prepared: RunContext["prepared"],
+  ): PlannedStatement {
+    if (statement.catalogVersion === catalog.version) return statement;
+    if (prepared === undefined) return this.#engine.plan(statement.text, catalog);
+    const current = this.#engine.plan(statement.text, catalog, prepared.parameters);
+    if (current.kind !== statement.kind || !sameColumns(current.columns, prepared.columns))
+      throw new PlanShapeChangedError();
+    return current;
+  }
+
+  /** A modification inside the session's open read-write transaction. */
+  #modify(lowered: LoweredModify, params: readonly WireValue[], context: RunContext): Run {
+    const tx = this.#openTransaction();
+    if (this.#native(lowered, tx.catalog)) return this.#nativeModify(lowered, params, context);
+    if (lowered.plan.root.op !== "modify") throw new TypeError("Missing modification root");
+    const rowRules = new StatementRules(
+      tx.catalog,
+      lowered.plan.root.tableId,
+      this.#rules(() => tx.catalog),
+      lowered.plan.root,
+    );
+    const statement = tx.statement({
+      rules: (id) => rowRules.table(id),
+      targets: rowRules.targets,
+      signal: context.signal,
+    });
+    let execution: Execution;
+    try {
+      execution = this.#execute(
+        lowered.plan,
+        params,
+        context,
+        { snapshot: null, statement, rowRules },
+        "atExecuted",
       );
-      if (reach.triggers || reach.unsupportedReferentialActions)
-        return this.#nativeModify(lowered, params, context);
+    } catch (error) {
+      statement.rollback();
+      this.#state = "failed";
+      return failedRun(error);
     }
-    if (this.#state === "open" && this.#tx !== null) {
-      const tx = this.#tx;
+    const done = execution.executed.then((summary) => {
+      const counts = countsOf(summary, lowered, statement.catalog);
+      for (const [table, rows] of Object.entries(counts))
+        this.#txCounts[table] = (this.#txCounts[table] ?? 0) + rows;
+      return { command: lowered.command, rowCount: summary.rowCount, counts, lsn: null };
+    });
+    return {
+      results: execution.results,
+      done: this.#abortOnFailure(done),
+      reachedCommit: false,
+      commits: false,
+    };
+  }
+
+  /** An autocommit modification's body on the transaction holding the writer turn. */
+  #modifyBody(
+    lowered: LoweredModify,
+    params: readonly WireValue[],
+    context: RunContext,
+    tx: WriteTransaction,
+    stream: DeferredStream,
+  ): ReturnType<AutocommitBody> {
+    {
       if (lowered.plan.root.op !== "modify") throw new TypeError("Missing modification root");
       const rowRules = new StatementRules(
         tx.catalog,
@@ -1228,154 +1421,107 @@ class ComposedSession implements EngineSession {
           params,
           context,
           { snapshot: null, statement, rowRules },
-          "atExecuted",
+          "atCommit",
         );
       } catch (error) {
         statement.rollback();
-        this.#state = "failed";
-        return failedRun(error);
+        throw error;
       }
-      const done = execution.executed.then((summary) => {
-        const counts = countsOf(summary, lowered, statement.catalog);
-        for (const [table, rows] of Object.entries(counts))
-          this.#txCounts[table] = (this.#txCounts[table] ?? 0) + rows;
-        return { command: lowered.command, rowCount: summary.rowCount, counts, lsn: null };
-      });
+      stream.attach(execution.results);
       return {
-        results: execution.results,
-        done: this.#abortOnFailure(done),
-        reachedCommit: false,
-        commits: false,
+        executed: execution.executed.then((summary) => ({
+          command: lowered.command,
+          rowCount: summary.rowCount,
+          counts: countsOf(summary, lowered, statement.catalog),
+          tables: lowered.writes,
+        })),
+        acknowledge: () => {
+          execution.acknowledgeCommit();
+        },
+        abort: (reason: unknown) => {
+          execution.cancel(reason);
+        },
       };
     }
-    return this.#autocommit(
-      lowered.columns,
-      (tx, stream) => {
-        if (lowered.plan.root.op !== "modify") throw new TypeError("Missing modification root");
-        const rowRules = new StatementRules(
-          tx.catalog,
-          lowered.plan.root.tableId,
-          this.#rules(() => tx.catalog),
-          lowered.plan.root,
-        );
-        const statement = tx.statement({
-          rules: (id) => rowRules.table(id),
-          targets: rowRules.targets,
-          signal: context.signal,
-        });
-        let execution: Execution;
-        try {
-          execution = this.#execute(
-            lowered.plan,
-            params,
-            context,
-            { snapshot: null, statement, rowRules },
-            "atCommit",
-          );
-        } catch (error) {
-          statement.rollback();
-          throw error;
-        }
-        stream.attach(execution.results);
-        return {
-          executed: execution.executed.then((summary) => ({
-            command: lowered.command,
-            rowCount: summary.rowCount,
-            counts: countsOf(summary, lowered, statement.catalog),
-            tables: lowered.writes,
-          })),
-          acknowledge: () => {
-            execution.acknowledgeCommit();
-          },
-          abort: (reason: unknown) => {
-            execution.cancel(reason);
-          },
-        };
-      },
-      context,
-    );
   }
 
   /** Same SQL/session/commit boundary as ordinary modifications; no public guard override. */
   #nativeModify(lowered: LoweredModify, params: readonly WireValue[], context: RunContext): Run {
-    const execute = async (tx: WriteTransaction) => {
-      const options = this.#engine.options,
-        queryId = this.#engine.nextQueryId();
-      const result = await executeNativeCommand({
-        transaction: tx,
-        rootId: queryId,
-        plan: lowered.plan,
-        parameters: params,
-        planner: options.planner,
-        context: {
-          catalog: tx.catalog,
-          statistics: options.statistics ?? { table: () => null },
-          costs: options.costs ?? EXECUTOR_COSTS,
-        },
-        governor: options.governor,
-        signal: context.signal,
-        execution: {
-          reads: options.reads,
-          spill: options.spill,
-          queryId,
-          statementTime: this.#statementTime(),
-          sequences: this.#sequenceAccess,
-          sequenceSession: this.sequences,
-          returning: "atExecuted",
-        },
-      });
-      return {
-        command: lowered.command,
-        rowCount: result.rowCount,
-        counts: countsOf(result, lowered, tx.catalog),
-        tables: result.tables,
-      };
-    };
-    if (this.#state === "open" && this.#tx !== null) {
-      const done = execute(this.#tx).then(({ command, rowCount, counts }) => {
+    const tx = this.#openTransaction();
+    const done = this.#executeNative(lowered, params, context, tx).then(
+      ({ command, rowCount, counts }) => {
         for (const [table, rows] of Object.entries(counts))
           this.#txCounts[table] = (this.#txCounts[table] ?? 0) + rows;
         return { command, rowCount, counts, lsn: null };
-      });
-      return {
-        results: emptyStream(),
-        done: this.#abortOnFailure(done),
-        reachedCommit: false,
-        commits: false,
-      };
-    }
-    return this.#autocommit(
-      lowered.columns,
-      (tx) => ({
-        executed: execute(tx),
-        acknowledge: () => undefined,
-        abort: () => undefined,
-      }),
-      context,
+      },
     );
+    return {
+      results: emptyStream(),
+      done: this.#abortOnFailure(done),
+      reachedCommit: false,
+      commits: false,
+    };
+  }
+
+  /** An autocommit native command's body. */
+  #nativeBody(
+    lowered: LoweredModify,
+    params: readonly WireValue[],
+    context: RunContext,
+    tx: WriteTransaction,
+  ): ReturnType<AutocommitBody> {
+    return {
+      executed: this.#executeNative(lowered, params, context, tx),
+      acknowledge: () => undefined,
+      abort: () => undefined,
+    };
+  }
+
+  /** A native command (triggers, referential actions) on the transaction holding the turn. */
+  async #executeNative(
+    lowered: LoweredModify,
+    params: readonly WireValue[],
+    context: RunContext,
+    tx: WriteTransaction,
+  ) {
+    const options = this.#engine.options,
+      queryId = this.#engine.nextQueryId();
+    const result = await executeNativeCommand({
+      transaction: tx,
+      rootId: queryId,
+      plan: lowered.plan,
+      parameters: params,
+      planner: options.planner,
+      context: {
+        catalog: tx.catalog,
+        statistics: options.statistics ?? { table: () => null },
+        costs: options.costs ?? EXECUTOR_COSTS,
+      },
+      governor: options.governor,
+      signal: context.signal,
+      execution: {
+        reads: options.reads,
+        spill: options.spill,
+        queryId,
+        statementTime: this.#statementTime(),
+        sequences: this.#sequenceAccess,
+        sequenceSession: this.sequences,
+        returning: "atExecuted",
+      },
+    });
+    return {
+      command: lowered.command,
+      rowCount: result.rowCount,
+      counts: countsOf(result, lowered, tx.catalog),
+      tables: result.tables,
+    };
   }
 
   /**
    * An autocommit write: writer slot, the statement, then the commit boundary. `body` starts the
    * statement on the transaction and reports its completion; `acknowledge` lets RETURNING flow.
    */
-  #autocommit(
-    columns: readonly WireColumnMeta[],
-    body: (
-      tx: WriteTransaction,
-      stream: DeferredStream,
-    ) => {
-      readonly executed: Promise<{
-        command: string;
-        rowCount: number | null;
-        counts: Record<string, number> | null;
-        tables: readonly number[];
-      }>;
-      readonly acknowledge: () => void;
-      readonly abort: (reason: unknown) => void;
-    },
-    context: RunContext,
-  ): Run {
+  #autocommit(columns: readonly WireColumnMeta[], body: AutocommitBody, context: RunContext): Run {
     const stream = new DeferredStream(toOutputColumns(columns));
     const run = makeRun(stream, true);
     const writePath = this.#writePath();
@@ -1423,8 +1569,35 @@ class ComposedSession implements EngineSession {
     return run;
   }
 
-  #ddl(lowered: Extract<LoweredStatement, { kind: "ddl" }>, context: RunContext): Run {
-    const apply = async (tx: WriteTransaction): Promise<void> => {
+  /** DDL inside the session's open read-write transaction. */
+  #ddl(lowered: LoweredDdl, context: RunContext): Run {
+    const outcome = { command: lowered.command, rowCount: null, counts: null, lsn: null };
+    const done = this.#abortOnFailure(
+      this.#applyDdl(lowered, context, this.#openTransaction()).then(() => outcome),
+    );
+    return { results: emptyStream(), done, reachedCommit: false, commits: false };
+  }
+
+  /** An autocommit DDL statement's body. */
+  #ddlBody(
+    lowered: LoweredDdl,
+    context: RunContext,
+    tx: WriteTransaction,
+  ): ReturnType<AutocommitBody> {
+    return {
+      executed: this.#applyDdl(lowered, context, tx).then(() => ({
+        command: lowered.command,
+        rowCount: null,
+        counts: null,
+        tables: [],
+      })),
+      acknowledge: () => undefined,
+      abort: () => undefined,
+    };
+  }
+
+  async #applyDdl(lowered: LoweredDdl, context: RunContext, tx: WriteTransaction): Promise<void> {
+    {
       const statement = tx.statement({
         rules: this.#rules(() => statement.catalog),
         signal: context.signal,
@@ -1437,7 +1610,9 @@ class ComposedSession implements EngineSession {
         throw error;
       }
       if (lowered.followUp !== null) {
-        const plannedFollowUp = this.plan(lowered.followUp);
+        // Against the transaction's catalog, which holds the table its change just made (an
+        // autocommit CREATE TABLE AS has no session transaction to plan in).
+        const plannedFollowUp = this.#engine.lower(lowered.followUp, tx.catalog);
         const followUp = plannedFollowUp.lowered;
         if (followUp.kind !== "modify") throw new TypeError("A DDL follow-up must be a write");
         if (followUp.plan.root.op !== "modify")
@@ -1460,24 +1635,12 @@ class ComposedSession implements EngineSession {
           { snapshot: null, statement: next, rowRules },
           "atExecuted",
         );
-        execution.results.cancel();
+        // Its results are none of this statement's: release them once it has run (cancelling
+        // first would cancel the run itself, 57014).
         await execution.executed;
+        execution.results.cancel();
       }
-    };
-    const outcome = { command: lowered.command, rowCount: null, counts: null, lsn: null };
-    if (this.#state === "open" && this.#tx !== null) {
-      const done = this.#abortOnFailure(apply(this.#tx).then(() => outcome));
-      return { results: emptyStream(), done, reachedCommit: false, commits: false };
     }
-    return this.#autocommit(
-      [],
-      (tx) => ({
-        executed: apply(tx).then(() => ({ ...outcome, tables: [] })),
-        acknowledge: () => undefined,
-        abort: () => undefined,
-      }),
-      context,
-    );
   }
 
   #control(

@@ -1,7 +1,7 @@
 /** Ordinary cursor binding. Credit is returned on handout; held Result buffers never recycle. */
 import type { Cursor, CursorOptions, Param, Row } from "./api.js";
 import { resultColumn } from "./api.js";
-import type { ProtocolClient } from "./client.js";
+import { preparedShape, type PreparedInfo, type ProtocolClient } from "./client.js";
 import { cancelledReason } from "./client-call.js";
 import { decodeResult } from "./result.js";
 import type { StatementSummary } from "./protocol.js";
@@ -22,7 +22,7 @@ export function clientCursor<TRow = Row>(
   session: number,
   options: CursorOptions,
   retired: () => void,
-  prepared: number | null = null,
+  prepared: PreparedInfo | null = null,
   check: () => void = () => undefined,
 ): Cursor<TRow> {
   options.signal?.throwIfAborted();
@@ -35,7 +35,7 @@ export function clientCursor<TRow = Row>(
   const raw = client.cursor(sql, structuredClone(params), {
     session,
     queryOnly: true,
-    ...(prepared === null ? {} : { prepared }),
+    ...(prepared === null ? {} : { prepared: prepared.id, preparedShape: preparedShape(prepared) }),
     ...(options.frameRows === undefined ? {} : { frameRows: options.frameRows }),
     ...(options.prefetchBytes === undefined ? {} : { windowBytes: options.prefetchBytes }),
   });

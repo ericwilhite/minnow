@@ -3073,6 +3073,16 @@ export class WritePathImpl implements WritePath, EngineHooks {
     });
   }
 
+  /** Writers waiting now for the slot (`WritePath.waitingWriters`). */
+  get waitingWriters(): number {
+    return this.#queue.length;
+  }
+
+  /** The transaction holding the slot changed the catalog (`WritePath.holderMovedCatalog`). */
+  get holderMovedCatalog(): boolean {
+    return this.#holder !== null && this.#holder.catalog.version !== this.#catalog.version;
+  }
+
   /** The writer slot is held (by a transaction or by maintenance). */
   get #slotBusy(): boolean {
     return this.#holder !== null || this.#maintenanceHolds || this.#claimed;

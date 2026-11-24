@@ -49,6 +49,19 @@ export class PlanStaleError extends ExecutionError {
   }
 }
 
+/**
+ * A prepared statement the owner re-planned (another transaction's DDL committed since it was
+ * prepared) returns other result columns than its client was told at prepare. PostgreSQL
+ * refuses a cached plan the same way, on every execute ("cached plan must not change result
+ * type", 0A000). Nothing ran.
+ */
+export class PlanShapeChangedError extends ExecutionError {
+  constructor() {
+    super("cached plan must not change result type", "MINNOW_PLAN_SHAPE_CHANGED", "0A000");
+    this.name = "PlanShapeChangedError";
+  }
+}
+
 /** A parameter value does not fit its slot's type, or the count is wrong. */
 export class ParameterBindError extends ExecutionError {
   constructor(

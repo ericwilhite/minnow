@@ -44,7 +44,7 @@ import { OwnedAdminReply } from "./admin-reply.js";
 import { RequestExpiredError, SessionLostError, DatabaseReplacedError } from "../errors.js";
 import { LIVENESS_IDLE_RELEASE_MS } from "./election.js";
 import { beginTask } from "../exec/pipeline.js";
-import { QueryCancelledError } from "../exec/errors.js";
+import { PlanShapeChangedError, QueryCancelledError } from "../exec/errors.js";
 import type { ResultFrame, ResultStream } from "../exec/result.js";
 import type { ReturnPool } from "../exec/return-pool.js";
 import type { Admission, Outcome } from "../format/ledger.js";
@@ -59,7 +59,8 @@ import type {
   RunOutcome,
   SyncRun,
 } from "./engine.js";
-import { IdleTransactionTimer } from "./engine.js";
+import { IdleTransactionTimer, sameColumns, sameParameters } from "./engine.js";
+import type { PhysicalType } from "../types.js";
 import {
   CancelledError,
   CommittedWithoutResultError,
@@ -81,10 +82,15 @@ import {
   type Hello,
   type OwnerMessage,
   type Request,
+  type StatementRequest,
   type StatementSummary,
   type StepDown,
   type WireColumnMeta,
 } from "./protocol.js";
+import { statementTokens } from "../lower/snapshot-rule.js";
+
+/** The first words of a statement that may be planned on its writer turn (`#plansOnTurn`). */
+const TURN_WORDS = new Set(["INSERT", "UPDATE", "DELETE", "MERGE", "ALTER", "CREATE", "DROP"]);
 
 /** The slice of a MessagePort the server needs (a Worker's own scope works too). */
 export interface ServerPort {
@@ -963,7 +969,7 @@ class Connection {
       return "other";
     let planned: PlannedStatement;
     try {
-      planned = this.#planStatement(this.#engineSession(slot), request.text, request.prepared);
+      planned = this.#planStatement(this.#engineSession(slot), request);
     } catch {
       return "other";
     }
@@ -1068,7 +1074,7 @@ class Connection {
     const lowering: { text: string | null } = { text: null };
     if (request.t === "statement" && session !== null) {
       try {
-        planned = this.#planStatement(session, request.text, request.prepared, lowering);
+        planned = this.#planStatement(session, request, lowering);
         if (
           request.scopedTransaction === true &&
           (planned.control === "begin" ||
@@ -1085,6 +1091,13 @@ class Connection {
       } catch (error) {
         planError = error;
       }
+    }
+    // Planned on its turn instead (`#plansOnTurn`): admitted and run like any write.
+    let onTurn: string | null = null;
+    if (planError !== null && session !== null && this.#plansOnTurn(request, session, planError)) {
+      onTurn = (request as StatementRequest).text;
+      planError = null;
+      lowering.text = null;
     }
     const before = session?.transaction ?? "idle";
     const scope = ledgerScope({
@@ -1131,39 +1144,87 @@ class Connection {
       this.post({ t: "error", seq: request.seq, error: toWireError(planError) });
       return;
     }
-    return this.#execute(request, planned, slot, session, before);
+    return this.#execute(request, planned, slot, session, before, onTurn);
+  }
+
+  /**
+   * An autocommit write or DDL statement that names a column or a conflict target the catalog
+   * lacks (42703, 42P10) while the transaction holding the writer turn has changed the catalog is
+   * planned once it holds the turn instead (`EngineSession.runOnTurn`): PostgreSQL analyses a
+   * write after locking its target, and that transaction's DDL holds a lock that conflicts with
+   * it, so it waits and is analysed on what that transaction leaves. It is admitted and waits for
+   * the turn like any write: in arrival order, in the ledger and in `#running`, so a reconnect,
+   * a close or a cancel ends it as it ends any write. A missing relation (42P01) is refused at
+   * once, as in PostgreSQL: a table another transaction has not committed is not found. When
+   * nothing could change the catalog before its turn (the holder changed none and no writer is
+   * queued ahead of it), its arrival answer is final: refused at once. A writer queued ahead may
+   * change the catalog (PostgreSQL would run it first), so then it waits its turn too.
+   */
+  #plansOnTurn(request: Request, session: EngineSession, error: unknown): boolean {
+    if (
+      request.t !== "statement" ||
+      request.prepared !== null ||
+      request.text === null ||
+      request.scopedTransaction === true ||
+      request.queryOnly === true ||
+      session.transaction !== "idle" ||
+      session.runOnTurn === undefined
+    )
+      return false;
+    const state = (error as { sqlState?: unknown } | null)?.sqlState;
+    if (state !== "42703" && state !== "42P10") return false;
+    const [first] = statementTokens(request.text, 1);
+    if (first?.kind !== "word" || !TURN_WORDS.has(first.text)) return false;
+    return this.#server.engine.catalogMayChangeBeforeTurn?.() === true;
   }
 
   /** Plans against the session's catalog (a transaction's own DDL included). */
   #planStatement(
     session: EngineSession,
-    text: string | null,
-    prepared: number | null,
+    request: StatementRequest,
     lowering: { text: string | null } = { text: null },
   ): PlannedStatement {
+    const { text, prepared } = request;
     // Records the text being lowered: when lowering throws, it stays (`statementFailed`).
-    const plan = (sql: string): PlannedStatement => {
+    const plan = (sql: string, parameters?: readonly PhysicalType[]): PlannedStatement => {
       lowering.text = sql;
-      const planned = session.plan(sql);
+      const planned = session.plan(sql, parameters);
       lowering.text = null;
       return planned;
     };
-    if (prepared !== null) {
-      const entry = this.#prepared.get(String(prepared));
-      if (entry === undefined) {
-        if (text !== null) return plan(text);
-        throw new ProtocolError(`Prepared statement ${String(prepared)} does not exist`);
-      }
-      if (text !== null && text !== entry.text)
-        throw new ProtocolError("Prepared fallback SQL does not match its handle");
-      // Re-planned against the session's catalog when it differs (the planned entry stays the
-      // shared one, so a transaction's private plan never outlives it).
-      return entry.planned.catalogVersion === session.catalogVersion
-        ? entry.planned
-        : plan(entry.text);
+    if (prepared === null) {
+      if (text === null) throw new ProtocolError("A statement needs text or a prepared id");
+      return plan(text);
     }
-    if (text === null) throw new ProtocolError("A statement needs text or a prepared id");
-    return plan(text);
+    const entry = this.#prepared.get(String(prepared));
+    if (entry === undefined) {
+      if (text === null)
+        throw new ProtocolError(`Prepared statement ${String(prepared)} does not exist`);
+      // The handle is gone here (evicted, or a new connection): its fallback text plans as the
+      // handle would, from what its client was told at prepare.
+      const shape = request.preparedShape;
+      if (shape === undefined)
+        throw new ProtocolError("A prepared fallback needs the shape its client was told");
+      const planned = plan(text);
+      if (sameParameters(planned.parameters, shape.parameters)) {
+        if (!sameColumns(planned.columns, shape.columns)) throw new PlanShapeChangedError();
+        return planned;
+      }
+      const replanned = plan(text, shape.parameters);
+      if (!sameColumns(replanned.columns, shape.columns)) throw new PlanShapeChangedError();
+      return replanned;
+    }
+    if (text !== null && text !== entry.text)
+      throw new ProtocolError("Prepared fallback SQL does not match its handle");
+    // Re-planned against the session's catalog when it differs (the planned entry stays the
+    // shared one, so a transaction's private plan never outlives it).
+    if (entry.planned.catalogVersion === session.catalogVersion) return entry.planned;
+    // Re-analysed as PostgreSQL re-analyses a prepared statement: with the parameter types its
+    // client binds with, and refused (0A000) on every execute while its result columns differ
+    // from those its client was told at prepare, until it is deallocated.
+    const replanned = plan(entry.text, entry.planned.parameters);
+    if (!sameColumns(replanned.columns, entry.planned.columns)) throw new PlanShapeChangedError();
+    return replanned;
   }
 
   #answerAdmission(
@@ -1284,7 +1345,18 @@ class Connection {
       windowBytes: result?.windowBytes ?? 2 * BATCH_TARGET_BYTES,
       frameRows: result?.frameRows ?? null,
       ...(result?.recycle === true ? { outputBuffers: this.#returnPool() } : {}),
+      ...this.#preparedContext(request),
     };
+  }
+
+  /** What a prepared statement's client was told at prepare (`RunContext.prepared`). */
+  #preparedContext(request: Request): Pick<RunContext, "prepared"> {
+    if (request.t !== "statement" || request.prepared === null) return {};
+    const entry = this.#prepared.get(String(request.prepared));
+    if (entry !== undefined)
+      return { prepared: { columns: entry.planned.columns, parameters: entry.planned.parameters } };
+    // A fallback (`#planStatement`): the shape its client sent, which it was told at prepare.
+    return request.preparedShape === undefined ? {} : { prepared: request.preparedShape };
   }
 
   #returnPool(): ReturnPool {
@@ -1314,6 +1386,7 @@ class Connection {
     slot: SessionSlot | null,
     session: EngineSession | null,
     before: AnsweredRequest["before"],
+    onTurn: string | null = null,
   ): void | Promise<void> {
     const server = this.#server;
     const engine = server.engine;
@@ -1362,6 +1435,13 @@ class Connection {
     try {
       switch (request.t) {
         case "statement": {
+          if (onTurn !== null) {
+            const owner = inSession();
+            if (owner.runOnTurn === undefined)
+              throw new ProtocolError("A statement without a plan");
+            run = owner.runOnTurn(onTurn, request.params, context);
+            break;
+          }
           if (planned === null) throw new ProtocolError("A statement without a plan");
           if (request.result.recycle === true && planned.kind !== "query")
             throw new TypeError("Streaming export requires a query");
@@ -1683,7 +1763,9 @@ class Connection {
     const engine = this.#server.engine;
     run.done.catch(() => undefined);
     const wantRows = "result" in request ? request.result.wantRows : false;
-    const columnsMeta = planned?.columns ?? [];
+    // The plan it runs reports its columns (an autocommit write re-planned on the catalog it
+    // runs on), read when they are sent: after it holds the writer turn.
+    const columnsOf = () => run.columns ?? planned?.columns ?? [];
     let columnsSent = false;
     const stream: Stream = {
       results: run.results,
@@ -1707,7 +1789,7 @@ class Connection {
       for (const frame of pending) for (const buffer of frame.transfer) transfer.push(buffer);
       const columns = columnsSent
         ? null
-        : this.#columnsFor(request, columnsMeta, planned?.catalogVersion ?? -1);
+        : this.#columnsFor(request, columnsOf(), planned?.catalogVersion ?? -1);
       columnsSent = true;
       this.post(
         {
@@ -1754,7 +1836,7 @@ class Connection {
         pending.push(frame);
       }
       const outcome = await run.done;
-      if (this.#drainingForRestore && !(run.reachedCommit && columnsMeta.length === 0))
+      if (this.#drainingForRestore && !(run.reachedCommit && columnsOf().length === 0))
         throw running.lost ?? new SessionLostError("result", request.seq);
       stream.finished = true;
       this.#finishLedger(request, planned, before, session, outcome, false, null, run);
@@ -1763,7 +1845,7 @@ class Connection {
         planned,
         pending,
         columnsSent,
-        columnsMeta,
+        columnsOf(),
         outcome,
         session,
         false,
@@ -1789,7 +1871,7 @@ class Connection {
           planned,
           [],
           columnsSent,
-          columnsMeta,
+          columnsOf(),
           outcome,
           session,
           true,

@@ -2086,7 +2086,26 @@ The full interface contract includes the following:
 - The executor admits its whole minimum atomically, including reads and downstream progress.
   Extra operator state is spillable. A complete minimum above the whole cap raises
   `MemoryAdmissionError`; temporary pressure waits or spills.
-- A plan from another catalog version fails with `PlanStaleError` before anything runs.
+- A plan from another catalog version fails with `PlanStaleError` before anything runs. The
+  owner never lets it reach a client: an autocommit write is planned when it arrives but runs
+  once it holds the writer turn, so after another transaction's DDL committed it is re-planned
+  from its text against the catalog it runs on (`ComposedSession.#autocommitWrite`), as
+  PostgreSQL plans after taking its locks (a dropped table is then 42P01). An unprepared
+  statement is re-planned freely and reports the columns of the plan it runs (`Run.columns`).
+  A prepared one is re-planned with the parameter types it was prepared with, and while its
+  result columns differ from those its client was told it is refused with
+  `PlanShapeChangedError` on every execute (0A000, PostgreSQL's "cached plan must not change
+  result type"; nullability is no part of the shape); nothing runs. An autocommit write or schema change (INSERT, UPDATE, DELETE, MERGE, ALTER, CREATE,
+  DROP) whose arrival plan fails for a column or a conflict target (42703, 42P10) while the
+  catalog may still change before its turn (the transaction holding the writer turn changed it,
+  or writers are queued ahead of it) is admitted like any write and planned from its text once
+  it holds the turn (`EngineSession.runOnTurn`, `OwnerServer` `#plansOnTurn`): it waits in arrival
+  order, in the ledger and among the running requests, so a reconnect, a close or a cancel ends it
+  as it ends any write, and PostgreSQL's lock waiters are served in the same order. When nothing
+  can change the catalog first, the arrival answer stands at once; a missing table (42P01) is
+  refused at once, as PostgreSQL does not find a table another transaction has not committed
+  (`testing/plan-stale-wait.test.ts`, generated against PGlite in
+  `testing/plan-stale-wait-pglite.test.ts`).
 - Three completions: `executed` (the plan ran; for DML the statement ended), committed
   (`acknowledgeCommit()`: autocommit RETURNING waits in a charged, spillable spool until then),
   and `delivered` (every frame released; the result grant closes).
@@ -5083,11 +5102,16 @@ a proved no-effect cancellation returns the caller's reason, and unknown effects
 
 Connection prepared handles use a bounded governor-charged cache, rather than holding a plan
 outside its original cache's charge. Executions include the original SQL as an exact fallback
-for eviction or reconnection, under the same protocol sequence and ledger identity. Private-DDL
-preparation runs in its session and does not retain the private plan beyond that session cache.
-The unreleased protocol profile is 9 (inspection ops plus optional owner-side call guards/session binding);
-this changes no stored bytes or published package entry. Raw id-only execution requires a live
-cached handle; the internal facade always supplies fallback SQL.
+for eviction or reconnection, under the same protocol sequence and ledger identity, with the
+columns and parameter types the client was told at prepare (`StatementRequest.preparedShape`).
+The fallback plans as the handle would: with those parameter types, and refused 0A000 on every
+execute while its result columns differ from those (PostgreSQL's "cached plan must not change
+result type"; nullability is no part of the shape). A fallback without the shape is a protocol
+error, so no path re-describes a prepared statement with new columns: preparing again does.
+Private-DDL preparation runs in its session and does not retain the private plan beyond that
+session cache. The unreleased protocol is version 12 (`PROTOCOL_VERSION`); this changes no
+stored bytes or published package entry. Raw id-only execution requires a live cached handle;
+the internal facade always supplies fallback SQL and its shape.
 
 CRUD input conversion preserves the native write-request shape, cloned inputs and typed validity.
 Native `ComposedSession.write` remains an explicit stub pending B5b's input/admission wiring;

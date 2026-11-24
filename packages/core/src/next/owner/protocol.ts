@@ -219,7 +219,7 @@ export type TransactionState = "idle" | "open" | "failed" | "timedOut";
 export const DEFAULT_TRANSACTION_IDLE_TIMEOUT_MS = 30_000;
 
 /** Bumped by every change to a message in this file or in frame.ts. */
-export const PROTOCOL_VERSION = 11;
+export const PROTOCOL_VERSION = 12;
 
 /** The owner sends `alive` at least this often while a client has requests in flight. */
 export const ALIVE_INTERVAL_MS = 1_000;
@@ -346,6 +346,13 @@ export interface StatementRequest extends RequestHeader {
    * reconnect. Null requires a live connection-owned cache entry. */
   readonly text: string | null;
   readonly prepared: number | null;
+  /**
+   * With a prepared id and its fallback text: what the client was told at prepare. When the
+   * owner no longer holds the handle (evicted, or a new connection), it plans the text with these
+   * parameter types and refuses 0A000 while the result columns differ, as it does for a handle it
+   * holds. A fallback without it is a protocol error.
+   */
+  readonly preparedShape?: PreparedShape;
   /** Familiar public query/cursor API: owner refuses non-query plans before any execution. */
   readonly queryOnly?: boolean;
   /** A callback transaction owns BEGIN/COMMIT/ROLLBACK; SQL savepoints remain allowed. */
@@ -354,6 +361,12 @@ export interface StatementRequest extends RequestHeader {
   readonly knownColumnsVersion: number;
   readonly params: readonly WireValue[];
   readonly result: ResultRequest;
+}
+
+/** A prepared statement as its client was told at prepare. */
+export interface PreparedShape {
+  readonly columns: readonly WireColumnMeta[];
+  readonly parameters: readonly PhysicalType[];
 }
 
 /** Plans `text` and names it `id` (client-chosen, unique on the connection). */
@@ -853,6 +866,16 @@ export function parseClientMessage(value: unknown): ClientMessage {
     typeof value.scopedTransaction !== "boolean"
   )
     throw new ProtocolError("Statement scopedTransaction must be a boolean");
+  if (kind === "statement" && "preparedShape" in value) {
+    const shape = value.preparedShape as Partial<PreparedShape> | null;
+    if (
+      typeof shape !== "object" ||
+      shape === null ||
+      !Array.isArray(shape.columns) ||
+      !Array.isArray(shape.parameters)
+    )
+      throw new ProtocolError("Statement preparedShape must hold columns and parameters");
+  }
   if (kind === "hello" && (value as Partial<Hello>).protocol === undefined)
     throw new ProtocolError("Hello without a protocol version");
   if (kind === "returnBuffers") {

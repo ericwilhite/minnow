@@ -82,6 +82,7 @@ import {
   PROTOCOL_VERSION,
   ProtocolError,
   type OwnerMessage,
+  type PreparedShape,
   type PreparedStatementKind,
   type Request,
   type StatementSummary,
@@ -288,6 +289,10 @@ export interface PreparedInfo {
   readonly columns: readonly WireColumnMeta[];
   readonly parameters: readonly PhysicalType[];
   readonly catalogVersion: number;
+}
+/** What a prepared handle's fallback sends (protocol.ts `StatementRequest.preparedShape`). */
+export function preparedShape(info: PreparedInfo): PreparedShape {
+  return { columns: info.columns, parameters: info.parameters };
 }
 export interface OrdinaryCursor {
   readonly seq: number;
@@ -1054,6 +1059,7 @@ export class ProtocolClient {
       readonly frameRows?: number;
       readonly queryOnly?: boolean;
       readonly prepared?: number;
+      readonly preparedShape?: PreparedShape;
     } = {},
   ): OrdinaryCursor {
     const queue = new CursorQueue();
@@ -1063,6 +1069,7 @@ export class ProtocolClient {
         session: options.session ?? 0,
         text: sql,
         prepared: options.prepared ?? null,
+        ...(options.preparedShape === undefined ? {} : { preparedShape: options.preparedShape }),
         ...(options.queryOnly === undefined ? {} : { queryOnly: options.queryOnly }),
         knownColumnsVersion: -1,
         params,

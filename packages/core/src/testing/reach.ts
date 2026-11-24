@@ -13906,3 +13906,30 @@ export const EXPRESSION_BOUND_CENSUS_REACH = [
   "negative numeric",
   "scale above precision",
 ] as const;
+
+/** Writes waiting behind another connection's DDL (next/testing/plan-stale-wait-pglite.test.ts). */
+export const PLAN_STALE_WAIT_REACH = [
+  "served",
+  "unprepared",
+  "prepared",
+  "parameters",
+  "returning computed",
+  "returning star",
+  "planned after the turn, served",
+  "planned after the turn, refused",
+  "re-planned, refused",
+  "prepared result shape refused",
+  "prepared parameter type kept",
+  "result shape changed, unprepared",
+  "table recreated",
+  "column renamed",
+  "column dropped",
+  "trigger added",
+  "trigger dropped",
+  "three waiters",
+  "cancelled while waiting",
+  "rolled back",
+  "answered at once",
+  "DDL planned on its turn",
+  "DDL after an earlier waiter's write",
+] as const;

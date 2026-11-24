@@ -244,6 +244,10 @@ export interface WritePath {
   pin(options?: PinOptions): Snapshot;
   /** Waits for the writer slot (FIFO) and for backpressure. */
   begin(options?: BeginOptions): Promise<WriteTransaction>;
+  /** Writers waiting now for the slot (`begin`). */
+  readonly waitingWriters?: number;
+  /** The transaction holding the writer slot changed the catalog (it has not committed it yet). */
+  readonly holderMovedCatalog?: boolean;
   /** Resolves when every frame with LSN ≤ `lsn` is durable; null if that is already so. */
   durable(lsn: number): Promise<void> | null;
   /**
