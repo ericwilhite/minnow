@@ -2812,13 +2812,14 @@ export class WritePathImpl implements WritePath, EngineHooks {
   }
 
   /**
-   * Waits for the rows a step needs beyond what relief freed, as an ordinary admission carrying
-   * the statement's holdings: refused (53200, before the step's effect) when it could never be
-   * served beside them (GOVERNOR-WAIT-POLICY point 5), else served once finite holders release,
-   * and cancelled with the statement. Not holder growth: a reader's own growth (its read steps,
-   * the writer metadata it opens run readers with) is served before it, and a query waits for
-   * an admission holding nothing (rule 2), so no reader waits on it. Its credit then moves to
-   * the row account.
+   * Waits for the rows a step needs beyond what relief freed, carrying the statement's
+   * holdings: refused (53200, before the step's effect) when it could never be served beside
+   * them (GOVERNOR-WAIT-POLICY point 5), else served once finite holders release, and cancelled
+   * with the statement. Holder growth from the writer's chain (point 2): the statement holds the
+   * writer's credit, its transaction's rows among it, and a reader that waits for that credit
+   * (another connection's query, queued as a new admission) must never be ahead of it; as a new
+   * admission it queued behind such a reader, and both waited forever
+   * (testing/transaction-holder-growth.test.ts). Its credit then moves to the row account.
    */
   async #waitForRows(
     bytes: number,
@@ -2847,6 +2848,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
           label: "write path memtable",
           grants: [{ label: "write path memtable", minimumBytes: deficit, spillable: false }],
           holdings,
+          holdsCredit: this.#credits.holderChain,
           ...(signal === undefined ? {} : { signal }),
         });
         try {
@@ -3260,6 +3262,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
     const credits = this.#credits;
     return {
       grants: credits.grants(),
+      // The statement holding the writer turn grows from the writer's chain (holder growth).
+      chain: credits.holderChain,
       retained: () => {
         const queued = credits.queuedGrowth;
         if (queued.ordinary + queued.progress === 0)

@@ -173,6 +173,16 @@ allocations (covered FTS mutation entries, row arenas) are finite and reclaim re
 A preparation restart doubles its credit only when the doubled
 credit is admissible at once; otherwise it waits for its measured need alone.
 
+The statement holding the writer turn holds the writer's credit until it ends, a writable
+transaction's uncommitted rows among it, so its own requests are holder growth from the writer's
+chain (GOVERNOR-WAIT-POLICY points 2 and 6), never new admissions: its execution's admissions
+(`holderGrowth`, applied by the owner when it lends the writer's holdings) and a row step's wait
+for rows relief could not free (`WritePathImpl.#waitForRows`). As new admissions they queued in
+FIFO order behind another connection's read that waited for that very credit, and both waited
+forever (`testing/transaction-holder-growth.test.ts`). They are still bounded by what the
+statement keeps (point 5) and refused with 53200 above it. The other connection's read stays an
+ordinary admission: it waits for the transaction to end, and is cancellable.
+
 An insert step charges the memtable what it allocates, before it allocates it
 (write/transaction.ts `#stepCharge`, checked by `testing/memtable-charge-census.test.ts`):
 per-row metadata, and for rows into chunks the live memtable already has, their arenas' growth
