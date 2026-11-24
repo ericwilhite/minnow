@@ -3512,7 +3512,14 @@ not require a home cache directory.
   boolean" in every comparison form (`comparisonType`); mismatched UNION columns and CASE
   results are 42804, as in PostgreSQL. An IN list without a common type is compared item by
   item, OR-ed (AND-ed with `<>` for NOT IN) in list order, as PostgreSQL's
-  `transformAExprIn` does. Front-end
+  `transformAExprIn` does. Two rewrites of the shared front end are told apart by an untyped
+  `rewrite` mark on their right operand (engine/query.ts): `x IS [NOT] TRUE|FALSE` (written as
+  IS [NOT] DISTINCT FROM a boolean) keeps PostgreSQL's 42804 "argument of IS TRUE must be type
+  boolean", and `x = ANY | <> ALL (ARRAY[...])` (written as an IN / NOT IN list) keeps the
+  array's common-type 42804 and is one comparison, never per item. LIKE, ILIKE and SIMILAR TO
+  over a non-text operand are 42883 (`~~`, `~~*`, `~`); json has no comparison operator
+  (42883 at lowering); a parameter one expression fixes to two types is 42P08. Divergences
+  `simple-case-untyped-test` and `json-to-jsonb-implicit-cast` (testing/divergences.ts). Front-end
   errors are translated by message (`frontEndError`), keeping the parse position and the
   original as `cause`. The messages it depends on are pinned (`testing/front-end-states.test.ts`:
   a snapshot of every mapped front-end message, and per pattern a PGlite-checked statement).

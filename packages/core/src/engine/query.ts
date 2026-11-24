@@ -7578,7 +7578,8 @@ function quantifiedArrayCondition(
   array: Expression,
 ): Expression {
   if (array.kind === "call" && array.name === "ARRAY") {
-    const right: Expression = { kind: "list", items: array.arguments };
+    // `rewrite` (untyped) keeps PostgreSQL's ARRAY typing in next/'s lowering of the list.
+    const right = { kind: "list", items: array.arguments, rewrite: "array" } as Expression;
     if (operator === "=" && !all) return { kind: "condition", operator: "IN", left, right };
     if ((operator === "<>" || operator === "!=") && all) {
       return { kind: "condition", operator: "NOT IN", left, right };
@@ -11904,11 +11905,12 @@ class Parser {
       if (this.#isKeyword("TRUE") || this.#isKeyword("FALSE")) {
         const truth = this.#isKeyword("TRUE");
         this.#keyword(truth ? "TRUE" : "FALSE");
+        // `rewrite` (untyped) lets next/'s lowering name PostgreSQL's IS TRUE errors.
         return {
           kind: "condition",
           operator: negatedIs ? "IS DISTINCT FROM" : "IS NOT DISTINCT FROM",
           left,
-          right: { kind: "literal", value: truth },
+          right: { kind: "literal", value: truth, rewrite: "truth" } as Expression,
         };
       }
       if (this.#isKeyword("UNKNOWN")) {

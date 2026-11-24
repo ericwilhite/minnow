@@ -45,7 +45,7 @@
  *   governor grant (plans are small and bounded by the statement text). The cache that holds
  *   plans is the owner's to bound.
  * - **Errors.** `lower` throws only `PlanningError` (a SQL error with PostgreSQL's SQLSTATE:
- *   42601 syntax, 42P01 relation, 42703 column, 42883 function, 42704 type, …) and
+ *   42601 syntax, 42P01 relation, 42703 column, 42883 function or operator, 42704 type, …) and
  *   `UnsupportedPlanError` (0A000, a construct the new core does not translate yet). Front-end
  *   failures are translated (errors.ts `frontEndError`): the original is the `cause`, and a parse
  *   error keeps its `position`. Neither leaves state behind.

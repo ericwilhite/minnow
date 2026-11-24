@@ -25,6 +25,8 @@ import {
   coerce,
   commonType,
   comparisonType,
+  nameOf,
+  operandName,
   resolveFunction,
   settle,
   type ParameterTypes,
@@ -53,6 +55,8 @@ export type SubqueryRequest =
       readonly test: Collated;
       readonly cmp: "=" | "<>" | "<" | "<=" | ">" | ">=";
       readonly quantifier: "any" | "all";
+      /** The operator PostgreSQL's 42883 names: NOT IN (subquery) is NOT (x = ANY (subquery)). */
+      readonly named?: "=";
     };
 
 /** How names (and, in a grouped block, whole expressions) resolve. */
@@ -107,10 +111,13 @@ function requestSubquery(request: SubqueryRequest, scope: Scope, state: Expressi
 }
 
 const QUANTIFIED: Readonly<
-  Record<string, { cmp: "=" | "<>" | "<" | "<=" | ">" | ">="; quantifier: "any" | "all" }>
+  Record<
+    string,
+    { cmp: "=" | "<>" | "<" | "<=" | ">" | ">="; quantifier: "any" | "all"; named?: "=" }
+  >
 > = {
   IN: { cmp: "=", quantifier: "any" },
-  "NOT IN": { cmp: "<>", quantifier: "all" },
+  "NOT IN": { cmp: "<>", quantifier: "all", named: "=" },
   "= ANY": { cmp: "=", quantifier: "any" },
   "!= ANY": { cmp: "<>", quantifier: "any" },
   "<> ANY": { cmp: "<>", quantifier: "any" },
@@ -519,6 +526,28 @@ function hasCommonType(values: readonly Typed[], state: ExpressionState): boolea
   }
 }
 
+/** The form the front end rewrote an operand from (engine/query.ts sets it, untyped): `truth`
+ * for IS [NOT] TRUE|FALSE's boolean, `array` for `= ANY` / `<> ALL` over an ARRAY constructor. */
+function rewriteOf(expression: Expression): string | undefined {
+  return (expression as { readonly rewrite?: string }).rewrite;
+}
+
+/** An ARRAY constructor's items have a common type, or PostgreSQL's 42804 naming the first two
+ * that cannot be matched. */
+function arrayType(items: readonly Typed[], state: ExpressionState): void {
+  const typed = items.filter((item) => item.pending === undefined);
+  typed.forEach((item, k) => {
+    if (k === 0 || hasCommonType(typed.slice(0, k + 1), state)) return;
+    const earlier = typed.slice(0, k);
+    const first = earlier.find((other) => !hasCommonType([other, item], state)) ?? earlier[0];
+    if (first === undefined) return;
+    throw new PlanningError(
+      `ARRAY types ${operandName(first.expr.type)} and ${operandName(item.expr.type)} cannot be matched`,
+      "42804",
+    );
+  });
+}
+
 const COMPARISONS: Readonly<Record<string, "=" | "<>" | "<" | "<=" | ">" | ">=">> = {
   "=": "=",
   "!=": "<>",
@@ -577,12 +606,25 @@ export function lowerCondition(
     }
     case "IS DISTINCT FROM":
     case "IS NOT DISTINCT FROM": {
-      const [a, b] = unify(
-        [lowerExpression(left, scope, state), lowerExpression(right, scope, state)],
-        state,
-        "=",
-        true,
-      ) as [Typed, Typed];
+      const l = lowerExpression(left, scope, state);
+      // `x IS [NOT] TRUE|FALSE`, which the front end writes as IS [NOT] DISTINCT FROM a boolean
+      // (`rewrite`): PostgreSQL requires a boolean argument (42804), before any operator.
+      if (
+        rewriteOf(right) === "truth" &&
+        l.pending === undefined &&
+        l.expr.type.kind !== BOOL.kind
+      ) {
+        const truth = right.kind === "literal" && right.value === true ? "TRUE" : "FALSE";
+        const not = operator === "IS DISTINCT FROM" ? "NOT " : "";
+        throw new PlanningError(
+          `argument of IS ${not}${truth} must be type boolean, not type ${operandName(l.expr.type)}`,
+          "42804",
+        );
+      }
+      const [a, b] = unify([l, lowerExpression(right, scope, state)], state, "=", true) as [
+        Typed,
+        Typed,
+      ];
       return {
         expr: {
           op: "distinctFrom",
@@ -619,10 +661,15 @@ export function lowerCondition(
       const arg = lowerExpression(left, scope, state);
       const items = right.items.map((item) => lowerExpression(item, scope, state));
       const cmp = operator === "IN" ? "=" : "<>";
+      // `x = ANY (ARRAY[...])` / `x <> ALL (ARRAY[...])`, which the front end writes as an IN /
+      // NOT IN list (`rewrite`): PostgreSQL builds the array first, so its items need a common
+      // type ("ARRAY types integer and boolean cannot be matched", 42804), and the test is one
+      // operator over it; no per-item comparison.
+      if (rewriteOf(right) === "array") arrayType(items, state);
       // PostgreSQL (transformAExprIn): one comparison with the list in the list's common type;
       // without one, each item compared on its own, OR-ed (AND-ed for NOT IN) in list order, so
       // an item without an operator is that pair's 42883 ("operator does not exist").
-      if (!hasCommonType([arg, ...items], state)) {
+      if (rewriteOf(right) !== "array" && !hasCommonType([arg, ...items], state)) {
         const each = items.map((item) => {
           const [a, b] = unify([arg, item], state, cmp, true) as [Typed, Typed];
           return {
@@ -665,13 +712,28 @@ export function lowerCondition(
     case "SIMILAR TO":
     case "NOT SIMILAR TO": {
       const text: PhysicalType = { kind: "text" };
-      const arg = coerce(lowerExpression(left, scope, state), text, "implicit", state.parameters);
-      const pattern = coerce(
-        lowerExpression(right, scope, state),
-        text,
-        "implicit",
-        state.parameters,
-      );
+      const l = lowerExpression(left, scope, state);
+      const r = lowerExpression(right, scope, state);
+      let arg: Typed, pattern: Typed;
+      try {
+        arg = coerce(l, text, "implicit", state.parameters);
+        pattern = coerce(r, text, "implicit", state.parameters);
+      } catch (error) {
+        // PostgreSQL resolves LIKE, ILIKE and SIMILAR TO as operators (~~, ~~*, ~ over
+        // similar_to_escape's text): a non-text operand is "operator does not exist" (42883).
+        if (!(error instanceof PlanningError) || error.sqlState !== "42804") throw error;
+        const similar = operator.endsWith("SIMILAR TO");
+        const symbol =
+          (operator.startsWith("NOT ") ? "!" : "") +
+          (similar ? "~" : operator.endsWith("ILIKE") ? "~~*" : "~~");
+        // SIMILAR TO compares with similar_to_escape's result, which is text.
+        const rightName =
+          similar && (r.pending !== undefined || r.expr.type.kind === "text") ? "text" : nameOf(r);
+        throw new PlanningError(
+          `operator does not exist: ${nameOf(l)} ${symbol} ${rightName}`,
+          "42883",
+        );
+      }
       return {
         expr: {
           op: "like",

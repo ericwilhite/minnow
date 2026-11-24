@@ -520,7 +520,11 @@ export function lowerFrom(
         big: innerColumn.big,
       };
       const type = baseType(
-        comparisonType([request.test, innerTyped], builder.parameters, request.cmp),
+        comparisonType(
+          [request.test, innerTyped],
+          builder.parameters,
+          request.named ?? request.cmp,
+        ),
       );
       const test = coerce(request.test, type, "implicit", builder.parameters);
       const cast = coerce(innerTyped, type, "implicit", builder.parameters);
@@ -686,7 +690,9 @@ export function lowerFrom(
       [...sourcesOf(expr)].every((source) => !innerSources.has(source));
     const innerOnly = (expr: ScalarExpr) => subset(sourcesOf(expr), innerSources);
     if (!innerOnly(tested.expr) || !outerOnly(request.test.expr)) return null;
-    const type = baseType(comparisonType([request.test, tested], builder.parameters, request.cmp));
+    const type = baseType(
+      comparisonType([request.test, tested], builder.parameters, request.named ?? request.cmp),
+    );
     const probeKey = coerce(request.test, type, "implicit", builder.parameters);
     const buildKey = coerce(tested, type, "implicit", builder.parameters);
     const collation = request.test.collation ?? (tested as Collated).collation ?? null;

@@ -919,7 +919,7 @@ function simplifyNegations(expression: Expression): Expression {
     };
   }
   if (expression.kind === "list") {
-    return { kind: "list", items: expression.items.map(simplifyNegations) };
+    return { ...expression, items: expression.items.map(simplifyNegations) };
   }
   if (expression.kind === "case") {
     return {

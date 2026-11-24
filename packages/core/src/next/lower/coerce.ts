@@ -276,7 +276,7 @@ export function settle(typed: Typed, parameters: ParameterTypes): Typed {
 
 /** An operand's type as PostgreSQL's operator errors print it: `format_type_be`, without a type
  * modifier (`character varying`, `character`, `numeric`). */
-function operandName(type: PhysicalType): string {
+export function operandName(type: PhysicalType): string {
   if (type.kind === "text" && type.maxLength !== undefined)
     return type.fixed === true ? "character" : "character varying";
   return sqlTypeName(baseType(type));
@@ -293,11 +293,25 @@ export function comparisonType(
   parameters: ParameterTypes,
   operator: string,
 ): PhysicalType {
+  const [left, ...rest] = values;
+  // PostgreSQL has no comparison operator for json (jsonb has them): "operator does not exist:
+  // json = json", at analysis, whatever the other operand is.
+  const isJson = (value: Typed) =>
+    value.pending === undefined && value.expr.type.kind === "json" && !value.expr.type.binary;
+  if (left !== undefined && values.some(isJson)) {
+    const right = isJson(left) ? rest[0] : rest.find(isJson);
+    if (right !== undefined)
+      throw new PlanningError(
+        `operator does not exist: ${nameOf(left)} ${operator} ${nameOf(right)}`,
+        "42883",
+      );
+  }
+  let common: PhysicalType;
   try {
-    return commonType(values, parameters, "comparison");
+    common = commonType(values, parameters, "comparison");
   } catch (error) {
     if (!(error instanceof PlanningError) || error.sqlState !== "42804") throw error;
-    const [left, ...rest] = values;
+    inconsistentParameter(values, parameters);
     if (left === undefined || left.pending !== undefined) throw error;
     for (const right of rest) {
       if (right.pending !== undefined) continue;
@@ -312,6 +326,48 @@ export function comparisonType(
     }
     // Each operand matches the left one but not each other: not an operator failure.
     throw error;
+  }
+  // A parameter this very comparison fixed to another type (`b IN ($1, ($1 = 1))`).
+  inconsistentParameter([...values, typedAs(common)], parameters);
+  return common;
+}
+
+/** A Typed standing for a value of `type` (for `commonType`'s checks only). */
+function typedAs(type: PhysicalType): Typed {
+  return {
+    expr: { op: "const", value: null, type } as unknown as ScalarExpr,
+    nullable: true,
+    big: false,
+  };
+}
+
+/** An operand as PostgreSQL's operator error names it: an untyped literal is `unknown`. */
+export function nameOf(value: Typed): string {
+  return value.pending === undefined ? operandName(value.expr.type) : "unknown";
+}
+
+/**
+ * PostgreSQL deduces an untyped parameter's type at its first use; a later use in the same
+ * expression that needs another type is "inconsistent types deduced for parameter $n" (42P08).
+ * A parameter still pending here was fixed while this expression was lowered (an earlier
+ * predicate's fix leaves it typed, and its mismatch is the operator's 42883).
+ */
+function inconsistentParameter(values: readonly Typed[], parameters: ParameterTypes): void {
+  for (const value of values) {
+    if (value.pending?.kind !== "param") continue;
+    const fixed = parameters.type(value.pending.index);
+    if (fixed === null) continue;
+    for (const other of values) {
+      if (other === value || other.pending !== undefined) continue;
+      try {
+        commonType([typedAs(fixed), other], parameters, "comparison");
+      } catch {
+        throw new PlanningError(
+          "inconsistent types deduced for parameter $" + String(value.pending.index + 1),
+          "42P08",
+        );
+      }
+    }
   }
 }
 
