@@ -1583,7 +1583,9 @@ and the owner import it directly.
   the memtable is freed. Writers never wait on readers.
 - **Large transactions commit through a staged root.** Rows past the memtable bounds are written as
   staged groups with staged index runs, published under the transaction's id, and committed by a
-  `publishedRows` frame.
+  `publishedRows` frame. Each staging rewrites the transaction's group directory whole; past
+  4,096 staged groups it has several pages in one extent, and the next staging, the fold and a
+  fold after replay release that extent once (R25).
 - **Index runs are tiered.** A level of 8 sorted runs merges into one at the next level, so a
   point read probes at most 7 runs per level once merges catch up (7·L for L = 1 + ⌈log₈(N / M)⌉
   levels over N entries and M per flush), and at most 23 + 7·(L − 1) while they lag (writers wait

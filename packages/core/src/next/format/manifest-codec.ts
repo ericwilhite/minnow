@@ -928,20 +928,25 @@ export function directoryPageGroups(remaining: number): number {
  * `GROUPS_PER_PAGE`, then the index. The caller keeps an unchanged prefix and selects the
  * suffix to rewrite. Binary tail sizing keeps the regular write path canonical while the
  * default packed mode preserves the legacy/staging writer behavior. The new pages share one extent; the index is a blob of its own extent.
+ * `pageGroups` caps a packed page below `GROUPS_PER_PAGE` (tests: multi-page directories without
+ * thousands of groups).
  */
 export async function writeGroupDirectory(
   writer: ExtentWriter,
   groups: readonly GroupRef[],
   keep: readonly GroupPageEntry[] = [],
   tail: "packed" | "binary" = "packed",
+  pageGroups = GROUPS_PER_PAGE,
 ): Promise<WrittenGroupDirectory> {
+  if (!Number.isSafeInteger(pageGroups) || pageGroups < 1 || pageGroups > GROUPS_PER_PAGE)
+    throw new RangeError(`A directory page holds 1 … ${String(GROUPS_PER_PAGE)} groups`);
   const last = keep[keep.length - 1];
   const first = groups[0];
   if (last !== undefined && first !== undefined && first.firstRowId <= last.lastRowId)
     throw new RangeError("New groups must follow the kept directory pages");
   const chunks: GroupRef[][] = [];
   for (let start = 0; start < groups.length;) {
-    const count = tail === "binary" ? directoryPageGroups(groups.length - start) : GROUPS_PER_PAGE;
+    const count = tail === "binary" ? directoryPageGroups(groups.length - start) : pageGroups;
     chunks.push(groups.slice(start, start + count));
     start += count;
   }

@@ -7716,6 +7716,18 @@ export const FTS_CREDIT_RETIREMENT_REACH = [
 /** FTS staging overlays must preserve native publication retirement bookkeeping (R25). */
 export const FTS_ROOT_TRACKING_REACH = ["FTS publication retires native staging"] as const;
 
+/**
+ * A staged directory of two or more pages (they share one extent) in each place its extents are
+ * released: by the transaction's next staging, by its fold at commit, and by a fold after the
+ * open replayed the commit (next/write/staged-generated.test.ts).
+ */
+export const STAGED_DIRECTORY_PAGES_REACH = [
+  "multi-page staged directory",
+  "multi-page directory restaged",
+  "multi-page directory folded",
+  "multi-page directory replayed",
+] as const;
+
 export const FTS_INLINE_MUTATION_REACH = [
   "wide commit LSN",
   "cancelled record rebound",

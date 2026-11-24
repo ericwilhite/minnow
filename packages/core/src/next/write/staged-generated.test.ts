@@ -1,4 +1,9 @@
-import { decodeManifestRoot } from "../format/manifest-codec.js";
+import {
+  decodeGroupIndex,
+  decodeManifestRoot,
+  GROUPS_PER_PAGE,
+  isEmptyDirectory,
+} from "../format/manifest-codec.js";
 import { ftsDef } from "../access/fts-def.js";
 /**
  * Generated histories of large transactions against a model (format/replay.ts "Large
@@ -10,12 +15,21 @@ import { ftsDef } from "../access/fts-def.js";
  * often, and crashes and reopens replay the log. A non-indexed text column includes values over
  * 64 KiB; value equality and declared reach cover staged, recovered lazy and folded reads.
  * Updating only v must preserve body through the write path's published-row reader.
+ *
+ * Each seed also picks the groups per staged directory page: the default, or one to three, so a
+ * staging of a few memtables writes the multi-page directory (its pages share one extent) that a
+ * transaction of thousands of memtables does. Its next staging, its fold and a fold after replay
+ * each release that directory once (ruling R25; storage/extent-list.ts refuses anything else).
  */
 import { describe, expect, it } from "vitest";
 import { UniqueViolationError } from "../access/modify.js";
 import type { Snapshot } from "../access/snapshot.js";
 import { encodeKeyBatch, KeyBatch } from "../keys/key-encoding.js";
-import { createReach, FTS_ROOT_TRACKING_REACH } from "../../testing/reach.js";
+import {
+  createReach,
+  FTS_ROOT_TRACKING_REACH,
+  STAGED_DIRECTORY_PAGES_REACH,
+} from "../../testing/reach.js";
 import { mulberry32, seedsFor } from "../../testing/seeds.js";
 import { need } from "./bytes.js";
 import type { WritePathImpl } from "./engine.js";
@@ -45,6 +59,7 @@ const FREE = { allocate: () => true, free: () => undefined };
 
 const REACH = [
   ...FTS_ROOT_TRACKING_REACH,
+  ...STAGED_DIRECTORY_PAGES_REACH,
   "staged",
   "folded",
   "truncated-tail",
@@ -155,7 +170,10 @@ describe("staged large transactions, generated", () => {
       let ftsFlushGate: Promise<void> | null = null,
         releaseFtsFlush: (() => void) | undefined;
       context.onTestFinished(() => releaseFtsFlush?.());
+      // From the seed alone, so a MINNOW_SEED replay stages the same directories.
+      const pageGroups = [GROUPS_PER_PAGE, 1, 2, 3][seed % 4] ?? GROUPS_PER_PAGE;
       const harness = new Harness("strict", "sim", 6, undefined, {
+        stagedDirectoryPageGroups: pageGroups,
         afterDeltaPrepared: (kind) => {
           if (kind === "fts" && retiresStaging)
             reach.reach("FTS publication retires native staging");
@@ -223,6 +241,39 @@ describe("staged large transactions, generated", () => {
       };
       const model = new Map<number, number>();
       let next = 1;
+      // Staged directories of two or more pages the durable root names, by staging id: the
+      // directory's index offset. `ending` is how the open transaction ended; a commit whose
+      // staging the open replayed is `replayed` until its fold.
+      let multiPage = new Map<number, number>();
+      let ending: "open" | "commit" | "rollback" | "replayed" = "open";
+      const observePages = async () => {
+        const table = path.state().root.tables.find((x) => x.tableId === t);
+        const now = new Map<number, number>();
+        for (const entry of table?.staged ?? []) {
+          if (isEmptyDirectory(entry.groups)) continue;
+          const lease = await harness.space.read([entry.groups], { budget: FREE });
+          try {
+            const pages = decodeGroupIndex(need(lease.bytes[0]), FREE).value;
+            const extents = new Set(pages.map((page) => page.ref.extent.offset));
+            if (pages.length >= 2 && extents.size < pages.length) {
+              reach.reach("multi-page staged directory");
+              now.set(entry.transaction, entry.groups.extent.offset);
+            }
+          } finally {
+            lease.release();
+          }
+        }
+        for (const [id, offset] of multiPage) {
+          const entry = table?.staged.find((staged) => staged.transaction === id);
+          if (entry !== undefined && entry.groups.extent.offset !== offset)
+            reach.reach("multi-page directory restaged");
+          if (entry === undefined && ending === "commit")
+            reach.reach("multi-page directory folded");
+          if (entry === undefined && ending === "replayed")
+            reach.reach("multi-page directory replayed");
+        }
+        multiPage = now;
+      };
       const observe = () => {
         const m = path.maintenance;
         if (m.stages > 0) reach.reach("staged");
@@ -310,6 +361,7 @@ describe("staged large transactions, generated", () => {
             throw error;
           }
           observe();
+          await observePages();
         }
         const end = int(100);
         if (end < 70) {
@@ -318,19 +370,26 @@ describe("staged large transactions, generated", () => {
           await (
             await tx.commit(null)
           ).durable;
+          ending = "commit";
           model.clear();
           for (const [id, v] of mine) model.set(id, v);
           if (unfolded) {
             observe();
+            await observePages();
             path = await crash();
+            if (multiPage.size > 0) ending = "replayed";
             observe();
             await check(path, t, model, `seed ${String(seed)} round ${String(round)} unfolded`);
             continue;
           }
-        } else if (end < 88) tx.rollback();
-        else {
+        } else if (end < 88) {
+          tx.rollback();
+          ending = "rollback";
+        } else {
           // The process dies mid-transaction: nothing of it may survive.
           observe();
+          await observePages();
+          ending = "rollback";
           path = await crash();
           observe();
           await check(path, t, model, `seed ${String(seed)} round ${String(round)} after a crash`);
