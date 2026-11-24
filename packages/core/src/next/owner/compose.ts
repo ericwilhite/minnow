@@ -1,3 +1,4 @@
+import { holderGrowth } from "../memory/governor.js";
 import { LiveRuntime } from "../live/runtime.js";
 import type { OwnerSnapshotOperations } from "./snapshot-connection.js";
 import { statementRuleReach } from "../exec/statement-reach.js";
@@ -846,11 +847,20 @@ class ComposedSession implements EngineSession {
   ): Execution {
     const prepared = this.#engine.prepare(plan);
     const options = this.#engine.options;
+    // A statement holding the writer turn (a modification's statement, a query inside a writable
+    // transaction) holds the writer's credit, its transaction's rows among it, until it is done:
+    // its admissions are holder growth from the writer's chain, never new admissions queued
+    // behind a request waiting on that credit (GOVERNOR-WAIT-POLICY points 2 and 6).
+    const lent =
+      target.statement !== null
+        ? (target.statement.writerHoldings?.() ?? null)
+        : (target.writerHoldings?.() ?? null);
     return prepared.execute({
       parameters: params,
       statementTime: this.#statementTime(),
       reads: options.reads,
-      governor: options.governor,
+      governor:
+        lent?.chain === undefined ? options.governor : holderGrowth(options.governor, lent.chain),
       spill: options.spill,
       queryId: this.#engine.nextQueryId(),
       sequences: this.#sequenceAccess,

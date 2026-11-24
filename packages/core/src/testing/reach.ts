@@ -2105,6 +2105,24 @@ export const WRITABLE_TRANSACTION_READ_REACH = [
   "after a write in the transaction",
 ] as const;
 
+/** A transaction's next statement beside a request waiting on it (transaction-holder-growth). */
+export const TRANSACTION_HOLDER_GROWTH_REACH = [
+  "A answered beside a waiting reader",
+  "A idle",
+  "savepoint",
+  "B cancelled",
+  "B served after A ended",
+  "commit",
+  "rollback",
+  "insert",
+  "update",
+  "select",
+  "create index",
+  "idle",
+  "wide select",
+  "write",
+] as const;
+
 /** A write step waiting for rows, decided without spinning (row-wait-reclaim). */
 export const ROW_WAIT_RECLAIM_REACH = ["waited for rows", "written", "refused typed"] as const;
 

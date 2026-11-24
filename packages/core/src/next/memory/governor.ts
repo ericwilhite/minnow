@@ -69,7 +69,8 @@ export interface AdmitOptions {
  * A registered holder chain (GOVERNOR-WAIT-POLICY point 6, checked): the only source of holder
  * growth. Holder priority is deadlock-free because holder chains never wait on each other: the
  * write engine is the one `"writer"` chain per governor (a native root, the write index range
- * cursor and an identity migration grow inside it), and an `"owner"` chain is exclusive owner
+ * cursor, an identity migration, a row step's wait and the executor admissions of the statement
+ * holding the writer turn, `holderGrowth`, grow inside it), and an `"owner"` chain is exclusive owner
  * work (startup, reopen, snapshot import) that runs while no writing transaction is open. The
  * governor enforces both: holder growth names an open chain of this governor, and an owner
  * chain's growth while the writer chain has a writing transaction open is an invariant error
@@ -259,6 +260,35 @@ export interface LentHoldings {
    * neither could they.
    */
   queued?(): { readonly ordinary: number; readonly progress: number };
+  /**
+   * The owner's holder chain (the writer's): the statement holding its turn holds this credit
+   * until its own requests are served, so they are holder growth from this chain
+   * (GOVERNOR-WAIT-POLICY points 2 and 6; `holderGrowth`).
+   */
+  readonly chain?: HolderChain;
+}
+
+/**
+ * `governor` for a statement that holds credit it cannot release until its requests are served
+ * (a statement holding the writer turn, inside a transaction that keeps its rows): every
+ * admission it queues is holder growth from `chain`, served before new admissions, so it never
+ * waits behind a request that waits on the credit it holds (GOVERNOR-WAIT-POLICY point 2). It is
+ * still bounded by what fits beside its holdings, and refused typed otherwise (point 5). `chain`
+ * is the holder's own registered chain (point 6, checked by the governor), never a new one.
+ */
+export function holderGrowth(governor: MemoryGovernor, chain: HolderChain): MemoryGovernor {
+  return new Proxy(governor, {
+    get(target, key) {
+      if (key === "admit")
+        return (options: AdmitOptions) =>
+          target.admit({ ...options, holdsCredit: options.holdsCredit ?? chain });
+      if (key === "admitGroup")
+        return (options: NativeGrantGroupOptions) =>
+          target.admitGroup({ ...options, holdsCredit: options.holdsCredit ?? chain });
+      const value: unknown = Reflect.get(target, key, target);
+      return typeof value === "function" ? (value as () => unknown).bind(target) : value;
+    },
+  });
 }
 
 /** Named parts of one complete minimum. Each part remains a normal native grant. */
