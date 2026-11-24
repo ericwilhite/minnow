@@ -101,13 +101,27 @@ function noSnapshotPrepare(second?: LeadingToken, third?: LeadingToken): boolean
  * extended-protocol Parse): when it starts a statement PostgreSQL analyses at Parse.
  */
 export function failedPrepareTakesSnapshot(text: string): boolean {
-  const tokens = statementTokens(text, Infinity);
-  const first = tokens[0];
+  // The first token decides every statement but CREATE: read only it (a failed prepare of a
+  // megabyte INSERT must not tokenize the megabyte).
+  const [first] = statementTokens(text, 1);
   if (first === undefined) return false;
   if (first.text === "(" && first.kind === "punct") return true;
   if (first.kind !== "word") return false;
   if (ANALYZED_WORDS.has(first.text)) return true;
-  return first.text === "CREATE" && createTableAs(tokens);
+  if (first.text !== "CREATE") return false;
+  // Then only CREATE [LOCAL | GLOBAL] [TEMP | TEMPORARY | UNLOGGED] { TABLE | MATERIALIZED }
+  // reads further: its AS can be anywhere after TABLE.
+  const head = statementTokens(text, 5);
+  return createTableHead(head) && createTableAs(statementTokens(text, Infinity));
+}
+
+/** Whether `tokens` (CREATE and the next four) start a TABLE or MATERIALIZED VIEW. */
+function createTableHead(tokens: readonly LeadingToken[]): boolean {
+  return tokens
+    .slice(1, 5)
+    .some(
+      (token) => token.kind === "word" && (token.text === "TABLE" || token.text === "MATERIALIZED"),
+    );
 }
 
 /**
@@ -233,6 +247,6 @@ function asciiUpper(word: string): string {
 
 /** An unquoted keyword or name (scan.l `identifier`: a letter, `_` or a non-ASCII character
  * first), read in place (sticky). */
-const WORD = /[A-Za-z_\u0080-\uffff][A-Za-z0-9_$\u0080-\uffff]*/uy;
+const WORD = /[A-Za-z_\u0080-\u{10ffff}][A-Za-z0-9_$\u0080-\u{10ffff}]*/uy;
 /** A dollar-quote tag (scan.l `dolqdelim`), read in place. */
-const DOLLAR_TAG = /\$(?:[A-Za-z_\u0080-\uffff][A-Za-z0-9_\u0080-\uffff]*)?\$/uy;
+const DOLLAR_TAG = /\$(?:[A-Za-z_\u0080-\u{10ffff}][A-Za-z0-9_\u0080-\u{10ffff}]*)?\$/uy;

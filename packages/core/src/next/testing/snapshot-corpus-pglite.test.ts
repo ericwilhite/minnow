@@ -65,7 +65,8 @@ function probeBreaking(sql: string): boolean {
       token.word ? token.text.replace(/[a-z]+/gu, (l) => l.toUpperCase()) : token.text,
     );
   if (first === undefined) return false;
-  if (first === "PREPARE") return second === "TRANSACTION" && /^(?:[Ee]?'|\$)/u.test(third ?? "");
+  if (first === "PREPARE")
+    return second === "TRANSACTION" && /^(?:[Ee]?'|[Uu]&'|\$)/u.test(third ?? "");
   return PROBE_BREAKING.has(first);
 }
 

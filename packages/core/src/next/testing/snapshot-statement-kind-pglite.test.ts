@@ -261,6 +261,8 @@ it("takes no snapshot for PREPARE TRANSACTION (PostgreSQL's ends the transaction
   // PostgreSQL ends the transaction (55000, then 25P01), so its probe cannot see this one:
   // `PlannedStmtRequiresSnapshot` refuses TransactionStmt (utility.c) is the authority.
   expect((await tookSnapshot(next, "PREPARE TRANSACTION 'x'")).took).toBe(false);
+  // Neon's re-check of #59 (4d9e0a44): a dollar-quoted identifier with an astral tag is a string.
+  expect((await tookSnapshot(next, "PREPARE TRANSACTION $𝕏$x$𝕏$")).took).toBe(false);
   expect((await tookSnapshot(next, "PREPARE p AS SELECT 1")).took).toBe(true);
 });
 

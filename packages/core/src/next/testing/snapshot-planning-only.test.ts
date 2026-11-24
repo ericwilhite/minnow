@@ -159,6 +159,9 @@ it("a prepare takes the snapshot exactly where PostgreSQL's Parse does", async (
     "PREPARE p AS SELECT 1",
     // A keyword folds ASCII letters only: no statement in PostgreSQL, none in next/.
     "ſelect 1",
+    // Neon's re-check of #59 (4d9e0a44): an astral dollar-quote tag (scan.l takes every
+    // non-ASCII byte) is one string, so its ") AS (" is no CREATE TABLE AS.
+    "CREATE TABLE z (a text DEFAULT $𝕏$) AS ($𝕏$, b no_such_type)",
   ]) {
     const postgres = await postgresParse(sql);
     const { port, header, took } = await session();

@@ -249,8 +249,8 @@ function scan(sql: string): Token[] {
   const out: Token[] = [];
   let i = 0;
   const at = (k: number) => sql[k] ?? "";
-  const isWordStart = (c: string) => /[A-Za-z_\u0080-\uffff]/u.test(c) && c !== "";
-  const isWordPart = (c: string) => /[A-Za-z0-9_$\u0080-\uffff]/u.test(c) && c !== "";
+  const isWordStart = (c: string) => /[A-Za-z_\u0080-\u{10ffff}]/u.test(c) && c !== "";
+  const isWordPart = (c: string) => /[A-Za-z0-9_$\u0080-\u{10ffff}]/u.test(c) && c !== "";
   const quoted = (from: number, quote: string, backslash: boolean): number => {
     let k = from + 1;
     while (k < sql.length) {
@@ -300,7 +300,7 @@ function scan(sql: string): Token[] {
       i += 1;
       while (/[0-9]/u.test(at(i))) i += 1;
     } else if (c === "$") {
-      const tag = /^\$(?:[A-Za-z_\u0080-\uffff][A-Za-z0-9_\u0080-\uffff]*)?\$/u.exec(
+      const tag = /^\$(?:[A-Za-z_\u0080-\u{10ffff}][A-Za-z0-9_\u0080-\u{10ffff}]*)?\$/u.exec(
         sql.slice(i),
       )?.[0];
       if (tag === undefined) i += 1;
