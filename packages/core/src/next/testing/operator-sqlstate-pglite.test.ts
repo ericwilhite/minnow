@@ -39,14 +39,18 @@ const COLUMNS = {
   uuid: "u",
   json: "j",
   jsonb: "jb",
+  // Neon's round 3 of #63: columns with a type modifier, inside an ARRAY beside untyped literals.
+  "character varying(3)": "v3",
+  "character(3)": "c3",
+  "numeric(5,2)": "n52",
 } as const;
 type Type = keyof typeof COLUMNS;
 const TYPES = Object.keys(COLUMNS) as Type[];
 const SETUP = [
-  "CREATE TABLE t (id integer PRIMARY KEY, i integer, g bigint, b boolean, s text, d date, ts timestamp, n numeric, f double precision, iv interval, vc varchar(10), ch char(5), si smallint, r real, tm time, tz timestamptz, u uuid, j json, jb jsonb)",
-  "INSERT INTO t VALUES (1, 1, 1, true, '1', DATE '2020-01-01', TIMESTAMP '2020-01-01 00:00:00', 1, 1, NULL, '1', '1', 1, 1, NULL, NULL, NULL, NULL, NULL)",
-  "INSERT INTO t VALUES (2, 2, 3, false, 'a', DATE '2020-01-02', TIMESTAMP '2020-01-02 12:00:00', 2.5, 2.5, NULL, 'a', 'a', 2, 2.5, NULL, NULL, NULL, NULL, NULL)",
-  "INSERT INTO t VALUES (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
+  "CREATE TABLE t (id integer PRIMARY KEY, i integer, g bigint, b boolean, s text, d date, ts timestamp, n numeric, f double precision, iv interval, vc varchar(10), ch char(5), si smallint, r real, tm time, tz timestamptz, u uuid, j json, jb jsonb, v3 varchar(3), c3 char(3), n52 numeric(5, 2))",
+  "INSERT INTO t VALUES (1, 1, 1, true, '1', DATE '2020-01-01', TIMESTAMP '2020-01-01 00:00:00', 1, 1, NULL, '1', '1', 1, 1, NULL, NULL, NULL, NULL, NULL, '1', '1', 1.5)",
+  "INSERT INTO t VALUES (2, 2, 3, false, 'a', DATE '2020-01-02', TIMESTAMP '2020-01-02 12:00:00', 2.5, 2.5, NULL, 'a', 'a', 2, 2.5, NULL, NULL, NULL, NULL, NULL, 'abc', 'a', 2.25)",
+  "INSERT INTO t VALUES (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
 ];
 
 const OPERATORS = ["=", "<>", "<", "<=", ">", ">="] as const;
@@ -145,7 +149,7 @@ function typeOf(column: string): string {
 }
 
 /** Left operands that are not columns: PostgreSQL types them from the other side. */
-const UNTYPED = ["'1'", "NULL"] as const;
+const UNTYPED = ["'1'", "NULL", "'12345'", "'1.2345'"] as const;
 
 interface Outcome {
   readonly state: string;
@@ -169,7 +173,11 @@ beforeAll(async () => {
     next.execute(sql);
     // The executor cannot cast into varchar(n) / char(n) yet (the text kernels): NULL there.
     await core.execute(
-      sql.replace(/'1', '1', (1|2), /u, "NULL, NULL, $1, ").replace(/'a', 'a', /u, "NULL, NULL, "),
+      sql
+        .replace(/'1', '1', (1|2), /u, "NULL, NULL, $1, ")
+        .replace(/'a', 'a', /u, "NULL, NULL, ")
+        .replace(/'1', '1', 1\.5\)$/u, "NULL, NULL, 1.5)")
+        .replace(/'abc', 'a', 2\.25\)$/u, "NULL, NULL, 2.25)"),
     );
   }
 }, 60_000);
@@ -265,7 +273,7 @@ async function compare(
   if (
     expected.state.startsWith("22") &&
     expected.message.startsWith("invalid input syntax") &&
-    sql.includes("'1'")
+    UNTYPED.some((literal) => literal !== "NULL" && sql.includes(literal))
   ) {
     expect(actual.state, `${sql}: refused (PostgreSQL: ${expected.message})`).not.toBe("00000");
     reach?.reach("untyped input refused");
@@ -275,6 +283,12 @@ async function compare(
     expected.state,
   );
   if (expected.state === "42883" && expected.message.startsWith("operator does not exist"))
+    expect(actual.message, sql).toBe(expected.message);
+  // ARRAY's matching and conversion refusals name PostgreSQL's types.
+  if (
+    (expected.state === "42804" || expected.state === "42846") &&
+    expected.message.startsWith("ARRAY ")
+  )
     expect(actual.message, sql).toBe(expected.message);
   if (rows && expected.state === "00000" && actual.rows !== undefined) {
     expect(actual.rows, `${sql}: rows`).toEqual(expected.rows);
@@ -289,7 +303,7 @@ async function compare(
     if (run.state !== "0A000") {
       expect(run.state, `${sql}: executed: ${run.message}`).toBe("00000");
       // Its varchar(n) / char(n) columns hold NULLs (above): rows compared without them.
-      if (rows && run.rows !== undefined && !/\b(vc|ch)\b/u.test(sql))
+      if (rows && run.rows !== undefined && !/\b(vc|ch|v3|c3)\b/u.test(sql))
         expect(run.rows, `${sql}: executed rows`).toEqual(expected.rows);
       reach?.reach("executed");
     }
@@ -428,6 +442,38 @@ it("answers every form Neon's re-check of #63 (a1f129e4) named, as PostgreSQL do
     "SELECT GREATEST(j, j) FROM t",
     "SELECT LEAST(j, j) FROM t",
     "SELECT GREATEST(jb, jb) FROM t",
+  ])
+    await compare(sql, undefined, true);
+});
+
+it("answers every form Neon's round 3 of #63 (8ac4d272) named, as PostgreSQL does", async () => {
+  for (const sql of [
+    // P1: an untyped literal in an ARRAY takes the element's base type, never a column's modifier.
+    "SELECT id FROM t WHERE '12345' = ANY (ARRAY[v3, '12345']) ORDER BY id",
+    "SELECT id FROM t WHERE '123' = ANY (ARRAY[v3, '12345']) ORDER BY id",
+    "SELECT id FROM t WHERE '12345' = ANY (ARRAY[c3, '12345']) ORDER BY id",
+    "SELECT id FROM t WHERE 1.2345 = ANY (ARRAY[n52, '1.2345']) ORDER BY id",
+    "SELECT id FROM t WHERE 1.23 = ANY (ARRAY[n52, '1.2345']) ORDER BY id",
+    "SELECT id FROM t WHERE 999999.99 = ANY (ARRAY[n52, '999999.99']) ORDER BY id",
+    // P2: an item of another type is ARRAY's 42804 before json beside jsonb's 42846.
+    "SELECT id FROM t WHERE i = ANY (ARRAY[1, j, jb])",
+    "SELECT id FROM t WHERE i = ANY (ARRAY[j, 1, jb])",
+    "SELECT id FROM t WHERE i = ANY (ARRAY[j, jb, 1])",
+    "SELECT id FROM t WHERE i = ANY (ARRAY[jb, 1, j])",
+    "SELECT id FROM t WHERE i = ANY (ARRAY[NULL, j, jb])",
+    // P2: a parameter a later item fixes to another type (42P08).
+    "SELECT id FROM t WHERE b = ANY (ARRAY[true, $1, ($1 = 1)])",
+    // P3: PostgreSQL's type names in ARRAY's 42804.
+    "SELECT id FROM t WHERE i = ANY (ARRAY[1, true])",
+    "SELECT id FROM t WHERE i = ANY (ARRAY[1, 1.5, true])",
+    "SELECT id FROM t WHERE i = ANY (ARRAY[vc, true])",
+    "SELECT id FROM t WHERE si = ANY (ARRAY[g, r, true])",
+    // Types of different categories never match, whatever implicit cast joins them; an operator
+    // still finds one (time = interval).
+    "SELECT id FROM t WHERE i <> ALL (ARRAY[tm, iv]) ORDER BY id",
+    "SELECT tm FROM t UNION SELECT iv FROM t",
+    "SELECT CASE WHEN i = 1 THEN tm ELSE iv END FROM t",
+    "SELECT 1 FROM t WHERE tm = iv",
   ])
     await compare(sql, undefined, true);
 });

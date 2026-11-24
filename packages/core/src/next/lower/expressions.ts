@@ -37,6 +37,7 @@ import {
   settle,
   type ParameterTypes,
   type Typed,
+  arrayElementType,
 } from "./coerce.js";
 import { PlanningError, unsupported } from "./errors.js";
 import {
@@ -555,9 +556,11 @@ function isNullLiteral(expression: Expression): boolean {
  * element type: `i = ANY (ARRAY['1'])` is "integer = text" (42883).
  */
 function arrayItems(items: readonly Typed[], state: ExpressionState): Typed[] {
-  // json and jsonb in one ARRAY: PostgreSQL keeps the first one's type (neither converts to the
-  // other implicitly there) and refuses the other's conversion (42846). next/'s implicit
-  // json -> jsonb (divergence `json-to-jsonb-implicit-cast`) does not reach an ARRAY.
+  const element = arrayElementType(items, state.parameters);
+  // json and jsonb in one ARRAY whose items otherwise match: PostgreSQL keeps the first one's
+  // type (neither converts to the other implicitly there) and refuses the other's conversion
+  // (42846). next/'s implicit json -> jsonb (divergence `json-to-jsonb-implicit-cast`) does not
+  // reach an ARRAY. An item of another type is the 42804 above, first.
   const jsonKinds = items.filter(
     (item) => item.pending === undefined && item.expr.type.kind === "json",
   );
@@ -568,8 +571,10 @@ function arrayItems(items: readonly Typed[], state: ExpressionState): Typed[] {
       `ARRAY could not convert type ${operandName(other.expr.type)} to ${operandName(firstJson.expr.type)}`,
       "42846",
     );
-  const element = commonType(items, state.parameters, "ARRAY");
-  return items.map((item) => coerce(item, element, "implicit", state.parameters));
+  // The element's base type, as a comparison's (`unify`): an untyped literal is never cut or
+  // rounded to a column's modifier (varchar(3), numeric(5,2)); typed items keep their own.
+  const base = baseType(element);
+  return items.map((item) => coerce(item, base, "implicit", state.parameters));
 }
 
 const COMPARISONS: Readonly<Record<string, "=" | "<>" | "<" | "<=" | ">" | ">=">> = {

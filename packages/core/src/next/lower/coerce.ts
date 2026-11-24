@@ -372,6 +372,42 @@ function inconsistentParameter(values: readonly Typed[], parameters: ParameterTy
 }
 
 /**
+ * An ARRAY constructor's element type (PostgreSQL's transformArrayExpr: select_common_type over
+ * its items, all untyped making text): "ARRAY types integer and boolean cannot be matched"
+ * (42804, PostgreSQL's type names), and a parameter one item fixed to a type another item cannot
+ * take is "inconsistent types deduced for parameter $n" (42P08), before any item is coerced.
+ */
+export function arrayElementType(
+  items: readonly Typed[],
+  parameters: ParameterTypes,
+): PhysicalType {
+  // json and jsonb never convert to each other implicitly in PostgreSQL: the running type is the
+  // first one's (its own 42846 comes after, expressions.ts `arrayItems`), whatever next/'s
+  // implicit json -> jsonb would make it.
+  const firstJson = items.find(
+    (item) => item.pending === undefined && item.expr.type.kind === "json",
+  );
+  const typed =
+    firstJson === undefined
+      ? items
+      : items.map((item) =>
+          item.pending === undefined && item.expr.type.kind === "json"
+            ? typedAs(firstJson.expr.type)
+            : item,
+        );
+  let element: PhysicalType;
+  try {
+    element = commonType(typed, parameters, "ARRAY", operandName);
+  } catch (error) {
+    if (error instanceof PlanningError && error.sqlState === "42804")
+      inconsistentParameter(items, parameters);
+    throw error;
+  }
+  inconsistentParameter([...items, typedAs(element)], parameters);
+  return element;
+}
+
+/**
  * The common type of several values (PostgreSQL's UNION / CASE resolution): pending values
  * adopt it; all pending is text. Throws 42804 when two types cannot be matched.
  */
@@ -379,6 +415,7 @@ export function commonType(
   values: readonly Typed[],
   parameters: ParameterTypes,
   what: string,
+  name: (type: PhysicalType) => string = typeName,
 ): PhysicalType {
   let candidate: PhysicalType | null = null;
   for (const value of values) {
@@ -400,12 +437,22 @@ export function commonType(
       candidate = baseType(type);
       continue;
     }
+    // PostgreSQL (select_common_type: UNION, CASE, ARRAY, an IN list): types of different
+    // categories never match, whatever implicit cast joins them (time and interval). An
+    // operator's resolution may cross them (`time = interval` finds interval's `=`).
+    const was = categoryOfType(candidate),
+      now = categoryOfType(type);
+    if (what !== "comparison" && was !== null && now !== null && was !== now)
+      throw new PlanningError(
+        `${what} types ${name(candidate)} and ${name(type)} cannot be matched`,
+        "42804",
+      );
     const up = canImplicitlyCast(candidate, type);
     const down = canImplicitlyCast(type, candidate);
     if (up && !down) candidate = type;
     else if (!down)
       throw new PlanningError(
-        `${what} types ${typeName(candidate)} and ${typeName(type)} cannot be matched`,
+        `${what} types ${name(candidate)} and ${name(type)} cannot be matched`,
         "42804",
       );
   }
@@ -441,6 +488,13 @@ function expand(overload: Overload, arity: number): ReadonlyArray<SqlType | "T" 
 }
 
 /** PostgreSQL's type categories (`pg_type.typcategory`) of the table's types. */
+/** A physical type's PostgreSQL type category (`categoryOf`; json and jsonb are both U), or null. */
+function categoryOfType(type: PhysicalType): string | null {
+  const sql = sqlTypeOf(type);
+  if (sql === null) return null;
+  return sql === "json" || sql === "jsonb" ? "U" : categoryOf(sql);
+}
+
 function categoryOf(type: SqlType): string {
   switch (type) {
     case "int2":
