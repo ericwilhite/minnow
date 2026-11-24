@@ -114,21 +114,24 @@ query-size error. A complete execution minimum greater than the whole cap is the
 checkpoint during a pressure handoff (see below).
 
 A statement's wait is also bounded by what it keeps while it waits (GOVERNOR-WAIT-POLICY
-point 5, `MemoryGovernor.servableNow`): the usable capacity less its own grants, what only its
-own snapshot keeps alive (`WaitingHoldings.pinned`), and, while it holds the writer turn, what
+point 5, `MemoryGovernor.servableNow`): the usable capacity less its own grants, what its own
+snapshot keeps from release (`WaitingHoldings.pinned`), and, while it holds the writer turn, what
 the writer keeps until the statement ends (`WriteCredits.retainedWhileOpen`). Every statement of
 a writable transaction holds the turn, a read too: the owner passes the writer's holdings with
 the query (`ExecuteRequest.writerHoldings`). This is accounting, not a guess about who might
 release.
 
-- What only the statement's snapshot keeps: a publication or drop leaves memory (a flushed
-  memtable's borrowed chunks and key deltas, a dropped table's rows, retired run readers) for
-  the readers older than it (`ReaderRegistry.holdUntilOlderClose`). When the statement's
-  snapshot is the only live reader older than such a hold, the hold is its own
-  (`Snapshot.exclusiveBytes`): it returns only when the statement ends. So is the snapshot's own
-  pin of a state a newer one superseded (its space pin, its root, the group directories and
-  chunks no other state shares), when no other pin shares that state. A hold another live,
-  older reader also keeps is that reader's, and is waited for.
+- What the statement's snapshot keeps from release: a publication or drop leaves memory (a
+  flushed memtable's borrowed chunks and key deltas, a dropped table's rows, retired run readers)
+  for the readers older than it (`ReaderRegistry.holdUntilOlderClose`). Such a hold returns only
+  once every reader older than it closes, so none of it returns while the statement's snapshot
+  stays open, whichever other readers keep it too (`ReaderRegistry.blockedBytes`,
+  `Snapshot.blockedBytes`). So is what the snapshot's pin of a superseded state keeps (its space
+  pin, its root, its group directories and chunks), each object once, except what the current
+  state references. Counting a shared hold for no one (as `exclusiveBytes` did) left two
+  read-only transactions sharing a drop both waiting forever
+  (`testing/shared-pin-accounting.test.ts`). A new hold wakes the owner: what waiting readers
+  keep grew.
 
 - When the writer runs no work of its own, its holdings are exact: everything it holds beyond
   its registered lifetime holding stays while the turn is held, except what reclaim returns
@@ -143,17 +146,23 @@ release.
   memtable rows that work will not publish count then, so the value is too large, never too
   small: nothing that could fit is refused.
 - While the writer's growth waits in the governor (a merge's credit, a flush's or merge's
-  metadata), that work frees nothing until it is served, and neither does the work whose
-  allocations it waits beside: everything the writer holds counts, beyond its lifetime holding. That growth is holder growth, served before every admission: when it cannot
-  fit beside what the statement keeps, in its own capacity class (ordinary growth may not use
-  the progress reserve), nothing the statement asks can be served either, and its value is 0
-  (`LentHoldings.queued`).
-- Left out always: what another live snapshot also keeps, a dropped table's state another
-  reader keeps, other statements' grants, evictable cache entries. Each is released by its own
-  holder.
+  metadata), everything the writer holds counts, beyond its lifetime holding, less what its
+  queued work will return (`LentHoldings.work`). That growth is holder growth, served before
+  every admission, and the safety order decides what it returns: from what is available now
+  (each capacity class's capacity less everything held, the statement's holdings, every queued
+  item's credit and everyone else's), any item whose remaining ask fits is served, finishes and
+  returns the credit it holds, which the next item may use. An item never reached blocks the
+  statement: its value is 0. Judging each item alone beside the statement would count two items
+  that fit only one at a time (`memory/servable-work.test.ts`). A served item leaves the record
+  in the drain that serves it (`NativeGrantGroupOptions.onServed`), so no microtask-late record
+  makes a request look blocked.
+- Left out always: other statements' grants, evictable cache entries. Each is released by its
+  own holder.
 
-An execution's fixed buffers and a preparation restart's credit carry their statement's
-holdings (`NativeGrantGroupOptions.holdings`), and the governor checks every queued group
+An execution's fixed buffers, a preparation restart's credit, and every admission a preparation
+makes while it holds nothing (a source recipe, parameter or read-step sizing, a dictionary probe,
+an index lookup window: exec/preparation.ts `besides`) carry their statement's holdings
+(`NativeGrantGroupOptions.holdings`); an optional probe refused that way falls back to its scan, and the governor checks every queued group
 against that value on every drain, wherever it sits in its queue, starting with the drain that
 queues it (before any wait). There the statement's own spillable grants count nothing: their
 reclaim is not asked yet. At the head of its queue, once the reclaim requests that drain made

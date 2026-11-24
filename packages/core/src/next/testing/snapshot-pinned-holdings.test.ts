@@ -128,7 +128,7 @@ it("counts a snapshot's own pin of a superseded state (Astra, review of #56)", a
     await core.execute("CREATE TABLE u(id INT PRIMARY KEY)");
     await core.harness.path.quiesce();
     const pinned = snapshot;
-    const holdings = () => ({ grants: [], pinned: () => pinned.exclusiveBytes() });
+    const holdings = () => ({ grants: [], pinned: () => pinned.blockedBytes() });
     const servable = governor.servableNow(holdings());
     const admit = (bytes: number) =>
       governor
@@ -149,7 +149,7 @@ it("counts a snapshot's own pin of a superseded state (Astra, review of #56)", a
     expect(await within(admit(servable + 1), 1_500), "one byte more is refused").toMatchObject(
       TYPED,
     );
-    expect(pinned.exclusiveBytes(), "its superseded state is its own").toBeGreaterThan(0);
+    expect(pinned.blockedBytes(), "its superseded state is its own").toBeGreaterThan(0);
   } finally {
     cancel.abort();
     snapshot?.release();
@@ -157,7 +157,10 @@ it("counts a snapshot's own pin of a superseded state (Astra, review of #56)", a
   }
 }, 60_000);
 
-it("leaves out a superseded state another snapshot also pins, until that one closes", async () => {
+// Council R* (2026-11-24, adopted): a superseded state two snapshots pin returns only once both
+// close, so each keeps all of it while it waits; leaving it out of both undercounted it, and two
+// read-only transactions sharing a drop both waited forever.
+it("counts a superseded state another snapshot also pins: it returns only when both close", async () => {
   const core = new StorageCore();
   Object.defineProperty(core.harness, "governor", { value: new Governor(32 * MiB) });
   await core.open();
@@ -169,10 +172,11 @@ it("leaves out a superseded state another snapshot also pins, until that one clo
     await core.harness.path.quiesce();
     const [first, second] = pins;
     if (first === undefined || second === undefined) throw new Error("two pins");
-    expect(first.exclusiveBytes(), "shared: the other keeps it too").toBe(0);
-    expect(second.exclusiveBytes()).toBe(0);
+    const both = first.blockedBytes();
+    expect(both, "shared: still kept from release while it is open").toBeGreaterThan(0);
+    expect(second.blockedBytes(), "the same objects, from the other pin").toBe(both);
     second.release();
-    expect(first.exclusiveBytes(), "now its own").toBeGreaterThan(0);
+    expect(first.blockedBytes(), "unchanged once the other closes").toBe(both);
   } finally {
     for (const pin of pins) pin.release();
     await core.close();

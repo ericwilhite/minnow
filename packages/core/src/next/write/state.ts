@@ -130,34 +130,26 @@ export class ReaderRegistry {
   }
 
   /** Runs `release` once every reader opened before now is closed (at once if there is none).
-   * `bytes` is the memory that release returns, as it stands (`exclusiveBytes`). */
+   * `bytes` is the memory that release returns, as it stands (`blockedBytes`). */
   holdUntilOlderClose(release: () => void, bytes?: () => number): void {
     this.#pins.push({ before: this.#next, release, bytes });
     this.#drain();
+    // Kept: what live readers block grew, so a waiting request's bound changed (it may now be
+    // refused, or another request served); wake the owner as any change of holdings does.
+    if (this.#pins.length > 0) this.changed?.();
   }
 
   /**
-   * The memory only reader `id` keeps: the held releases that wait for it and for no other live
-   * reader. A hold waits for every reader opened before it, so only the oldest live reader can
-   * keep one alone: those registered after it opened and no later than the next live reader.
-   * Any older reader keeps everything this one does (0).
+   * The memory the live readers `ids` keep from release: every hold registered after the oldest
+   * of them opened, whichever other readers keep it too (a hold returns only once every reader
+   * older than it closes, so none of it returns while any of `ids` stays open). Each hold once.
    */
-  exclusiveBytes(id: number): number {
-    let oldest: number | undefined,
-      next = Infinity;
-    for (const live of this.#live) {
-      if (oldest === undefined) oldest = live;
-      else {
-        next = live;
-        break;
-      }
-    }
-    if (oldest !== id) return 0;
+  blockedBytes(ids: Iterable<number>): number {
+    let oldest = Infinity;
+    for (const id of ids) if (this.#live.has(id) && id < oldest) oldest = id;
+    if (oldest === Infinity) return 0;
     let bytes = 0;
-    for (const pin of this.#pins) {
-      if (pin.before > next) break;
-      if (pin.before > id) bytes += pin.bytes?.() ?? 0;
-    }
+    for (const pin of this.#pins) if (pin.before > oldest) bytes += pin.bytes?.() ?? 0;
     return bytes;
   }
 
@@ -195,11 +187,11 @@ export interface Shared {
    */
   pinState(state: WriteState, label: string): SpacePin;
   /**
-   * The memory a pin of `state` alone keeps (its space pin, its root, its group directories and
-   * chunks no other state shares), when it is the state's only pin and the state is not the
-   * current one; 0 otherwise (`Snapshot.exclusiveBytes`).
+   * The memory pins of `states` keep from release, each object once: their space pins, roots,
+   * group directories and chunks, whichever other pins keep them too, except what the current
+   * state references (the writer's, never a reader's to return) (`Snapshot.blockedBytes`).
    */
-  exclusiveStateBytes?(state: WriteState): number;
+  blockedStateBytes?(states: Iterable<WriteState>): number;
   runReader(ref: RunRef): RunReader | Promise<RunReader>;
   /**
    * A group's root through the metadata reader (format/metadata-reader.ts): cached and shared,

@@ -14,7 +14,7 @@ import type { MaybePromise } from "../../access/key-index.js";
 import { YIELD_INTERVAL_MS } from "../pipeline.js";
 import { TableScan } from "../table-scan.js";
 import { OutputArena } from "../kernels/vectors.js";
-import { batchTargetFor } from "../../memory/governor.js";
+import { MemoryAdmissionError, batchTargetFor, type Grant } from "../../memory/governor.js";
 import { SnapshotReleasedError } from "../../access/snapshot.js";
 import { GROUP_PROBE_BYTES, GroupPartitionProbe, type PartitionBounds } from "./partition-probe.js";
 
@@ -41,17 +41,22 @@ export function probeDictionaryGroups(
     signal.throwIfAborted();
     const readerBytes = read.bytes + read.io + read.progress;
     if (GROUP_PROBE_BYTES + readerBytes > governor.capBytes) return null;
+    // An optional probe: beyond what fits beside what the statement keeps it is refused typed
+    // (its wait carries the statement's holdings), and the plan falls back to its scan.
     const parts = yield* readValue(
-      admitWorkingSet(governor, {
-        label,
-        includesProgress: true,
-        signal,
-        grants: [
-          { label: "domains", minimumBytes: GROUP_PROBE_BYTES, spillable: false },
-          { label: "reader", minimumBytes: readerBytes, spillable: false },
-        ],
-      }),
+      optional(() =>
+        admitWorkingSet(governor, {
+          label,
+          includesProgress: true,
+          signal,
+          grants: [
+            { label: "domains", minimumBytes: GROUP_PROBE_BYTES, spillable: false },
+            { label: "reader", minimumBytes: readerBytes, spillable: false },
+          ],
+        }),
+      ),
     );
+    if (parts === null) return null;
     const domains = parts[0],
       budget = parts[1];
     if (!domains || !budget) throw new Error("Missing dictionary planning minimum");
@@ -204,5 +209,21 @@ export function probeDictionaryGroups(
       probe?.close();
       for (const part of parts) part.close();
     }
+  }
+}
+
+/** An optional working set: null when the governor refuses it typed (53200). */
+function optional(
+  admit: () => MaybePromise<readonly Grant[]>,
+): MaybePromise<readonly Grant[] | null> {
+  const refused = (error: unknown) => {
+    if (error instanceof MemoryAdmissionError) return null;
+    throw error;
+  };
+  try {
+    const admitted = admit();
+    return admitted instanceof Promise ? admitted.catch(refused) : admitted;
+  } catch (error) {
+    return refused(error);
   }
 }

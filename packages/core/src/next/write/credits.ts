@@ -4,7 +4,7 @@
  */
 import type { Grant, HolderChain, MemoryGovernor, WaitingHoldings } from "../memory/governor.js";
 import { RETRY_GUARD_LIMIT, retryGuard } from "../memory/retry-guard.js";
-import { GrantClosedError, MemoryAdmissionError } from "../memory/governor.js";
+import { GrantClosedError, MemoryAdmissionError, type QueuedWork } from "../memory/governor.js";
 import type { MaybePromise } from "../access/key-index.js";
 import { releaseIdle } from "./budget.js";
 
@@ -249,7 +249,17 @@ export class WriteCredits {
    * (`LentHoldings.queued`).
    */
   get queuedGrowth(): { readonly ordinary: number; readonly progress: number } {
-    return { ...this.#queuedGrowth };
+    let ordinary = 0,
+      progress = 0;
+    for (const item of this.#queuedWork)
+      if (item.progress) progress += item.ask;
+      else ordinary += item.ask;
+    return { ordinary, progress };
+  }
+  /** The owner's own work waiting in the governor now (`LentHoldings.work`): each item leaves in
+   * the drain that serves it (`onServed`), never a microtask later. */
+  get queuedWork(): readonly QueuedWork[] {
+    return [...this.#queuedWork];
   }
   readonly #queuedListeners = new Set<() => void>();
   /** Calls `listener` whenever the owner's work queues growth in the governor; returns the
@@ -258,8 +268,9 @@ export class WriteCredits {
     this.#queuedListeners.add(listener);
     return () => this.#queuedListeners.delete(listener);
   }
-  /** Ordinary growth may not use the progress reserve (`includesProgress`); progress growth may. */
-  readonly #queuedGrowth = { ordinary: 0, progress: 0 };
+  /** The owner's work queued as holder growth (`queuedWork`): ordinary growth may not use the
+   * progress reserve (`includesProgress`); progress growth may. */
+  readonly #queuedWork = new Set<QueuedWork>();
 
   get hasMergeStep(): boolean {
     return this.#mergeFloor !== 0 || this.#mergeActive !== null;
@@ -763,9 +774,16 @@ export class WriteCredits {
       // instead: the governor bounds it by them, and it is not growth queued ahead of it.
       const queued =
         holdings === undefined ? parts.reduce((sum, part) => sum + part.minimumBytes, 0) : 0;
-      const queue = includesProgress ? "progress" : "ordinary";
-      this.#queuedGrowth[queue] += queued;
+      // The credit this work holds and returns once it is served and finishes: the accounts it
+      // grows (`servableNow`'s safety order).
+      const item: QueuedWork = {
+        ask: queued,
+        progress: includesProgress,
+        held: () => accounts.reduce((sum, account) => sum + account.held, 0),
+      };
+      const leave = () => this.#queuedWork.delete(item);
       if (queued > 0) {
+        this.#queuedWork.add(item);
         this.#changed?.();
         for (const listener of [...this.#queuedListeners]) listener();
       }
@@ -780,9 +798,10 @@ export class WriteCredits {
           grants: parts,
           ...(holdings === undefined ? {} : { holdings }),
           signal: stop,
+          onServed: leave,
         });
       } finally {
-        this.#queuedGrowth[queue] -= queued;
+        leave();
       }
       try {
         this.#check();

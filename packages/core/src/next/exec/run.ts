@@ -1216,7 +1216,7 @@ export class QueryRuntime {
     const writer = writerOf(this.request);
     // What only this query's snapshot keeps (a flushed memtable's borrowed chunks, a dropped
     // table's rows) stays while it waits: it returns when the snapshot closes.
-    const pinned = () => this.view.exclusiveBytes?.() ?? 0;
+    const pinned = () => this.view.blockedBytes?.() ?? 0;
     return writer === null
       ? { grants: this.#grants, pinned }
       : { grants: this.#grants, lent: writer, pinned };
@@ -1587,6 +1587,7 @@ export class QueryExecution implements Execution {
     this.#reject = reject as (reason: unknown) => void;
     this.executed.catch(() => undefined);
     this.#preparation = preparationGovernor(request.governor, `query#${String(request.queryId)}`);
+    this.#preparation?.besides(() => this.#beside());
     this.results = new ResultChannel(plan.columns, {
       windowBytes,
       onCancel: (reason) => this.cancel(reason),
@@ -1625,7 +1626,7 @@ export class QueryExecution implements Execution {
       const own = (): WaitingHoldings => {
         const holdings = this.#runtime?.waitingHoldings() ?? {
           grants: [],
-          pinned: () => view.exclusiveBytes?.() ?? 0,
+          pinned: () => view.blockedBytes?.() ?? 0,
         };
         return this.#result === null
           ? holdings
@@ -1835,15 +1836,8 @@ export class QueryExecution implements Execution {
     runtime.abort(RESTART);
     await runtime.close();
     await sizingSettled(this.#controller.signal);
-    // Holding nothing but its result grant, what only its snapshot keeps alive, and, while it
-    // holds the writer turn, the writer's.
     const view = runtime.view;
-    const pinned = () => view.exclusiveBytes?.() ?? 0;
-    await preparation.regrow(error, this.#controller.signal, () => {
-      const writer = writerOf(this.request);
-      const grants = this.#result === null ? [] : [this.#result];
-      return writer === null ? { grants, pinned } : { grants, lent: writer, pinned };
-    });
+    await preparation.regrow(error, this.#controller.signal, () => this.#beside(view));
     const fresh = this.#newRuntime();
     this.#runtime = fresh;
     if (this.#atomic !== null) fresh.atomicResult(this.#atomic.result, this.#atomic.window);
@@ -1851,6 +1845,18 @@ export class QueryExecution implements Execution {
     if (grant === null) throw new TypeError("execution result grant missing");
     this.#bind(fresh, grant);
     return this.#attempt(program);
+  }
+
+  /**
+   * What this statement keeps while a preparation admission waits: its result grant, what its
+   * snapshot keeps from release, and, while it holds the writer turn, the writer's
+   * (exec/preparation.ts `besides`).
+   */
+  #beside(view = this.#runtime?.view): WaitingHoldings {
+    const writer = writerOf(this.request);
+    const grants = this.#result === null ? [] : [this.#result];
+    const pinned = () => view?.blockedBytes?.() ?? 0;
+    return writer === null ? { grants, pinned } : { grants, lent: writer, pinned };
   }
 
   /** Connects a (fresh) runtime to this execution's result grant and sink. */

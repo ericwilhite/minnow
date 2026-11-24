@@ -858,7 +858,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
         this.#reclaimable();
       }),
       pinState: (state, label) => this.#pinState(state, label),
-      exclusiveStateBytes: (state) => this.#exclusiveStateBytes(state),
+      blockedStateBytes: (states) => this.#blockedStateBytes(states),
       runReader: (ref) => this.#runReader(ref),
       groupRoot: (ref, budget) => this.#metadata.groupRoot(ref, budget),
       bitmap: (ref, rowCount, budget) => this.#bitmap(ref, rowCount, budget),
@@ -2758,14 +2758,40 @@ export class WritePathImpl implements WritePath, EngineHooks {
     for (const view of state.tables.values()) view.groups.retain();
   }
 
-  /** What releasing `state`'s only pin would free (`Shared.exclusiveStateBytes`). */
-  #exclusiveStateBytes(state: WriteState): number {
-    if (state === this.#state) return 0;
-    const held = this.#statePins.get(state);
-    if (held?.count !== 1) return 0;
-    const root = this.#roots.get(state.root);
-    let bytes = (held.pin.bytes ?? 0) + (root?.refs === 1 ? root.bytes : 0);
-    for (const view of state.tables.values()) bytes += view.groups.releaseBytes();
+  /**
+   * What pins of `states` keep from release (`Shared.blockedStateBytes`): each pinned non-current
+   * state's space pin, root, group directories and chunks, each object once, except what the
+   * current state references (the writer keeps it whatever readers do).
+   */
+  #blockedStateBytes(states: Iterable<WriteState>): number {
+    const current = this.#state;
+    const currentDirs = new Set<object>();
+    const currentChunks = new Set<object>();
+    for (const view of current.tables.values()) {
+      currentDirs.add(view.groups);
+      for (const chunk of view.groups.chunks) currentChunks.add(chunk);
+    }
+    const seen = new Set<object>();
+    let bytes = 0;
+    const count = (object: object, charge: number) => {
+      if (seen.has(object)) return;
+      seen.add(object);
+      bytes += charge;
+    };
+    for (const state of states) {
+      if (state === current) continue;
+      const held = this.#statePins.get(state);
+      if (held === undefined) continue;
+      count(held.pin, held.pin.bytes ?? 0);
+      const root = this.#roots.get(state.root);
+      if (root !== undefined && state.root !== current.root) count(root, root.bytes);
+      for (const view of state.tables.values()) {
+        const groups = view.groups;
+        if (!currentDirs.has(groups)) count(groups, groups.charge);
+        for (const chunk of groups.chunks)
+          if (!currentChunks.has(chunk)) count(chunk, chunk.charge);
+      }
+    }
     return bytes;
   }
 
@@ -3280,7 +3306,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
           this.#lifetimeBytes() - FIXED_CACHE_BYTES - this.#space.stats.permanentBytes;
         return Math.max(0, held - lifetimeInGrants);
       },
-      queued: () => credits.queuedGrowth,
+      work: () => credits.queuedWork,
     };
   }
 

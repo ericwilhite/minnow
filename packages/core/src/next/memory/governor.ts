@@ -209,6 +209,9 @@ export interface MemoryGovernor {
   servableNow?(own: WaitingHoldings, includesProgress?: boolean, unasked?: boolean): number;
   /** Whether `bytes` could be admitted at once, without waiting (`Governor.canAdmitNow`). */
   canAdmitNow?(bytes: number, includesProgress: boolean): boolean;
+  /** A facade's governor (a wrapper adding options to a session's admissions): per-governor
+   * state, such as the phase idle pool, belongs to it (exec/preparation.ts `baseGovernor`). */
+  readonly fronts?: MemoryGovernor;
   /** Moves idle ordinary credit within this owner. No allocation or global admission occurs. */
   transferCredit(source: Grant, target: Grant, bytes: number): boolean;
   /**
@@ -236,8 +239,8 @@ export interface WaitingHoldings {
   readonly grants: readonly Grant[];
   /** Another owner's holdings kept for the statement: its writer's, while it holds the turn. */
   readonly lent?: LentHoldings;
-  /** Memory only the statement's own snapshots keep alive (`Snapshot.exclusiveBytes`): it
-   * returns when they close, so it stays while the statement waits. */
+  /** Memory the statement's own snapshots keep from release (`Snapshot.blockedBytes`): none of
+   * it returns while they stay open, so it stays while the statement waits. */
   readonly pinned?: () => number;
 }
 
@@ -252,13 +255,22 @@ export interface LentHoldings {
    */
   retained(): number;
   /**
-   * The bytes the owner's own work waits for in the governor as holder growth (a merge's
-   * credit, a flush's metadata), by whether it may use the progress reserve. Holder growth is
-   * served before admissions, so the statement's
-   * requests wait behind it: when it could never be served beside what the statement keeps,
-   * neither could they.
+   * The owner's own work queued in the governor as holder growth (a flush's, a merge's), served
+   * before the statement's requests. `servableNow` runs the safety order over it: work whose
+   * remaining ask fits what is available will finish and return the credit it holds; work that
+   * never fits blocks every request of the statement behind it.
    */
-  queued?(): { readonly ordinary: number; readonly progress: number };
+  work?(): readonly QueuedWork[];
+}
+
+/** One item of an owner's work waiting in the governor as holder growth (`LentHoldings.work`). */
+export interface QueuedWork {
+  /** What it still asks the governor for. */
+  readonly ask: number;
+  /** Whether it may use the progress reserve. */
+  readonly progress: boolean;
+  /** The credit it holds now and returns once it is served and finishes. */
+  held(): number;
 }
 
 /** Named parts of one complete minimum. Each part remains a normal native grant. */
@@ -294,6 +306,9 @@ export interface NativeGrantGroupOptions {
    * never inferred. The chain is checked (`HolderChain`).
    */
   readonly holdsCredit?: HolderChain;
+  /** Called synchronously when the request is served, before its promise settles (the owner's
+   * record of its queued work leaves with it, in the same drain: `LentHoldings.work`). */
+  readonly onServed?: () => void;
 }
 
 export class ValueTooLargeError extends Error {
@@ -348,6 +363,8 @@ interface Request {
   readonly parts: NativeGrantGroupOptions["grants"] | null;
   /** `NativeGrantGroupOptions.holdings`: its bound is checked while it waits. */
   readonly holdings: (() => WaitingHoldings) | null;
+  /** `NativeGrantGroupOptions.onServed`. */
+  readonly onServed?: () => void;
 }
 
 /** A growth observer (Governor.observeGrowth) tried to change grant or governor state. */
@@ -734,15 +751,35 @@ export class Governor implements MemoryGovernor {
       )
         held += grant.held;
     const kept = held + (own.lent?.retained() ?? 0) + (own.pinned?.() ?? 0);
-    const servable = this.usableCapacity(includesProgress) - kept;
-    // The owner's queued growth is served first: beyond what fits beside the statement in its
-    // own capacity class it never is, and every admission of the statement waits behind it.
-    const queued = own.lent?.queued?.();
-    const blocked =
-      queued !== undefined &&
-      (queued.ordinary > this.usableCapacity(false) - kept ||
-        queued.progress > this.usableCapacity(true) - kept);
-    return blocked ? Math.min(0, servable) : servable;
+    const work = own.lent?.work?.() ?? [];
+    if (work.length === 0) return this.usableCapacity(includesProgress) - kept;
+    // The owner's queued work is served before the statement's requests. The safety order (as a
+    // banker's): from what is available now (each class's capacity less everything held), any
+    // item whose remaining ask fits is served, finishes and returns the credit it holds, which
+    // the next may use. Its credit is then not kept; an item never reached blocks the statement.
+    // Judging each item alone beside the statement would count two that fit only one at a time.
+    const inUse = this.usedBytes - this.permanentBytes;
+    const available = {
+      ordinary: this.usableCapacity(false) - inUse,
+      progress: this.usableCapacity(true) - inUse,
+    };
+    const marked = new Set<QueuedWork>();
+    let returned = 0;
+    for (let found = true; found;) {
+      found = false;
+      for (const item of work) {
+        if (marked.has(item) || item.ask > available[item.progress ? "progress" : "ordinary"])
+          continue;
+        marked.add(item);
+        const credit = item.held();
+        returned += credit;
+        available.ordinary += credit;
+        available.progress += credit;
+        found = true;
+      }
+    }
+    const servable = this.usableCapacity(includesProgress) - Math.max(0, kept - returned);
+    return marked.size < work.length ? Math.min(0, servable) : servable;
   }
 
   registerPermanent(bytes: () => number, label = "owner lifetime holdings"): () => void {
@@ -1180,6 +1217,7 @@ export class Governor implements MemoryGovernor {
       this.#progress++;
       queue.shift();
       request.detach();
+      request.onServed?.();
       const wanted = demand();
       const taken = bytes();
       this.#take(taken);
@@ -1451,6 +1489,7 @@ export class Governor implements MemoryGovernor {
         spillable: false,
         includesProgress: includesProgress === true,
         holdings: options.holdings ?? null,
+        ...(options.onServed === undefined ? {} : { onServed: options.onServed }),
       },
       signal,
       null,

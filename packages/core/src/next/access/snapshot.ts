@@ -182,12 +182,12 @@ export interface Snapshot {
   /** Idempotent. Not allowed on a statement view (its statement releases it). */
   release(): void;
   /**
-   * Memory only this view keeps alive: what a publication or drop left for readers older than
-   * it when no other live reader is older (write/state.ts `ReaderRegistry.exclusiveBytes`). It
-   * returns when this view closes, never before: a statement waiting while it holds this view
-   * keeps it.
+   * Memory this view keeps from release while it is open: what a publication or drop left for
+   * readers older than it (write/state.ts `ReaderRegistry.blockedBytes`) and what its state pin
+   * keeps, whichever other views keep it too: none of it returns while this view stays open, so
+   * a statement waiting while it holds this view keeps all of it.
    */
-  exclusiveBytes?(): number;
+  blockedBytes?(): number;
 }
 
 export interface TableReadOptions {

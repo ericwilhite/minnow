@@ -4,7 +4,7 @@ import { SnapshotReleasedError, type TableSnapshot } from "../access/snapshot.js
 import type { PhysicalPlan, Rel, ScalarExpr } from "../ir/ir.js";
 import { encodeKeyBatch, KeyBatch } from "../keys/key-encoding.js";
 import type { Grant, Loan } from "../memory/governor.js";
-import { batchTargetFor } from "../memory/governor.js";
+import { MemoryAdmissionError, batchTargetFor } from "../memory/governor.js";
 import { admitWorkingSet } from "../memory/working-set.js";
 import { trackSizing } from "../page/read-bounds.js";
 import type { WindowSegments } from "./key-order.js";
@@ -143,15 +143,24 @@ async function readLookup(
     segmentBytes = bound * (Uint32Array.BYTES_PER_ELEMENT + Float64Array.BYTES_PER_ELEMENT),
     scratchBytes = 2 * keyMinimum + locatorBytes;
   if (scratchBytes + segmentBytes > governor.capBytes - governor.reserveBytes) return null;
-  const [grant, held] = await admitWorkingSet(governor, {
-    label: "index-lookup/window",
-    includesProgress: true,
-    signal,
-    grants: [
-      { label: LOOKUP_SIZING_LABEL, minimumBytes: scratchBytes, spillable: false },
-      { label: LOOKUP_SEGMENTS_LABEL, minimumBytes: segmentBytes, spillable: false },
-    ],
-  });
+  // An optional window: refused typed beside what the statement keeps (its wait carries the
+  // statement's holdings), the plan reads without it.
+  let admitted: readonly Grant[];
+  try {
+    admitted = await admitWorkingSet(governor, {
+      label: "index-lookup/window",
+      includesProgress: true,
+      signal,
+      grants: [
+        { label: LOOKUP_SIZING_LABEL, minimumBytes: scratchBytes, spillable: false },
+        { label: LOOKUP_SEGMENTS_LABEL, minimumBytes: segmentBytes, spillable: false },
+      ],
+    });
+  } catch (error) {
+    if (error instanceof MemoryAdmissionError) return null;
+    throw error;
+  }
+  const [grant, held] = admitted;
   if (grant === undefined || held === undefined)
     throw new Error("lookup sizing did not receive its minimum");
   let kept = false;

@@ -189,6 +189,16 @@ export class PreparationGovernor implements MemoryGovernor {
     const grant = this.governor.carve(source, label, spillable, bytes);
     return grant === null ? null : this.#took(grant);
   }
+  #beside: (() => WaitingHoldings) | null = null;
+  /**
+   * What the statement keeps while an admission of its preparation waits (its result grant, what
+   * its snapshot keeps from release, its writer's holdings while it holds the turn): every wait
+   * carries it (`NativeGrantGroupOptions.holdings`), so a request that could never be served
+   * beside it is refused with 53200 (GOVERNOR-WAIT-POLICY point 5), never left waiting.
+   */
+  besides(holdings: () => WaitingHoldings): void {
+    this.#beside = holdings;
+  }
   /**
    * Holding no live grant, the attempt may wait like any execution: it first returns the idle
    * credit, so the wait holds nothing.
@@ -229,8 +239,29 @@ export class PreparationGovernor implements MemoryGovernor {
     options.signal?.throwIfAborted();
     const grant = this.tryAdmit(options);
     if (grant !== null) return Promise.resolve(grant);
-    if (this.#holdsNothing())
-      return this.governor.admit(options).then((admitted) => this.#took(admitted));
+    if (this.#holdsNothing()) {
+      const beside = this.#beside;
+      if (beside === null)
+        return this.governor.admit(options).then((admitted) => this.#took(admitted));
+      // The same request, bounded by what the statement keeps (`besides`).
+      return this.governor
+        .admitGroup({
+          label: options.label,
+          grants: [
+            {
+              label: options.label,
+              minimumBytes: options.minimumBytes,
+              spillable: options.spillable,
+            },
+          ],
+          holdings: beside,
+          ...(options.signal === undefined ? {} : { signal: options.signal }),
+        })
+        .then(([admitted]) => {
+          if (admitted === undefined) throw new Error("A preparation admission was not served");
+          return this.#took(admitted);
+        });
+    }
     return Promise.reject(
       this.#wouldWait(options.label, options.minimumBytes, false, [
         { label: options.label, minimumBytes: options.minimumBytes, spillable: options.spillable },
@@ -288,7 +319,11 @@ export class PreparationGovernor implements MemoryGovernor {
         grants: options.grants,
         includesProgress: progress,
         ...(options.signal === undefined ? {} : { signal: options.signal }),
-        ...(options.holdings === undefined ? {} : { holdings: options.holdings }),
+        ...(options.holdings === undefined
+          ? this.#beside === null
+            ? {}
+            : { holdings: this.#beside }
+          : { holdings: options.holdings }),
       };
       if (this.governor.canAdmitNow(total, progress) || this.#holdsNothing())
         return this.governor
@@ -385,9 +420,18 @@ export class PreparationGovernor implements MemoryGovernor {
   }
 }
 
-/** The governor a facade fronts (shared per-governor state, such as the phase idle pool). */
+/**
+ * The governor a facade fronts (shared per-governor state, such as the phase idle pool): through
+ * every facade that names what it fronts (`MemoryGovernor.fronts`), a preparation facade over a
+ * session's wrapper included, to the governor itself.
+ */
 export function baseGovernor(governor: MemoryGovernor): MemoryGovernor {
-  return governor instanceof PreparationGovernor ? governor.governor : governor;
+  let base = governor;
+  for (;;) {
+    const next = base instanceof PreparationGovernor ? base.governor : base.fronts;
+    if (next === undefined || next === base) return base;
+    base = next;
+  }
 }
 
 /**
