@@ -128,6 +128,9 @@ export default tseslint.config(
       // Reads the front end's sources off disk to pin the messages lowering's SQLSTATE map
       // depends on (lower/errors.ts).
       "packages/core/src/next/testing/front-end-states.test.ts",
+      // The snapshot corpus reads the repository's SQL (SQLLogicTest profile, feature
+      // matrix, docs, console queries) off disk.
+      "packages/core/src/next/testing/grammar-corpus.ts",
       // Node-only lifecycle fault observers associate native callbacks with their producer.
       // No production module imports this test or node:async_hooks.
       "packages/core/src/next/testing/retaining-parent-lifecycle.test.ts",

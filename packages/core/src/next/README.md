@@ -3362,7 +3362,45 @@ not require a home cache directory.
   evictable caches (`registerCache`): charged at a size walked from the expressions, and evicted,
   oldest unused across caches, before growth is refused or an operator spills.
 - SQL `BEGIN` / `START TRANSACTION` and `SET TRANSACTION` apply lowering's typed modes.
-  READ ONLY starts with a pinned snapshot and no writer slot. Switching to it after writes
+  READ ONLY starts with no writer slot and no snapshot: its first statement that needs one pins
+  it, as PostgreSQL takes the transaction snapshot "as of the start of the first
+  non-transaction-control statement" (Transaction Isolation, 13.2). Planning never takes it
+  (`ComposedSession.plan` is pure: an explain, the read bypass's classification, a request the
+  ledger refuses plan without effect); a statement takes it when it runs. One that lowers decides
+  by its planned kind (`#guard`): a query or data statement, as PostgreSQL's
+  `analyze_requires_snapshot`, and a schema change, which PostgreSQL's utility statements take
+  when they run (`PlannedStmtRequiresSnapshot`, utility.c); transaction control, SET, RESET and
+  SHOW take none. One that fails to lower, once admitted (`EngineSession.statementFailed`), counts
+  as raw-parsed: the front end reads a subset of PostgreSQL's grammar, so its failure says
+  nothing about PostgreSQL's raw parse. Its first words decide (lower/snapshot-rule.ts, after
+  whitespace, leading semicolons, nested block comments and `--` comments ending at `\n` or
+  `\r`; keywords fold ASCII letters only): every statement takes it but those
+  `PlannedStmtRequiresSnapshot` refuses (BEGIN, START, COMMIT, END, ROLLBACK, ABORT, SAVEPOINT,
+  RELEASE, PREPARE TRANSACTION, LOCK, SET, RESET, SHOW, FETCH, MOVE, LISTEN, NOTIFY, UNLISTEN,
+  CHECKPOINT); PREPARE is decided by its third token, as gram.y does (`PREPARE TRANSACTION
+'gid'` against a statement named `transaction`). So a statement that fails analysis has
+  taken it, and with it the isolation level (25001 after). A raw syntax error, or several
+  statements in one request, takes it too unless its first word takes none, where PostgreSQL's
+  takes none (divergence `syntax-error-snapshot`). A prepare request takes it where PostgreSQL's
+  extended-protocol Parse does (`EngineSession.prepared`, `analyze_requires_snapshot`): lowered,
+  for a query, a data change but TRUNCATE (a utility statement) and CREATE TABLE AS in every form
+  (its command tag, SELECT; with or without data, whether or not IF NOT EXISTS finds the table);
+  failed, by its first tokens (lower/snapshot-rule.ts `failedPrepareTakesSnapshot`: SELECT, WITH,
+  VALUES, TABLE, `(`, INSERT, UPDATE, DELETE, MERGE, EXPLAIN, DECLARE, CALL, and CREATE [TEMP |
+  UNLOGGED] TABLE with an AS outside every parenthesis, or CREATE MATERIALIZED VIEW). A failed
+  prepare leaves the transaction open where PostgreSQL's aborts it (divergence
+  `failed-prepare-keeps-transaction`). A live sweep pins each of its cohort's sessions before it
+  plans (`EngineSession.pinSnapshot`), so the cohort reads one committed state and each plan
+  runs at its snapshot's catalog.
+  testing/snapshot-corpus-pglite.test.ts compares the decision with PostgreSQL's through the 25001
+  probe, run and prepared, for every statement of a seeded corpus (the SQLLogicTest profile, the feature matrix, the
+  docs and console SQL, the simulator's statements, PostgreSQL's forms, the review forms, and
+  mutations of them that keep the original spacing). A write it refuses takes it too (`#guard`).
+  A row committed between BEGIN and that statement is seen; BEGIN, SAVEPOINT, RELEASE, ROLLBACK
+  TO, SET TRANSACTION and SHOW take none. Switching to READ
+  ONLY pins at the switch only once a statement ran (the writer turn kept anything from
+  committing since). The statement clock (`now()`) stays the transaction's start, BEGIN, as in
+  PostgreSQL. Switching to it after writes
   keeps the transaction and commits those earlier writes; subsequent writes fail with 25006.
   Sequence mutation is checked at `SequenceAccess.next` / `set`, when execution reaches it:
   currval and unexecuted conditional calls remain allowed. SQL lastval() is still refused

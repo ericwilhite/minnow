@@ -2114,6 +2114,59 @@ export const ROW_WAIT_RECLAIM_REACH = [
   "read back through SQL after a refusal",
 ] as const;
 
+/** A statement's snapshot by its kind, behind each prefix (snapshot-statement-kind-pglite). */
+export const SNAPSHOT_STATEMENT_KIND_REACH = [
+  "syntax",
+  "several",
+  "control syntax",
+  "analysis",
+  "valid",
+  "no snapshot",
+  "empty",
+  "behind a comment",
+  "behind a carriage-return comment",
+  "behind semicolons",
+] as const;
+
+/** The snapshot corpus (next/testing/snapshot-corpus-pglite.test.ts): each source of statements
+ * and mutation, both engines' agreement either way, both divergence classes, and the
+ * transaction control the probe skips. */
+export const SNAPSHOT_CORPUS_REACH = [
+  "original",
+  "deleted tokens",
+  "truncated",
+  "duplicated token",
+  "swapped keyword",
+  "emptied list",
+  "type modifier",
+  "subquery form",
+  "simulator statement",
+  "next/ ran it",
+  "next/ refused it",
+  "both take it",
+  "neither takes it",
+  "syntax error taken",
+  "several statements taken",
+  "prepare: both take it",
+  "prepare: neither takes it",
+  "prepare: syntax error taken",
+  "prepare: several statements taken",
+  "transaction control, not probed",
+] as const;
+
+/** A read-only transaction's snapshot is taken by its first statement (read-only-snapshot-timing). */
+export const READ_ONLY_SNAPSHOT_TIMING_REACH = [
+  "commit before the snapshot seen",
+  "commit after the snapshot unseen",
+  "point read first",
+  "refused write first",
+  "read only after the first statement",
+  "analysis error first",
+  "syntax error first",
+  "control syntax error first",
+  "isolation fixed by a failed statement",
+] as const;
+
 /** PG per-attribute mode transitions, statement attempts, savepoints and transaction cleanup. */
 export const OWNER_TRANSACTION_MODE_STATES = [
   "read-only begin",

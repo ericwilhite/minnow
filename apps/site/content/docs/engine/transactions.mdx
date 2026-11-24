@@ -182,6 +182,29 @@ named marker and its nested markers. Reusing a name shadows the older marker. A 
 does not nest; use a savepoint instead. A transaction may hold at most 64 savepoints, whose
 retained rollback state may total at most 8 MiB. Release markers that are no longer needed.
 
+In the 1.0 rebuild, a read-only transaction takes its snapshot at its first statement, as
+PostgreSQL does. Every statement takes it, even when it then fails (for example on an unknown
+column) or is refused as a write, except these, which never do: `BEGIN`, `START TRANSACTION`,
+`COMMIT`, `END`, `ROLLBACK`, `ABORT`, `SAVEPOINT`, `RELEASE`, `PREPARE TRANSACTION`, `SET`,
+`RESET`, `SHOW`, `LOCK`, `LISTEN`, `NOTIFY`, `UNLISTEN`, `FETCH`, `MOVE` and `CHECKPOINT`.
+Explaining a statement does not run it, so it takes no snapshot.
+
+Preparing a statement takes the snapshot where PostgreSQL's `Parse` does: for a query, a data
+change other than `TRUNCATE`, `CREATE TABLE … AS`, `CREATE MATERIALIZED VIEW`, `EXPLAIN`,
+`DECLARE` and `CALL`, even when the statement then fails. Preparing anything else, such as
+`CREATE TABLE`, `TRUNCATE` or `DROP`, takes none.
+
+Two differences remain, and both affect only statements that fail:
+
+- PostgreSQL takes no snapshot for text it rejects as a syntax error, or for several statements
+  sent as one. Minnow cannot always tell a syntax error apart from SQL it does not support, so it
+  treats such text like any other failed statement: it takes the snapshot unless the text starts
+  with one of the statements listed above. For example, `SELEC 1` fixes a read-only
+  transaction's snapshot in Minnow, but not in PostgreSQL. When such text is prepared, Minnow
+  takes the snapshot if it starts like a statement PostgreSQL's `Parse` takes one for.
+- In PostgreSQL, a failed `Parse` aborts the transaction, and every later statement fails until
+  `ROLLBACK`. In Minnow, a failed prepare leaves the transaction open.
+
 ### A failed scope stays failed
 
 A statement that fails _after_ staging part of its work cannot be undone one statement at a time.

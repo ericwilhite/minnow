@@ -596,3 +596,39 @@ export const FTS_RENDERING_AUTHORITY = {
   authority:
     "PostgreSQL type output (::text), verified by fts-render-pglite.test.ts; canonical TIME fractions and array quoting, JSON source text and JSONB stored text",
 } as const;
+
+/**
+ * Lead ruling 2026-11-23 (#59, after Neon's review): next/ cannot tell PostgreSQL's raw parse
+ * from its own (its parser reads a subset of PostgreSQL's grammar), so a statement that fails to
+ * lower counts as raw-parsed, and its first words decide its snapshot (lower/snapshot-rule.ts).
+ * Only statements PostgreSQL rejects before its snapshot are affected: a raw syntax error, or
+ * several statements in one request (refused by PostgreSQL's extended protocol, and by next/),
+ * fixes a transaction's snapshot in next/ unless its first word starts a statement that takes
+ * none (`SELEC 1` takes one; bare `SHOW` takes none); in PostgreSQL it takes none. So does a
+ * syntax next/ accepts as an extension (`?` placeholders, MATCH ... AGAINST, `SELECT 1e`).
+ * Prepared, such text takes the snapshot when it starts like a statement PostgreSQL's Parse
+ * analyses (`failedPrepareTakesSnapshot`). snapshot-corpus-pglite.test.ts checks every other
+ * statement of its seeded corpus agrees, run and prepared, and reports how many take the snapshot
+ * through this divergence; there is no ceiling.
+ */
+export const SYNTAX_ERROR_SNAPSHOT = {
+  id: "syntax-error-snapshot",
+  ruling:
+    "lead 2026-11-23, #59 after Neon's review: a failed statement counts as raw-parsed; its first words decide",
+  authority:
+    "PostgreSQL takes the transaction snapshot only after a statement's raw parse succeeds (exec_simple_query, exec_parse_message); probed in PGlite with 25001 (snapshot-statement-kind-pglite.test.ts, snapshot-corpus-pglite.test.ts)",
+} as const;
+
+/**
+ * Found while fixing #59 (2026-11-23), not changed by it: PostgreSQL's extended-protocol Parse
+ * that fails (a syntax error, an unknown column) aborts the open transaction, and every later
+ * statement is refused with 25P02 until ROLLBACK (checked in PGlite). next/'s failed prepare
+ * request (`prepareTask`, owner/server.ts `#prepare`) answers the error and leaves the
+ * transaction open. Its snapshot does follow PostgreSQL's Parse (snapshot-planning-only.test.ts).
+ */
+export const FAILED_PREPARE_KEEPS_TRANSACTION = {
+  id: "failed-prepare-keeps-transaction",
+  ruling: "lead 2026-11-23: register it; not widened into #59",
+  authority:
+    "PostgreSQL exec_parse_message: an error during Parse aborts the transaction (25P02 after), observed in PGlite",
+} as const;

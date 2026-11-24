@@ -140,6 +140,8 @@ it.each(layers)("keeps only proven bounded call spreads in rebuild layer %s", (l
     ["owner/fts-transaction.test-support.ts", new Set(["open"])],
     ["write/directory-publication-compat.test-support.ts", new Set(["begin"])],
     ["testing/json-group-generated-lifetime.test.fixture.ts", new Set(["decode"])],
+    // The snapshot corpus draws one of its seven fixed mutation kinds (`MUTATIONS`).
+    ["testing/grammar-corpus.ts", new Set(["fc.constantFrom"])],
   ]);
   const unbounded: string[] = [];
   function walk(directory: string, descend = true) {

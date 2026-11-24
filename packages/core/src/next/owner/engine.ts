@@ -165,6 +165,17 @@ export interface EngineSession {
    * when the transaction ends or rolls back to a savepoint.
    */
   plan(text: string): PlannedStatement;
+  /**
+   * An admitted statement failed to plan (`text`'s lowering threw): it takes the open
+   * transaction's snapshot as PostgreSQL's would once the text raw-parsed, by its first words
+   * (lower/snapshot-rule.ts). Call before `fail`. Planning alone never takes it.
+   */
+  statementFailed(text: string): void;
+  /**
+   * A prepare request planned `text` (`planned`, or null when planning failed): it takes the open
+   * transaction's snapshot where PostgreSQL's extended-protocol Parse does, for what it analyses.
+   */
+  prepared(text: string, planned: PlannedStatement | null): void;
   /** This session's last commit LSN: relaxed read-your-writes pins at least this (B3 `atLeastLsn`). */
   readonly lastCommitLsn: number | null;
   /**
@@ -194,8 +205,18 @@ export interface EngineSession {
     },
     context: RunContext,
   ): Run;
-  /** Read-write: waits for B3's writer slot (FIFO). Read-only: pins a snapshot, synchronously. */
+  /**
+   * Read-write: waits for B3's writer slot (FIFO). Read-only: opens the transaction
+   * synchronously, without a snapshot: its first statement that needs one takes it
+   * (`pinSnapshot` takes it now).
+   */
   begin(readOnly: boolean, signal: AbortSignal): Promise<void>;
+  /**
+   * Takes the open transaction's snapshot now, synchronously, as its first statement would: a
+   * live sweep pins every session of a cohort in one turn, before it plans, so the cohort reads
+   * one committed state and its plans match their snapshot's catalog (live/runtime.ts `#sweep`).
+   */
+  pinSnapshot(): void;
   /** Commits the open transaction; resolves when acknowledged per durability mode. */
   commit(context: RunContext): Run;
   /** Rolls back the open transaction (releasing the writer slot or the pin). Idempotent. */
