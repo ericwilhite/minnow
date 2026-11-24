@@ -2086,7 +2086,16 @@ The full interface contract includes the following:
 - The executor admits its whole minimum atomically, including reads and downstream progress.
   Extra operator state is spillable. A complete minimum above the whole cap raises
   `MemoryAdmissionError`; temporary pressure waits or spills.
-- A plan from another catalog version fails with `PlanStaleError` before anything runs.
+- A plan from another catalog version fails with `PlanStaleError` before anything runs. The
+  owner never lets it reach a client: an autocommit write is planned when it arrives but runs
+  once it holds the writer turn, so after another transaction's DDL committed it is re-planned
+  from its text against the catalog it runs on (`ComposedSession.#autocommitWrite`), as
+  PostgreSQL plans after taking its locks (a dropped table is then 42P01). A re-plan whose
+  result columns or parameter types differ from what the client was told is refused with
+  `PlanShapeChangedError` (0A000, PostgreSQL's "cached plan must not change result type"); nothing
+  ran, and the statement sent again is planned on the new catalog
+  (`testing/plan-stale-wait.test.ts`). PostgreSQL's simple protocol would describe the new shape
+  instead (divergence `plan-shape-changed-refusal`, testing/divergences.ts).
 - Three completions: `executed` (the plan ran; for DML the statement ended), committed
   (`acknowledgeCommit()`: autocommit RETURNING waits in a charged, spillable spool until then),
   and `delivered` (every frame released; the result grant closes).

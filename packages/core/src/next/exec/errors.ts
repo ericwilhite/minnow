@@ -49,6 +49,19 @@ export class PlanStaleError extends ExecutionError {
   }
 }
 
+/**
+ * A statement the owner re-planned (its plan was stale: another transaction's DDL committed
+ * while it waited for the writer turn) would no longer match what its client was told when it
+ * was planned: its result columns or parameter types. PostgreSQL refuses a cached plan the same
+ * way ("cached plan must not change result type", 0A000). Nothing ran.
+ */
+export class PlanShapeChangedError extends ExecutionError {
+  constructor() {
+    super("cached plan must not change result type", "MINNOW_PLAN_SHAPE_CHANGED", "0A000");
+    this.name = "PlanShapeChangedError";
+  }
+}
+
 /** A parameter value does not fit its slot's type, or the count is wrong. */
 export class ParameterBindError extends ExecutionError {
   constructor(
