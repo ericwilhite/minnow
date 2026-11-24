@@ -176,6 +176,14 @@ export interface EngineSession {
    * transaction's snapshot where PostgreSQL's extended-protocol Parse does, for what it analyses.
    */
   prepared(text: string, planned: PlannedStatement | null): void;
+  /**
+   * In a failed transaction, PostgreSQL's refusal (25P02) for a statement or a prepare of `text`
+   * (`planned`, or null when it failed to lower), or null: what ends the transaction (COMMIT,
+   * ROLLBACK, ROLLBACK TO) is accepted, as PostgreSQL accepts it, and so is anything outside one.
+   * A text that fails to lower counts as raw-parsed (divergence `syntax-error-snapshot`): its
+   * first word decides.
+   */
+  refusedInFailedTransaction(text: string, planned: PlannedStatement | null): Error | null;
   /** This session's last commit LSN: relaxed read-your-writes pins at least this (B3 `atLeastLsn`). */
   readonly lastCommitLsn: number | null;
   /**

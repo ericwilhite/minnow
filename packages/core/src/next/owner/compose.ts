@@ -79,6 +79,7 @@ import {
 } from "../lower/parameterize.js";
 import {
   failedPrepareTakesSnapshot,
+  statementTokens,
   failedStatementTakesSnapshot,
 } from "../lower/snapshot-rule.js";
 import { statisticsDrifted, type PlanningStatistics } from "../lower/statistics.js";
@@ -845,6 +846,25 @@ class ComposedSession implements EngineSession {
     if (failedStatementTakesSnapshot(text)) this.#takeSnapshot();
   }
 
+  refusedInFailedTransaction(text: string, planned: PlannedStatement | null): Error | null {
+    if (this.#state !== "failed") return null;
+    if (planned === null) {
+      // PostgreSQL checks the aborted state after the raw parse: COMMIT, END, ROLLBACK and ABORT
+      // (ROLLBACK TO among them) pass; next/ counts a failed lowering as raw-parsed.
+      const [first] = statementTokens(text, 1);
+      return first?.kind === "word" && TRANSACTION_EXIT_WORDS.has(first.text)
+        ? null
+        : new InFailedTransactionError();
+    }
+    const lowered = planned.lowered;
+    return lowered.kind === "transactionControl" &&
+      (lowered.action === "rollback" ||
+        lowered.action === "commit" ||
+        lowered.action === "rollbackTo")
+      ? null
+      : new InFailedTransactionError();
+  }
+
   prepared(text: string, planned: PlannedStatement | null): void {
     // An extended-protocol Parse takes the snapshot for what it analyses (`analyze_requires_
     // snapshot`), parsed or failing analysis (PGlite): a query, a data change but TRUNCATE (a
@@ -858,6 +878,9 @@ class ComposedSession implements EngineSession {
           (lowered.kind === "modify" && lowered.command !== "TRUNCATE") ||
           (lowered.kind === "ddl" && lowered.command === "SELECT");
     if (takes) this.#takeSnapshot();
+    // PostgreSQL (exec_parse_message): a failed Parse aborts the open transaction, as a failed
+    // statement does (25P02 until ROLLBACK or ROLLBACK TO a savepoint taken before it).
+    if (planned === null) this.fail();
   }
 
   #pinOptions() {
@@ -1736,3 +1759,6 @@ class ComposedSession implements EngineSession {
     }
   }
 }
+
+/** First words that end a transaction (gram.y TransactionStmt: COMMIT, END, ROLLBACK, ABORT). */
+const TRANSACTION_EXIT_WORDS = new Set(["COMMIT", "END", "ROLLBACK", "ABORT"]);

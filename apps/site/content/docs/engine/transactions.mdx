@@ -194,16 +194,18 @@ change other than `TRUNCATE`, `CREATE TABLE … AS`, `CREATE MATERIALIZED VIEW`,
 `DECLARE` and `CALL`, even when the statement then fails. Preparing anything else, such as
 `CREATE TABLE`, `TRUNCATE` or `DROP`, takes none.
 
-Two differences remain, and both affect only statements that fail:
+A failed prepare inside a transaction aborts it, as a failed statement does and as a failed
+`Parse` does in PostgreSQL: every later statement and prepare fails with SQLSTATE 25P02 until
+`ROLLBACK`, or until `ROLLBACK TO` a savepoint taken before the failure.
 
-- PostgreSQL takes no snapshot for text it rejects as a syntax error, or for several statements
-  sent as one. Minnow cannot always tell a syntax error apart from SQL it does not support, so it
-  treats such text like any other failed statement: it takes the snapshot unless the text starts
-  with one of the statements listed above. For example, `SELEC 1` fixes a read-only
-  transaction's snapshot in Minnow, but not in PostgreSQL. When such text is prepared, Minnow
-  takes the snapshot if it starts like a statement PostgreSQL's `Parse` takes one for.
-- In PostgreSQL, a failed `Parse` aborts the transaction, and every later statement fails until
-  `ROLLBACK`. In Minnow, a failed prepare leaves the transaction open.
+One difference remains, and it affects only statements that fail. PostgreSQL takes no snapshot
+for text it rejects as a syntax error, or for several statements sent as one. Minnow cannot always
+tell a syntax error apart from SQL it does not support, so it treats such text like any other
+failed statement: it takes the snapshot unless the text starts with one of the statements listed
+above. For example, `SELEC 1` fixes a read-only transaction's snapshot in Minnow, but not in
+PostgreSQL. When such text is prepared, Minnow takes the snapshot if it starts like a statement
+PostgreSQL's `Parse` takes one for. For the same reason, inside a transaction that has already
+failed, Minnow answers such text with 25P02 where PostgreSQL reports the syntax error (42601).
 
 ### A failed scope stays failed
 

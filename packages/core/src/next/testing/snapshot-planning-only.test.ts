@@ -19,7 +19,6 @@
  */
 import { PGlite, protocol } from "@electric-sql/pglite";
 import { afterAll, beforeAll, expect, it } from "vitest";
-import { FAILED_PREPARE_KEEPS_TRANSACTION } from "./divergences.js";
 import { harness, raw } from "./owner-harness.js";
 
 let pg: PGlite;
@@ -123,8 +122,8 @@ it("a prepare takes the snapshot exactly where PostgreSQL's Parse does", async (
     "SELECT v FROM t WHERE id = 1",
     "INSERT INTO t VALUES (1, 1)",
     "CREATE TABLE z AS SELECT 1 AS a",
-    // Analysis fails after the snapshot: taken (and the transaction aborts: 25P02 in
-    // PostgreSQL; next/ keeps it open, `FAILED_PREPARE_KEEPS_TRANSACTION`).
+    // Analysis fails after the snapshot: taken (and the transaction aborts, 25P02 after, in both:
+    // failed-prepare-aborts-pglite.test.ts).
     "SELECT missing_column FROM t",
     "SELECT * FROM missing_table",
     "UPDATE missing_table SET v = 1",
@@ -164,13 +163,18 @@ it("a prepare takes the snapshot exactly where PostgreSQL's Parse does", async (
     "CREATE TABLE z (a text DEFAULT $𝕏$) AS ($𝕏$, b no_such_type)",
   ]) {
     const postgres = await postgresParse(sql);
-    const { port, header, took } = await session();
+    const { port, header, run, took } = await session();
+    // As the PostgreSQL probe does: a failed prepare aborts the transaction (in both), and
+    // ROLLBACK TO a savepoint taken before it recovers it, keeping the snapshot it took.
+    expect(await run("SAVEPOINT s")).toBe("00000");
     const request = { ...header(), t: "prepare", session: 1, id: 7, text: sql };
     port.deliver(request);
     const reply = await port.reply(request.seq);
+    expect(await run("ROLLBACK TO s")).toBe("00000");
+    expect(await run("RELEASE s")).toBe("00000");
     // Where each fails may differ (next/ reads the catalog when it prepares a DROP; PostgreSQL
     // when it runs one): the snapshot may not.
-    const context = `prepare ${sql} (PostgreSQL ${postgres.failed ? "failed" : "parsed"}, next/ ${reply.t}; ${FAILED_PREPARE_KEEPS_TRANSACTION.id} for the abort)`;
+    const context = `prepare ${sql} (PostgreSQL ${postgres.failed ? "failed" : "parsed"}, next/ ${reply.t})`;
     expect(await took(), `${context}: the snapshot`).toBe(postgres.took);
   }
 });

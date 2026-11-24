@@ -3388,8 +3388,11 @@ not require a home cache directory.
   failed, by its first tokens (lower/snapshot-rule.ts `failedPrepareTakesSnapshot`: SELECT, WITH,
   VALUES, TABLE, `(`, INSERT, UPDATE, DELETE, MERGE, EXPLAIN, DECLARE, CALL, and CREATE [TEMP |
   UNLOGGED] TABLE with an AS outside every parenthesis, or CREATE MATERIALIZED VIEW). A failed
-  prepare leaves the transaction open where PostgreSQL's aborts it (divergence
-  `failed-prepare-keeps-transaction`). A live sweep pins each of its cohort's sessions before it
+  prepare aborts the open transaction, as PostgreSQL's failed Parse does (25P02 until ROLLBACK
+  or ROLLBACK TO); inside a failed transaction a statement or prepare is refused 25P02 unless it
+  ends the transaction, a text that fails to lower included (its first word decides,
+  `EngineSession.refusedInFailedTransaction`; testing/failed-prepare-aborts-pglite.test.ts). A
+  live sweep pins each of its cohort's sessions before it
   plans (`EngineSession.pinSnapshot`), so the cohort reads one committed state and each plan
   runs at its snapshot's catalog.
   testing/snapshot-corpus-pglite.test.ts compares the decision with PostgreSQL's through the 25001

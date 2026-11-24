@@ -13891,3 +13891,11 @@ export const EXPRESSION_BOUND_CENSUS_REACH = [
   "negative numeric",
   "scale above precision",
 ] as const;
+
+/** next/testing/failed-prepare-aborts-pglite.test.ts: a failed prepare inside a transaction. */
+export const FAILED_PREPARE_REACH = [
+  "prepared",
+  "prepare failed",
+  "aborted",
+  "savepoint recovered",
+] as const;

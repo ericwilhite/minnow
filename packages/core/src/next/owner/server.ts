@@ -1125,10 +1125,17 @@ class Connection {
     if (planError !== null) {
       // Admitted: a statement that failed to lower takes the snapshot it would have taken in
       // PostgreSQL before failing; an unadmitted, expired or refused retry above took none.
-      if (lowering.text !== null) session?.statementFailed(lowering.text);
+      // In an aborted transaction PostgreSQL refuses it (25P02) after its raw parse, unless it
+      // ends the transaction (`refusedInFailedTransaction`).
+      const refused =
+        lowering.text === null
+          ? null
+          : (session?.refusedInFailedTransaction(lowering.text, null) ?? null);
+      const error = refused ?? planError;
+      if (refused === null && lowering.text !== null) session?.statementFailed(lowering.text);
       session?.fail();
-      this.#finishLedger(request, planned, before, session, null, true, planError);
-      this.post({ t: "error", seq: request.seq, error: toWireError(planError) });
+      this.#finishLedger(request, planned, before, session, null, true, error);
+      this.post({ t: "error", seq: request.seq, error: toWireError(error) });
       return;
     }
     return this.#execute(request, planned, slot, session, before);
@@ -1570,10 +1577,17 @@ class Connection {
     try {
       planned = session === null ? engine.plan(request.text) : session.plan(request.text);
     } catch (error) {
-      // PostgreSQL's failed Parse takes the snapshot for what it analyses, and aborts the
-      // transaction (25P02); next/ keeps it open (divergence failed-prepare-keeps-transaction).
-      session?.prepared(request.text, null);
-      this.post({ t: "error", seq: request.seq, error: toWireError(error) });
+      // In an aborted transaction PostgreSQL refuses the Parse (25P02) after its raw parse;
+      // otherwise its failed Parse takes the snapshot for what it analyses and aborts the open
+      // transaction (`prepared`).
+      const refused = session?.refusedInFailedTransaction(request.text, null) ?? null;
+      if (refused === null) session?.prepared(request.text, null);
+      this.post({ t: "error", seq: request.seq, error: toWireError(refused ?? error) });
+      return;
+    }
+    const refused = session?.refusedInFailedTransaction(request.text, planned) ?? null;
+    if (refused !== null) {
+      this.post({ t: "error", seq: request.seq, error: toWireError(refused) });
       return;
     }
     session?.prepared(request.text, planned);

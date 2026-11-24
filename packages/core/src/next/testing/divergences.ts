@@ -618,17 +618,3 @@ export const SYNTAX_ERROR_SNAPSHOT = {
   authority:
     "PostgreSQL takes the transaction snapshot only after a statement's raw parse succeeds (exec_simple_query, exec_parse_message); probed in PGlite with 25001 (snapshot-statement-kind-pglite.test.ts, snapshot-corpus-pglite.test.ts)",
 } as const;
-
-/**
- * Found while fixing #59 (2026-11-23), not changed by it: PostgreSQL's extended-protocol Parse
- * that fails (a syntax error, an unknown column) aborts the open transaction, and every later
- * statement is refused with 25P02 until ROLLBACK (checked in PGlite). next/'s failed prepare
- * request (`prepareTask`, owner/server.ts `#prepare`) answers the error and leaves the
- * transaction open. Its snapshot does follow PostgreSQL's Parse (snapshot-planning-only.test.ts).
- */
-export const FAILED_PREPARE_KEEPS_TRANSACTION = {
-  id: "failed-prepare-keeps-transaction",
-  ruling: "lead 2026-11-23: register it; not widened into #59",
-  authority:
-    "PostgreSQL exec_parse_message: an error during Parse aborts the transaction (25P02 after), observed in PGlite",
-} as const;
