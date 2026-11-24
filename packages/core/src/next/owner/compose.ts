@@ -435,10 +435,9 @@ class ComposedEngine implements CatalogOwnerEngine {
     return this.#options.writePath.catalog.version;
   }
 
-  writerTurnReleased(signal: AbortSignal): Promise<void> | null {
+  catalogMayChangeBeforeTurn(): boolean {
     const path = this.#options.writePath;
-    if (path.transactionOpen !== true || path.whenTransactionEnds === undefined) return null;
-    return path.whenTransactionEnds(signal);
+    return path.holderMovedCatalog === true || (path.waitingWriters ?? 0) > 0;
   }
 
   get ledger(): OwnerLedger {
@@ -1287,6 +1286,31 @@ class ComposedSession implements EngineSession {
         if (lowered.kind === "ddl") return this.#ddlBody(lowered, context, tx);
         if (lowered.kind !== "modify")
           throw new TypeError("A write statement re-planned as another kind");
+        const bound = boundParameters(current, params);
+        return this.#native(lowered, tx.catalog)
+          ? this.#nativeBody(lowered, bound, context, tx)
+          : this.#modifyBody(lowered, bound, context, tx, stream);
+      },
+      context,
+    );
+    Object.defineProperty(run, "columns", { get: () => columns, enumerable: true });
+    return run;
+  }
+
+  runOnTurn(text: string, params: readonly WireValue[], context: RunContext): Run {
+    if (this.#state !== "idle")
+      throw new TypeError("Only an autocommit write is planned on its turn");
+    let columns: readonly WireColumnMeta[] = [];
+    const run = this.#autocommit(
+      columns,
+      (tx, stream) => {
+        // Planned now, on the catalog it runs on: its answer when this fails (42703, 42P10).
+        const current = this.#engine.plan(text, tx.catalog);
+        columns = current.columns;
+        const lowered = current.lowered;
+        if (lowered.kind === "ddl") return this.#ddlBody(lowered, context, tx);
+        if (lowered.kind !== "modify")
+          throw new TypeError("A statement planned on its turn is not a write");
         const bound = boundParameters(current, params);
         return this.#native(lowered, tx.catalog)
           ? this.#nativeBody(lowered, bound, context, tx)

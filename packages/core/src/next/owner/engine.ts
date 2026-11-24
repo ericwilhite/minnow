@@ -177,6 +177,13 @@ export interface EngineSession {
    */
   plan(text: string, parameterTypes?: readonly PhysicalType[]): PlannedStatement;
   /**
+   * An autocommit write planned once it holds the writer turn, from `text` on the catalog it runs
+   * on (PostgreSQL analyses a write after locking its target): its arrival plan failed on a
+   * column or conflict target the transaction holding the turn is adding. It waits for the turn
+   * in arrival order like any write; a planning error then is its answer.
+   */
+  runOnTurn?(text: string, params: readonly WireValue[], context: RunContext): Run;
+  /**
    * An admitted statement failed to plan (`text`'s lowering threw): it takes the open
    * transaction's snapshot as PostgreSQL's would once the text raw-parsed, by its first words
    * (lower/snapshot-rule.ts). Call before `fail`. Planning alone never takes it.
@@ -272,10 +279,12 @@ export interface OwnerEngine {
   /** Parses, rewrites and lowers `text`, or returns the cached plan. Throws SQL errors. */
   plan(text: string): PlannedStatement;
   /**
-   * Resolves when the transaction holding the writer turn ends (rejects when `signal` aborts),
-   * or null when none holds it now.
+   * Whether the catalog may change before an autocommit write arriving now gets the writer turn:
+   * the transaction holding it changed the catalog without committing it, or writers queued for
+   * it ahead of this one may change it. Then an arrival plan's failure is not yet the answer, and
+   * the write is planned on its turn (`EngineSession.runOnTurn`).
    */
-  writerTurnReleased?(signal: AbortSignal): Promise<void> | null;
+  catalogMayChangeBeforeTurn?(): boolean;
   /**
    * The write path's delivery rule (access/write-path.ts "Delivery"): null when everything up to
    * `lsn` is durable (or the mode is relaxed), else a promise for it. The server checks it per

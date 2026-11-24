@@ -13914,4 +13914,7 @@ export const PLAN_STALE_WAIT_REACH = [
   "three waiters",
   "cancelled while waiting",
   "rolled back",
+  "answered at once",
+  "DDL planned on its turn",
+  "DDL after an earlier waiter's write",
 ] as const;

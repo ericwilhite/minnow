@@ -2095,13 +2095,17 @@ The full interface contract includes the following:
   A prepared one is re-planned with the parameter types it was prepared with, and while its
   result columns differ from those its client was told it is refused with
   `PlanShapeChangedError` on every execute (0A000, PostgreSQL's "cached plan must not change
-  result type"; nullability is no part of the shape); nothing runs. An autocommit write whose
-  arrival plan fails for a column or a conflict target (42703, 42P10) while another
-  connection's transaction holds the writer turn plans again once that transaction ends
-  (`OwnerServer` `#planAfterTurn`), as PostgreSQL's write waits for its lock on the table that
-  transaction is altering; a missing table (42P01) is refused at once, as PostgreSQL does not
-  find a table another transaction has not committed (`testing/plan-stale-wait.test.ts`,
-  generated against PGlite in `testing/plan-stale-wait-pglite.test.ts`).
+  result type"; nullability is no part of the shape); nothing runs. An autocommit write or schema change (INSERT, UPDATE, DELETE, MERGE, ALTER, CREATE,
+  DROP) whose arrival plan fails for a column or a conflict target (42703, 42P10) while the
+  catalog may still change before its turn (the transaction holding the writer turn changed it,
+  or writers are queued ahead of it) is admitted like any write and planned from its text once
+  it holds the turn (`EngineSession.runOnTurn`, `OwnerServer` `#plansOnTurn`): it waits in arrival
+  order, in the ledger and among the running requests, so a reconnect, a close or a cancel ends it
+  as it ends any write, and PostgreSQL's lock waiters are served in the same order. When nothing
+  can change the catalog first, the arrival answer stands at once; a missing table (42P01) is
+  refused at once, as PostgreSQL does not find a table another transaction has not committed
+  (`testing/plan-stale-wait.test.ts`, generated against PGlite in
+  `testing/plan-stale-wait-pglite.test.ts`).
 - Three completions: `executed` (the plan ran; for DML the statement ended), committed
   (`acknowledgeCommit()`: autocommit RETURNING waits in a charged, spillable spool until then),
   and `delivered` (every frame released; the result grant closes).

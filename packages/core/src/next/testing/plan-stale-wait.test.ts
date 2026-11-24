@@ -53,7 +53,14 @@ async function untilWaiting(h: Harness, count = 1): Promise<void> {
   }
 }
 
-async function sessions(body: (a: ProtocolClient, b: ProtocolClient, h: Harness) => Promise<void>) {
+async function sessions(
+  body: (
+    a: ProtocolClient,
+    b: ProtocolClient,
+    h: Harness,
+    reconnect: (client: ProtocolClient) => Promise<void>,
+  ) => Promise<void>,
+) {
   Governor.stallAfterMs = 5_000;
   const h = new Harness("strict", "memory");
   const governor = new Governor(256 * (1 << 20));
@@ -84,7 +91,12 @@ async function sessions(body: (a: ProtocolClient, b: ProtocolClient, h: Harness)
     await a.query("INSERT INTO t VALUES (1, 1, 'a'), (2, 2, 'a')");
     await a.query("CREATE TABLE audit (id integer PRIMARY KEY, n integer)");
     await a.query("INSERT INTO audit VALUES (1, 0)");
-    await body(a, b, h);
+    await body(a, b, h, async (client) => {
+      const { port1, port2 } = new MessageChannel();
+      ports.push(port1, port2);
+      server.accept(port1);
+      await client.reconnect(port2);
+    });
   } finally {
     for (const client of clients) client.close();
     const stop = server.quiesce("closing");
@@ -426,6 +438,66 @@ it("serves a prepared fallback whose columns only changed nullability", async ()
     await a.query("CREATE TABLE t (id integer PRIMARY KEY, k integer NOT NULL, v text)");
     expect(await insert.run()).toBe("served");
     expect((await a.query("SELECT id, k, v FROM t")).rows()).toEqual([[100, 7, "b"]]);
+  });
+}, 60_000);
+
+/**
+ * #69 re-review P1 (exactly-once): a write planned on its turn is admitted like any write, in the
+ * ledger and in the owner's running requests, so a reconnect or a close while it waits ends it
+ * as it ends a write waiting for the turn (`MINNOW_SESSION_LOST`, nothing written). Before, it
+ * waited outside both: the resent request was answered 42703 and the orphaned original
+ * committed when A did.
+ */
+for (const named of ["c", "v"] as const)
+  it(`ends a write waiting for its turn exactly once on a reconnect (names ${named})`, async () => {
+    await sessions(async (a, b, h, reconnect) => {
+      await a.query("BEGIN");
+      await a.query("ALTER TABLE t ADD COLUMN c integer");
+      // c: A's new column (its arrival plan fails: planned on its turn); v: plans at arrival.
+      const told = outcome(b.query(`INSERT INTO t (id, k, ${named}) VALUES (10, 10, 5)`));
+      await untilWaiting(h);
+      await reconnect(b);
+      expect(await settledYet(told), "answered for the old connection").not.toBe("pending");
+      const answer = await told;
+      await a.query("COMMIT");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const rows = (await a.query("SELECT id FROM t ORDER BY id")).rows();
+      // Never an error for a write that committed, nor a success for one that did not.
+      expect(answer).toMatch(/MINNOW_SESSION_LOST/u);
+      expect(rows).toEqual([[1], [2]]);
+    });
+  }, 60_000);
+
+for (const named of ["c", "v"] as const)
+  it(`ends a write waiting for its turn on its connection's close, and writes nothing (names ${named})`, async () => {
+    await sessions(async (a, b, h) => {
+      await a.query("BEGIN");
+      await a.query("ALTER TABLE t ADD COLUMN c integer");
+      const told = outcome(b.query(`INSERT INTO t (id, k, ${named}) VALUES (10, 10, 5)`));
+      await untilWaiting(h);
+      b.close();
+      expect(await told).not.toBe("served");
+      // The close reaches the owner on its own port: once it does, the write no longer waits.
+      const deadline = Date.now() + 5_000;
+      while (h.path.waitingWriters > 0) {
+        if (Date.now() > deadline) throw new Error("the closed connection's write still waits");
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+      await a.query("COMMIT");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect((await a.query("SELECT id FROM t ORDER BY id")).rows()).toEqual([[1], [2]]);
+      expect(h.path.waitingWriters).toBe(0);
+    });
+  }, 60_000);
+
+it("answers at once a write that cannot plan behind a transaction that changed no catalog", async () => {
+  await sessions(async (a, b, h) => {
+    await a.query("BEGIN");
+    await a.query("INSERT INTO t VALUES (3, 3, 'a')");
+    const told = outcome(b.query("INSERT INTO t (id, k, nope) VALUES (10, 10, 5)"));
+    expect(await settledYet(told), "no wait: nothing can change its answer").toMatch(/ 42703 /u);
+    expect(h.path.waitingWriters).toBe(0);
+    await a.query("COMMIT");
   });
 }, 60_000);
 

@@ -89,8 +89,8 @@ import {
 } from "./protocol.js";
 import { statementTokens } from "../lower/snapshot-rule.js";
 
-/** The first words of a write that may plan again once the writer turn is released. */
-const WRITE_WORDS = new Set(["INSERT", "UPDATE", "DELETE", "MERGE"]);
+/** The first words of a statement that may be planned on its writer turn (`#plansOnTurn`). */
+const TURN_WORDS = new Set(["INSERT", "UPDATE", "DELETE", "MERGE", "ALTER", "CREATE", "DROP"]);
 
 /** The slice of a MessagePort the server needs (a Worker's own scope works too). */
 export interface ServerPort {
@@ -422,9 +422,6 @@ class Connection {
   readonly #running = new Map<number, Running>();
   /** Requests waiting behind their session, by seq: a cancel marks them. */
   readonly #queued = new Map<number, { cancelled: boolean; close: boolean }>();
-  /** Writes waiting to plan again once the writer turn is released (`#planAfterTurn`). */
-  readonly #replanning = new Map<number, { abort: AbortController; close: boolean }>();
-  readonly #replanned = new WeakSet<Request>();
   readonly #streams = new Map<number, Stream>();
   readonly #live = new Map<number, LiveHandle>();
   readonly #inspectionReplies = new Map<
@@ -1095,9 +1092,12 @@ class Connection {
         planError = error;
       }
     }
-    if (planError !== null && slot !== null && session !== null) {
-      const again = this.#planAfterTurn(request, session, slot, planError);
-      if (again !== null) return again;
+    // Planned on its turn instead (`#plansOnTurn`): admitted and run like any write.
+    let onTurn: string | null = null;
+    if (planError !== null && session !== null && this.#plansOnTurn(request, session, planError)) {
+      onTurn = (request as StatementRequest).text;
+      planError = null;
+      lowering.text = null;
     }
     const before = session?.transaction ?? "idle";
     const scope = ledgerScope({
@@ -1144,54 +1144,38 @@ class Connection {
       this.post({ t: "error", seq: request.seq, error: toWireError(planError) });
       return;
     }
-    return this.#execute(request, planned, slot, session, before);
+    return this.#execute(request, planned, slot, session, before, onTurn);
   }
 
   /**
-   * An autocommit write that names a column or a conflict target the catalog lacks (42703,
-   * 42P10) while another connection's transaction holds the writer turn plans again once that
-   * transaction ends, before it is admitted. PostgreSQL analyses a write after locking its
-   * target, and the DDL that would add the column or the unique index holds a lock that
-   * conflicts with it: the write waits and is analysed on the committed catalog. A missing
-   * relation (42P01) is refused at once, as in PostgreSQL: a table another transaction has not
-   * committed is not found, so there is nothing to lock and wait on. Once per request: the
-   * second failure is the answer.
+   * An autocommit write or DDL statement that names a column or a conflict target the catalog
+   * lacks (42703, 42P10) while the transaction holding the writer turn has changed the catalog is
+   * planned once it holds the turn instead (`EngineSession.runOnTurn`): PostgreSQL analyses a
+   * write after locking its target, and that transaction's DDL holds a lock that conflicts with
+   * it, so it waits and is analysed on what that transaction leaves. It is admitted and waits for
+   * the turn like any write: in arrival order, in the ledger and in `#running`, so a reconnect,
+   * a close or a cancel ends it as it ends any write. A missing relation (42P01) is refused at
+   * once, as in PostgreSQL: a table another transaction has not committed is not found. When
+   * nothing could change the catalog before its turn (the holder changed none and no writer is
+   * queued ahead of it), its arrival answer is final: refused at once. A writer queued ahead may
+   * change the catalog (PostgreSQL would run it first), so then it waits its turn too.
    */
-  #planAfterTurn(
-    request: Request,
-    session: EngineSession,
-    slot: SessionSlot,
-    error: unknown,
-  ): Promise<void> | null {
+  #plansOnTurn(request: Request, session: EngineSession, error: unknown): boolean {
     if (
       request.t !== "statement" ||
       request.prepared !== null ||
       request.text === null ||
-      request.retry ||
       request.scopedTransaction === true ||
+      request.queryOnly === true ||
       session.transaction !== "idle" ||
-      this.#replanned.has(request)
+      session.runOnTurn === undefined
     )
-      return null;
+      return false;
     const state = (error as { sqlState?: unknown } | null)?.sqlState;
-    if (state !== "42703" && state !== "42P10") return null;
+    if (state !== "42703" && state !== "42P10") return false;
     const [first] = statementTokens(request.text, 1);
-    if (first?.kind !== "word" || !WRITE_WORDS.has(first.text)) return null;
-    const waiting = { abort: new AbortController(), close: false };
-    const released = this.#server.engine.writerTurnReleased?.(waiting.abort.signal) ?? null;
-    if (released === null) return null;
-    this.#replanned.add(request);
-    this.#replanning.set(request.seq, waiting);
-    return released.then(
-      () => {
-        this.#replanning.delete(request.seq);
-        return this.#serveOne(request, slot);
-      },
-      () => {
-        this.#replanning.delete(request.seq);
-        this.#answerCancelledBeforeStart(request, slot, waiting.close);
-      },
-    );
+    if (first?.kind !== "word" || !TURN_WORDS.has(first.text)) return false;
+    return this.#server.engine.catalogMayChangeBeforeTurn?.() === true;
   }
 
   /** Plans against the session's catalog (a transaction's own DDL included). */
@@ -1402,6 +1386,7 @@ class Connection {
     slot: SessionSlot | null,
     session: EngineSession | null,
     before: AnsweredRequest["before"],
+    onTurn: string | null = null,
   ): void | Promise<void> {
     const server = this.#server;
     const engine = server.engine;
@@ -1450,6 +1435,13 @@ class Connection {
     try {
       switch (request.t) {
         case "statement": {
+          if (onTurn !== null) {
+            const owner = inSession();
+            if (owner.runOnTurn === undefined)
+              throw new ProtocolError("A statement without a plan");
+            run = owner.runOnTurn(onTurn, request.params, context);
+            break;
+          }
           if (planned === null) throw new ProtocolError("A statement without a plan");
           if (request.result.recycle === true && planned.kind !== "query")
             throw new TypeError("Streaming export requires a query");
@@ -2020,12 +2012,6 @@ class Connection {
     if (queued !== undefined) {
       queued.cancelled = true;
       queued.close ||= close;
-      return;
-    }
-    const replanning = this.#replanning.get(target);
-    if (replanning !== undefined) {
-      replanning.close ||= close;
-      replanning.abort.abort(new CancelledError());
       return;
     }
     this.#releaseInspection(target);

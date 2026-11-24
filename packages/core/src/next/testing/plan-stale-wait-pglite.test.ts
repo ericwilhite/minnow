@@ -97,8 +97,20 @@ const CHANGES: Record<string, Change> = {
 };
 const TRIGGERED = new Set(["add trigger", "drop trigger"]);
 
+/** Statements that take the writer turn as DDL: some name the column, some conflict. */
+const DDL_VERBS = [
+  "drop column",
+  "create index",
+  "create table as",
+  "add column",
+  "unique index",
+  "drop table",
+] as const;
+const DDL = new Set<string>(DDL_VERBS);
+
 interface Waiter {
-  readonly verb: "insert" | "insert select" | "update" | "delete" | "upsert";
+  readonly verb:
+    "insert" | "insert select" | "update" | "delete" | "upsert" | (typeof DDL_VERBS)[number];
   /** The non-key column it names: t's own v, or c (added or renamed by some changes). */
   readonly column: "v" | "c";
   readonly parameters: "none" | "key" | "key and value";
@@ -116,12 +128,18 @@ interface History {
 const waiter = (change: string): fc.Arbitrary<Waiter> =>
   fc
     .record({
-      verb: fc.constantFrom<Waiter["verb"]>(
-        "insert",
-        "insert select",
-        "update",
-        "delete",
-        "upsert",
+      verb: fc.oneof(
+        {
+          weight: 3,
+          arbitrary: fc.constantFrom<Waiter["verb"]>(
+            "insert",
+            "insert select",
+            "update",
+            "delete",
+            "upsert",
+          ),
+        },
+        { weight: 1, arbitrary: fc.constantFrom<Waiter["verb"]>(...DDL_VERBS) },
       ),
       column: fc.constantFrom<Waiter["column"]>("v", "c"),
       parameters: fc.constantFrom<Waiter["parameters"]>("none", "key", "key and value"),
@@ -129,14 +147,19 @@ const waiter = (change: string): fc.Arbitrary<Waiter> =>
       prepared: fc.boolean(),
       cancel: fc.constantFrom(false, false, false, true),
     })
-    .map((w): Waiter => ({
-      ...w,
-      // Header: a non-key parameter only where its type is fixed (prepared), no prepared
-      // upsert, no RETURNING beside a trigger.
-      parameters: w.parameters === "key and value" && !w.prepared ? "key" : w.parameters,
-      prepared: w.prepared && w.verb !== "upsert",
-      returning: TRIGGERED.has(change) ? "none" : w.returning,
-    }));
+    .map((w): Waiter =>
+      DDL.has(w.verb)
+        ? // DDL: simple protocol, no parameters, no RETURNING.
+          { ...w, parameters: "none", returning: "none", prepared: false }
+        : {
+            ...w,
+            // Header: a non-key parameter only where its type is fixed (prepared), no prepared
+            // upsert, no RETURNING beside a trigger.
+            parameters: w.parameters === "key and value" && !w.prepared ? "key" : w.parameters,
+            prepared: w.prepared && w.verb !== "upsert",
+            returning: TRIGGERED.has(change) ? "none" : w.returning,
+          },
+    );
 
 const history: fc.Arbitrary<History> = fc.constantFrom(...Object.keys(CHANGES)).chain((change) =>
   fc.record({
@@ -176,6 +199,18 @@ function render(w: Waiter, i: number): { sql: string; params: Array<number | str
         return `DELETE FROM t WHERE id = ${key(i + 1)} AND ${c} IS NOT NULL`;
       case "upsert":
         return `INSERT INTO t (id, k, ${c}) VALUES (${key(100 + i)}, '${String(i + 1)}', ${value()}) ON CONFLICT (k) DO NOTHING`;
+      case "drop column":
+        return `ALTER TABLE t DROP COLUMN ${c}`;
+      case "create index":
+        return `CREATE INDEX t_${c}_${String(i)} ON t (${c})`;
+      case "create table as":
+        return `CREATE TABLE copy_${String(i)} AS SELECT id, ${c} FROM t`;
+      case "add column":
+        return `ALTER TABLE t ADD COLUMN d${String(i)} integer`;
+      case "unique index":
+        return `CREATE UNIQUE INDEX t_k_${String(i)} ON t (k)`;
+      case "drop table":
+        return "DROP TABLE t";
     }
   })();
   return { sql: body + returning, params };
@@ -203,7 +238,7 @@ async function postgres(h: History): Promise<{
   answers: Array<Answer | null>;
   state: string;
 }> {
-  await pg.exec("DROP TABLE IF EXISTS t, u, audit CASCADE; DEALLOCATE ALL");
+  await pg.exec("DROP TABLE IF EXISTS t, u, audit, copy_0, copy_1, copy_2 CASCADE; DEALLOCATE ALL");
   const change = CHANGES[h.change];
   if (change === undefined) throw new Error(h.change);
   const code = (error: unknown) => String((error as { code?: unknown }).code);
@@ -254,7 +289,9 @@ async function postgres(h: History): Promise<{
 const minnowState = (error: unknown) =>
   String((error as { sqlState?: unknown }).sqlState ?? (error as { name?: unknown }).name);
 
-async function minnow(h: History): Promise<{ answers: Array<Answer | null>; state: string }> {
+async function minnow(
+  h: History,
+): Promise<{ answers: Array<Answer | null>; state: string; early: ReadonlySet<number> }> {
   const change = CHANGES[h.change];
   if (change === undefined) throw new Error(h.change);
   Governor.stallAfterMs = 5_000;
@@ -308,9 +345,15 @@ async function minnow(h: History): Promise<{ answers: Array<Answer | null>; stat
     for (const sql of change.minnow) await a.query(sql);
     const aborts = h.waiters.map(() => new AbortController());
     let settledEarly = 0;
+    let open = true;
+    const early = new Set<number>();
     const answers = h.waiters.map((_, i): Promise<Answer> | Answer => {
       const handle = prepared[i];
-      if (typeof handle === "string") return handle;
+      if (typeof handle === "string") {
+        // Its prepare failed: never sent, never queued.
+        early.add(i);
+        return handle;
+      }
       const client = clientAt(i + 1);
       const { sql, params } = rendered[i] ?? { sql: "", params: [] };
       const signal = aborts[i]?.signal;
@@ -320,6 +363,7 @@ async function minnow(h: History): Promise<{ answers: Array<Answer | null>; stat
           : client.execute(handle.id, params, 0, -1, signal === undefined ? {} : { signal });
       return sent.then(answer, minnowState).finally(() => {
         settledEarly++;
+        if (open) early.add(i);
       });
     });
     // Observed, not timed: every sent waiter waits for the writer turn (queued for it, or
@@ -331,27 +375,41 @@ async function minnow(h: History): Promise<{ answers: Array<Answer | null>; stat
       await new Promise((resolve) => setTimeout(resolve, 1));
     }
     // None is answered while A's transaction holds the turn: each waits to be analysed on the
-    // catalog A leaves (as PostgreSQL's waits for its lock).
-    expect(settledEarly, "waiters answered while A's transaction was open").toBe(0);
+    // catalog A leaves (as PostgreSQL's waits for its lock). Except one whose arrival plan fails
+    // while A changed no catalog: nothing A does can change its answer, and PostgreSQL gives it
+    // at once (its lock does not conflict with A's).
+    for (const i of early) {
+      if (typeof answers[i] === "string") continue;
+      expect(h.change, `waiter ${String(i)} answered while A's transaction was open`).toBe("none");
+      expect(
+        [...Array(i).keys()].every((j) => early.has(j)),
+        `waiter ${String(i)} answered before an earlier waiter queued for the turn`,
+      ).toBe(true);
+      expect(["42703", "42P10"]).toContain(await answers[i]);
+    }
     for (const [i, w] of h.waiters.entries()) {
       const pending = answers[i];
-      if (!w.cancel || typeof pending === "string" || pending === undefined) continue;
+      if (!w.cancel || typeof pending === "string" || pending === undefined || early.has(i))
+        continue;
       // The client answers a sent request's cancellation with the signal's reason once the
       // owner has answered it cancelled (client.ts `#fail`).
       aborts[i]?.abort(new CancelledError());
       expect(await pending, `waiter ${String(i)} cancelled while it waited`).toBe("57014");
     }
+    open = false;
     await a.query(h.end);
     const settled: Array<Answer | null> = [];
     for (const [i, w] of h.waiters.entries()) {
       const pending = answers[i];
+      // A cancelled waiter is left out of PGlite's history (one answered at once is checked
+      // above).
       settled.push(w.cancel && typeof pending !== "string" ? null : ((await pending) ?? null));
     }
     const state = [
-      answer(await a.query("SELECT * FROM t ORDER BY id")),
-      answer(await a.query("SELECT n FROM audit")),
+      await a.query("SELECT * FROM t ORDER BY id").then(answer, minnowState),
+      await a.query("SELECT n FROM audit").then(answer, minnowState),
     ];
-    return { answers: settled, state: state.join("\n") };
+    return { answers: settled, state: state.join("\n"), early };
   } finally {
     Governor.stallAfterMs = null;
     for (const client of clients) client.close();
@@ -386,8 +444,14 @@ function noteReach(h: History, expected: Awaited<ReturnType<typeof postgres>>, r
     if (w.returning === "computed") reach.reach("returning computed");
     if (w.returning === "star") reach.reach("returning star");
     const arrival = expected.arrival[i] ?? "";
-    if (!w.prepared && (arrival === "42703" || arrival === "42P10"))
-      reach.reach(ok ? "planned after the turn, served" : "planned after the turn, refused");
+    if (!w.prepared && (arrival === "42703" || arrival === "42P10")) {
+      if (h.change === "none") reach.reach("answered at once");
+      else reach.reach(ok ? "planned after the turn, served" : "planned after the turn, refused");
+      if (DDL.has(w.verb) && ok && h.change !== "none") reach.reach("DDL planned on its turn");
+    }
+    // Arrival order: an earlier waiter's write, then a later waiter's conflicting DDL.
+    if (DDL.has(w.verb) && h.waiters.slice(0, i).some((earlier) => !DDL.has(earlier.verb)))
+      reach.reach("DDL after an earlier waiter's write");
     if (!w.prepared && arrival.startsWith("ok ") && answer === "42703")
       reach.reach("re-planned, refused");
     if (w.prepared && answer === "0A000") reach.reach("prepared result shape refused");
@@ -405,7 +469,36 @@ function noteReach(h: History, expected: Awaited<ReturnType<typeof postgres>>, r
 }
 
 /** Cases the review named, as the generator writes them. */
+const ddl = (verb: Waiter["verb"], column: Waiter["column"] = "v"): Waiter => ({
+  verb,
+  column,
+  parameters: "none",
+  returning: "none",
+  prepared: false,
+  cancel: false,
+});
+const write = (
+  verb: Waiter["verb"],
+  returning: Waiter["returning"] = "none",
+  column: Waiter["column"] = "c",
+): Waiter => ({ verb, column, parameters: "none", returning, prepared: false, cancel: false });
+
 const PINNED: readonly History[] = [
+  // #69 re-review P2: B1 names the column A adds and arrives first; B2 conflicts and arrives
+  // second. PostgreSQL grants their locks in arrival order: B1 runs before B2.
+  { change: "add column", end: "COMMIT", waiters: [write("insert"), ddl("drop table")] },
+  { change: "add column", end: "COMMIT", waiters: [write("insert"), ddl("unique index")] },
+  { change: "add column", end: "COMMIT", waiters: [write("update", "star"), ddl("add column")] },
+  // #69 re-review P3: DDL naming A's new column waits for A, as PostgreSQL's does.
+  {
+    change: "add column",
+    end: "COMMIT",
+    waiters: [ddl("drop column", "c"), ddl("create index", "c"), ddl("create table as", "c")],
+  },
+  // A typo behind a transaction that changed no catalog is answered at once; behind a queued
+  // writer that may change the catalog (found by this generator: DROP TABLE t first), it waits.
+  { change: "none", end: "COMMIT", waiters: [write("insert")] },
+  { change: "none", end: "COMMIT", waiters: [ddl("drop table"), write("insert")] },
   {
     change: "add column",
     end: "COMMIT",
@@ -492,6 +585,18 @@ for (const seed of seedsFor("next-plan-stale-wait", [0x69a1, 0x69a2]))
         const actual = await minnow(h);
         const context = JSON.stringify(h);
         expect(actual.answers, `${context}: the waiters' answers`).toEqual(expected.answers);
+        // One that cannot plan, behind a transaction that changed no catalog and no earlier
+        // waiter still queued for the turn, is answered at once: nothing can change its answer
+        // first (PostgreSQL: no conflicting lock, and the earlier writers ran before it).
+        if (h.change === "none")
+          for (const [i, w] of h.waiters.entries()) {
+            const arrival = expected.arrival[i];
+            const ahead = h.waiters.slice(0, i).every((_, j) => actual.early.has(j));
+            if (!w.prepared && ahead && (arrival === "42703" || arrival === "42P10"))
+              expect(actual.early.has(i), `${context}: waiter ${String(i)} answered at once`).toBe(
+                true,
+              );
+          }
         expect(actual.state, `${context}: t and audit`).toBe(expected.state);
         noteReach(h, expected, reach);
       }),
