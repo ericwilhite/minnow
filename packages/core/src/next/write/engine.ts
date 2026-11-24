@@ -111,6 +111,11 @@ export type EngineInput = OpenWritePathInput & {
      * among those it stages in its table; −1 for the directory); a throw fails there.
      */
     readonly stageFault?: (step: "group" | "runs" | "directory", part: number) => void;
+    /**
+     * Tests: groups per page of a staged directory (default `GROUPS_PER_PAGE`), so a staging of a
+     * few memtables writes the multi-page directory a transaction of thousands of them does.
+     */
+    readonly stagedDirectoryPageGroups?: number;
   };
 };
 import { CatalogChangeError, type TableDef } from "../access/catalog.js";
@@ -218,6 +223,7 @@ import {
   encodeGroupRoot,
   encodeManifestRoot,
   directoryPageGroups,
+  GROUPS_PER_PAGE,
   isEmptyDirectory,
   ParseBudgetError,
   parseCharge,
@@ -608,6 +614,8 @@ export class WritePathImpl implements WritePath, EngineHooks {
   readonly #published = new Set<Memtable>();
   readonly #governorCap: number;
   readonly #memtableRows: number;
+  /** `EngineInput.tuning.stagedDirectoryPageGroups`. */
+  readonly #stagedDirectoryPageGroups: number;
   /** Rows a new memtable takes (`EngineHooks.memtableRows`). */
   get memtableRows(): number {
     return this.#memtableRows;
@@ -762,6 +770,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
     this.#roots.set(root, { refs: 1, bytes: metadata.rootCharge });
     this.durability = input.options.durability;
     this.#memtableRows = input.tuning?.memtableRows ?? MEMTABLE_ROWS;
+    this.#stagedDirectoryPageGroups = input.tuning?.stagedDirectoryPageGroups ?? GROUPS_PER_PAGE;
     this.#session = input.session;
     this.#space = input.space;
     this.#grant = grant;
@@ -1701,13 +1710,12 @@ export class WritePathImpl implements WritePath, EngineHooks {
         `Transaction ${String(effect.transaction)} is not staged for table ${String(effect.tableId)}`,
       );
     const refs: GroupRef[] = [];
-    const directory: ExtentRef[] = [];
+    let directory: ExtentRef[] = [];
     if (!isEmptyDirectory(entry.groups)) {
-      directory.push(entry.groups.extent);
       const index = await this.#metadata.groupIndex(entry.groups, this.#grant);
       try {
+        directory = directoryExtents(entry.groups, index.value);
         for (const page of index.value) {
-          directory.push(page.ref.extent);
           const held = await this.#metadata.groupPage(page.ref, this.#grant);
           try {
             for (const group of held.value) refs.push(group);
@@ -5328,9 +5336,15 @@ export class WritePathImpl implements WritePath, EngineHooks {
             ...partOf(memtable).group,
             groupId: k + 1,
           }));
-          const written = await writeGroupDirectory(writer, refs);
+          const written = await writeGroupDirectory(
+            writer,
+            refs,
+            [],
+            "packed",
+            this.#stagedDirectoryPageGroups,
+          );
           this.#check();
-          directory = [written.ref.extent, ...written.pages.map((page) => page.ref.extent)];
+          directory = directoryExtents(written.ref, written.pages);
           entry = {
             transaction: id,
             firstRowId: need(refs[0]).firstRowId,
@@ -7077,6 +7091,23 @@ async function encodeDelta(
     builder.close();
     release();
   }
+}
+
+/**
+ * The extents a staged group directory occupies, each named once: its index's, then its pages'.
+ * The pages one `writeGroupDirectory` call writes share one extent, so a directory of two or more
+ * pages names that extent once per page. A staging's directory is released whole by the next
+ * staging or by its fold, and a publication releases each extent once (ruling R25).
+ */
+function directoryExtents(index: BlobRef, pages: readonly GroupPageEntry[]): ExtentRef[] {
+  const out: ExtentRef[] = [index.extent];
+  const named = new Set<number>([index.extent.offset]);
+  for (const page of pages)
+    if (!named.has(page.ref.extent.offset)) {
+      named.add(page.ref.extent.offset);
+      out.push(page.ref.extent);
+    }
+  return out;
 }
 
 /** Adds `extents` to a publication's retirements, each at most once. */
