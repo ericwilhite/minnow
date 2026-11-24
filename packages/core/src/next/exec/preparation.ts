@@ -189,6 +189,16 @@ export class PreparationGovernor implements MemoryGovernor {
     const grant = this.governor.carve(source, label, spillable, bytes);
     return grant === null ? null : this.#took(grant);
   }
+  #beside: (() => WaitingHoldings) | null = null;
+  /**
+   * What the statement keeps while an admission of its preparation waits (its result grant, what
+   * its snapshot keeps from release, its writer's holdings while it holds the turn): every wait
+   * carries it (`NativeGrantGroupOptions.holdings`), so a request that could never be served
+   * beside it is refused with 53200 (GOVERNOR-WAIT-POLICY point 5), never left waiting.
+   */
+  besides(holdings: () => WaitingHoldings): void {
+    this.#beside = holdings;
+  }
   /**
    * Holding no live grant, the attempt may wait like any execution: it first returns the idle
    * credit, so the wait holds nothing.
@@ -229,8 +239,37 @@ export class PreparationGovernor implements MemoryGovernor {
     options.signal?.throwIfAborted();
     const grant = this.tryAdmit(options);
     if (grant !== null) return Promise.resolve(grant);
-    if (this.#holdsNothing())
-      return this.governor.admit(options).then((admitted) => this.#took(admitted));
+    if (this.#holdsNothing()) {
+      const beside = this.#beside;
+      // Served, it is adopted a turn later: a cancel in between returns the grant, never hands it
+      // to a caller that stopped waiting.
+      const adopt = (admitted: Grant | undefined): Grant => {
+        if (admitted === undefined) throw new Error("A preparation admission was not served");
+        if (options.signal?.aborted === true) {
+          admitted.close();
+          options.signal.throwIfAborted();
+        }
+        return this.#took(admitted);
+      };
+      if (beside === null) return this.governor.admit(options).then(adopt);
+      // The same request, bounded by what the statement keeps (`besides`), in the same queue:
+      // holder growth stays holder growth (`holdsCredit`).
+      return this.governor
+        .admitGroup({
+          label: options.label,
+          grants: [
+            {
+              label: options.label,
+              minimumBytes: options.minimumBytes,
+              spillable: options.spillable,
+            },
+          ],
+          holdings: beside,
+          ...(options.holdsCredit === undefined ? {} : { holdsCredit: options.holdsCredit }),
+          ...(options.signal === undefined ? {} : { signal: options.signal }),
+        })
+        .then(([admitted]) => adopt(admitted));
+    }
     return Promise.reject(
       this.#wouldWait(options.label, options.minimumBytes, false, [
         { label: options.label, minimumBytes: options.minimumBytes, spillable: options.spillable },
@@ -283,17 +322,31 @@ export class PreparationGovernor implements MemoryGovernor {
       }
       // Else the governor's own group, when it serves that group at once (a private-progress
       // group may use the reserve), or an ordinary wait when the attempt holds nothing.
+      // The caller's group (holder growth, its returns and leave hook kept; its idle pool is
+      // registered already), bounded by what the statement keeps unless it names its own holdings.
       const group: NativeGrantGroupOptions = {
         label: options.label,
         grants: options.grants,
         includesProgress: progress,
         ...(options.signal === undefined ? {} : { signal: options.signal }),
-        ...(options.holdings === undefined ? {} : { holdings: options.holdings }),
+        ...(options.holdsCredit === undefined ? {} : { holdsCredit: options.holdsCredit }),
+        ...(options.returns === undefined ? {} : { returns: options.returns }),
+        ...(options.onLeave === undefined ? {} : { onLeave: options.onLeave }),
+        ...(options.holdings === undefined
+          ? this.#beside === null
+            ? {}
+            : { holdings: this.#beside }
+          : { holdings: options.holdings }),
       };
       if (this.governor.canAdmitNow(total, progress) || this.#holdsNothing())
-        return this.governor
-          .admitGroup(group)
-          .then((grants) => grants.map((grant) => this.#took(grant)));
+        return this.governor.admitGroup(group).then((grants) => {
+          // A cancel between the governor's answer and this adoption returns the grants.
+          if (options.signal?.aborted === true) {
+            for (const grant of grants) grant.close();
+            options.signal.throwIfAborted();
+          }
+          return grants.map((grant) => this.#took(grant));
+        });
       throw this.#wouldWait(options.label, total, progress, options.grants);
     } catch (error) {
       return Promise.reject(error instanceof Error ? error : new Error(String(error)));
@@ -385,9 +438,18 @@ export class PreparationGovernor implements MemoryGovernor {
   }
 }
 
-/** The governor a facade fronts (shared per-governor state, such as the phase idle pool). */
+/**
+ * The governor a facade fronts (shared per-governor state, such as the phase idle pool): through
+ * every facade that names what it fronts (`MemoryGovernor.fronts`), a preparation facade over a
+ * session's wrapper included, to the governor itself.
+ */
 export function baseGovernor(governor: MemoryGovernor): MemoryGovernor {
-  return governor instanceof PreparationGovernor ? governor.governor : governor;
+  let base = governor;
+  for (;;) {
+    const next = base instanceof PreparationGovernor ? base.governor : base.fronts;
+    if (next === undefined || next === base) return base;
+    base = next;
+  }
 }
 
 /**

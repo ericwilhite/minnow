@@ -198,17 +198,23 @@ export interface MemoryGovernor {
   openHolderChain?(label: string, kind: HolderChain["kind"]): HolderChain;
   /**
    * GOVERNOR-WAIT-POLICY point 5: the most a request could ever be served while its statement
-   * waits: the usable capacity (`usableCapacity(includesProgress)`: the cap, less the reserve for
-   * an ordinary request, less every registered lifetime holding) less what that statement keeps
-   * held while it waits (`WaitingHoldings`). A waiting group carries it as
+   * waits. Every finite holder is taken to have released (they return what they hold however long
+   * the statement waits); what stays is the registered lifetime holdings and what the statement
+   * keeps (`WaitingHoldings`). The holder growth queued ahead of the request is then run as the
+   * drain runs it, in FIFO order with the drain's own room rule: each that fits is served and
+   * returns the credit it names (`NativeGrantGroupOptions.returns`); one that never fits blocks
+   * the request (0 or less). The result is the most that room rule then gives the request (the
+   * cap, less the reserve for an ordinary request beside any loan). A waiting group carries it as
    * `NativeGrantGroupOptions.holdings`. With `unasked`, the statement's own spillable grants
    * count nothing: their reclaim, not yet asked, may return all they hold. Optional for wrapping
-   * governors that never wait (a
-   * prepaid native body's).
+   * governors that never wait (a prepaid native body's).
    */
   servableNow?(own: WaitingHoldings, includesProgress?: boolean, unasked?: boolean): number;
   /** Whether `bytes` could be admitted at once, without waiting (`Governor.canAdmitNow`). */
   canAdmitNow?(bytes: number, includesProgress: boolean): boolean;
+  /** A facade's governor (a wrapper adding options to a session's admissions): per-governor
+   * state, such as the phase idle pool, belongs to it (exec/preparation.ts `baseGovernor`). */
+  readonly fronts?: MemoryGovernor;
   /** Moves idle ordinary credit within this owner. No allocation or global admission occurs. */
   transferCredit(source: Grant, target: Grant, bytes: number): boolean;
   /**
@@ -236,8 +242,8 @@ export interface WaitingHoldings {
   readonly grants: readonly Grant[];
   /** Another owner's holdings kept for the statement: its writer's, while it holds the turn. */
   readonly lent?: LentHoldings;
-  /** Memory only the statement's own snapshots keep alive (`Snapshot.exclusiveBytes`): it
-   * returns when they close, so it stays while the statement waits. */
+  /** Memory the statement's own snapshots keep from release (`Snapshot.blockedBytes`): none of
+   * it returns while they stay open, so it stays while the statement waits. */
   readonly pinned?: () => number;
 }
 
@@ -245,20 +251,15 @@ export interface WaitingHoldings {
 export interface LentHoldings {
   readonly grants: readonly Grant[];
   /**
-   * The bytes of `grants`, beyond the owner's registered lifetime holding, that stay held
-   * however long the statement waits. The rest is finite: a flush, a snapshot's close or the
-   * owner's reclaim frees it. Never more than stays: while the owner runs work of its own its
-   * holdings are not yet known, and it counts none.
+   * The bytes of `grants`, beyond the owner's registered lifetime holding and beyond `pinned`
+   * (the statement's `WaitingHoldings.pinned`, which these grants hold too: retired rows and run
+   * readers kept for its snapshots), that stay held however long the statement waits. The rest is
+   * finite: a flush, a snapshot's close or the owner's reclaim frees it. Never more than stays.
+   * The owner's own work queued as holder growth (a flush's, a merge's) is not finite by itself:
+   * `servableNow` runs the queue, and that work returns credit only once served
+   * (`NativeGrantGroupOptions.returns`).
    */
-  retained(): number;
-  /**
-   * The bytes the owner's own work waits for in the governor as holder growth (a merge's
-   * credit, a flush's metadata), by whether it may use the progress reserve. Holder growth is
-   * served before admissions, so the statement's
-   * requests wait behind it: when it could never be served beside what the statement keeps,
-   * neither could they.
-   */
-  queued?(): { readonly ordinary: number; readonly progress: number };
+  retained(pinned: number): number;
 }
 
 /** Named parts of one complete minimum. Each part remains a normal native grant. */
@@ -294,6 +295,21 @@ export interface NativeGrantGroupOptions {
    * never inferred. The chain is checked (`HolderChain`).
    */
   readonly holdsCredit?: HolderChain;
+  /**
+   * Holder growth only: the grants whose credit this growth's work returns once it is served and
+   * finishes (a flush's or merge's accounts). `servableNow` credits each grant once however many
+   * queued requests name it, and only grants a waiting statement counts as kept
+   * (`LentHoldings.grants`). Without it the work returns nothing it is counted for.
+   */
+  readonly returns?: () => readonly Grant[];
+  /**
+   * Called synchronously when the request leaves its queue (served, cancelled, refused or its
+   * grant closed), before the drain goes on and before its promise settles: an owner's record of
+   * its queued work leaves with it. If it throws when the request is served, the request is
+   * refused with that error (nothing was taken) and the drain goes on; when it leaves otherwise,
+   * the request's own reason stands.
+   */
+  readonly onLeave?: () => void;
 }
 
 export class ValueTooLargeError extends Error {
@@ -322,6 +338,27 @@ export class GrantClosedError extends Error {
   }
 }
 
+/**
+ * The drain's room rule (`Governor.#missing`), over a state: the bytes missing for `bytes` more
+ * from `used`, with `loaned` out on loans and `idle` unused private idle credit. Every request
+ * must fit the cap; one that is not `whole` (a loan or a private-progress group is) must also fit
+ * `cap − reserve`, where loans and idle credit do not count. `servableNow` applies the same rule
+ * to the state a waiting statement could reach, so its bound and the drain cannot disagree.
+ */
+function roomShortfall(
+  governor: { readonly capBytes: number; readonly reserveBytes: number },
+  state: { readonly used: number; readonly loaned: number; readonly idle: number },
+  bytes: number,
+  whole: boolean,
+): number {
+  const total = state.used + bytes - governor.capBytes;
+  if (whole) return total;
+  return Math.max(
+    total,
+    state.used - state.loaned - state.idle + bytes - (governor.capBytes - governor.reserveBytes),
+  );
+}
+
 function abortReason(signal: AbortSignal | undefined): Error {
   const reason: unknown = signal?.reason;
   return reason instanceof Error ? reason : new Error("Aborted", { cause: reason });
@@ -330,6 +367,9 @@ function abortReason(signal: AbortSignal | undefined): Error {
 function checkSignal(signal: AbortSignal | undefined): void {
   if (signal?.aborted === true) throw abortReason(signal);
 }
+
+/** `Governor.#leave`'s result when `onLeave` did not throw. */
+const NO_FAULT = Symbol("no fault");
 
 interface Request {
   readonly bytes: number;
@@ -348,6 +388,10 @@ interface Request {
   readonly parts: NativeGrantGroupOptions["grants"] | null;
   /** `NativeGrantGroupOptions.holdings`: its bound is checked while it waits. */
   readonly holdings: (() => WaitingHoldings) | null;
+  /** `NativeGrantGroupOptions.returns`. */
+  readonly returns?: () => readonly Grant[];
+  /** `NativeGrantGroupOptions.onLeave`. */
+  readonly onLeave?: () => void;
 }
 
 /** A growth observer (Governor.observeGrowth) tried to change grant or governor state. */
@@ -724,25 +768,69 @@ export class Governor implements MemoryGovernor {
   }
 
   servableNow(own: WaitingHoldings, includesProgress = false, unasked = false): number {
-    let held = 0;
+    return this.#servable(own, includesProgress, unasked, null);
+  }
+
+  /**
+   * `servableNow` for `request` (null: a request not queued yet, behind every queued holder).
+   * One pass over the holder growth queued ahead of it, in the drain's order and by the drain's
+   * room rule (`roomShortfall`), from the state the statement could reach: every finite holder
+   * released, and only the lifetime holdings and what the statement keeps still held.
+   */
+  #servable(
+    own: WaitingHoldings,
+    includesProgress: boolean,
+    unasked: boolean,
+    request: Request | null,
+  ): number {
+    let used = this.permanentBytes,
+      loaned = 0;
     for (const grant of new Set(own.grants))
       if (
         grant instanceof GrantImpl &&
         grant.governor === this &&
         !grant.closed &&
-        !(unasked && grant.spillable)
-      )
-        held += grant.held;
-    const kept = held + (own.lent?.retained() ?? 0) + (own.pinned?.() ?? 0);
-    const servable = this.usableCapacity(includesProgress) - kept;
-    // The owner's queued growth is served first: beyond what fits beside the statement in its
-    // own capacity class it never is, and every admission of the statement waits behind it.
-    const queued = own.lent?.queued?.();
-    const blocked =
-      queued !== undefined &&
-      (queued.ordinary > this.usableCapacity(false) - kept ||
-        queued.progress > this.usableCapacity(true) - kept);
-    return blocked ? Math.min(0, servable) : servable;
+        !(unasked && grant.spillable) &&
+        // Idle credit is not kept: the drain lets any request adopt it.
+        !this.#idleCredit.has(grant)
+      ) {
+        used += grant.held;
+        loaned += grant.loan;
+      }
+    const pinned = own.pinned?.() ?? 0;
+    // What the lent owner keeps beyond what the statement pins inside its grants (counted once).
+    let lent = own.lent === undefined ? 0 : Math.max(0, own.lent.retained(pinned));
+    used += pinned + lent;
+    const state = { used, loaned, idle: 0 };
+    const most = () =>
+      includesProgress
+        ? this.capBytes - state.used
+        : Math.min(
+            this.capBytes - state.used,
+            this.capBytes - this.reserveBytes - (state.used - state.loaned),
+          );
+    // Holder growth is served before any admission, FIFO (GOVERNOR-WAIT-POLICY): a head that
+    // never fits blocks every request behind it, this one included. One that fits is served, its
+    // work finishes and returns the lent credit it names, each grant once.
+    const lentGrants = own.lent === undefined ? null : new Set<Grant>(own.lent.grants);
+    const credited = new Set<Grant>();
+    const credit = (returns: (() => readonly Grant[]) | undefined) => {
+      if (lentGrants === null || returns === undefined) return;
+      for (const grant of returns()) {
+        if (!lentGrants.has(grant) || credited.has(grant)) continue;
+        credited.add(grant);
+        const back = Math.min(lent, grant.held);
+        lent -= back;
+        state.used -= back;
+      }
+    };
+    for (const ahead of this.#holders) {
+      if (ahead === request) break;
+      if (roomShortfall(this, state, ahead.bytes, ahead.includesProgress) > 0)
+        return Math.min(0, most());
+      credit(ahead.returns);
+    }
+    return most();
   }
 
   registerPermanent(bytes: () => number, label = "owner lifetime holdings"): () => void {
@@ -783,7 +871,7 @@ export class Governor implements MemoryGovernor {
     for (const queue of [this.#holders, this.#admissions])
       for (const request of [...queue]) {
         if (request.holdings === null || request.pending.size > 0) continue;
-        const most = this.servableNow(request.holdings(), request.includesProgress, true);
+        const most = this.#servable(request.holdings(), request.includesProgress, true, request);
         if (request.bytes <= most) continue;
         this.#reject(
           queue,
@@ -819,6 +907,7 @@ export class Governor implements MemoryGovernor {
   readonly #admissions: Request[] = [];
   /** Holder growth (`holdsCredit`): served before any queued new admission. */
   readonly #holders: Request[] = [];
+
   #draining = false;
   #again = false;
   /** Bytes out on loans: they count against the cap, never against the admission limit. */
@@ -840,12 +929,7 @@ export class Governor implements MemoryGovernor {
    * cap; ordinary admissions and growth must also fit `cap − reserve` excluding shared loans.
    */
   #missing(bytes: number, loan: boolean, idle = 0): number {
-    const total = this.usedBytes + bytes - this.capBytes;
-    if (loan) return total;
-    return Math.max(
-      total,
-      this.usedBytes - this.#loaned - idle + bytes - (this.capBytes - this.reserveBytes),
-    );
+    return roomShortfall(this, { used: this.usedBytes, loaned: this.#loaned, idle }, bytes, loan);
   }
 
   /** Room for a request, evicting the caches first (rule 6). */
@@ -1021,7 +1105,7 @@ export class Governor implements MemoryGovernor {
         if (request.grant === grant) {
           this.#progress++;
           queue.splice(queue.indexOf(request), 1);
-          request.detach();
+          this.#leave(request);
           request.reject(new GrantClosedError(grant.label));
         }
   }
@@ -1160,7 +1244,7 @@ export class Governor implements MemoryGovernor {
           const most =
             holdings === undefined
               ? undefined
-              : this.servableNow(holdings, request.includesProgress);
+              : this.#servable(holdings, request.includesProgress, false, request);
           if (most !== undefined && demand() > most) {
             this.#reject(
               queue,
@@ -1179,7 +1263,13 @@ export class Governor implements MemoryGovernor {
       if (this.#preempted(queue)) return;
       this.#progress++;
       queue.shift();
-      request.detach();
+      // Its owner's record leaves in this drain. A throwing hook refuses this request only: nothing
+      // was taken yet, and the error (its SQLSTATE) is the request's, never the drain's caller's.
+      const fault = this.#leave(request);
+      if (fault !== NO_FAULT) {
+        request.reject(fault);
+        continue;
+      }
       const wanted = demand();
       const taken = bytes();
       this.#take(taken);
@@ -1257,7 +1347,8 @@ export class Governor implements MemoryGovernor {
         const index = queue.indexOf(entry);
         if (index >= 0) queue.splice(index, 1);
         this.#progress++;
-        entry.detach();
+        // Withdrawn before the drain below: its owner's record must not outlive it there.
+        this.#leave(entry);
         reject(abortReason(signal));
         this.#drain();
       };
@@ -1370,9 +1461,21 @@ export class Governor implements MemoryGovernor {
     if (at < 0) return;
     this.#progress++;
     queue.splice(at, 1);
-    request.detach();
+    this.#leave(request);
     request.reject(error);
     this.#drain();
+  }
+
+  /** A request leaves its queue: its abort listener goes and its `onLeave` runs, contained (the
+   * error it threw, else `NO_FAULT`). */
+  #leave(request: Request): unknown {
+    request.detach();
+    try {
+      request.onLeave?.();
+      return NO_FAULT;
+    } catch (error) {
+      return error;
+    }
   }
 
   async admit(options: AdmitOptions): Promise<Grant> {
@@ -1451,6 +1554,8 @@ export class Governor implements MemoryGovernor {
         spillable: false,
         includesProgress: includesProgress === true,
         holdings: options.holdings ?? null,
+        ...(options.returns === undefined ? {} : { returns: options.returns }),
+        ...(options.onLeave === undefined ? {} : { onLeave: options.onLeave }),
       },
       signal,
       null,

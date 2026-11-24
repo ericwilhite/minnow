@@ -13906,3 +13906,21 @@ export const EXPRESSION_BOUND_CENSUS_REACH = [
   "negative numeric",
   "scale above precision",
 ] as const;
+
+/**
+ * GOVERNOR-WAIT-POLICY point 5 over the governor's real holder queue
+ * (next/memory/servable-queue-generated.test.ts): the step's four outcomes, and the queue shapes
+ * #71's review found unreached by synthetic work records.
+ */
+export const SERVABLE_QUEUE_REACH = [
+  "served at once",
+  "served after release",
+  "refused at once",
+  "refused after a cancel",
+  "simultaneous writer growth",
+  "mixed capacity classes",
+  "loan held beside queued growth",
+  "shared account named twice",
+  "cancel before the decision",
+  "cancel during a drain",
+] as const;

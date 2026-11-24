@@ -1134,12 +1134,12 @@ export class SnapshotImpl implements Snapshot {
     };
   }
   #pinReleased = false;
-  exclusiveBytes(): number {
+  blockedBytes(): number {
     if (this.#pinReleased) return 0;
-    // Holds older readers keep, and this view's own state pin when no other pin shares it.
+    // The holds this view's reader keeps from release, and what its state pin keeps, each once.
     return (
-      this.shared.readers.exclusiveBytes(this.#reader) +
-      (this.shared.exclusiveStateBytes?.(this.state) ?? 0)
+      this.shared.readers.blockedBytes([this.#reader]) +
+      (this.shared.blockedStateBytes?.([this.state]) ?? 0)
     );
   }
   #releasePin(): void {
