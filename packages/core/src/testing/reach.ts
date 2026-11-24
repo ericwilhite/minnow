@@ -2106,7 +2106,12 @@ export const WRITABLE_TRANSACTION_READ_REACH = [
 ] as const;
 
 /** A write step waiting for rows, decided without spinning (row-wait-reclaim). */
-export const ROW_WAIT_RECLAIM_REACH = ["waited for rows", "written", "refused typed"] as const;
+export const ROW_WAIT_RECLAIM_REACH = [
+  "waited for rows",
+  "written",
+  "refused typed",
+  "read back through SQL",
+] as const;
 
 /** PG per-attribute mode transitions, statement attempts, savepoints and transaction cleanup. */
 export const OWNER_TRANSACTION_MODE_STATES = [
