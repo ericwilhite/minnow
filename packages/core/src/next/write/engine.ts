@@ -961,8 +961,11 @@ export class WritePathImpl implements WritePath, EngineHooks {
               // A refused metadata attempt's funded credit, until that attempt settles.
               engine.#metadataBudget.fundedBytes,
             ),
+            // Recovery keeps the commit window the open admitted: the log appender takes its
+            // header from it when recovery ends, and growth that waits during the open must not
+            // release it first (that left the appender's buffer unfunded).
             commits:
-              engine.#commitEncoding > 0 || (!engine.#recovering && engine.#appender.hasPendingWork)
+              engine.#recovering || engine.#commitEncoding > 0 || engine.#appender.hasPendingWork
                 ? COMMIT_MINIMUM_BYTES
                 : 0,
           },
