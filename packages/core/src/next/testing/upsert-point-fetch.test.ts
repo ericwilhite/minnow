@@ -76,8 +76,15 @@ async function table(rows: number): Promise<Table> {
     publish = resolve;
   });
   const core = await new StorageCore(MEMTABLE_ROWS, { beforeFlushPublish: () => held }).open();
-  await core.execute("CREATE TABLE s(id INTEGER PRIMARY KEY, v INTEGER)");
-  await core.execute(`INSERT INTO s SELECT g, g FROM generate_series(1, ${String(rows + 1)}) g`);
+  try {
+    await core.execute("CREATE TABLE s(id INTEGER PRIMARY KEY, v INTEGER)");
+    await core.execute(`INSERT INTO s SELECT g, g FROM generate_series(1, ${String(rows + 1)}) g`);
+  } catch (error) {
+    // Let held flushes go, or close waits on them until the test times out.
+    publish();
+    await core.close();
+    throw error;
+  }
   return Object.assign(core, { publish });
 }
 /** The sum of v as inserted: ids 1 … rows + 1. */
@@ -125,6 +132,7 @@ it("does the same work per conflicting row at N and 2N rows", async () => {
       expect(memo.held, "the memo gives back everything at statement end").toBe(0);
       measured.push({ rows, reads, opens: memo.opens, composites });
     } finally {
+      core.publish(); // a failure before the first fetch still holds the flushes
       await core.close();
     }
     expect(core.harness.governor.usedBytes).toBe(0);
@@ -155,6 +163,7 @@ it("releases the memo when a row's update fails mid-statement", async () => {
     vi.restoreAllMocks();
     expect(await sumOfV(core)).toBe(inserted(rows));
   } finally {
+    core.publish(); // a failure before the first fetch still holds the flushes
     await core.close();
   }
   expect(core.harness.governor.usedBytes).toBe(0);
@@ -180,6 +189,7 @@ it("releases the memo when the statement is aborted between fetches", async () =
     vi.restoreAllMocks();
     expect(await sumOfV(core)).toBe(inserted(rows));
   } finally {
+    core.publish(); // a failure before the first fetch still holds the flushes
     await core.close();
   }
   expect(core.harness.governor.usedBytes).toBe(0);
@@ -213,6 +223,7 @@ it("declines a memo its budget refuses and reads every row without it", async ()
     vi.restoreAllMocks();
     expect(await sumOfV(core)).toBe(inserted(rows) + rows);
   } finally {
+    core.publish(); // a failure before the first fetch still holds the flushes
     await core.close();
   }
   expect(core.harness.governor.usedBytes).toBe(0);

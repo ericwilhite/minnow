@@ -54,7 +54,8 @@ export class ReaderMemo {
   readonly budget: ByteBudget & { optionalAllocate(bytes: number): boolean };
   constructor(
     owner: ByteBudget,
-    /** The statement's signal; it must cover the signal of every read that uses the memo. */
+    /** The statement's signal. Every read that uses the memo passes this same signal (`===`,
+     * checked by write/memory-read.ts): memo reads build no per-read composite. */
     readonly signal: AbortSignal,
   ) {
     const optional = owner as ByteBudget & { optionalAllocate?(bytes: number): boolean };

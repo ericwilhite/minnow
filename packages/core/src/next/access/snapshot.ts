@@ -290,7 +290,8 @@ export interface MemoryReadContext {
    * none of what it parses (page/reader.ts `ChunkReadOptions.once`). */
   readonly once?: boolean;
   /** A statement-owned memo of opened published readers for repeated point reads
-   * (access/reader-memo.ts). Its signal must cover `signal`. */
+   * (access/reader-memo.ts). `signal` must be the memo's own signal (`===`): a memo read builds
+   * no per-read composite, so it cannot honour another one. */
   readonly readers?: ReaderMemo;
 }
 
