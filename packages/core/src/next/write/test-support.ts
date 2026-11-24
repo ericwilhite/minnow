@@ -171,6 +171,8 @@ export class Harness {
   ownerHoldings: (() => number) | null = null;
   /** Called with the extent space before the write path opens over it (tests instrument reads). */
   onSpace: ((space: ExtentSpace) => void) | null = null;
+  /** The next open's signal (`EngineInput.options.signal`): cancels an open that waits. */
+  signal: AbortSignal | undefined = undefined;
   /** Wall time of the last open's two phases: the extent space (its walk), then the write path. */
   lastOpen = { spaceMs: 0, pathMs: 0 };
 
@@ -217,7 +219,10 @@ export class Harness {
         session,
         space: this.space,
         governor: this.governor,
-        options: { durability: this.durability },
+        options: {
+          durability: this.durability,
+          ...(this.signal === undefined ? {} : { signal: this.signal }),
+        },
         ...(this.extentDeltas === null ? {} : { extentDeltas: this.extentDeltas }),
         ...(this.ownerHoldings === null ? {} : { ownerHoldings: this.ownerHoldings }),
         tuning: {

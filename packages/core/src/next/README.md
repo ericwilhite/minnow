@@ -182,6 +182,15 @@ of a query's independently admitted minimum. `write/recovery-credit.test.ts` and
 `testing/native-recovery-credit.test.ts` generate in-flight reads with real competing
 buffers, prepared rows, exact reopen/continued writes and zero final charge.
 
+Replay stores the log tail's rows in memtables it cannot flush before recovery ends, so it
+admits each step of at most 2,048 rows first, with the insert path's own step charge
+(`write/step-charge.ts`): from the row account's headroom or the owner's idle forecasts, else by
+waiting (holder growth, cancellable through the open's signal). A tail that could never fit
+at the cap refuses the open with `ReplayMemoryError` (53200), leaving the log as it was. While
+recovering, the commit window keeps its minimum: the log appender recovery builds takes its
+header from it. `write/recovery-replay-admission.test.ts` and
+`write/recovery-commit-floor.test.ts` cover the wait, the refusal and a cancelled open.
+
 Extent-list preparation and `GroupWriter` page buffers use that metadata budget too:
 reclaimed idle row credit is never mistaken for prepaid publication workspace. Only the
 keeper's internal metadata-pressure request can reach the outer retry; genuine external

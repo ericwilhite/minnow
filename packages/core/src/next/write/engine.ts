@@ -211,6 +211,7 @@ import {
 } from "./catalog-storage.js";
 import { decodeCatalogParts } from "./catalog-stream.js";
 import { decodeColumn, isNullAt, MEMORY_CHUNK_ROWS } from "./columns.js";
+import { stepCharge, type StepTable } from "./step-charge.js";
 import { IDLE_FLUSH_MS, LogAppender, type LogPosition } from "./log.js";
 import { BlobCache, fullBlobKey } from "../format/blob-cache.js";
 import {
@@ -506,6 +507,22 @@ function tableStatistics(groupCount: number, totals: ReadonlyMap<number, Totals>
     )
     .sort((a, b) => a.columnId - b.columnId);
   return { groupCount, columns };
+}
+
+/**
+ * Opening needs more memory than the cap allows for the rows it must replay from the log: they
+ * stay in memory until recovery ends. The data is intact; a larger memory cap opens it. A typed
+ * memory refusal (53200), with a message that says what to do.
+ */
+export class ReplayMemoryError extends MemoryAdmissionError {
+  constructor(bytes: number, capacity: number) {
+    super("log replay", bytes, capacity);
+    const mib = (n: number) => (n / (1024 * 1024)).toFixed(1);
+    this.message =
+      `Opening this database replays at least ${mib(bytes)} MiB of recently written rows, more ` +
+      `than the memory cap allows (${mib(capacity)} MiB). The data is intact; open it with a ` +
+      `larger memory cap.`;
+  }
 }
 
 export class WritePathImpl implements WritePath, EngineHooks {
@@ -1608,6 +1625,28 @@ export class WritePathImpl implements WritePath, EngineHooks {
     }
   }
 
+  /**
+   * Room for a replayed step of rows, before it is appended: from the row account's headroom or
+   * the owner's idle forecasts at once, else by waiting for another holder (cancellable through the
+   * open's signal). Replay cannot flush what it replays, so when the replayed rows could never
+   * fit at this cap the open is refused (53200, `ReplayMemoryError`); the log is untouched and a
+   * larger cap opens the database.
+   */
+  async #replayAdmit(bytes: number): Promise<void> {
+    if (this.#headroom(bytes)) return;
+    try {
+      await this.#credits.growTo(
+        this.#grant,
+        this.#grant.allocated + this.#grant.loaned + bytes,
+        this.#signal,
+      );
+    } catch (error) {
+      if (error instanceof MemoryAdmissionError)
+        throw new ReplayMemoryError(this.#memtableBytes() + bytes, this.#governorCap);
+      throw error;
+    }
+  }
+
   async #replayRows(effect: Extract<BodyEffect, { kind: "rows" }>, lsn: number): Promise<void> {
     const def = this.#catalog.table(effect.tableId);
     const state = this.#tables.get(effect.tableId);
@@ -1640,9 +1679,21 @@ export class WritePathImpl implements WritePath, EngineHooks {
                 ? missingVector(column, inserts.rowCount)
                 : need(columns[position]);
             });
+      // Replay stores rows as an insert does, so it admits what each step stores first
+      // (write/step-charge.ts): stored columns are the logged ones, keys the current catalog's.
+      const step: StepTable = {
+        def: { ...physicalDef, indexes: def.indexes },
+        invalid: (indexId) => this.#catalog.index(indexId)?.invalid === true,
+        live: () => state.view.memtables.at(-1),
+        memtableRows: this.#memtableRows,
+        key: (_, columnId) =>
+          need(indexed[def.columns.findIndex((column) => column.id === columnId)]),
+      };
       let done = 0;
       while (done < inserts.rowCount) {
-        let { memtable } = this.liveMemtable(effect.tableId, inserts.rowCount - done, physicalDef);
+        const count = Math.min(MEMORY_CHUNK_ROWS, inserts.rowCount - done);
+        await this.#replayAdmit(stepCharge(step, columns, { rows: null, from: done, count }));
+        let { memtable } = this.liveMemtable(effect.tableId, count, physicalDef);
         const logged = inserts.firstRowId + done;
         // Staging moves the root's next row id past its rows; after a rollback the ids it used
         // (never committed) may be used again by rows logged but not flushed. An empty memtable
@@ -1661,7 +1712,7 @@ export class WritePathImpl implements WritePath, EngineHooks {
           throw new LogCorruptionError(
             `Logged rows of table ${String(effect.tableId)} start at row ${String(inserts.firstRowId + done)}, not ${String(next)}`,
           );
-        const take = Math.min(memtable.capacity, inserts.rowCount - done);
+        const take = Math.min(memtable.capacity, count);
         const before = memtable.rowCount;
         memtable.append(columns, null, done, take);
         memtable.mark(lsn);

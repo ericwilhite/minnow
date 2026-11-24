@@ -82,6 +82,13 @@ result your application keeps open while it awaits its own write can therefore m
 wait until the result is released; aborting the write's signal ends the wait with an
 `AbortError`, and nothing of the write is kept.
 
+Opening a database after a crash works the same way. The rows written since the last flush are
+replayed from the log and stay in memory until the open finishes, and replay waits for memory
+another holder is using. If those rows can never fit at the memory cap, the open is refused with
+SQLSTATE 53200 (`MINNOW_MEMORY_ADMISSION`) and a message saying how much the replay needs. Nothing
+is lost: the log is untouched, and opening with a larger memory cap replays every row. Aborting the
+open's signal while replay waits stops it the same way; the next open replays from the start.
+
 ## The buffer pool
 
 Separately from execution, decoded blocks are cached so a warm scan does not re-read and
